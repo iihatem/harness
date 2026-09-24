@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 harness-config = { path = "crates/harness-config" }
 harness-core = { path = "crates/harness-core" }
+harness-providers = { path = "crates/harness-providers" }
 harness-tools = { path = "crates/harness-tools" }
 anyhow = "1.0.104"
 async-stream = "0.3"

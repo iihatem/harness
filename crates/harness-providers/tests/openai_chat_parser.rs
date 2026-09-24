@@ -1,0 +1,203 @@
+use harness_core::message::{ChatRequest, Message, ToolCall, ToolSpec, Usage};
+use harness_core::provider::{FinishReason, ProviderError, ProviderEvent};
+use harness_providers::openai_chat::{ChatStreamParser, request_body};
+use serde_json::json;
+
+fn parse(chunks: &[&str]) -> Vec<ProviderEvent> {
+    let mut parser = ChatStreamParser::default();
+    let mut events = Vec::new();
+    for chunk in chunks {
+        events.extend(parser.push(chunk).unwrap());
+    }
+    events.extend(parser.finish());
+    events
+}
+
+#[test]
+fn text_usage_and_finish() {
+    let events = parse(&[
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}]}"#,
+        r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":8}}}"#,
+        "[DONE]",
+    ]);
+    assert_eq!(
+        events,
+        vec![
+            ProviderEvent::TextDelta("Hel".into()),
+            ProviderEvent::TextDelta("lo".into()),
+            ProviderEvent::Usage(Usage {
+                input_tokens: 12,
+                output_tokens: 2,
+                cached_tokens: 8
+            }),
+            ProviderEvent::Finished(FinishReason::Stop),
+        ]
+    );
+}
+
+#[test]
+fn tool_call_fragments_are_assembled() {
+    let events = parse(&[
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":""}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ]);
+    assert_eq!(
+        events,
+        vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "call_a".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"a.txt"}"#.into()
+            }),
+            ProviderEvent::Finished(FinishReason::ToolCalls),
+        ]
+    );
+}
+
+// Review Focus: servers that omit tool-call ids or indexes.
+#[test]
+fn missing_ids_and_indexes_still_yield_distinct_calls() {
+    let events = parse(&[
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"name":"read","arguments":{"path":"a"}}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"name":"glob","arguments":"{\"pattern\":\"*\"}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+    ]);
+    assert_eq!(
+        events,
+        vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "call_0".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"a"}"#.into()
+            }),
+            ProviderEvent::ToolCall(ToolCall {
+                id: "call_1".into(),
+                name: "glob".into(),
+                arguments: r#"{"pattern":"*"}"#.into()
+            }),
+            ProviderEvent::Finished(FinishReason::ToolCalls),
+        ]
+    );
+}
+
+#[test]
+fn empty_arguments_become_an_empty_object() {
+    let events = parse(&[
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"glob"}}]},"finish_reason":"tool_calls"}]}"#,
+    ]);
+    assert_eq!(
+        events[0],
+        ProviderEvent::ToolCall(ToolCall {
+            id: "c".into(),
+            name: "glob".into(),
+            arguments: "{}".into()
+        })
+    );
+}
+
+#[test]
+fn reasoning_fields_become_reasoning_deltas() {
+    let events = parse(&[
+        r#"{"choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"reasoning":"more"},"finish_reason":"length"}]}"#,
+    ]);
+    assert_eq!(
+        events,
+        vec![
+            ProviderEvent::ReasoningDelta("think".into()),
+            ProviderEvent::ReasoningDelta("more".into()),
+            ProviderEvent::Finished(FinishReason::Length),
+        ]
+    );
+}
+
+#[test]
+fn invalid_json_and_error_payloads_are_protocol_errors() {
+    let mut parser = ChatStreamParser::default();
+    assert!(matches!(
+        parser.push("{not json"),
+        Err(ProviderError::Protocol(_))
+    ));
+    assert!(matches!(
+        parser.push(r#"{"error":{"message":"model not found"}}"#),
+        Err(ProviderError::Protocol(_))
+    ));
+}
+
+#[test]
+fn finish_is_idempotent() {
+    let mut parser = ChatStreamParser::default();
+    parser.push("[DONE]").unwrap();
+    assert!(parser.is_done());
+    assert!(parser.finish().is_empty());
+}
+
+#[test]
+fn request_body_maps_messages_and_tools() {
+    let req = ChatRequest {
+        model: "qwen3:14b".into(),
+        system: "be brief".into(),
+        messages: vec![
+            Message::User {
+                content: "hi".into(),
+            },
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }],
+                model: "ollama/qwen3:14b".into(),
+            },
+            Message::Tool {
+                call_id: "c1".into(),
+                content: "data".into(),
+                is_error: false,
+            },
+        ],
+        tools: vec![ToolSpec {
+            name: "read".into(),
+            description: "Read".into(),
+            parameters: json!({"type": "object"}),
+        }],
+    };
+    let body = request_body(&req);
+    assert_eq!(body["model"], "qwen3:14b");
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["stream_options"]["include_usage"], true);
+    assert_eq!(
+        body["messages"][0],
+        json!({"role": "system", "content": "be brief"})
+    );
+    assert_eq!(
+        body["messages"][1],
+        json!({"role": "user", "content": "hi"})
+    );
+    assert_eq!(body["messages"][2]["content"], serde_json::Value::Null);
+    assert_eq!(
+        body["messages"][2]["tool_calls"][0]["function"]["name"],
+        "read"
+    );
+    assert_eq!(
+        body["messages"][3],
+        json!({"role": "tool", "tool_call_id": "c1", "content": "data"})
+    );
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["tools"][0]["function"]["name"], "read");
+}
+
+#[test]
+fn request_body_omits_empty_tools() {
+    let req = ChatRequest {
+        model: "m".into(),
+        system: String::new(),
+        messages: vec![],
+        tools: vec![],
+    };
+    assert!(request_body(&req).get("tools").is_none());
+}

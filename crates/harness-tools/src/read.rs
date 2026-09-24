@@ -83,6 +83,12 @@ impl Tool for ReadTool {
                 lines.len()
             );
         }
+        // Check if the file is valid UTF-8; if not, append a note
+        if std::str::from_utf8(&bytes).is_err() {
+            out.push_str(
+                "[note: file is not valid UTF-8; invalid bytes are shown as U+FFFD, so rewriting it would change those bytes]\n",
+            );
+        }
         ToolOutput::ok(out)
     }
 }

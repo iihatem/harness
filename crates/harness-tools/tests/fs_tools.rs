@@ -215,3 +215,41 @@ async fn edit_requires_a_prior_read() {
     assert!(out.is_error);
     assert!(out.content.contains("read it first"));
 }
+
+#[tokio::test]
+async fn read_reports_an_empty_file() {
+    let (dir, ctx) = setup();
+    put(dir.path(), "empty.txt", "");
+    let out = call(&ReadTool, &ctx, json!({"path": "empty.txt"})).await;
+    assert!(!out.is_error);
+    assert!(out.content.contains("[empty file]"));
+}
+
+#[tokio::test]
+async fn read_reports_an_offset_past_the_end() {
+    let (dir, ctx) = setup();
+    put(dir.path(), "short.txt", "line 1\nline 2\nline 3\n");
+    let out = call(&ReadTool, &ctx, json!({"path": "short.txt", "offset": 10})).await;
+    assert!(!out.is_error);
+    assert!(out.content.contains("past the end"));
+    assert!(out.content.contains("3 lines"));
+}
+
+#[tokio::test]
+async fn read_flags_non_utf8_content() {
+    let (dir, ctx) = setup();
+    std::fs::write(dir.path().join("latin1.txt"), b"caf\xe9\n").unwrap();
+    let out = call(&ReadTool, &ctx, json!({"path": "latin1.txt"})).await;
+    assert!(!out.is_error);
+    assert!(out.content.contains("not valid UTF-8"));
+    assert!(out.content.contains("U+FFFD"));
+}
+
+#[tokio::test]
+async fn read_of_valid_utf8_has_no_encoding_note() {
+    let (dir, ctx) = setup();
+    put(dir.path(), "utf8.txt", "héllo\n");
+    let out = call(&ReadTool, &ctx, json!({"path": "utf8.txt"})).await;
+    assert!(!out.is_error);
+    assert!(!out.content.contains("not valid UTF-8"));
+}

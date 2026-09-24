@@ -6,5 +6,6 @@ pub mod message;
 pub mod output;
 pub mod permission;
 pub mod provider;
+pub mod retry;
 pub mod testing;
 pub mod tool;

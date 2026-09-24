@@ -14,6 +14,7 @@ use crate::{
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
     permission::{Action, Decision, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
+    retry::RetryPolicy,
     tool::{ToolContext, ToolOutput, ToolRegistry},
 };
 
@@ -28,6 +29,7 @@ pub struct AgentConfig {
     pub max_steps: u32,
     pub output_limit: usize,
     pub output_dir: PathBuf,
+    pub retry: RetryPolicy,
 }
 
 impl AgentConfig {
@@ -44,6 +46,7 @@ impl AgentConfig {
             max_steps: 50,
             output_limit: DEFAULT_OUTPUT_LIMIT,
             output_dir,
+            retry: RetryPolicy::default(),
         }
     }
 }
@@ -90,6 +93,13 @@ struct ModelReply {
     finish: Option<FinishReason>,
     /// Whether any output was already shown to the user (then the call must not be retried).
     emitted: bool,
+}
+
+/// How one model call (including its retries) ended.
+enum ModelOutcome {
+    Reply(ModelReply),
+    Failed(ProviderError, ModelReply),
+    Interrupted(ModelReply),
 }
 
 pub struct Agent {
@@ -148,38 +158,100 @@ impl Agent {
         self.invalid_calls
     }
 
-    /// Runs one user turn to completion, reporting everything on `events`.
+    /// Runs one user turn to completion, reporting everything on `events`. Cancelling `cancel` stops the
+    /// turn promptly: in-flight model calls are dropped and running tools are told to stop.
     pub async fn run_turn(
         &mut self,
         input: String,
         events: &UnboundedSender<AgentEvent>,
         cancel: CancellationToken,
     ) -> TurnEndReason {
-        self.ctx.cancel = cancel;
+        self.ctx.cancel = cancel.clone();
         self.invalid_calls = 0;
         let _ = events.send(AgentEvent::TurnStarted);
         self.history.push(Message::User { content: input });
 
         for _ in 0..self.config.max_steps {
-            let mut reply = ModelReply::default();
-            if let Err(error) = self.stream_into(&mut reply, events).await {
-                return self.fail(error, reply, events);
-            }
-            let calls = std::mem::take(&mut reply.tool_calls);
+            let reply = match self.call_model(events, &cancel).await {
+                ModelOutcome::Reply(reply) => reply,
+                ModelOutcome::Failed(error, partial) => return self.fail(error, partial, events),
+                ModelOutcome::Interrupted(partial) => {
+                    if !partial.text.is_empty() {
+                        self.push_assistant(partial.text, Vec::new(), events);
+                    }
+                    return self.finish(TurnEndReason::Interrupted, events);
+                }
+            };
+            let calls = reply.tool_calls.clone();
             self.push_assistant(reply.text, calls.clone(), events);
             if calls.is_empty() {
                 return self.finish(TurnEndReason::Completed, events);
             }
-            for call in calls {
-                let output = self.execute(&call, events).await;
+            for (index, call) in calls.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    // Every tool call needs a result, or the next request would be rejected.
+                    for skipped in &calls[index..] {
+                        self.history.push(Message::Tool {
+                            call_id: skipped.id.clone(),
+                            content: "interrupted by the user before this tool ran".into(),
+                            is_error: true,
+                        });
+                    }
+                    return self.finish(TurnEndReason::Interrupted, events);
+                }
+                let output = self.execute(call, events).await;
                 self.history.push(Message::Tool {
-                    call_id: call.id,
+                    call_id: call.id.clone(),
                     content: output.content,
                     is_error: output.is_error,
                 });
             }
+            if cancel.is_cancelled() {
+                return self.finish(TurnEndReason::Interrupted, events);
+            }
         }
         self.finish(TurnEndReason::StepLimit, events)
+    }
+
+    /// One model call with retries for transient errors. Never retries once output reached the user.
+    async fn call_model(
+        &self,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> ModelOutcome {
+        let mut attempt = 1;
+        loop {
+            let mut reply = ModelReply::default();
+            let result = tokio::select! {
+                result = self.stream_into(&mut reply, events) => Some(result),
+                _ = cancel.cancelled() => None,
+            };
+            match result {
+                None => return ModelOutcome::Interrupted(reply),
+                Some(Ok(())) => return ModelOutcome::Reply(reply),
+                Some(Err(error))
+                    if error.is_retryable()
+                        && !reply.emitted
+                        && attempt < self.config.retry.max_attempts =>
+                {
+                    let delay = self.config.retry.delay(attempt, error.retry_after());
+                    let _ = events.send(AgentEvent::Retrying {
+                        attempt,
+                        reason: error.to_string(),
+                        delay_ms: delay.as_millis() as u64,
+                    });
+                    let waited = tokio::select! {
+                        _ = tokio::time::sleep(delay) => true,
+                        _ = cancel.cancelled() => false,
+                    };
+                    if !waited {
+                        return ModelOutcome::Interrupted(ModelReply::default());
+                    }
+                    attempt += 1;
+                }
+                Some(Err(error)) => return ModelOutcome::Failed(error, reply),
+            }
+        }
     }
 
     fn push_assistant(

@@ -4,19 +4,19 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 
 ## 1. P1 Foundation (`docs/superpowers/plans/2026-09-24-m1-p1-foundation.md`)
 
-- [ ] 1.1 Workspace scaffold, licences, and CI; verify `cargo test -p harness-cli --test cli_smoke` passes
-- [ ] 1.2 Core message, event, provider, and permission types; verify `cargo test -p harness-core --test types`
-- [ ] 1.3 XDG paths and layered config that ignores widening project settings; verify `cargo test -p harness-config`
-- [ ] 1.4 Symlink-aware path resolution and baseline permission policy; verify `cargo test -p harness-core --test permission`
-- [ ] 1.5 Tool trait, read tracking, and large-output spilling; verify `cargo test -p harness-core --test tool`
-- [ ] 1.6 `read`, `write`, `edit` tools; verify `cargo test -p harness-tools --test fs_tools`
-- [ ] 1.7 `grep`, `glob` tools; verify `cargo test -p harness-tools --test search_tools`
-- [ ] 1.8 `bash` tool and builtin registry; verify `cargo test -p harness-tools --test bash_tool --test registry`
-- [ ] 1.9 OpenAI Chat Completions adapter; verify `cargo test -p harness-providers --test openai_chat_parser --test openai_chat_http`
-- [ ] 1.10 Local discovery and model-id resolution; verify `cargo test -p harness-providers --test discovery --test registry`
-- [ ] 1.11 Agent loop with validation, approvals, and spilling; verify `cargo test -p harness-core --test agent`
-- [ ] 1.12 Retries and interruption; verify `cargo test -p harness-core --test resilience`
-- [ ] 1.13 `harness ask` and `harness models`; verify `cargo test -p harness-cli --test ask_e2e` and `cargo deny check`
+- [x] 1.1 Workspace scaffold, licences, and CI; verify `cargo test -p harness-cli --test cli_smoke` passes
+- [x] 1.2 Core message, event, provider, and permission types; verify `cargo test -p harness-core --test types`
+- [x] 1.3 XDG paths and layered config that ignores widening project settings; verify `cargo test -p harness-config`
+- [x] 1.4 Symlink-aware path resolution and baseline permission policy; verify `cargo test -p harness-core --test permission`
+- [x] 1.5 Tool trait, read tracking, and large-output spilling; verify `cargo test -p harness-core --test tool`
+- [x] 1.6 `read`, `write`, `edit` tools; verify `cargo test -p harness-tools --test fs_tools`
+- [x] 1.7 `grep`, `glob` tools; verify `cargo test -p harness-tools --test search_tools`
+- [x] 1.8 `bash` tool and builtin registry; verify `cargo test -p harness-tools --test bash_tool --test registry`
+- [x] 1.9 OpenAI Chat Completions adapter; verify `cargo test -p harness-providers --test openai_chat_parser --test openai_chat_http`
+- [x] 1.10 Local discovery and model-id resolution; verify `cargo test -p harness-providers --test discovery --test registry`
+- [x] 1.11 Agent loop with validation, approvals, and spilling; verify `cargo test -p harness-core --test agent`
+- [x] 1.12 Retries and interruption; verify `cargo test -p harness-core --test resilience`
+- [x] 1.13 `harness ask` and `harness models`; verify `cargo test -p harness-cli --test ask_e2e` and `cargo deny check`
 
 ## 2. P2 Safety (plan written after P1)
 

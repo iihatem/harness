@@ -1,4 +1,12 @@
-use clap::Parser;
+mod ask;
+mod models;
+mod prompt;
+mod setup;
+
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+use harness_core::permission::Mode;
 
 #[derive(Parser)]
 #[command(
@@ -6,8 +14,46 @@ use clap::Parser;
     version,
     about = "A hybrid local/frontier coding agent"
 )]
-struct Cli {}
+struct Cli {
+    /// Model to use, as <provider>/<model> (e.g. ollama/qwen3-coder:30b)
+    #[arg(long, global = true)]
+    model: Option<String>,
+    /// Approval mode: plan, read-only, ask, auto, or full-access
+    #[arg(long, global = true)]
+    mode: Option<Mode>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
 
-fn main() {
-    let _cli = Cli::parse();
+#[derive(Subcommand)]
+enum Command {
+    /// Run one prompt to completion without interaction; piped stdin is appended to the prompt
+    Ask {
+        /// Print every event as one JSON object per line
+        #[arg(long)]
+        json: bool,
+        /// The prompt
+        #[arg(required = true, num_args = 1..)]
+        prompt: Vec<String>,
+    },
+    /// List models from local servers and configured providers
+    Models,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let runtime = tokio::runtime::Runtime::new().expect("failed to start the tokio runtime");
+    let code = runtime.block_on(async move {
+        match cli.command {
+            Some(Command::Ask { json, prompt }) => {
+                ask::run(cli.model, cli.mode, prompt.join(" "), json).await
+            }
+            Some(Command::Models) => models::run().await,
+            None => {
+                eprintln!("Interactive mode is not available yet; use `harness ask \"...\"`.");
+                2
+            }
+        }
+    });
+    ExitCode::from(code)
 }

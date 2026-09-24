@@ -757,7 +757,17 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "harness-config",
+ "harness-core",
+ "harness-providers",
+ "harness-tools",
+ "nix",
  "predicates",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "wiremock",
 ]
 
 [[package]]

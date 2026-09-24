@@ -66,6 +66,59 @@ async fn lists_models_sorted_and_skips_unreachable_or_slow_servers() {
 }
 
 #[tokio::test]
+async fn probes_run_concurrently() {
+    let server1 = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": [{"id": "m"}]}))
+                .set_delay(Duration::from_secs(2)),
+        )
+        .mount(&server1)
+        .await;
+    let server2 = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": [{"id": "m"}]}))
+                .set_delay(Duration::from_secs(2)),
+        )
+        .mount(&server2)
+        .await;
+    let server3 = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": [{"id": "m"}]}))
+                .set_delay(Duration::from_secs(2)),
+        )
+        .mount(&server3)
+        .await;
+
+    let started = Instant::now();
+    let found = list_models(
+        &[
+            endpoint("p1", format!("{}/v1", server1.uri())),
+            endpoint("p2", format!("{}/v1", server2.uri())),
+            endpoint("p3", format!("{}/v1", server3.uri())),
+        ],
+        Duration::from_millis(300),
+    )
+    .await;
+
+    let elapsed = started.elapsed();
+    assert!(
+        found.is_empty(),
+        "all probes should time out with 300ms timeout against 2s servers"
+    );
+    assert!(
+        elapsed < Duration::from_millis(700),
+        "probes must run concurrently (got {:.3}s; sequential would take ≥ 900ms)",
+        elapsed.as_secs_f64()
+    );
+}
+
+#[tokio::test]
 async fn error_statuses_yield_no_models() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

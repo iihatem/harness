@@ -17,5 +17,6 @@ similar.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+nix.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

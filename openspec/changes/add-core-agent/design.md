@@ -1,0 +1,250 @@
+# Design: add-core-agent (Milestone 1)
+
+## Context
+
+Greenfield Rust project (see proposal.md for motivation). Decisions below were made during a brainstorming session on 2026-09-24, informed by two research rounds: vendor auth policy and existing harness architectures, then a survey of 30+ coding agents, developer surveys, and GitHub feature-request data (References at the end).
+
+Constraints that shape everything:
+
+- **Audience:** public open source, so vendor terms and safety defaults matter more than convenience.
+- **Vendor policy (as of 2026-09):** Anthropic forbids third-party apps from using Claude Free/Pro/Max credentials and blocks it server-side; only the unmodified `claude` binary may use them. OpenAI publicly tolerates ChatGPT sign-in in third-party harnesses (pi, OpenCode, Amp) and exposes `codex app-server`. Gemini CLI / Antigravity OAuth reuse is banned; Qwen's free OAuth tier is discontinued.
+- **Platforms:** macOS and Linux in v1; Windows via WSL until M5.
+- **Reference implementations:** vercel-labs/fx (Zig; Unix-like, minimal, embeddable); openai/codex (Rust, Apache-2.0) for sandboxing, the inline TUI, and ChatGPT auth; pi for provider-neutral branching sessions and a sub-1k-token system prompt; Claude Code for plan mode, `/rewind`, and command formats; Capy and Aider for the planner/builder split that M2 builds on.
+
+### What the research changed
+
+| Finding | Design response |
+|---|---|
+| Plan mode and rewind are table stakes (Codex #2101 406👍, #9203 460👍) | D12 plan mode, D13 checkpoints in M1 |
+| Users approve 93–97% of permission prompts; prefix rules are bypassed with `a && b` | D5 sandbox-first autonomy, compound-command parsing, destructive-command list |
+| Agents deleted production data using credentials found in unrelated files | D5 reads outside the workspace need approval |
+| Local users suffer silent context truncation, broken tool formats, cache-busting prompts | D2 model profiles, D14 local-model robustness, D15 cache-stable prefix |
+| Opaque quotas and silent model switches drive churn; automatic routers were removed by Goose three times | Every message attributed to its model; M1 never switches models on its own; M2 routes only at boundaries |
+| XDG compliance (CC #1455 431👍) and multiple accounts (CC #18435 829👍) are top requests | D9 XDG paths; D3 account profiles |
+
+## Goals / Non-Goals
+
+**Goals:**
+
+- A lean, embeddable core whose frontends are thin consumers of one event stream.
+- First-class local models: short system prompt, stable prompt prefix, tight tool output, robust tool-call handling, per-model profiles.
+- Safe by default for a large user base: OS sandbox, approval modes, checkpoints, no silent unsandboxed fallback.
+- Transparency: the user always knows which model answered, how much context is used, and what the harness sends where. No telemetry.
+- Drop-in compatibility with existing `AGENTS.md`, `CLAUDE.md`, and Markdown command setups.
+- Interfaces that leave room for M2–M5 without implementing them.
+
+**Non-Goals (M1):**
+
+- Routing, fallback chains, usage ledger, verification gates, LSP (M2); subagents, delegation to Claude Code or Codex, worktree-parallel and background agents (M3); hooks, MCP, Skills, ACP, custom statusline, image input (M4); installers, native Windows, remote steering, scheduling (M5).
+- Web fetch, a session-tree browser beyond `/rewind`, a plugin/extension API, Gemini TOML commands, hashline or diff edit formats (M2 decides edit formats with its eval suite).
+
+## Decisions
+
+### D1. Library core with thin frontends (single binary)
+
+Cargo workspace:
+
+```
+crates/
+  harness-core       agent loop, session model, event stream, Tool trait, permission engine, checkpoints
+  harness-providers  Provider trait; openai-chat, openai-responses, anthropic-messages adapters; model profiles; credential store
+  harness-tools      read, write, edit, bash, grep, glob
+  harness-sandbox    macOS Seatbelt; Linux Landlock + seccomp (bubblewrap when present)
+  harness-context    AGENTS.md/CLAUDE.md discovery; prompt assembly; slash-command discovery and expansion
+  harness-config     XDG paths, config layering, workspace trust
+  harness-cli        `harness` binary: clap subcommands, inline TUI, `ask`, NDJSON output
+```
+
+The core runs on `tokio` and emits `AgentEvent`s: `TurnStarted`, `TextDelta`, `ReasoningDelta`, `ToolCallRequested`, `ApprovalNeeded`, `ToolCallFinished`, `Usage`, `TurnStats`, `Retrying`, `Compacted`, `CheckpointCreated`, `TurnFinished { reason }`, `Error { kind }`. Every assistant message carries the id of the model that produced it. Frontends send back `UserInput { delivery: Queued | SendNow }`, `ApprovalDecision`, and `Interrupt`. The TUI, `ask` (plain), and `ask --json` (NDJSON) are consumers; the M4 ACP server will be another.
+
+*Alternatives:* a local daemon plus clients (OpenCode-style) enables shared live sessions but adds a daemon, ports, and auth, and OpenCode draws criticism for 1 GB+ memory use; a routing proxy (claude-code-router-style) cannot route Claude subscriptions compliantly. Rejected for M1; the event-stream core makes a daemon an additive frontend later.
+
+### D2. Provider-neutral messages, three wire adapters, model profiles
+
+Conversation history is stored in an internal, provider-neutral format. Each adapter translates to and from its wire protocol:
+
+| Adapter | Protocol | Covers |
+|---|---|---|
+| `openai-chat` | `/v1/chat/completions` (SSE) | Ollama, LM Studio, llama-server, vLLM-MLX, OpenRouter, Groq, Gemini's OpenAI-compatible endpoint |
+| `openai-responses` | `/v1/responses` (SSE) | OpenAI API keys; ChatGPT sign-in |
+| `anthropic-messages` | `/v1/messages` (SSE) | Anthropic API keys; Anthropic-compatible local servers |
+
+Model ids are `<provider>/<model>` (e.g. `ollama/qwen3-coder:30b`, `chatgpt/<model>`). On first interactive use with no configured model, the model picker opens and saves the choice as the global default; `harness ask` never picks a model implicitly. When switching models, provider-specific content the target cannot accept (e.g. signed reasoning blocks) is dropped.
+
+**Model profiles** are TOML tables keyed by model-id glob (`[profiles."ollama/qwen3-coder*"]`) with fields `context_window`, `min_context`, `max_output_tokens`, `temperature`, `reasoning_effort`, `text_tool_calls` (on/off), and `local` (bool). Resolution order: user config → built-in profiles shipped in the binary for common open-weight coding families → protocol defaults. `Provider` is a trait so M2's router can be a provider that delegates to other providers; delegated agents (M3) will use a separate `AgentBackend` trait. M1 defines neither.
+
+### D3. Credentials and account profiles
+
+- Resolution per provider and account profile: configured env var (e.g. `OPENAI_API_KEY`) → stored credential for the active profile.
+- Storage: OS keychain via `keyring`, keyed by provider and profile; fallback `$XDG_DATA_HOME/harness/credentials.json` with mode `0600` and a warning when no keychain service exists. Credentials never live in the config directory, which users often sync to dotfile repositories.
+- Profiles: `harness login chatgpt --profile work`, `harness auth use <provider> <profile>` selects the default; the unnamed profile is `default`.
+- ChatGPT sign-in: OAuth PKCE in the browser with a localhost callback; device-code flow with `--device` or when no browser can be opened. Tokens refresh automatically. Isolated behind a default-on Cargo feature so it can be disabled quickly if OpenAI's policy changes.
+- Claude subscription credentials are never read, stored, or used.
+
+### D4. Tools
+
+Six tools with short descriptions and a fixed definition order. `write`/`edit` enforce read-before-overwrite with a content hash. `bash` is non-interactive (`sh -c`) in its own process group. Tool output larger than 10 KB, or larger than the active model's output budget, is saved to `$XDG_STATE_HOME/harness/tool-output/<session>/<call-id>.txt`; the model receives the head, the tail, the omitted size, and the file path, which it may `read` without approval. `grep`/`glob` use ripgrep's `ignore` and `grep` crates.
+
+### D5. Permissions and sandbox
+
+| Mode | File writes | `bash` | Reads outside workspace |
+|---|---|---|---|
+| `plan` | rejected | read-only sandbox, no network | ask |
+| `read-only` | rejected | read-only sandbox, no network | ask |
+| `ask` | every write asks | every command asks; sandboxed | ask |
+| `auto` | in-workspace allowed | sandboxed (workspace + temp writable, no network) without asking | ask |
+| `full-access` | allowed | unsandboxed, no prompts (explicit flag only, persistent warning) | allowed |
+
+- Default mode: `auto` inside a git work tree, `ask` elsewhere. Shift+Tab cycles `plan → ask → auto` (never into `full-access`).
+- Rules (`allow`/`deny`, `<tool>:<glob>`) are evaluated before prompting; deny always wins, in every mode.
+- **Compound commands:** shell commands are parsed (sequences, `&&`, `||`, pipes, subshells, command substitution) into sub-commands. A command is allowed without prompting only if every sub-command is allowed; it is blocked if any sub-command is denied. Unparseable commands require approval.
+- **Destructive commands** always require approval outside `full-access`, even in `auto` or when allow-listed: `git push --force`/`-f`, `git reset --hard`, `git clean` with `-f`, `git checkout -- .`/`git restore .`, `rm -r` targeting the workspace root or a path outside it, and any user-configured `confirm` patterns.
+- Reads (`read`, `grep`, `glob`) outside the workspace require approval except for harness's own tool-output directory and configured `read_dirs`.
+- When a sandboxed command fails because of a sandbox denial, the interactive UI offers to re-run it unsandboxed with approval. If no sandbox mechanism is available, every `bash` call requires approval (except in `full-access`). There is never a silent unsandboxed fallback.
+- macOS uses `sandbox-exec` with a generated Seatbelt profile (as Codex and Claude Code do). Linux uses Landlock for the filesystem and seccomp to deny network sockets, plus bubblewrap when installed.
+
+### D6. Context and commands
+
+Instruction discovery walks from the working directory up to the discovery root (repository root; outside a repository, `$HOME` when inside it, otherwise the working directory), plus global `$XDG_CONFIG_HOME/harness/AGENTS.md`. Per directory, `AGENTS.md` is preferred and `CLAUDE.md` is the fallback. `@path` imports resolve relative to the importing file, up to depth 5, confined to the discovery root and the harness config directory, and each file is included at most once.
+
+Command discovery order (first match wins): project `.harness/commands`, `.claude/commands`, `.opencode/commands`, then global `$XDG_CONFIG_HOME/harness/commands`, `~/.claude/commands`. Subdirectories become `:` namespaces (`opsx/propose.md` → `/opsx:propose`). Supported frontmatter: `description`, `argument-hint`, `model`, `allowed-tools` (Claude Code tool names mapped to harness rules for that invocation only; cannot bypass deny rules, destructive-command confirmation, or the sandbox).
+
+### D7. Sessions
+
+Append-only JSONL at `$XDG_DATA_HOME/harness/sessions/<project-key>/<session-id>.jsonl`, where `<project-key>` is derived from the canonical repo root path (or the working directory outside a repo). Each entry has `id` and `parent_id`; the session's active branch is the path from the root to the most recent leaf. `/rewind` moves the active leaf, so rewinding creates a branch without deleting history. Auto-compaction triggers at 80% of the model's context window (configurable) and keeps the most recent turns verbatim within a budget (default 20% of the window); the summary is displayed to the user, stored as a `compaction` entry, and the originals stay on disk so the user can rewind to before the compaction.
+
+### D8. Inline terminal UI
+
+ratatui inline viewport (as in Codex): a live region at the bottom (input, streaming output, approval prompts), with finished messages inserted into normal terminal scrollback; only the live region is redrawn, so tmux and scrollback stay intact. Markdown via `pulldown-cmark`, code highlighting via `syntect`, diffs via `similar`, fuzzy file completion via `nucleo`. Pickers, `/rewind`, and long diffs use a temporary full-screen view and return to inline.
+
+- **Steering:** input submitted while a turn runs is queued and sent when the turn ends; the send-now key (default Ctrl+S; raw mode disables XON/XOFF) delivers it at the next tool boundary instead.
+- **Notifications:** when a turn that ran longer than 10 seconds finishes, or an approval is needed, harness emits an OSC 9 desktop notification and a terminal bell (configurable).
+- **Pastes** over 10 lines or 1,000 characters collapse to a `[Pasted text #n, N lines]` placeholder that can be expanded for editing; the full text is sent.
+- **Stats:** after each turn, a dim line shows the model, time to first token, output tokens per second, and prompt-cache hit rate when reported.
+- `NO_COLOR` is honoured; no ANSI output when stdout is not a TTY.
+
+### D9. Configuration and workspace trust
+
+Paths follow the XDG base-directory spec on macOS and Linux: config `$XDG_CONFIG_HOME/harness` (default `~/.config/harness`), data `$XDG_DATA_HOME/harness` (default `~/.local/share/harness`: sessions, checkpoints, trust list, credential fallback), state `$XDG_STATE_HOME/harness` (default `~/.local/state/harness`: logs, tool output). `HARNESS_HOME`, when set, overrides all three with subdirectories of one path.
+
+TOML layering: global `config.toml` ← project `.harness/config.toml` ← CLI flags. Project settings that could widen the harness's reach (a `mode` other than `plan`/`read-only`/`ask`, `allow` rules, `read_dirs`, provider definitions or `base_url` overrides, and `full-access`) are applied only after the user trusts the workspace. On first interactive use of a workspace with such settings, harness shows them and asks; the decision is stored in the data directory. Headless runs ignore untrusted widening settings with a warning. Narrowing settings (`deny`, `confirm`, stricter modes) always apply.
+
+Example global config:
+
+```toml
+model = "ollama/qwen3-coder:30b"
+mode = "auto"
+
+[providers.openrouter]
+protocol = "openai-chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[profiles."ollama/qwen3-coder*"]
+context_window = 65536
+temperature = 0.2
+
+[permissions]
+allow = ["bash:cargo test*", "bash:git status*"]
+deny  = ["bash:git push*"]
+confirm = ["bash:terraform apply*"]
+```
+
+Built-in providers need no config: `ollama`, `lmstudio`, `llamacpp` (discovered), `openai`, `anthropic`, `openrouter` (API keys), `chatgpt` (sign-in).
+
+### D10. Headless mode and exit codes
+
+`harness ask "<prompt>"` appends piped stdin to the prompt, prints the final assistant text to stdout (progress to stderr), or the full event stream as NDJSON with `--json`. Actions that need approval are denied and the model is told why. Exit codes: `0` success, `1` runtime error, `2` invalid usage or no usable model, `3` finished with at least one action blocked for lack of approval, `130` interrupted.
+
+### D11. Engineering baseline
+
+MSRV pinned to the stable toolchain at M1 start via `rust-toolchain.toml`. CI on macOS and Ubuntu runners: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo nextest`, `cargo deny check`, and security suites on every PR (sandbox escapes, compound-command bypasses, symlink/path escapes, untrusted project config). Provider adapters are tested against recorded SSE fixtures (`insta` snapshots); the end-to-end suite runs `harness ask --json` against a local mock HTTP server in a temp git repo (`assert_cmd`, `tempfile`). Live-API tests are `#[ignore]` and run manually or nightly. The base system prompt is versioned in the repository with a changelog, so behaviour changes are visible.
+
+### D12. Plan mode
+
+`plan` is an approval mode with read-only permissions plus a short planning instruction appended to the conversation (not the system prompt, see D15). The turn ends with a plan message. The user can then choose **Build** (switch back to the previous non-plan mode and send "Implement the plan above"), **Edit** (open the plan in `$EDITOR`; the edited text is presented again for approval), or **Keep planning**. The approved plan is stored as a `plan` session entry. M2 attaches a different model to the build step (planner/builder split).
+
+### D13. Checkpoints and rewind
+
+Before the first mutating action of each turn (`write`, `edit`, or `bash` outside `plan`/`read-only`), harness snapshots the workspace into a shadow git repository at `$XDG_DATA_HOME/harness/checkpoints/<project-key>.git`, using a separate `GIT_DIR` so the user's own repository, index, and history are never touched and non-git directories work too. Snapshots honour `.gitignore` plus built-in excludes (`.git`, `node_modules`, `target`) and skip files over 10 MB. `/rewind` (or Esc Esc on empty input) lists previous user messages; the user picks one and restores **code and conversation**, **code only**, or **conversation only**. A rewind first snapshots the current state, and the rewind list then offers "undo last rewind". Rewind cannot undo effects outside the workspace (network calls, databases, pushed commits), and the UI says so. Checkpoints use the `git` binary; when it is missing, checkpoints are disabled with a warning.
+
+*Alternative:* per-file backups on `write`/`edit` only (Claude Code's approach). Rejected because it misses changes made by `bash`, which is how agents run formatters, code generators, and `rm`.
+
+### D14. Local-model robustness
+
+- **Effective context:** harness queries the context size the server is actually running with (llama.cpp `/props`, Ollama running-model info, LM Studio model info) and uses the smaller of that and the profile. If it is below the profile's `min_context` (default 32k tokens for agentic use), the user is warned with the fix (e.g. `OLLAMA_CONTEXT_LENGTH`).
+- **Text tool calls:** when `text_tool_calls` is on (default for local providers), an assistant message with no native tool calls whose content is a recognised tool-call wrapper (`<tool_call>…</tool_call>` blocks, or a message consisting solely of a JSON object with `name` and `arguments`) is parsed into tool calls. Parsed calls go through the same schema validation.
+- **Truncation:** when the provider reports output stopped at the length limit, a partial tool call is never executed; the model is told its output was cut off and asked to continue in smaller steps.
+- **Bounded repair:** invalid tool calls are fed back as errors; the per-turn invalid-call count is exposed for M2's escalation rule.
+
+### D15. Cache-stable prompt prefix
+
+Local servers and hosted providers both reuse cached prompt prefixes, and cache misses dominate latency on Macs. Within a session, the system prompt and tool definitions are byte-identical across turns: the date and git status are captured once at session start, tool definitions keep a fixed order, and instruction files are read at session start. Mode changes, plan instructions, and similar context are appended as messages rather than edited into the prefix. Only compaction or a model switch rebuilds the prefix. Conversation history is append-only on the active branch.
+
+### Design principles adopted from the research
+
+- **No telemetry.** Network traffic goes only to configured providers and localhost discovery.
+- **No silent model switching.** In M1 only the user changes models; every message shows which model wrote it.
+- **Never remove a loved feature without a replacement** (Codex `/undo` removal and Amp's thread removal drew sustained backlash).
+- **Ask with real stakes only.** The sandbox handles routine safety so approval prompts stay rare enough to be read.
+
+## Risks / Trade-offs
+
+- [OpenAI withdraws tolerance for ChatGPT sign-in in third-party tools] → Isolated module behind a feature flag; API keys and M3's `codex app-server` delegation remain as sanctioned paths.
+- [Anthropic policy shifts; the Claude client may fingerprint wrapped use] → M1 does not touch Claude subscriptions; M3 re-checks the policy before implementation.
+- [Apple removes `sandbox-exec`] → Sandbox is behind a `harness-sandbox` trait; on failure, harness degrades to approval-required for every command, never silently unsandboxed.
+- [Landlock/seccomp unavailable (old kernels, some containers)] → Same degradation plus a clear startup warning.
+- [Shell parsing misses an exotic construct] → Anything the parser cannot fully decompose requires approval; the sandbox remains the second line of defence; bypass attempts are part of the security test suite.
+- [Checkpoints are slow or large in big workspaces] → Excludes and size cap; snapshot only before the first mutating action per turn; if a snapshot exceeds 5 seconds, checkpoints for that session are disabled with a warning.
+- [Text tool-call parsing misfires on example code] → Only whole-message wrappers are recognised, parsing is off by default for hosted providers, and every parsed call is schema-validated and permission-checked.
+- [Local servers run with a smaller context than the model supports] → D14 effective-context detection and warning.
+- [Malicious repository content: command files, project config, instruction files] → Command shell expansion uses the same approval and sandbox as `bash`; `allowed-tools` cannot override deny rules or destructive-command confirmation; widening project settings need workspace trust; imports are confined to the discovery root.
+- [Supply-chain risk in dependencies] → `cargo-deny` advisories and licence checks in CI; lockfile committed.
+- Trade-off: inline rendering limits rich layouts (split panes). Accepted in favour of native scrollback, copy, and search; full-screen views are used only where they add value.
+- Trade-off: M1 grew by roughly a third after the research round. Accepted because plan mode, checkpoints, permission hardening, XDG paths, and the cache-stable prefix all shape core data structures and are costly to retrofit.
+
+## Migration Plan
+
+Not applicable (greenfield). Releases start as `0.x` pre-releases built from source (`cargo install --path crates/harness-cli`); packaged distribution is M5.
+
+## References
+
+Vendor policy and integration surfaces:
+
+- Anthropic, Claude Code legal and compliance: https://code.claude.com/docs/en/legal-and-compliance
+- Anthropic, Agent SDK overview: https://code.claude.com/docs/en/agent-sdk/overview
+- Anthropic, Agent SDK with Claude plans (policy status): https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan
+- OpenAI, Codex app-server: https://learn.chatgpt.com/docs/app-server
+- OpenAI, Codex authentication: https://learn.chatgpt.com/docs/auth
+- OpenAI (Codex team) on third-party harnesses: https://x.com/thsottiaux/status/2058071172361998482
+- Gemini CLI terms: https://geminicli.com/docs/resources/tos-privacy/
+
+Harnesses and patterns:
+
+- vercel-labs/fx: https://github.com/vercel-labs/fx
+- openai/codex: https://github.com/openai/codex
+- pi: https://github.com/earendil-works/pi
+- OpenCode commands: https://opencode.ai/docs/commands/
+- Capy planner/builder split: https://capy.ai/blog/captain-vs-build
+- Aider architect/editor: https://aider.chat/2024/09/26/architect.html
+- Amp handoff and "The Dial": https://ampcode.com/news/handoff, https://ampcode.com/news/the-dial
+- Kiro specs and hooks: https://kiro.dev/docs/specs/, https://kiro.dev/docs/hooks/
+- Claude Code checkpointing and agent view: https://code.claude.com/docs/en/changelog, https://code.claude.com/docs/en/agent-view
+- Goose removal of automatic model switching: https://github.com/aaif-goose/goose/issues/5781
+- Claude Code sandboxing (84% fewer prompts): https://www.anthropic.com/engineering/claude-code-sandboxing
+- claude-code-router: https://github.com/musistudio/claude-code-router
+- Agent Client Protocol: https://agentclientprotocol.com
+
+Local models:
+
+- Ollama context length: https://docs.ollama.com/context-length
+- Local agent tuning case study (cache hits, output caps): https://doug.sh/posts/tuning-a-local-coding-agent-oh-my-pi/
+- Prompt-cache invalidation by changing headers: https://github.com/musistudio/claude-code-router/issues/1217
+- Ollama Anthropic compatibility: https://docs.ollama.com/api/anthropic-compatibility
+
+Developer sentiment and demand:
+
+- Stack Overflow Developer Survey 2025, AI section: https://survey.stackoverflow.co/2025/ai
+- JetBrains AI coding agent adoption 2026: https://blog.jetbrains.com/research/2026/08/ai-coding-agent-adoption-2026/
+- Pragmatic Engineer AI tooling 2026: https://newsletter.pragmaticengineer.com/p/ai-tooling-2026
+- Most-requested features: Claude Code #6235 (AGENTS.md), #18435 (accounts), #1455 (XDG); Codex #2109 (hooks), #9203 (undo), #2101 (plan mode), #8745 (LSP); OpenCode #7602 (fallback), #6231 (model discovery)

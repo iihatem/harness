@@ -1,4 +1,8 @@
-use std::{fmt, path::PathBuf, str::FromStr};
+use std::{
+    fmt,
+    path::{Component, Path, PathBuf},
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -62,4 +66,103 @@ pub enum Decision {
     Allow,
     Ask(String),
     Deny(String),
+}
+
+/// Resolves `path` (absolute, or relative to `workspace`) to an absolute path. Each existing prefix is
+/// canonicalized before the next component is applied, so symlinks are followed exactly as the OS would
+/// follow them (including `link/..`). Components that do not exist yet are applied lexically.
+pub fn resolve_path(workspace: &Path, path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Ok(real) = out.canonicalize() {
+                    out = real;
+                }
+                out.pop();
+            }
+            Component::Normal(name) => {
+                out.push(name);
+                if let Ok(real) = out.canonicalize() {
+                    out = real;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Decides whether an action may run, must be approved, or is refused.
+pub trait PermissionPolicy: Send + Sync {
+    fn check(&self, action: &Action) -> Decision;
+}
+
+/// The P1 policy: mode-based decisions with no OS sandbox. Because no sandbox exists yet, every shell
+/// command needs approval outside `full-access` (no silent unsandboxed fallback). P2 replaces this.
+#[derive(Debug, Clone)]
+pub struct BaselinePolicy {
+    mode: Mode,
+    workspace: PathBuf,
+    read_dirs: Vec<PathBuf>,
+}
+
+impl BaselinePolicy {
+    pub fn new(mode: Mode, workspace: &Path, read_dirs: Vec<PathBuf>) -> Self {
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        BaselinePolicy {
+            mode,
+            workspace: canonical(workspace),
+            read_dirs: read_dirs.iter().map(|d| canonical(d)).collect(),
+        }
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+}
+
+impl PermissionPolicy for BaselinePolicy {
+    fn check(&self, action: &Action) -> Decision {
+        if self.mode == Mode::FullAccess {
+            return Decision::Allow;
+        }
+        match action {
+            Action::Read(path) => {
+                let target = resolve_path(&self.workspace, path);
+                if target.starts_with(&self.workspace)
+                    || self.read_dirs.iter().any(|d| target.starts_with(d))
+                {
+                    Decision::Allow
+                } else {
+                    Decision::Ask(format!("read outside the workspace: {}", target.display()))
+                }
+            }
+            Action::Write(path) => {
+                if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
+                    return Decision::Deny(format!(
+                        "file writes are not allowed in {} mode",
+                        self.mode
+                    ));
+                }
+                let target = resolve_path(&self.workspace, path);
+                if !target.starts_with(&self.workspace) {
+                    Decision::Ask(format!("write outside the workspace: {}", target.display()))
+                } else if self.mode == Mode::Auto {
+                    Decision::Allow
+                } else {
+                    Decision::Ask(format!("write {}", target.display()))
+                }
+            }
+            Action::Bash(command) => {
+                Decision::Ask(format!("run `{command}` (no sandbox is available yet)"))
+            }
+        }
+    }
 }

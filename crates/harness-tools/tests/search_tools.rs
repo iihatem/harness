@@ -86,3 +86,13 @@ async fn grep_rejects_an_invalid_regex() {
     assert!(out.is_error);
     assert!(out.content.contains("invalid regex"));
 }
+
+#[tokio::test]
+async fn glob_with_a_path_reports_workspace_relative_paths() {
+    let (_dir, ctx) = project();
+    let out = GlobTool
+        .run(json!({"pattern": "*.rs", "path": "src"}), &ctx)
+        .await;
+    assert!(!out.is_error);
+    assert_eq!(out.content.trim(), "src/main.rs");
+}

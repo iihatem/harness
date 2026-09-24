@@ -42,17 +42,27 @@ impl Tool for GlobTool {
             Ok(glob) => glob.compile_matcher(),
             Err(e) => return ToolOutput::error(format!("invalid glob `{pattern}`: {e}")),
         };
+        let workspace = ctx.workspace.clone();
         let hits = tokio::task::spawn_blocking(move || {
             walk::files(&base)
                 .into_iter()
                 .filter_map(|path| {
                     let rel = path.strip_prefix(&base).ok()?.to_path_buf();
-                    matcher.is_match(&rel).then(|| rel.display().to_string())
+                    matcher.is_match(&rel).then(|| {
+                        let ws_rel = path.strip_prefix(&workspace).unwrap_or(&path).to_path_buf();
+                        ws_rel.display().to_string()
+                    })
                 })
                 .collect::<Vec<_>>()
         })
         .await
-        .unwrap_or_default();
+        .map_err(|e| e.to_string());
+
+        let hits = match hits {
+            Ok(h) => h,
+            Err(e) => return ToolOutput::error(format!("glob failed: {e}")),
+        };
+
         if hits.is_empty() {
             return ToolOutput::ok(format!("No files matched `{pattern}`"));
         }

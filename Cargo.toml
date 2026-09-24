@@ -9,6 +9,7 @@ rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+harness-core = { path = "crates/harness-core" }
 anyhow = "1.0.104"
 async-stream = "0.3"
 async-trait = "0.1.92"

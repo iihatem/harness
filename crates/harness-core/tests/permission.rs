@@ -127,3 +127,70 @@ fn resolve_path_handles_missing_tails() {
     );
     assert_eq!(resolve_path(&ws, Path::new("./x")), ws.join("x"));
 }
+
+#[test]
+fn symlink_to_a_not_yet_created_outside_dir_is_outside() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&ws).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let newsub = outside.join("newsub");
+    symlink(&newsub, ws.join("link")).unwrap();
+    let policy = BaselinePolicy::new(Mode::Auto, &ws, vec![]);
+    assert!(is_ask(policy.check(&write("link/payload.txt"))));
+}
+
+#[test]
+fn dangling_symlink_outside_is_outside() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let missing = dir.path().join("missing-unique");
+    symlink(&missing, ws.join("link")).unwrap();
+    let policy = BaselinePolicy::new(Mode::Auto, &ws, vec![]);
+    assert!(is_ask(policy.check(&write("link/x.txt"))));
+}
+
+#[test]
+fn symlink_chains_are_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&ws).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let sub = ws.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    // ws/a -> ws/b (relative)
+    symlink("b", ws.join("a")).unwrap();
+    // ws/b -> <outside> (absolute)
+    symlink(&outside, ws.join("b")).unwrap();
+    // ws/c -> sub (relative, inside, sub exists)
+    symlink("sub", ws.join("c")).unwrap();
+    let policy = BaselinePolicy::new(Mode::Auto, &ws, vec![]);
+    // a -> b -> outside, so a/x is outside
+    assert!(is_ask(policy.check(&write("a/x.txt"))));
+    // c -> sub (inside), so c/x is inside
+    assert_eq!(policy.check(&write("c/x.txt")), Decision::Allow);
+}
+
+#[test]
+fn sibling_directory_with_a_common_prefix_is_outside() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    let ws_evil = dir.path().join("ws-evil");
+    std::fs::create_dir(&ws).unwrap();
+    std::fs::create_dir(&ws_evil).unwrap();
+    let policy = BaselinePolicy::new(Mode::Auto, &ws, vec![]);
+    assert!(is_ask(policy.check(&Action::Write(ws_evil.join("x")))));
+}
+
+#[test]
+fn symlink_loops_do_not_hang() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    symlink("loop", ws.join("loop")).unwrap();
+    // Should complete without hanging; exact path doesn't matter
+    let _result = resolve_path(&ws, Path::new("loop/x"));
+}

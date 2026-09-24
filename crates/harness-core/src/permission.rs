@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fmt,
     path::{Component, Path, PathBuf},
     str::FromStr,
@@ -68,34 +69,73 @@ pub enum Decision {
     Deny(String),
 }
 
-/// Resolves `path` (absolute, or relative to `workspace`) to an absolute path. Each existing prefix is
-/// canonicalized before the next component is applied, so symlinks are followed exactly as the OS would
-/// follow them (including `link/..`). Components that do not exist yet are applied lexically.
+/// Resolves `path` (absolute, or relative to `workspace`) to an absolute path. Symlinks are followed
+/// component by component (including dangling symlinks and chains), so the result always reflects where
+/// the OS would navigate to (including `link/..` following the real target). Symlink loops are detected
+/// with a hop limit of 40; components beyond that are applied lexically.
 pub fn resolve_path(workspace: &Path, path: &Path) -> PathBuf {
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         workspace.join(path)
     };
+
     let mut out = PathBuf::new();
-    for component in joined.components() {
+    let mut pending: VecDeque<PathBuf> = joined
+        .components()
+        .map(|c| {
+            let mut p = PathBuf::new();
+            p.push(c.as_os_str());
+            p
+        })
+        .collect();
+    let mut hop_count = 0;
+    const HOP_LIMIT: usize = 40;
+
+    while let Some(component_path) = pending.pop_front() {
+        let component = component_path.components().next().unwrap();
         match component {
-            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
-            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir => {
+                out.push(component.as_os_str());
+            }
+            Component::CurDir => {
+                // . is a no-op
+            }
             Component::ParentDir => {
-                if let Ok(real) = out.canonicalize() {
-                    out = real;
-                }
                 out.pop();
             }
             Component::Normal(name) => {
                 out.push(name);
-                if let Ok(real) = out.canonicalize() {
-                    out = real;
+
+                // Check if this is a symlink; if so, follow it
+                if hop_count < HOP_LIMIT
+                    && let Ok(metadata) = std::fs::symlink_metadata(&out)
+                    && metadata.file_type().is_symlink()
+                {
+                    hop_count += 1;
+                    if let Ok(target) = std::fs::read_link(&out) {
+                        out.pop();
+                        if target.is_absolute() {
+                            out.clear();
+                        }
+                        // Create target component paths and push to front of queue in reverse order
+                        let target_comps: Vec<_> = target
+                            .components()
+                            .map(|c| {
+                                let mut p = PathBuf::new();
+                                p.push(c.as_os_str());
+                                p
+                            })
+                            .collect();
+                        for comp in target_comps.iter().rev() {
+                            pending.push_front(comp.clone());
+                        }
+                    }
                 }
             }
         }
     }
+
     out
 }
 

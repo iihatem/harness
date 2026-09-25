@@ -1,5 +1,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// A server-requested `Retry-After` beyond this is not worth waiting for automatically; the turn
+/// fails instead of blocking the session for that long.
+pub const MAX_AUTOMATIC_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 /// How transient provider errors (network, 429, 5xx) are retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {

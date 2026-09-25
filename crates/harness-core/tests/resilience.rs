@@ -189,12 +189,15 @@ async fn interrupt_during_a_tool_answers_every_pending_call() {
     );
 }
 
+// Review Focus: a Retry-After long enough that we refuse to wait automatically (see
+// `a_retry_after_longer_than_a_minute_fails_the_turn_instead_of_waiting`) must not be confused
+// with an ordinary, retried backoff that the user interrupts while it's waiting.
 #[tokio::test(start_paused = true)]
 async fn interrupt_during_backoff_stops_waiting() {
     let dir = tempfile::tempdir().unwrap();
     let provider = MockProvider::new(vec![Script::error(http(
         429,
-        Some(Duration::from_secs(600)),
+        Some(Duration::from_secs(50)),
     ))]);
     let mut agent = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
     let cancel = CancellationToken::new();
@@ -207,6 +210,25 @@ async fn interrupt_during_backoff_stops_waiting() {
     let (reason, _) = run_with(&mut agent, "go", cancel).await;
     assert_eq!(reason, TurnEndReason::Interrupted);
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_after_longer_than_a_minute_fails_the_turn_instead_of_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::error(http(
+        429,
+        Some(Duration::from_secs(3600)),
+    ))]);
+    let mut agent = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert!(retries(&events).is_empty(), "{:?}", retries(&events));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("3600"))),
+        "{events:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]

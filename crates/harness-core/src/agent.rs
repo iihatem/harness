@@ -264,7 +264,10 @@ impl Agent {
                 Some(Err(error))
                     if error.is_retryable()
                         && !reply.emitted
-                        && attempt < self.config.retry.max_attempts =>
+                        && attempt < self.config.retry.max_attempts
+                        && !error
+                            .retry_after()
+                            .is_some_and(|d| d > crate::retry::MAX_AUTOMATIC_RETRY_AFTER) =>
                 {
                     let delay = self.config.retry.delay(attempt, error.retry_after());
                     let _ = events.send(AgentEvent::Retrying {
@@ -477,6 +480,14 @@ impl Agent {
 
 /// A human-readable error message for the user.
 fn describe(error: &ProviderError) -> String {
+    if let Some(wait) = error.retry_after()
+        && wait > crate::retry::MAX_AUTOMATIC_RETRY_AFTER
+    {
+        return format!(
+            "the provider asked to wait {}s before retrying, which is longer than we wait automatically. {error}",
+            wait.as_secs()
+        );
+    }
     match error {
         ProviderError::Http { status: 429, .. } => {
             format!(

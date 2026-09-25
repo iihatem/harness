@@ -74,6 +74,21 @@ async fn timeout_kills_the_whole_process_group() {
     assert!(gone, "background child {pid} survived the timeout");
 }
 
+// Review Focus: output produced before a timeout must not be lost.
+#[tokio::test]
+async fn timeout_preserves_output_produced_before_it_fired() {
+    let (_dir, ctx) = ctx();
+    let out = BashTool
+        .run(
+            json!({"command": "echo started; sleep 30", "timeout_secs": 1}),
+            &ctx,
+        )
+        .await;
+    assert!(out.is_error);
+    assert!(out.content.contains("timed out"), "{}", out.content);
+    assert!(out.content.contains("started"), "{}", out.content);
+}
+
 // Review Focus: a background process holding stdout open.
 #[tokio::test]
 async fn background_process_holding_stdout_does_not_hang_past_the_timeout() {

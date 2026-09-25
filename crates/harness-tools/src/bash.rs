@@ -1,4 +1,4 @@
-use std::{process::Stdio, time::Duration};
+use std::{process::Stdio, sync::Arc, sync::Mutex, time::Duration};
 
 use async_trait::async_trait;
 use harness_core::{
@@ -61,15 +61,39 @@ impl Tool for BashTool {
         let pgid = child.id().map(|id| id as i32);
         let mut stdout = child.stdout.take().expect("stdout is piped");
 
+        // Read stdout on a separate task into a buffer that outlives the `select!` below: if a
+        // branch other than `finished` wins (timeout/interrupt), `finished` (and any buffer local
+        // to it) is dropped, but this task keeps draining into `output`, so whatever the command
+        // already printed is not lost.
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let reader_output = output.clone();
+        let mut reader = tokio::spawn(async move {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stdout.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => reader_output
+                        .lock()
+                        .expect("bash output lock")
+                        .extend_from_slice(&chunk[..n]),
+                }
+            }
+        });
+        let partial_text = |output: &Arc<Mutex<Vec<u8>>>| {
+            let buf = output.lock().expect("bash output lock");
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+
         let finished = async {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf).await;
-            (buf, child.wait().await)
+            let status = child.wait().await;
+            // Drain whatever is left so a fast-exiting command's full output is captured.
+            let _ = (&mut reader).await;
+            status
         };
 
         tokio::select! {
-            (buf, status) = finished => {
-                let text = String::from_utf8_lossy(&buf).into_owned();
+            status = finished => {
+                let text = partial_text(&output);
                 match status {
                     Ok(status) => {
                         let code = status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
@@ -81,11 +105,15 @@ impl Tool for BashTool {
             }
             _ = tokio::time::sleep(Duration::from_secs(secs)) => {
                 kill_group(pgid);
-                ToolOutput::error(format!("command timed out after {secs}s and was terminated"))
+                reader.abort();
+                let text = partial_text(&output);
+                ToolOutput::error(format!("command timed out after {secs}s and was terminated\n{text}"))
             }
             _ = ctx.cancel.cancelled() => {
                 kill_group(pgid);
-                ToolOutput::error("command interrupted by the user")
+                reader.abort();
+                let text = partial_text(&output);
+                ToolOutput::error(format!("command interrupted by the user\n{text}"))
             }
         }
     }

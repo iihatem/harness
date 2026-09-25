@@ -51,6 +51,9 @@ impl Tool for GrepTool {
             Some(Err(e)) => return ToolOutput::error(format!("invalid glob: {e}")),
         };
         let base = ctx.resolve(args["path"].as_str().unwrap_or("."));
+        if !base.exists() {
+            return ToolOutput::error(format!("no such file or directory: {}", base.display()));
+        }
         let workspace = ctx.workspace.clone();
         tokio::task::spawn_blocking(move || search(&regex, filter.as_ref(), &base, &workspace))
             .await

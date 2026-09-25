@@ -88,6 +88,34 @@ async fn grep_rejects_an_invalid_regex() {
 }
 
 #[tokio::test]
+async fn glob_reports_a_nonexistent_path_instead_of_no_matches() {
+    let (_dir, ctx) = project();
+    let out = GlobTool
+        .run(json!({"pattern": "*.rs", "path": "nope"}), &ctx)
+        .await;
+    assert!(out.is_error);
+    assert!(
+        out.content.contains("no such file or directory"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn grep_reports_a_nonexistent_path_instead_of_no_matches() {
+    let (_dir, ctx) = project();
+    let out = GrepTool
+        .run(json!({"pattern": "fn main", "path": "nope"}), &ctx)
+        .await;
+    assert!(out.is_error);
+    assert!(
+        out.content.contains("no such file or directory"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
 async fn glob_with_a_path_reports_workspace_relative_paths() {
     let (_dir, ctx) = project();
     let out = GlobTool

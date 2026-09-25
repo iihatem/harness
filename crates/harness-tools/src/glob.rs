@@ -37,6 +37,9 @@ impl Tool for GlobTool {
 
     async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let base = ctx.resolve(args["path"].as_str().unwrap_or("."));
+        if !base.exists() {
+            return ToolOutput::error(format!("no such file or directory: {}", base.display()));
+        }
         let pattern = args["pattern"].as_str().unwrap_or_default().to_string();
         let matcher = match globset::Glob::new(&pattern) {
             Ok(glob) => glob.compile_matcher(),

@@ -155,11 +155,25 @@ pub struct BaselinePolicy {
 
 impl BaselinePolicy {
     pub fn new(mode: Mode, workspace: &Path, read_dirs: Vec<PathBuf>) -> Self {
-        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        // The per-run tool-output dir may not exist yet when the policy is built, so we can't
+        // `canonicalize` it (that requires every component to exist). `resolve_path` follows
+        // symlinks component by component and tolerates a non-existent tail, so use it instead,
+        // resolving against `/` since these inputs are (or are made) absolute.
+        let root = Path::new("/");
+        let absolute = |p: &Path| -> PathBuf {
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(p)
+            }
+        };
+        let resolve = |p: &Path| resolve_path(root, &absolute(p));
         BaselinePolicy {
             mode,
-            workspace: canonical(workspace),
-            read_dirs: read_dirs.iter().map(|d| canonical(d)).collect(),
+            workspace: resolve(workspace),
+            read_dirs: read_dirs.iter().map(|d| resolve(d)).collect(),
         }
     }
 

@@ -186,6 +186,35 @@ fn sibling_directory_with_a_common_prefix_is_outside() {
 }
 
 #[test]
+fn spill_dir_through_a_symlink_is_readable_even_before_it_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = dir.path().join("alias");
+    symlink(&real, &alias).unwrap();
+
+    // The per-run tool-output dir doesn't exist yet when the policy is built.
+    let spill = alias.join("state/tool-output/run-1");
+    let policy = BaselinePolicy::new(Mode::Auto, &ws, vec![spill.clone()]);
+
+    // Now the run creates the spill dir and writes a file into it.
+    let real_spill = real.join("state/tool-output/run-1");
+    std::fs::create_dir_all(&real_spill).unwrap();
+    std::fs::write(real_spill.join("c.txt"), b"hello").unwrap();
+
+    assert_eq!(
+        policy.check(&Action::Read(real_spill.join("c.txt"))),
+        Decision::Allow
+    );
+    assert_eq!(
+        policy.check(&Action::Read(spill.join("c.txt"))),
+        Decision::Allow
+    );
+}
+
+#[test]
 fn symlink_loops_do_not_hang() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");

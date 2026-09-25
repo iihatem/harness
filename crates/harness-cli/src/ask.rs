@@ -34,8 +34,6 @@ pub async fn run(
             return 2;
         }
     };
-    let input = with_piped_stdin(prompt_text);
-
     let Some(model_id) = model_flag.or_else(|| setup.config.model.clone()) else {
         eprintln!("error: no model configured.");
         let found = models::available(&setup).await;
@@ -62,10 +60,16 @@ pub async fn run(
             return 2;
         }
     };
+    // Only read (and potentially block on) stdin once we know we're actually going to run: a
+    // missing model must exit 2 promptly even if a pipe into stdin is still open.
+    let input = with_piped_stdin(prompt_text);
 
     let mode = mode_flag
         .or(setup.config.mode)
         .unwrap_or_else(|| setup::default_mode(&setup.workspace));
+    if mode == Mode::FullAccess {
+        eprintln!("warning: full-access mode: commands run without approval or sandbox");
+    }
     let run_id = format!(
         "run-{}-{}",
         SystemTime::now()

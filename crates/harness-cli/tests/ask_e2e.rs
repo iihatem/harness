@@ -339,6 +339,57 @@ async fn a_closed_stdout_pipe_does_not_panic_and_still_exits() {
     assert!(!stderr_text.contains("panicked"), "{stderr_text}");
 }
 
+// Review Focus: full-access mode runs commands with no approval and no sandbox; the user should
+// be warned.
+#[tokio::test(flavor = "multi_thread")]
+async fn full_access_mode_warns_once_on_stderr() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(stream(&[text_chunk("done")]))
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri(), "model = \"mock/test-model\"");
+    tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .args(["--mode", "full-access", "ask", "go"])
+            .assert()
+            .success()
+            .stderr(contains(
+                "warning: full-access mode: commands run without approval or sandbox",
+            ));
+    })
+    .await
+    .unwrap();
+}
+
+// Review Focus: a missing model must be reported promptly, without first blocking on stdin.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_model_exits_2_promptly_even_with_an_open_stdin_pipe() {
+    let server = MockServer::start().await;
+    let env = Env::new(&server.uri(), ""); // no model configured
+    let mut child = std::process::Command::new(BIN)
+        .args(["ask", "hi"])
+        .current_dir(env.ws.path())
+        .env("HARNESS_HOME", env.home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Hold the write end open (never send EOF): if stdin were read before the model check, this
+    // would hang the child instead of letting it exit promptly.
+    let _stdin_writer = child.stdin.take().unwrap();
+
+    let wait = tokio::task::spawn_blocking(move || child.wait().unwrap());
+    let status = match tokio::time::timeout(Duration::from_secs(3), wait).await {
+        Ok(joined) => joined.unwrap(),
+        Err(_) => {
+            panic!("harness ask hung waiting on stdin instead of exiting for a missing model")
+        }
+    };
+    assert_eq!(status.code(), Some(2));
+}
+
 #[test]
 fn no_subcommand_explains_that_interactive_mode_is_not_ready() {
     Command::new(BIN)

@@ -87,12 +87,14 @@ pub fn local_endpoints(providers: &BTreeMap<String, ProviderConfig>) -> Vec<Endp
         .collect()
 }
 
-/// Configured providers whose API key (if one is required) is present.
+/// Configured providers whose API key (if one is required) is present, plus any built-in
+/// provider that needs a key (currently just openrouter) whose key is set and that the user
+/// hasn't redefined under `[providers.<name>]`.
 pub fn configured_endpoints(
     providers: &BTreeMap<String, ProviderConfig>,
     env: impl Fn(&str) -> Option<String>,
 ) -> Vec<Endpoint> {
-    providers
+    let mut endpoints: Vec<Endpoint> = providers
         .iter()
         .filter_map(|(name, cfg)| {
             let api_key = match &cfg.api_key_env {
@@ -105,5 +107,19 @@ pub fn configured_endpoints(
                 api_key,
             })
         })
-        .collect()
+        .collect();
+
+    for (name, url, key_env) in BUILTIN_PROVIDERS {
+        if LOCAL_PROVIDERS.contains(&name) || providers.contains_key(name) {
+            continue;
+        }
+        if let Some(api_key) = key_env.and_then(&env).filter(|v| !v.is_empty()) {
+            endpoints.push(Endpoint {
+                provider: name.to_string(),
+                base_url: url.to_string(),
+                api_key: Some(api_key),
+            });
+        }
+    }
+    endpoints
 }

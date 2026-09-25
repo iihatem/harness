@@ -87,6 +87,31 @@ fn configured_endpoints_require_their_key() {
     assert_eq!(with_key[0].api_key.as_deref(), Some("k"));
 }
 
+// Review Focus: the built-in openrouter provider needs a key but isn't in any user config, so it
+// was invisible to `configured_endpoints` (and so to `harness models`) even with a key set.
+#[test]
+fn configured_endpoints_include_builtin_openrouter_when_its_key_is_set() {
+    assert!(configured_endpoints(&BTreeMap::new(), env(&[])).is_empty());
+
+    let found = configured_endpoints(&BTreeMap::new(), env(&[("OPENROUTER_API_KEY", "k")]));
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].provider, "openrouter");
+    assert_eq!(found[0].base_url, "https://openrouter.ai/api/v1");
+    assert_eq!(found[0].api_key.as_deref(), Some("k"));
+}
+
+#[test]
+fn configured_endpoints_prefer_the_users_own_openrouter_definition() {
+    let providers = custom(
+        "openrouter",
+        "https://custom.example/v1",
+        Some("OPENROUTER_API_KEY"),
+    );
+    let found = configured_endpoints(&providers, env(&[("OPENROUTER_API_KEY", "k")]));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].base_url, "https://custom.example/v1");
+}
+
 #[test]
 fn local_endpoints_cover_the_three_servers() {
     let names: Vec<String> = local_endpoints(&BTreeMap::new())

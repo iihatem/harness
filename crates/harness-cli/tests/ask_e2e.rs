@@ -239,6 +239,11 @@ async fn models_lists_configured_provider_models() {
 }
 
 // Review Focus: Ctrl+C during `harness ask`.
+//
+// The child's SIGINT handler is installed as the very first thing `ask::run` does, before it sends
+// the chat request. So instead of racing a fixed sleep against process/runtime start-up (flaky under
+// load), we wait for wiremock to confirm the request actually arrived: that proves the handler is
+// already live, making the SIGINT below deterministic.
 #[tokio::test(flavor = "multi_thread")]
 async fn ctrl_c_interrupts_the_run_and_exits_130() {
     let server = MockServer::start().await;
@@ -247,29 +252,41 @@ async fn ctrl_c_interrupts_the_run_and_exits_130() {
         .mount(&server)
         .await;
     let env = Env::new(&server.uri(), "model = \"mock/test-model\"");
-    let (code, elapsed) = tokio::task::spawn_blocking(move || {
-        let mut child = std::process::Command::new(BIN)
-            .args(["ask", "hi"])
-            .current_dir(env.ws.path())
-            .env("HARNESS_HOME", env.home.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(800));
-        let started = Instant::now();
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(child.id() as i32),
-            nix::sys::signal::Signal::SIGINT,
-        )
+    let mut child = std::process::Command::new(BIN)
+        .args(["ask", "hi"])
+        .current_dir(env.ws.path())
+        .env("HARNESS_HOME", env.home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .unwrap();
-        let status = child.wait().unwrap();
-        (status.code(), started.elapsed())
-    })
-    .await
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let received = server.received_requests().await.unwrap_or_default();
+        if !received.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the mock server never received a chat request within 10s");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let started = Instant::now();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
     .unwrap();
-    assert_eq!(code, Some(130));
+    let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(status.code(), Some(130));
     assert!(elapsed < Duration::from_secs(5));
 }
 

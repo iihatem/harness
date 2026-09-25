@@ -290,6 +290,55 @@ async fn ctrl_c_interrupts_the_run_and_exits_130() {
     assert!(elapsed < Duration::from_secs(5));
 }
 
+// Review Focus: a closed stdout pipe (e.g. `harness ask --json | head -c1`) must not panic the
+// renderer and silently lose the exit code.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_stdout_pipe_does_not_panic_and_still_exits() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(stream(&[text_chunk("hello there")]).set_delay(Duration::from_millis(500)))
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri(), "model = \"mock/test-model\"");
+    let mut child = std::process::Command::new(BIN)
+        .args(["ask", "--json", "hi"])
+        .current_dir(env.ws.path())
+        .env("HARNESS_HOME", env.home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+
+    // Read exactly one byte, then drop the read end: once every reader is gone, the next write
+    // the child makes to stdout fails with a broken pipe.
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut byte = [0u8; 1];
+        let _ = stdout.read_exact(&mut byte);
+        drop(stdout);
+    })
+    .await
+    .unwrap();
+
+    let wait = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let status = child.wait().unwrap();
+        let mut stderr_text = String::new();
+        let _ = stderr.read_to_string(&mut stderr_text);
+        (status, stderr_text)
+    });
+    let (_status, stderr_text) = match tokio::time::timeout(Duration::from_secs(10), wait).await {
+        Ok(joined) => joined.unwrap(),
+        Err(_) => panic!("harness ask did not exit within 10s after its stdout pipe closed"),
+    };
+
+    assert!(!stderr_text.contains("panicked"), "{stderr_text}");
+}
+
 #[test]
 fn no_subcommand_explains_that_interactive_mode_is_not_ready() {
     Command::new(BIN)

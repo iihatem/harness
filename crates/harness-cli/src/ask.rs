@@ -1,5 +1,5 @@
 use std::{
-    io::{IsTerminal, Read},
+    io::{IsTerminal, Read, Write},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -107,12 +107,13 @@ pub async fn run(
     });
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let renderer = tokio::spawn(render(rx, json));
+    let renderer = tokio::spawn(render(rx, json, cancel.clone()));
     let reason = agent.run_turn(input, &tx, cancel).await;
     drop(tx);
     let (final_text, blocked) = renderer.await.unwrap_or_default();
     if !json && !final_text.is_empty() {
-        println!("{final_text}");
+        // A closed stdout pipe must not panic (and so must not lose `blocked`/the exit code).
+        let _ = writeln!(std::io::stdout().lock(), "{final_text}");
     }
     exit_code(reason, blocked)
 }
@@ -141,15 +142,25 @@ fn with_piped_stdin(prompt_text: String) -> String {
 }
 
 /// Prints events as they arrive. Returns the last assistant text and whether an action was blocked.
-async fn render(mut rx: mpsc::UnboundedReceiver<AgentEvent>, json: bool) -> (String, bool) {
+///
+/// If stdout is closed (e.g. the reader end of a pipe exits early), writing must not panic: it sets
+/// `stdout_broken` and cancels the run so it stops promptly, but keeps draining events (so `blocked`
+/// is still tracked correctly) until the channel closes.
+async fn render(
+    mut rx: mpsc::UnboundedReceiver<AgentEvent>,
+    json: bool,
+    cancel: CancellationToken,
+) -> (String, bool) {
     let mut last_text = String::new();
     let mut blocked = false;
+    let mut stdout_broken = false;
     while let Some(event) = rx.recv().await {
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string(&event).expect("events serialize")
-            );
+        if json && !stdout_broken {
+            let line = serde_json::to_string(&event).expect("events serialize");
+            if writeln!(std::io::stdout().lock(), "{line}").is_err() {
+                stdout_broken = true;
+                cancel.cancel();
+            }
         }
         match &event {
             AgentEvent::AssistantMessage { content, .. } if !content.is_empty() => {

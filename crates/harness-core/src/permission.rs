@@ -208,6 +208,16 @@ impl PermissionPolicy for BaselinePolicy {
                 let target = resolve_path(&self.workspace, path);
                 if !target.starts_with(&self.workspace) {
                     Decision::Ask(format!("write outside the workspace: {}", target.display()))
+                } else if target
+                    .strip_prefix(&self.workspace)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|rest| rest.components())
+                    .any(|c| c.as_os_str() == ".git")
+                {
+                    Decision::Ask(
+                        "write inside .git (hooks and config can run commands)".to_string(),
+                    )
                 } else if self.mode == Mode::Auto {
                     Decision::Allow
                 } else {

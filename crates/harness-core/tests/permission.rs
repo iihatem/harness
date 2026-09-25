@@ -215,6 +215,24 @@ fn spill_dir_through_a_symlink_is_readable_even_before_it_exists() {
 }
 
 #[test]
+fn auto_mode_asks_before_writing_inside_dot_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = BaselinePolicy::new(Mode::Auto, dir.path(), vec![]);
+    assert!(is_ask(policy.check(&write(".git/hooks/pre-commit"))));
+    assert!(is_ask(policy.check(&write(".git/config"))));
+    // A file that merely starts with ".git" but isn't the .git directory is unaffected.
+    assert_eq!(
+        policy.check(&write("src/.git_notes.txt")),
+        Decision::Allow
+    );
+    let full = BaselinePolicy::new(Mode::FullAccess, dir.path(), vec![]);
+    assert_eq!(
+        full.check(&write(".git/hooks/pre-commit")),
+        Decision::Allow
+    );
+}
+
+#[test]
 fn symlink_loops_do_not_hang() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");

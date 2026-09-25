@@ -64,6 +64,46 @@ async fn read_caps_very_long_lines() {
     assert!(out.content.len() < 2_200, "{}", out.content.len());
 }
 
+// Review Focus: many lines whose combined rendered output exceeds the tool-output spill limit
+// before hitting the default line limit — the old code would let the agent's head/tail spill
+// truncate it with a hole in the middle instead of a clean, resumable page.
+#[tokio::test]
+async fn read_stops_at_a_byte_budget_instead_of_a_head_tail_hole() {
+    let (dir, ctx) = setup();
+    let line = "x".repeat(53); // ~60 bytes once numbered: "   NNN\t" + 53 chars + "\n"
+    let text: String = (1..=600).map(|_| format!("{line}\n")).collect();
+    put(dir.path(), "big.txt", &text);
+
+    let out = call(&ReadTool, &ctx, json!({"path": "big.txt"})).await;
+    assert!(!out.is_error);
+    assert!(out.content.len() < 8_500, "{}", out.content.len());
+    assert!(!out.content.contains("omitted"), "{}", out.content);
+    assert!(out.content.contains("call read with offset="));
+
+    let marker = "call read with offset=";
+    let start = out.content.find(marker).unwrap() + marker.len();
+    let rest = &out.content[start..];
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let next_offset: usize = rest[..digits].parse().unwrap();
+    assert!(next_offset > 1 && next_offset < 600, "{next_offset}");
+
+    let cont = call(
+        &ReadTool,
+        &ctx,
+        json!({"path": "big.txt", "offset": next_offset}),
+    )
+    .await;
+    assert!(!cont.is_error);
+    assert!(
+        cont.content
+            .starts_with(&format!("{next_offset:>6}\t{line}\n")),
+        "{}",
+        cont.content
+    );
+}
+
 #[tokio::test]
 async fn read_reports_a_missing_file() {
     let (_dir, ctx) = setup();

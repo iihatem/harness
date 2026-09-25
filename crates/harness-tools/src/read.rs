@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 
 const DEFAULT_LIMIT: usize = 2000;
 const MAX_LINE_CHARS: usize = 2000;
+/// Rendered output (numbered lines) stops once it would cross this many bytes, so a page never
+/// approaches the tool-output spill limit and gets truncated with a head/tail hole in the middle.
+const BYTE_BUDGET: usize = 8_000;
 
 pub struct ReadTool;
 
@@ -61,15 +64,22 @@ impl Tool for ReadTool {
             return ToolOutput::ok("[empty file]\n");
         }
         let mut out = String::new();
+        let mut shown = 0usize;
         for (index, line) in lines.iter().enumerate().skip(offset - 1).take(limit) {
-            if line.chars().count() > MAX_LINE_CHARS {
-                let shown: String = line.chars().take(MAX_LINE_CHARS).collect();
-                out.push_str(&format!("{:>6}\t{shown} [line truncated]\n", index + 1));
+            let formatted = if line.chars().count() > MAX_LINE_CHARS {
+                let truncated: String = line.chars().take(MAX_LINE_CHARS).collect();
+                format!("{:>6}\t{truncated} [line truncated]\n", index + 1)
             } else {
-                out.push_str(&format!("{:>6}\t{line}\n", index + 1));
+                format!("{:>6}\t{line}\n", index + 1)
+            };
+            // Always show at least one line, even if that line alone exceeds the budget.
+            if shown > 0 && out.len() + formatted.len() > BYTE_BUDGET {
+                break;
             }
+            out.push_str(&formatted);
+            shown += 1;
         }
-        let end = (offset - 1 + limit).min(lines.len());
+        let end = offset - 1 + shown;
         if end < lines.len() {
             out.push_str(&format!(
                 "[... {} more lines; call read with offset={} to continue]\n",

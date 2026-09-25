@@ -159,6 +159,11 @@ impl ChatStreamParser {
     pub fn is_done(&self) -> bool {
         self.done
     }
+
+    /// Whether a chunk with a `finish_reason` has been seen, even if `[DONE]` never arrived.
+    pub fn saw_finish_reason(&self) -> bool {
+        self.finish.is_some()
+    }
 }
 
 /// A provider speaking the OpenAI Chat Completions protocol (Ollama, LM Studio, llama.cpp, OpenRouter, ...).
@@ -205,6 +210,14 @@ impl Provider for OpenAiChat {
                     if parser.is_done() {
                         break;
                     }
+                }
+                // The byte stream ended without `[DONE]`. That's fine if we already saw a
+                // `finish_reason` (some servers omit the trailing `[DONE]`), but otherwise the
+                // connection dropped mid-reply and must not be mistaken for a normal completion.
+                if !parser.is_done() && !parser.saw_finish_reason() {
+                    Err::<(), ProviderError>(ProviderError::Network(
+                        "stream ended before the response finished".into(),
+                    ))?;
                 }
                 for item in parser.finish() {
                     yield item;

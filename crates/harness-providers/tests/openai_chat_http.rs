@@ -92,6 +92,28 @@ async fn http_date_retry_after_is_ignored_safely() {
     ));
 }
 
+// Review Focus: a server that just closes the connection mid-reply (no finish_reason, no [DONE])
+// must not be mistaken for a normal, complete stop.
+#[tokio::test]
+async fn stream_ending_without_a_finish_reason_or_done_is_a_network_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sse(&[r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#]),
+            "text/event-stream",
+        ))
+        .mount(&server)
+        .await;
+
+    let provider = OpenAiChat::new(format!("{}/v1", server.uri()), None);
+    let events: Vec<_> = provider.stream(request()).collect().await;
+    assert!(
+        matches!(events.last(), Some(Err(ProviderError::Network(_)))),
+        "{events:?}"
+    );
+}
+
 #[tokio::test]
 async fn unreachable_servers_are_network_errors() {
     let provider = OpenAiChat::new("http://127.0.0.1:9/v1", None);

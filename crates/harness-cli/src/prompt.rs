@@ -3,14 +3,17 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use harness_core::permission::Mode;
+
 /// The base system prompt plus environment facts captured once per run. Kept short on purpose:
 /// local models have small context windows. P3 replaces this with full context assembly.
-pub fn system_prompt(workspace: &Path, date: &str) -> String {
+pub fn system_prompt(workspace: &Path, date: &str, mode: Mode) -> String {
     format!(
         "You are harness, a coding agent working in the user's project.\n\
          Use the tools to inspect files and make changes; never guess file contents.\n\
          Read a file before editing it. Make focused changes, and verify them (for example by running the tests) when you can.\n\
          When you are done, reply with a short summary of what you changed.\n\
+         Approval mode: {mode}. You are running non-interactively: actions that need approval will be refused, so prefer read-only investigation and file edits unless the mode is full-access.\n\
          \n\
          Working directory: {}\n\
          Operating system: {}\n\
@@ -57,8 +60,17 @@ mod tests {
 
     #[test]
     fn base_prompt_is_under_1000_tokens() {
-        let prompt = system_prompt(Path::new("/some/project"), "2026-09-24");
+        let prompt = system_prompt(Path::new("/some/project"), "2026-09-24", Mode::Auto);
         assert!(prompt.len() / 4 < 1000, "~{} tokens", prompt.len() / 4);
         assert!(prompt.contains("Working directory: /some/project"));
+    }
+
+    // Review Focus: headless runs (e.g. `harness ask`) block on approval, so the model needs to
+    // know its mode won't let it ask.
+    #[test]
+    fn approval_mode_line_names_the_mode() {
+        let prompt = system_prompt(Path::new("/some/project"), "2026-09-24", Mode::Ask);
+        assert!(prompt.contains("Approval mode: ask"), "{prompt}");
+        assert!(prompt.contains("non-interactively"));
     }
 }

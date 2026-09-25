@@ -454,6 +454,7 @@ async fn slowly_piped_stdin_is_still_included() {
         .spawn()
         .unwrap();
     let mut stdin_writer = child.stdin.take().unwrap();
+    let pid = nix::unistd::Pid::from_raw(child.id() as i32);
     let _writer = tokio::task::spawn_blocking(move || {
         use std::io::Write as _;
         std::thread::sleep(Duration::from_millis(500));
@@ -464,7 +465,12 @@ async fn slowly_piped_stdin_is_still_included() {
     let wait = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap());
     let output = match tokio::time::timeout(Duration::from_secs(10), wait).await {
         Ok(joined) => joined.unwrap(),
-        Err(_) => panic!("harness ask did not exit within 10s with slowly piped stdin"),
+        Err(_) => {
+            // Bound the failure instead of hanging the test suite forever: kill the leaked child
+            // (the background writer task holds no further resources once the child is gone).
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            panic!("harness ask did not exit within 10s with slowly piped stdin (child killed)")
+        }
     };
     assert!(
         output.status.success(),
@@ -472,6 +478,63 @@ async fn slowly_piped_stdin_is_still_included() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("saw the late data"));
+}
+
+// Review Focus: Ctrl+C must be honoured while `ask::run` is still waiting on piped stdin, including
+// during the unbounded read-to-EOF phase (data has started arriving, but the pipe never closes — e.g.
+// `tail -f | harness ask ...`). Before this fix the SIGINT listener task wasn't spawned until after
+// the stdin wait returned, so a pipe that never closes could only be killed, never interrupted.
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_c_during_a_never_closing_stdin_exits_130() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(stream(&[text_chunk("too late")]))
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri(), "model = \"mock/test-model\"");
+    let mut child = std::process::Command::new(BIN)
+        .args(["--model", "mock/test-model", "ask", "hi"])
+        .current_dir(env.ws.path())
+        .env("HARNESS_HOME", env.home.path())
+        .env("HARNESS_STDIN_WAIT_MS", "2000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin_writer = child.stdin.take().unwrap();
+    {
+        use std::io::Write as _;
+        // Write immediately so the first-data wait resolves almost instantly and the reader moves
+        // into the unbounded read-to-EOF phase; the handle is then kept open (never closed), so that
+        // phase never finishes on its own.
+        stdin_writer.write_all(b"partial\n").unwrap();
+    }
+    let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+
+    let wait = tokio::task::spawn_blocking(move || child.wait().unwrap());
+    let status = match tokio::time::timeout(Duration::from_secs(5), wait).await {
+        Ok(joined) => joined.unwrap(),
+        Err(_) => {
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            panic!(
+                "harness ask did not exit within 5s after SIGINT during a never-closing stdin pipe (child killed)"
+            )
+        }
+    };
+    assert_eq!(status.code(), Some(130));
+
+    let received = server.received_requests().await.unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "expected no chat request before SIGINT, got {}",
+        received.len()
+    );
+
+    drop(stdin_writer);
 }
 
 #[test]

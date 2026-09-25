@@ -60,9 +60,26 @@ pub async fn run(
             return 2;
         }
     };
+
+    // Ctrl+C must be honoured from here on: the piped-stdin wait below can block for seconds (the
+    // first-data timeout) or indefinitely (the unbounded read-to-EOF phase once data has started
+    // arriving but the pipe never closes, e.g. `tail -f | harness ask ...`). So the cancellation
+    // token and its SIGINT listener are wired up before that wait, not after it.
+    let cancel = CancellationToken::new();
+    let on_ctrl_c = cancel.clone();
+    tokio::spawn(async move {
+        if sigint.recv().await.is_some() {
+            on_ctrl_c.cancel();
+        }
+    });
+
     // Only read (and potentially block on) stdin once we know we're actually going to run: a
     // missing model must exit 2 promptly even if a pipe into stdin is still open.
-    let input = with_piped_stdin(prompt_text).await;
+    let input = match with_piped_stdin(prompt_text, cancel.clone()).await {
+        StdinOutcome::Ready(input) => input,
+        // Cancelled while waiting on stdin: exit immediately, before any model call.
+        StdinOutcome::Cancelled => return exit_code(TurnEndReason::Interrupted, false),
+    };
 
     let mode = mode_flag
         .or(setup.config.mode)
@@ -102,14 +119,6 @@ pub async fn run(
         ToolContext::new(&setup.workspace),
     );
 
-    let cancel = CancellationToken::new();
-    let on_ctrl_c = cancel.clone();
-    tokio::spawn(async move {
-        if sigint.recv().await.is_some() {
-            on_ctrl_c.cancel();
-        }
-    });
-
     let (tx, rx) = mpsc::unbounded_channel();
     let renderer = tokio::spawn(render(rx, json, cancel.clone()));
     let reason = agent.run_turn(input, &tx, cancel).await;
@@ -145,6 +154,13 @@ fn stdin_wait_timeout() -> Duration {
         .unwrap_or(Duration::from_millis(STDIN_FIRST_DATA_TIMEOUT_MS))
 }
 
+/// The result of waiting on piped stdin: either the (possibly stdin-augmented) prompt, or a signal
+/// that Ctrl+C arrived while still waiting, in which case the caller must not proceed to a model call.
+enum StdinOutcome {
+    Ready(String),
+    Cancelled,
+}
+
 /// Appends piped stdin to `prompt_text`, without blocking the async runtime and without hanging
 /// forever on a pipe that a parent process leaves open but never writes to or closes.
 ///
@@ -155,14 +171,26 @@ fn stdin_wait_timeout() -> Duration {
 /// the OS read call), which is fine because the process exits normally when the turn finishes. Once
 /// the first signal does arrive, the rest of stdin is read to EOF with no further timeout, so slow
 /// producers are still included in full.
-async fn with_piped_stdin(prompt_text: String) -> String {
+///
+/// Both the first-data wait and the (potentially unbounded) read-to-EOF join race against `cancel`:
+/// Ctrl+C during either phase abandons the reader thread and returns `StdinOutcome::Cancelled`
+/// immediately, so the caller can exit without ever making a model call.
+async fn with_piped_stdin(prompt_text: String, cancel: CancellationToken) -> StdinOutcome {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
-        return prompt_text;
+        return StdinOutcome::Ready(prompt_text);
     }
 
+    // Two one-shot signals from the reader thread: `first_tx` fires the moment the first `read()`
+    // call returns (data or immediate EOF), `done_tx` fires once the thread has read to EOF (or hit
+    // an error) and has the full buffer. Deliberately not joined via `tokio::task::spawn_blocking`:
+    // if this function is cancelled while awaiting `done_rx`, the receiver is simply dropped and the
+    // raw OS thread (untracked by Tokio) is left running detached. Wrapping the join in
+    // `spawn_blocking` instead would register it as a Tokio-managed blocking task, which the runtime
+    // waits for on shutdown — so an abandoned one would hang process exit even after "cancelling".
     let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
-    let handle = std::thread::spawn(move || {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<String>();
+    std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut lock = stdin.lock();
         let mut buf = Vec::new();
@@ -185,27 +213,30 @@ async fn with_piped_stdin(prompt_text: String) -> String {
         if let Some(tx) = first_tx.take() {
             let _ = tx.send(());
         }
-        String::from_utf8_lossy(&buf).into_owned()
+        let _ = done_tx.send(String::from_utf8_lossy(&buf).into_owned());
     });
 
-    let first_signal_received = matches!(
-        tokio::time::timeout(stdin_wait_timeout(), first_rx).await,
-        Ok(Ok(()))
-    );
+    let first_signal_received = tokio::select! {
+        result = tokio::time::timeout(stdin_wait_timeout(), first_rx) => {
+            matches!(result, Ok(Ok(())))
+        }
+        _ = cancel.cancelled() => return StdinOutcome::Cancelled,
+    };
     if !first_signal_received {
         eprintln!(
             "warning: no stdin data received in 3s, proceeding without it (redirect stdin from /dev/null to skip the wait)"
         );
-        return prompt_text;
+        return StdinOutcome::Ready(prompt_text);
     }
 
-    let piped = tokio::task::spawn_blocking(move || handle.join().unwrap_or_default())
-        .await
-        .unwrap_or_default();
+    let piped = tokio::select! {
+        result = done_rx => result.unwrap_or_default(),
+        _ = cancel.cancelled() => return StdinOutcome::Cancelled,
+    };
     if piped.trim().is_empty() {
-        prompt_text
+        StdinOutcome::Ready(prompt_text)
     } else {
-        format!("{prompt_text}\n\n{piped}")
+        StdinOutcome::Ready(format!("{prompt_text}\n\n{piped}"))
     }
 }
 

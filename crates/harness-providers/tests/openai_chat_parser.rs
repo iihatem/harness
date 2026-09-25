@@ -99,6 +99,29 @@ fn empty_arguments_become_an_empty_object() {
     );
 }
 
+// Review Focus: an empty-string tool-call id must be treated like a missing one, not a real id
+// that happens to be "" — otherwise it both keeps an empty id downstream and can be mistaken for
+// the start of a brand-new call on a continuation fragment that has no `index`.
+#[test]
+fn empty_string_id_falls_back_and_does_not_start_a_new_call() {
+    let events = parse(&[
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"","function":{"name":"read","arguments":""}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"","function":{"arguments":"{}"}}]}}]}"#,
+        r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+    ]);
+    assert_eq!(
+        events,
+        vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "call_0".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }),
+            ProviderEvent::Finished(FinishReason::ToolCalls),
+        ]
+    );
+}
+
 #[test]
 fn reasoning_fields_become_reasoning_deltas() {
     let events = parse(&[

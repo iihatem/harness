@@ -1,6 +1,10 @@
 //! The agent loop: call the model, run the tools it requests, feed results back, repeat.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -112,6 +116,10 @@ pub struct Agent {
     history: Vec<Message>,
     validators: HashMap<String, jsonschema::Validator>,
     invalid_calls: u32,
+    /// Tool-call ids already used in this session, so a missing or repeated id (from a model or
+    /// provider that doesn't guarantee unique ids) can be rewritten before it collides.
+    used_call_ids: HashSet<String>,
+    next_call_id: u64,
 }
 
 impl Agent {
@@ -142,6 +150,27 @@ impl Agent {
             history: Vec::new(),
             validators,
             invalid_calls: 0,
+            used_call_ids: HashSet::new(),
+            next_call_id: 0,
+        }
+    }
+
+    /// Ensures every call in `calls` has a non-empty id not already used in this session,
+    /// rewriting any empty or repeated id to a fresh `call_h{n}`. The rewritten id is used
+    /// everywhere downstream (events, history, spill file), so two calls never collide.
+    fn dedupe_call_ids(&mut self, calls: &mut [ToolCall]) {
+        for call in calls.iter_mut() {
+            if call.id.is_empty() || self.used_call_ids.contains(&call.id) {
+                loop {
+                    let candidate = format!("call_h{}", self.next_call_id);
+                    self.next_call_id += 1;
+                    if !self.used_call_ids.contains(&candidate) {
+                        call.id = candidate;
+                        break;
+                    }
+                }
+            }
+            self.used_call_ids.insert(call.id.clone());
         }
     }
 
@@ -173,7 +202,10 @@ impl Agent {
 
         for _ in 0..self.config.max_steps {
             let reply = match self.call_model(events, &cancel).await {
-                ModelOutcome::Reply(reply) => reply,
+                ModelOutcome::Reply(mut reply) => {
+                    self.dedupe_call_ids(&mut reply.tool_calls);
+                    reply
+                }
                 ModelOutcome::Failed(error, partial) => return self.fail(error, partial, events),
                 ModelOutcome::Interrupted(partial) => {
                     if !partial.text.is_empty() {

@@ -221,15 +221,9 @@ fn auto_mode_asks_before_writing_inside_dot_git() {
     assert!(is_ask(policy.check(&write(".git/hooks/pre-commit"))));
     assert!(is_ask(policy.check(&write(".git/config"))));
     // A file that merely starts with ".git" but isn't the .git directory is unaffected.
-    assert_eq!(
-        policy.check(&write("src/.git_notes.txt")),
-        Decision::Allow
-    );
+    assert_eq!(policy.check(&write("src/.git_notes.txt")), Decision::Allow);
     let full = BaselinePolicy::new(Mode::FullAccess, dir.path(), vec![]);
-    assert_eq!(
-        full.check(&write(".git/hooks/pre-commit")),
-        Decision::Allow
-    );
+    assert_eq!(full.check(&write(".git/hooks/pre-commit")), Decision::Allow);
 }
 
 #[test]

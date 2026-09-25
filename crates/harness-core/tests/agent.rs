@@ -259,6 +259,52 @@ async fn provider_errors_end_the_turn_but_the_session_stays_usable() {
     assert_eq!(second, TurnEndReason::Completed);
 }
 
+// Review Focus: providers/models that don't send a tool-call id (or reuse one) across steps.
+// Two spilled outputs sharing a fallback id like `call_0` would overwrite the same spill file.
+#[tokio::test]
+async fn duplicate_tool_call_ids_are_rewritten_to_stay_unique() {
+    let dir = tempfile::tempdir().unwrap();
+    let one = "one".repeat(7000);
+    let two = "two".repeat(7000);
+    let provider = MockProvider::new(vec![
+        Script::tool_call("call_0", "echo", json!({"text": one})),
+        Script::tool_call("call_0", "echo", json!({"text": two})),
+        Script::text("done"),
+    ]);
+    let mut agent = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
+    let (_, events) = run(&mut agent, "go").await;
+
+    let finished: Vec<(String, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallFinished { id, output, .. } => Some((id.clone(), output.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished.len(), 2, "{finished:?}");
+    assert_ne!(
+        finished[0].0, finished[1].0,
+        "ids must differ: {finished:?}"
+    );
+
+    fn spill_path(output: &str) -> std::path::PathBuf {
+        let marker = "full output saved to ";
+        let start = output.find(marker).expect("spill marker") + marker.len();
+        let rest = &output[start..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        std::path::PathBuf::from(&rest[..end])
+    }
+    let p0 = spill_path(&finished[0].1);
+    let p1 = spill_path(&finished[1].1);
+    assert_ne!(p0, p1, "spill paths must differ");
+    let c0 = std::fs::read_to_string(&p0).unwrap();
+    let c1 = std::fs::read_to_string(&p1).unwrap();
+    assert!(c0.contains("one"));
+    assert!(c1.contains("two"));
+    assert!(!c0.contains("two"));
+    assert!(!c1.contains("one"));
+}
+
 #[tokio::test]
 async fn large_tool_output_is_spilled_to_a_file() {
     let dir = tempfile::tempdir().unwrap();

@@ -85,17 +85,21 @@ impl ChatStreamParser {
             }
             if let Some(calls) = delta["tool_calls"].as_array() {
                 for call in calls {
-                    let starts_new = call["id"].is_string() || call["function"]["name"].is_string();
+                    // An empty-string id or function name is not a real value; treat it as absent
+                    // like a provider that omitted the field entirely.
+                    let call_id = call["id"].as_str().filter(|s| !s.is_empty());
+                    let func_name = call["function"]["name"].as_str().filter(|s| !s.is_empty());
+                    let starts_new = call_id.is_some() || func_name.is_some();
                     let index = match call["index"].as_u64() {
                         Some(index) => index,
                         None if starts_new => self.calls.len() as u64,
                         None => self.calls.keys().last().copied().unwrap_or(0),
                     };
                     let entry = self.calls.entry(index).or_default();
-                    if let Some(id) = call["id"].as_str() {
+                    if let Some(id) = call_id {
                         entry.id = Some(id.to_string());
                     }
-                    if let Some(name) = call["function"]["name"].as_str() {
+                    if let Some(name) = func_name {
                         entry.name.push_str(name);
                     }
                     match &call["function"]["arguments"] {

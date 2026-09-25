@@ -390,6 +390,90 @@ async fn missing_model_exits_2_promptly_even_with_an_open_stdin_pipe() {
     assert_eq!(status.code(), Some(2));
 }
 
+// Review Focus: an idle stdin pipe (open, but the writer never sends data or closes it) must not
+// hang `harness ask` forever. HARNESS_STDIN_WAIT_MS shortens the first-data wait for the test.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_stdin_pipe_does_not_hang() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(stream(&[text_chunk("ok")]))
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri(), "model = \"mock/test-model\"");
+    let mut child = std::process::Command::new(BIN)
+        .args(["ask", "hi"])
+        .current_dir(env.ws.path())
+        .env("HARNESS_HOME", env.home.path())
+        .env("HARNESS_STDIN_WAIT_MS", "300")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Hold the write end open (never write, never close): a real "idle pipe" from a parent process.
+    let _stdin_writer = child.stdin.take().unwrap();
+    let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+
+    let wait = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap());
+    let output = match tokio::time::timeout(Duration::from_secs(10), wait).await {
+        Ok(joined) => joined.unwrap(),
+        Err(_) => {
+            // Bound the failure instead of hanging the test suite forever: kill the leaked child.
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            panic!("harness ask hung on an idle stdin pipe instead of timing out (child killed)")
+        }
+    };
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no stdin data received"));
+}
+
+// Review Focus: a slow producer piping into stdin (data arrives after the first-data wait starts,
+// then the pipe closes) must still have its data included in full, with no further timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn slowly_piped_stdin_is_still_included() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("late data line"))
+        .respond_with(stream(&[text_chunk("saw the late data")]))
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri(), "model = \"mock/test-model\"");
+    let mut child = std::process::Command::new(BIN)
+        .args(["ask", "hi"])
+        .current_dir(env.ws.path())
+        .env("HARNESS_HOME", env.home.path())
+        .env("HARNESS_STDIN_WAIT_MS", "2000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin_writer = child.stdin.take().unwrap();
+    let _writer = tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = stdin_writer.write_all(b"late data line\n");
+        drop(stdin_writer);
+    });
+
+    let wait = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap());
+    let output = match tokio::time::timeout(Duration::from_secs(10), wait).await {
+        Ok(joined) => joined.unwrap(),
+        Err(_) => panic!("harness ask did not exit within 10s with slowly piped stdin"),
+    };
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("saw the late data"));
+}
+
 #[test]
 fn no_subcommand_explains_that_interactive_mode_is_not_ready() {
     Command::new(BIN)

@@ -1,7 +1,7 @@
 use std::{
     io::{IsTerminal, Read, Write},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use harness_core::{
@@ -62,7 +62,7 @@ pub async fn run(
     };
     // Only read (and potentially block on) stdin once we know we're actually going to run: a
     // missing model must exit 2 promptly even if a pipe into stdin is still open.
-    let input = with_piped_stdin(prompt_text);
+    let input = with_piped_stdin(prompt_text).await;
 
     let mode = mode_flag
         .or(setup.config.mode)
@@ -132,16 +132,80 @@ pub fn exit_code(reason: TurnEndReason, blocked: bool) -> u8 {
     }
 }
 
-fn with_piped_stdin(prompt_text: String) -> String {
+/// How long to wait for the first byte of data (or EOF) on a piped stdin before giving up on it and
+/// running the turn with the prompt alone. Test/automation-only override: `HARNESS_STDIN_WAIT_MS`
+/// (milliseconds) — not a documented user-facing setting.
+const STDIN_FIRST_DATA_TIMEOUT_MS: u64 = 3000;
+
+fn stdin_wait_timeout() -> Duration {
+    std::env::var("HARNESS_STDIN_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(STDIN_FIRST_DATA_TIMEOUT_MS))
+}
+
+/// Appends piped stdin to `prompt_text`, without blocking the async runtime and without hanging
+/// forever on a pipe that a parent process leaves open but never writes to or closes.
+///
+/// A TTY stdin is never read (unchanged behaviour). Otherwise the blocking read happens on a
+/// dedicated thread; this function waits only for that thread's first byte-or-EOF signal, bounded by
+/// `stdin_wait_timeout()`. If that first signal doesn't arrive in time, it prints a one-time warning
+/// and proceeds with the prompt alone — the reader thread is left running (it may still be blocked in
+/// the OS read call), which is fine because the process exits normally when the turn finishes. Once
+/// the first signal does arrive, the rest of stdin is read to EOF with no further timeout, so slow
+/// producers are still included in full.
+async fn with_piped_stdin(prompt_text: String) -> String {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
         return prompt_text;
     }
-    let mut piped = String::new();
-    if stdin.lock().read_to_string(&mut piped).is_ok() && !piped.trim().is_empty() {
-        format!("{prompt_text}\n\n{piped}")
-    } else {
+
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut lock = stdin.lock();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut first_tx = Some(first_tx);
+        loop {
+            match lock.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(tx) = first_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // Reached on immediate EOF (e.g. `< /dev/null`) or a read error: still counts as "first
+        // signal" so the waiter below doesn't sit out the full timeout for nothing.
+        if let Some(tx) = first_tx.take() {
+            let _ = tx.send(());
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    let first_signal_received = matches!(
+        tokio::time::timeout(stdin_wait_timeout(), first_rx).await,
+        Ok(Ok(()))
+    );
+    if !first_signal_received {
+        eprintln!(
+            "warning: no stdin data received in 3s, proceeding without it (redirect stdin from /dev/null to skip the wait)"
+        );
+        return prompt_text;
+    }
+
+    let piped = tokio::task::spawn_blocking(move || handle.join().unwrap_or_default())
+        .await
+        .unwrap_or_default();
+    if piped.trim().is_empty() {
         prompt_text
+    } else {
+        format!("{prompt_text}\n\n{piped}")
     }
 }
 

@@ -10,9 +10,11 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+brush-parser = "=0.4.0"
 harness-config = { path = "crates/harness-config" }
 harness-core = { path = "crates/harness-core" }
 harness-providers = { path = "crates/harness-providers" }
+harness-shell = { path = "crates/harness-shell" }
 harness-tools = { path = "crates/harness-tools" }
 async-stream = "0.3"
 async-trait = "0.1.92"

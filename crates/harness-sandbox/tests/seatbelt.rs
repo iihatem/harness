@@ -210,9 +210,8 @@ async fn test_5_git_protections() {
     let policy = workspace_write(&ws);
 
     // git init runs OUTSIDE the sandbox.
-    let status = std::process::Command::new("git")
+    let status = host_git(&ws)
         .args(["init", "-q"])
-        .current_dir(&ws)
         .status()
         .expect("run git init");
     assert!(status.success(), "git init should succeed");
@@ -490,14 +489,16 @@ async fn test_11_overhead() {
 }
 
 // ===========================================================================
-// Escape and metadata-protection regression tests (T1–T12).
+// Escape and metadata-protection regression tests (T1–T15).
 //
 // These run through `Seatbelt::command`, the entry point harness itself uses
 // (it also puts the child in its own process group). Every file they create,
 // link, rename or write lives in temp dirs the test creates; the only
 // "outside the writable roots" location is a temp dir under Cargo's
-// `CARGO_TARGET_TMPDIR` (see `outside_tempdir`). Network tests only touch a
-// listener the test opens on 127.0.0.1, or an unroutable address.
+// `CARGO_TARGET_TMPDIR`, or under `$HOME` when that one is writable (see
+// `outside_tempdir`). Git only ever runs in scratch repos inside those temp
+// dirs. Network tests only touch a listener the test opens on 127.0.0.1, or
+// an unroutable address.
 // ===========================================================================
 
 /// Collects failed sub-checks so one run reports every hole a test finds,
@@ -523,6 +524,21 @@ impl Checks {
     }
 }
 
+/// Git environment variables that would point git at another repo or inject
+/// config (a git hook running `cargo test` sets some of them). Every git the
+/// tests start, sandboxed or not, runs without them, so it can only find the
+/// scratch repo it is run in.
+const GIT_ENV_TO_CLEAR: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
+
 /// Runs `/bin/sh -c script` in `ws` through [`Seatbelt::command`] and returns
 /// `(exit_code, combined_stdout_stderr)`. Git is isolated from the user's
 /// global and system config.
@@ -536,6 +552,9 @@ async fn sh_in(
     let mut cmd = sandbox
         .command(access, ws, "/bin/sh", &["-c", script])
         .expect("build seatbelt command");
+    for var in GIT_ENV_TO_CLEAR {
+        cmd.env_remove(var);
+    }
     cmd.current_dir(ws)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -558,8 +577,44 @@ async fn ws_sh(ws: &Path, script: &str) -> (Option<i32>, String) {
     .await
 }
 
-/// Runs `script` in `ws` (workspace-write) and records a failure unless it
-/// exits non-zero AND `intact()` holds afterwards.
+/// `sandbox-exec`'s own exit codes when it cannot compile the profile (65,
+/// EX_DATAERR) or cannot exec the command (71, EX_OSERR).
+const SANDBOX_EXEC_FAILURES: [i32; 2] = [65, 71];
+
+/// Whether the sandbox refused a command: it failed, and not because
+/// `sandbox-exec` itself failed to start it. Counting 65 or 71 as a denial
+/// would let a broken profile pass every deny-only check.
+fn denied(code: Option<i32>) -> bool {
+    code != Some(0) && !code.is_some_and(|c| SANDBOX_EXEC_FAILURES.contains(&c))
+}
+
+#[test]
+fn sandbox_exec_startup_failures_are_not_counted_as_denials() {
+    if skip_if_nested("sandbox_exec_startup_failures_are_not_counted_as_denials") {
+        return;
+    }
+    for (label, profile) in [
+        (
+            "profile that does not compile",
+            "(version 1)(no-such-operation)",
+        ),
+        ("profile that refuses the exec", "(version 1)(deny default)"),
+    ] {
+        let out = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", profile, "/usr/bin/true"])
+            .output()
+            .expect("run sandbox-exec");
+        let code = out.status.code();
+        assert!(
+            code.is_some_and(|c| SANDBOX_EXEC_FAILURES.contains(&c)) && !denied(code),
+            "{label}: sandbox-exec exited {code:?}, expected one of {SANDBOX_EXEC_FAILURES:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// Runs `script` in `ws` (workspace-write) and records a failure unless the
+/// sandbox refuses it (see [`denied`]) AND `intact()` holds afterwards.
 async fn expect_denied(
     c: &mut Checks,
     ws: &Path,
@@ -569,7 +624,7 @@ async fn expect_denied(
 ) {
     let (code, out) = ws_sh(ws, script).await;
     let intact = intact();
-    c.check(code != Some(0) && intact, || {
+    c.check(denied(code) && intact, || {
         format!(
             "{label}: `{script}` should be denied: exit={code:?} intact={intact} output={:?}",
             out.trim()
@@ -589,9 +644,23 @@ async fn expect_allowed(c: &mut Checks, ws: &Path, label: &str, script: &str) {
     });
 }
 
+/// An unsandboxed `git` in `dir`, isolated from the user's config and from
+/// any repo but the one `dir` is in (see [`GIT_ENV_TO_CLEAR`]).
+fn host_git(dir: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    for var in GIT_ENV_TO_CLEAR {
+        cmd.env_remove(var);
+    }
+    cmd.current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::null());
+    cmd
+}
+
 /// Runs git outside the sandbox (test setup), isolated from the user's config.
 fn git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = host_git(dir)
         .args([
             "-c",
             "user.email=t@t",
@@ -601,9 +670,6 @@ fn git(dir: &Path, args: &[&str]) {
             "init.defaultBranch=main",
         ])
         .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .expect("run git");
     assert!(
@@ -620,24 +686,56 @@ fn git_repo(dir: &Path) {
     git(dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
 }
 
-/// A temp dir OUTSIDE every writable root: under `CARGO_TARGET_TMPDIR`
-/// (`target/tmp`), not under `$TMPDIR`, `/tmp`, `/var/tmp` or the user cache
-/// dir. Panics unless a sandboxed write there is denied and it is on the same
-/// volume as `ws` (hard links cannot cross volumes).
-async fn outside_tempdir(ws: &Path) -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create outside tempdir");
+/// A new temp dir under `base` (hidden, so a leftover in `$HOME` stays out of
+/// sight) and whether it qualifies as "outside": on the same volume as `ws`
+/// (hard links cannot cross volumes), and a sandboxed write there is denied.
+/// Returns `(dir, canonical path, same_volume, write_denied, details)`.
+async fn outside_candidate(
+    ws: &Path,
+    base: &Path,
+) -> (tempfile::TempDir, PathBuf, bool, bool, String) {
+    let dir = tempfile::Builder::new()
+        .prefix(".harness-sandbox-test-")
+        .tempdir_in(base)
+        .unwrap_or_else(|e| panic!("create a temp dir in {base:?}: {e}"));
     let canon = dir.path().canonicalize().expect("canonicalize outside");
-    assert_eq!(
-        std::fs::metadata(&canon).unwrap().dev(),
-        std::fs::metadata(ws).unwrap().dev(),
-        "outside dir {canon:?} and workspace {ws:?} are on different volumes"
-    );
+    let same_volume =
+        std::fs::metadata(&canon).unwrap().dev() == std::fs::metadata(ws).unwrap().dev();
     let probe = canon.join("probe");
     let (code, out) = ws_sh(ws, &format!("touch '{}'", probe.display())).await;
+    let write_denied = denied(code) && !probe.exists();
+    let details = format!(
+        "{canon:?}: same volume as {ws:?}: {same_volume}; sandboxed `touch` exit={code:?} \
+         output={:?}",
+        out.trim()
+    );
+    (dir, canon, same_volume, write_denied, details)
+}
+
+/// A temp dir OUTSIDE every writable root. The first choice is under
+/// `CARGO_TARGET_TMPDIR` (`target/tmp`), which holds no user files. That is
+/// itself writable when the target dir lies under a writable root (a target
+/// dir under `/tmp`, say), so the fallback is a temp dir under `$HOME`, the
+/// location the older tests use. Panics unless the chosen dir is on the same
+/// volume as `ws` and a sandboxed write there is denied.
+async fn outside_tempdir(ws: &Path) -> (tempfile::TempDir, PathBuf) {
+    let target_tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let (dir, canon, same_volume, write_denied, details) = outside_candidate(ws, target_tmp).await;
+    if same_volume && write_denied {
+        return (dir, canon);
+    }
+    drop(dir);
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"));
+    let (dir, canon, same_volume, write_denied, home_details) = outside_candidate(ws, &home).await;
     assert!(
-        code != Some(0) && !probe.exists(),
-        "{canon:?} must not be writable from the sandbox for this test to mean anything: \
-         exit={code:?} output={out:?}"
+        same_volume,
+        "the $HOME fallback is on a different volume from the workspace (target/tmp was \
+         rejected too):\n  {details}\n  {home_details}"
+    );
+    assert!(
+        write_denied,
+        "the $HOME fallback is writable from the sandbox, so this test would mean nothing \
+         (target/tmp was rejected too):\n  {details}\n  {home_details}"
     );
     (dir, canon)
 }
@@ -1069,7 +1167,7 @@ async fn t06_extra_writable_root_is_writable_but_its_sibling_is_not() {
             &format!("touch '{}'", target.display()),
         )
         .await;
-        c.check(code != Some(0) && !target.exists(), || {
+        c.check(denied(code) && !target.exists(), || {
             format!("write to {target:?} should be denied: exit={code:?} output={out:?}")
         });
     }
@@ -1128,7 +1226,7 @@ async fn t08a_hard_links_to_outside_or_protected_files_cannot_be_created() {
     std::fs::write(&target, "original\n").unwrap();
 
     let (code, out) = ws_sh(&ws, &format!("ln '{}' f", target.display())).await;
-    c.check(code != Some(0) && !ws.join("f").exists(), || {
+    c.check(denied(code) && !ws.join("f").exists(), || {
         format!("ln <outside>/f ws/f should be denied: exit={code:?} output={out:?}")
     });
     let _ = ws_sh(&ws, "echo pwned > f").await;
@@ -1210,7 +1308,7 @@ async fn t08b_preexisting_hard_link_to_outside_file_is_not_writable() {
         let script = script.replace("{i}", &i.to_string());
         let (code, out) = ws_sh(&ws, &script).await;
         let after = inode(&target);
-        c.check(code != Some(0) && after == before, || {
+        c.check(denied(code) && after == before, || {
             format!(
                 "{label} through a pre-existing hard link: `{script}` exit={code:?} \
                  output={:?}\n      before={before:?}\n      after ={after:?}",
@@ -1450,7 +1548,7 @@ async fn t12_read_only_mode_denies_every_write_and_allows_reads() {
         ),
     ] {
         let (code, out) = ro(script.clone()).await;
-        c.check(code != Some(0), || {
+        c.check(denied(code), || {
             format!("read-only {label}: `{script}` should be denied: exit={code:?} output={out:?}")
         });
     }
@@ -1472,6 +1570,386 @@ async fn t12_read_only_mode_denies_every_write_and_allows_reads() {
             && read(&ws.join(".git/HEAD")) == head_before,
         || ".git changed".into(),
     );
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T13–T15. gitdir files that redirect where git loads config and hooks from
+// ---------------------------------------------------------------------------
+//
+// Git reads `<gitdir>/commondir` for every gitdir and takes `config` and
+// `hooks` from the dir it names (setup.c `get_common_dir_noenv`, path.c
+// `common_list`). It reads `<gitdir>/config.worktree` once
+// `extensions.worktreeConfig` is set (config.c `do_git_config_sequence`). A
+// sandboxed command that could write either would make the user's next
+// unsandboxed `git status` run a command of its choosing (`core.fsmonitor`).
+
+/// Gitdirs that can live inside a workspace, as `(gitdir, the working tree git
+/// uses it from)`, relative to the workspace. See [`gitdirs_workspace`].
+const TOP: (&str, &str) = (".git", ".");
+const NESTED: (&str, &str) = ("sub/.git", "sub");
+const MODULE: (&str, &str) = (".git/modules/m", "m");
+const LINKED: (&str, &str) = (".git/worktrees/wt", "wt");
+
+/// A fresh temp workspace with one gitdir of each kind, set up outside the
+/// sandbox: the top-level repo, a nested repo at `sub/`, a repo at `m/` whose
+/// gitdir is `.git/modules/m` (a submodule's layout), and a linked worktree at
+/// `wt/` whose gitdir is `.git/worktrees/wt`.
+fn gitdirs_workspace() -> (tempfile::TempDir, PathBuf) {
+    let (dir, ws) = canonical_tempdir();
+    git_repo(&ws);
+    git_repo(&ws.join(NESTED.1));
+    std::fs::create_dir_all(ws.join(".git/modules")).unwrap();
+    let module_gitdir = ws.join(MODULE.0);
+    let module_gitdir = module_gitdir.to_str().expect("temp path is valid UTF-8");
+    git(
+        &ws,
+        &["init", "-q", "--separate-git-dir", module_gitdir, MODULE.1],
+    );
+    git(
+        &ws.join(MODULE.1),
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    git(&ws, &["worktree", "add", "-q", "-b", "wt", LINKED.1]);
+    (dir, ws)
+}
+
+/// Every way a sandboxed command could give the gitdir file `rel` content of
+/// its own: while the file is absent, create it, rename a file onto it, or
+/// make it a symlink or a hard link; while it exists, overwrite it, append to
+/// it, replace it (by rename, or by rm and create) or remove it. Records a
+/// failure for each attempt that is not denied or that changes the file, and
+/// puts the file back as it was afterwards.
+async fn expect_gitdir_file_protected(c: &mut Checks, ws: &Path, rel: &str) {
+    let path = ws.join(rel);
+    let scratch = ws.join("planted.tmp");
+    let saved = std::fs::read(&path).ok();
+    let original = saved.clone().unwrap_or_else(|| b"original\n".to_vec());
+    let remove = |p: &Path| {
+        let _ = std::fs::remove_file(p);
+    };
+
+    let absent = || std::fs::symlink_metadata(&path).is_err();
+    for (label, script) in [
+        ("create", format!("echo planted > '{rel}'")),
+        (
+            "rename onto",
+            format!("echo planted > planted.tmp && mv planted.tmp '{rel}'"),
+        ),
+        (
+            "symlink",
+            format!("echo planted > planted.tmp && ln -s \"$PWD/planted.tmp\" '{rel}'"),
+        ),
+        (
+            "hard link",
+            format!("echo planted > planted.tmp && ln planted.tmp '{rel}'"),
+        ),
+    ] {
+        remove(&path);
+        let label = format!("{rel} (absent): {label}");
+        expect_denied(c, ws, &label, &script, absent).await;
+        remove(&path);
+        remove(&scratch);
+    }
+
+    let intact = || {
+        std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file())
+            && read(&path) == original
+    };
+    for (label, script) in [
+        ("overwrite", format!("echo planted > '{rel}'")),
+        ("append", format!("echo planted >> '{rel}'")),
+        (
+            "replace by rename",
+            format!("echo planted > planted.tmp && mv -f planted.tmp '{rel}'"),
+        ),
+        (
+            "replace by rm and create",
+            format!("rm -f '{rel}' && echo planted > '{rel}'"),
+        ),
+        ("rm", format!("rm -f '{rel}'")),
+    ] {
+        remove(&path);
+        std::fs::write(&path, &original).unwrap();
+        let label = format!("{rel} (exists): {label}");
+        expect_denied(c, ws, &label, &script, intact).await;
+        remove(&scratch);
+    }
+
+    remove(&path);
+    if let Some(saved) = saved {
+        std::fs::write(&path, saved).unwrap();
+    }
+}
+
+/// What an attacker would plant, in a temp dir of its own (any writable root
+/// would do). `config` sets a `core.fsmonitor` hook, which `git status` runs,
+/// that creates `marker`. `common/` is a minimal common dir (`objects/`,
+/// `refs/` and that config) for a planted `commondir` to name.
+struct Payload {
+    _dir: tempfile::TempDir,
+    marker: PathBuf,
+    config: PathBuf,
+    common: PathBuf,
+}
+
+impl Payload {
+    fn new() -> Self {
+        let (dir, root) = canonical_tempdir();
+        let marker = root.join("hook-ran");
+        let config = root.join("config");
+        // Git runs the hook through the shell with two arguments appended
+        // (fsmonitor.c `query_fsmonitor_hook`); `; exit 1; :` swallows them,
+        // and the failure makes git fall back to a full scan.
+        let fsmonitor = format!("touch '{}'; exit 1; :", marker.display());
+        std::fs::write(
+            &config,
+            format!("[core]\n\trepositoryformatversion = 0\n\tfsmonitor = \"{fsmonitor}\"\n"),
+        )
+        .unwrap();
+        let common = root.join("common");
+        for sub in ["objects", "refs"] {
+            std::fs::create_dir_all(common.join(sub)).unwrap();
+        }
+        std::fs::copy(&config, common.join("config")).unwrap();
+        Payload {
+            _dir: dir,
+            marker,
+            config,
+            common,
+        }
+    }
+}
+
+/// The user's next git command: `git status`, unsandboxed, in `dir`. Returns
+/// its exit code and output, for failure messages.
+fn user_git_status(dir: &Path) -> String {
+    let out = host_git(dir)
+        .args(["status", "--short"])
+        .output()
+        .expect("run git status");
+    format!(
+        "exit={:?} stdout={:?} stderr={:?}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// End to end: after `plant` (a shell script, run from the workspace root)
+/// runs in the sandbox, the user's next `git status` in `worktree` must not
+/// run the planted hook. A control first runs the same script unsandboxed in
+/// an identical workspace and requires the hook to run, so this check cannot
+/// pass just because git ignores the planted file. `prepare` applies the
+/// user's own setup to each workspace, outside the sandbox.
+async fn expect_planted_hook_not_run(
+    c: &mut Checks,
+    label: &str,
+    worktree: &str,
+    prepare: impl Fn(&Path),
+    plant: impl Fn(&Payload) -> String,
+) {
+    let (_ctl_dir, ctl) = gitdirs_workspace();
+    prepare(&ctl);
+    let payload = Payload::new();
+    let script = plant(&payload);
+    let out = std::process::Command::new("/bin/sh")
+        .args(["-c", &script])
+        .current_dir(&ctl)
+        .output()
+        .expect("run the control plant");
+    assert!(
+        out.status.success(),
+        "{label}: control `{script}` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status = user_git_status(&ctl.join(worktree));
+    assert!(
+        payload.marker.exists(),
+        "{label}: control failed: `{script}` run outside the sandbox did not make `git status` \
+         in {worktree} run the planted hook, so the sandboxed check would prove nothing: {status}"
+    );
+
+    let (_ws_dir, ws) = gitdirs_workspace();
+    prepare(&ws);
+    let payload = Payload::new();
+    let script = plant(&payload);
+    let (code, out) = ws_sh(&ws, &script).await;
+    let status = user_git_status(&ws.join(worktree));
+    c.check(!payload.marker.exists(), || {
+        format!(
+            "{label}: after the sandboxed `{script}` (exit={code:?} output={:?}), the user's \
+             `git status` in {worktree} ran the planted hook: {status}",
+            out.trim()
+        )
+    });
+}
+
+// ---------------------------------------------------------------------------
+// T13. `commondir` in the top-level, a nested and a module gitdir
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t13_commondir_cannot_be_planted_in_any_gitdir() {
+    if skip_if_nested("t13_commondir_cannot_be_planted_in_any_gitdir") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = gitdirs_workspace();
+
+    for (gitdir, _) in [TOP, NESTED, MODULE] {
+        expect_gitdir_file_protected(&mut c, &ws, &format!("{gitdir}/commondir")).await;
+    }
+    // On a case-insensitive volume this is the same file.
+    expect_denied(
+        &mut c,
+        &ws,
+        ".GIT/CommonDir",
+        "echo planted > .GIT/CommonDir",
+        || !ws.join(".git/commondir").exists(),
+    )
+    .await;
+    let _ = std::fs::remove_file(ws.join(".git/commondir"));
+
+    for (gitdir, worktree) in [TOP, NESTED, MODULE] {
+        expect_planted_hook_not_run(
+            &mut c,
+            &format!("{gitdir}/commondir"),
+            worktree,
+            |_| {},
+            |p| format!("echo '{}' > '{gitdir}/commondir'", p.common.display()),
+        )
+        .await;
+    }
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T14. `config.worktree` in every kind of gitdir
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t14_config_worktree_cannot_be_planted_in_any_gitdir() {
+    if skip_if_nested("t14_config_worktree_cannot_be_planted_in_any_gitdir") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = gitdirs_workspace();
+
+    for (gitdir, _) in [TOP, NESTED, MODULE, LINKED] {
+        expect_gitdir_file_protected(&mut c, &ws, &format!("{gitdir}/config.worktree")).await;
+    }
+
+    // Git reads `config.worktree` only once the user's own config sets
+    // `extensions.worktreeConfig` (`git sparse-checkout` does, for one).
+    for (gitdir, worktree) in [TOP, NESTED, MODULE, LINKED] {
+        expect_planted_hook_not_run(
+            &mut c,
+            &format!("{gitdir}/config.worktree"),
+            worktree,
+            |ws| {
+                git(
+                    &ws.join(worktree),
+                    &["config", "extensions.worktreeConfig", "true"],
+                )
+            },
+            |p| format!("cat '{}' > '{gitdir}/config.worktree'", p.config.display()),
+        )
+        .await;
+    }
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T15. a linked worktree's gitdir (`.git/worktrees/<id>`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t15_linked_worktree_gitdir_cannot_redirect_config_or_hooks() {
+    if skip_if_nested("t15_linked_worktree_gitdir_cannot_redirect_config_or_hooks") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = gitdirs_workspace();
+    // Linked worktrees of the nested repo and of the module repo too.
+    git(
+        &ws.join(NESTED.1),
+        &["worktree", "add", "-q", "-b", "w", "../subwt"],
+    );
+    git(
+        &ws.join(MODULE.1),
+        &["worktree", "add", "-q", "-b", "w", "../mwt"],
+    );
+    let (gitdir, worktree) = LINKED;
+
+    // `config` and `hooks` here are ignored while `commondir` names the main
+    // gitdir, but git falls back to them if `commondir` is gone.
+    for rel in [
+        format!("{gitdir}/commondir"),
+        format!("{gitdir}/config"),
+        "sub/.git/worktrees/subwt/commondir".to_string(),
+        ".git/modules/m/worktrees/mwt/commondir".to_string(),
+    ] {
+        expect_gitdir_file_protected(&mut c, &ws, &rel).await;
+    }
+    let hooks = ws.join(gitdir).join("hooks");
+    expect_denied(
+        &mut c,
+        &ws,
+        "hooks in a linked worktree's gitdir",
+        &format!("mkdir -p '{gitdir}/hooks' && touch '{gitdir}/hooks/pre-commit'"),
+        || !hooks.exists(),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&hooks);
+
+    expect_planted_hook_not_run(
+        &mut c,
+        &format!("{gitdir}/commondir"),
+        worktree,
+        |_| {},
+        |p| format!("echo '{}' > '{gitdir}/commondir'", p.common.display()),
+    )
+    .await;
+    expect_planted_hook_not_run(
+        &mut c,
+        &format!("{gitdir}/config after removing {gitdir}/commondir"),
+        worktree,
+        |_| {},
+        |p| {
+            format!(
+                "rm -f '{gitdir}/commondir' && mkdir -p '{gitdir}/objects' '{gitdir}/refs' \
+                 && cat '{}' > '{gitdir}/config'",
+                p.config.display()
+            )
+        },
+    )
+    .await;
+
+    // Everyday git in the linked worktree still works: its HEAD, index, logs
+    // and per-worktree refs live in this gitdir.
+    const GIT: &str = "git -c user.email=t@t -c user.name=t";
+    for (label, step) in [
+        (
+            "commit",
+            format!("echo x > f && {GIT} add f && {GIT} commit -q -m on-wt"),
+        ),
+        ("switch -c", format!("{GIT} switch -q -c wt2")),
+        ("checkout -", format!("{GIT} checkout -q -")),
+        ("stash", format!("echo y > f && {GIT} stash -q")),
+        ("status", format!("{GIT} status --short")),
+    ] {
+        expect_allowed(
+            &mut c,
+            &ws,
+            &format!("[{worktree}] {label}"),
+            &format!("cd {worktree} && {step}"),
+        )
+        .await;
+    }
 
     c.finish();
 }

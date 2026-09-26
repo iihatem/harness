@@ -271,14 +271,32 @@ fn write_section(root_keys: &[String]) -> String {
 
 ; ---- protected metadata inside the workspace ----
 ; Every `.git` entry at any depth (dir, gitfile or symlink: no create,
-; rename, replace or delete), config and hooks in any `.git` and in
-; `.git/modules/*`, the whole `.harness/` dir, and a top-level `HEAD` (which
-; would make the workspace look like a bare repo). Other writes inside `.git`
-; stay allowed so commit, checkout and stash keep working.
+; rename, replace or delete), the whole `.harness/` dir, and a top-level
+; `HEAD` (which would make the workspace look like a bare repo).
+;
+; In every gitdir -- any `.git`, `.git/modules/*` (submodules) and
+; `.git/worktrees/<id>` (linked worktrees) -- the files that decide where git
+; loads config and hooks from, or that hold them:
+; - `config` and `hooks/`;
+; - `commondir`: git reads it in any gitdir and then takes config and hooks
+;   from the dir it names (setup.c get_common_dir_noenv, path.c common_list);
+; - `config.worktree`: read once extensions.worktreeConfig is set;
+; - in `.git/worktrees/<id>`, config and hooks are ignored while `commondir`
+;   is there, and git falls back to them if it is not, so they are protected
+;   too.
+; Git writes none of these during commit, checkout, switch or stash; other
+; writes inside `.git` stay allowed so those keep working. Denied as a result:
+; `git worktree add` (creates `commondir`), `git worktree remove/prune`
+; (delete it), and `git config --worktree` or `git sparse-checkout` once
+; worktreeConfig is set (write `config.worktree`).
+; These are path rules: moving a parent dir (a nested repo, `.git/modules/*`,
+; `.git/worktrees/<id>`) out to a writable root, editing it there and moving
+; it back is not covered. The top-level `.git` cannot be moved.
 (deny file-write* (with message (param "LOG_TAG"))
   (regex (string-append "^" (regex-quote (param "WORKSPACE")) "(/.*)?/\\.git$"))
   (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-                        "(/.*)?/\\.git(/modules/.+)?/(config|hooks(/.*)?)$"))
+                        "(/.*)?/\\.git(/modules/.+|/worktrees/[^/]+)?"
+                        "/(config|config\\.worktree|commondir|hooks(/.*)?)$"))
   (subpath (string-append (param "WORKSPACE") "/.harness"))
   (literal (string-append (param "WORKSPACE") "/HEAD")))
 (deny file-write-unlink (with message (param "LOG_TAG"))

@@ -13,7 +13,9 @@ pub struct SandboxPolicy {
     /// Extra directories writable with [`FsAccess::WorkspaceWrite`], beyond the workspace and the
     /// standard temp directories. Paths that do not exist are skipped.
     pub extra_writable: Vec<PathBuf>,
-    /// Allow AF_UNIX sockets and loopback networking. Honoured on macOS only: Linux seccomp cannot
-    /// tell loopback from other addresses, so the Linux backend always denies non-AF_UNIX sockets.
+    /// Allow loopback (localhost) networking. This does not open up AF_UNIX sockets: on macOS the
+    /// only one a command can connect to, in either mode, is the syslog socket. Honoured on macOS
+    /// only: Linux seccomp cannot tell loopback from other addresses, so the Linux backend always
+    /// denies non-AF_UNIX sockets.
     pub allow_localhost: bool,
 }

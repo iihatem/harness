@@ -1,16 +1,21 @@
 #![cfg(target_os = "macos")]
 //! End-to-end tests against the real `/usr/bin/sandbox-exec` on this Mac.
 //!
-//! Each test builds its own temp workspace via `tempfile::tempdir()`. Per
-//! the task brief, the whole file is skipped (with a note) when
-//! `HARNESS_SANDBOX` is set, since that means these tests are themselves
-//! running nested inside a sandbox and `sandbox-exec` would not behave the
-//! same way (or might not be reachable at all).
+//! Each test builds its own temp workspace via `tempfile::tempdir()`. Every
+//! test skips itself (with a note) when `HARNESS_SANDBOX` is set, since that
+//! means these tests are themselves running nested inside a sandbox and
+//! `sandbox-exec` would not behave the same way (or might not be reachable at
+//! all).
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Instant;
 
-use harness_sandbox::{FsAccess, SandboxPolicy, looks_like_sandbox_denial, seatbelt_command};
+use harness_core::tool::CommandSandbox;
+use harness_sandbox::{
+    FsAccess, SandboxPolicy, SandboxSettings, Seatbelt, looks_like_sandbox_denial, seatbelt_command,
+};
 
 /// Returns `true` (after printing a note) if this whole test should be
 /// skipped because we're running nested inside another sandbox.
@@ -147,6 +152,9 @@ async fn test_3_workspace_write() {
 
     let (code, text) = run(&policy, "mktemp", &["-t", "harnessproto"], &ws).await;
     assert_eq!(code, Some(0), "mktemp should succeed: {text}");
+    let made = PathBuf::from(text.lines().next().unwrap_or_default().trim());
+    assert!(made.is_absolute(), "mktemp printed no path: {text}");
+    std::fs::remove_file(&made).expect("remove the mktemp file");
 
     let home = std::env::var("HOME").expect("HOME must be set");
     let probe = format!("{home}/.harness_proto_home_probe_{}", std::process::id());
@@ -479,4 +487,991 @@ async fn test_11_overhead() {
         "[test_11_overhead] {ITERATIONS} sandboxed spawns of `true` took {:.2} ms total, {avg_ms:.2} ms/spawn average",
         elapsed.as_secs_f64() * 1000.0
     );
+}
+
+// ===========================================================================
+// Escape and metadata-protection regression tests (T1–T12).
+//
+// These run through `Seatbelt::command`, the entry point harness itself uses
+// (it also puts the child in its own process group). Every file they create,
+// link, rename or write lives in temp dirs the test creates; the only
+// "outside the writable roots" location is a temp dir under Cargo's
+// `CARGO_TARGET_TMPDIR` (see `outside_tempdir`). Network tests only touch a
+// listener the test opens on 127.0.0.1, or an unroutable address.
+// ===========================================================================
+
+/// Collects failed sub-checks so one run reports every hole a test finds,
+/// not just the first.
+#[derive(Default)]
+struct Checks(Vec<String>);
+
+impl Checks {
+    fn check(&mut self, ok: bool, what: impl FnOnce() -> String) {
+        if !ok {
+            self.0.push(what());
+        }
+    }
+
+    #[track_caller]
+    fn finish(self) {
+        assert!(
+            self.0.is_empty(),
+            "{} check(s) failed:\n  - {}",
+            self.0.len(),
+            self.0.join("\n  - ")
+        );
+    }
+}
+
+/// Runs `/bin/sh -c script` in `ws` through [`Seatbelt::command`] and returns
+/// `(exit_code, combined_stdout_stderr)`. Git is isolated from the user's
+/// global and system config.
+async fn sh_in(
+    settings: &SandboxSettings,
+    access: FsAccess,
+    ws: &Path,
+    script: &str,
+) -> (Option<i32>, String) {
+    let sandbox = Seatbelt::new(settings.clone());
+    let mut cmd = sandbox
+        .command(access, ws, "/bin/sh", &["-c", script])
+        .expect("build seatbelt command");
+    cmd.current_dir(ws)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = cmd.output().await.expect("spawn sandboxed command");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.code(), text)
+}
+
+/// [`sh_in`] with default settings and [`FsAccess::WorkspaceWrite`].
+async fn ws_sh(ws: &Path, script: &str) -> (Option<i32>, String) {
+    sh_in(
+        &SandboxSettings::default(),
+        FsAccess::WorkspaceWrite,
+        ws,
+        script,
+    )
+    .await
+}
+
+/// Runs `script` in `ws` (workspace-write) and records a failure unless it
+/// exits non-zero AND `intact()` holds afterwards.
+async fn expect_denied(
+    c: &mut Checks,
+    ws: &Path,
+    label: &str,
+    script: &str,
+    intact: impl FnOnce() -> bool,
+) {
+    let (code, out) = ws_sh(ws, script).await;
+    let intact = intact();
+    c.check(code != Some(0) && intact, || {
+        format!(
+            "{label}: `{script}` should be denied: exit={code:?} intact={intact} output={:?}",
+            out.trim()
+        )
+    });
+}
+
+/// Runs `script` in `ws` (workspace-write) and records a failure unless it
+/// exits zero.
+async fn expect_allowed(c: &mut Checks, ws: &Path, label: &str, script: &str) {
+    let (code, out) = ws_sh(ws, script).await;
+    c.check(code == Some(0), || {
+        format!(
+            "{label}: `{script}` should succeed: exit={code:?} output={:?}",
+            out.trim()
+        )
+    });
+}
+
+/// Runs git outside the sandbox (test setup), isolated from the user's config.
+fn git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `git init` plus one empty commit in `dir` (outside the sandbox).
+fn git_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("create repo dir");
+    git(dir, &["init", "-q"]);
+    git(dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+}
+
+/// A temp dir OUTSIDE every writable root: under `CARGO_TARGET_TMPDIR`
+/// (`target/tmp`), not under `$TMPDIR`, `/tmp`, `/var/tmp` or the user cache
+/// dir. Panics unless a sandboxed write there is denied and it is on the same
+/// volume as `ws` (hard links cannot cross volumes).
+async fn outside_tempdir(ws: &Path) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create outside tempdir");
+    let canon = dir.path().canonicalize().expect("canonicalize outside");
+    assert_eq!(
+        std::fs::metadata(&canon).unwrap().dev(),
+        std::fs::metadata(ws).unwrap().dev(),
+        "outside dir {canon:?} and workspace {ws:?} are on different volumes"
+    );
+    let probe = canon.join("probe");
+    let (code, out) = ws_sh(ws, &format!("touch '{}'", probe.display())).await;
+    assert!(
+        code != Some(0) && !probe.exists(),
+        "{canon:?} must not be writable from the sandbox for this test to mean anything: \
+         exit={code:?} output={out:?}"
+    );
+    (dir, canon)
+}
+
+fn read(path: &Path) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// T1. case (and APFS Unicode-fold) variants of protected names
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t01_case_variants_of_protected_names_are_denied() {
+    if skip_if_nested("t01_case_variants_of_protected_names_are_denied") {
+        return;
+    }
+    let mut c = Checks::default();
+
+    // A workspace that already has `.git` and `.harness/`.
+    let (_d1, ws) = canonical_tempdir();
+    git_repo(&ws);
+    std::fs::create_dir(ws.join(".harness")).unwrap();
+    let config = ws.join(".git/config");
+    let config_before = read(&config);
+    let config_intact = || read(&config) == config_before;
+
+    expect_denied(
+        &mut c,
+        &ws,
+        ".GIT/config",
+        "echo '[x]' >> .GIT/config",
+        &config_intact,
+    )
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        ".git/CONFIG",
+        "echo '[x]' >> .git/CONFIG",
+        &config_intact,
+    )
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        ".Git/hooks/pre-commit",
+        "touch .Git/hooks/pre-commit",
+        || !ws.join(".git/hooks/pre-commit").exists(),
+    )
+    .await;
+    for variant in [".HARNESS", ".Harness", ".harne\u{17F}s"] {
+        expect_denied(
+            &mut c,
+            &ws,
+            &format!("{variant}/x"),
+            &format!("touch '{variant}/x'"),
+            || !ws.join(".harness/x").exists(),
+        )
+        .await;
+    }
+
+    // Top-level HEAD, first when it does not exist ...
+    for variant in ["head", "Head", "HEAD"] {
+        expect_denied(
+            &mut c,
+            &ws,
+            &format!("{variant} (no HEAD yet)"),
+            &format!("touch {variant}"),
+            || !ws.join(variant).exists(),
+        )
+        .await;
+        let _ = std::fs::remove_file(ws.join(variant));
+    }
+    // ... then when it does.
+    std::fs::write(ws.join("HEAD"), "x\n").unwrap();
+    for variant in ["head", "Head"] {
+        expect_denied(
+            &mut c,
+            &ws,
+            &format!("{variant} (HEAD exists)"),
+            &format!("echo pwned > {variant}"),
+            || read(&ws.join("HEAD")) == b"x\n",
+        )
+        .await;
+    }
+
+    // A repo whose `.git` has no `hooks/` or `modules/` yet: re-creating them
+    // under a case variant must be denied too (git would use them).
+    let (_d2, ws) = canonical_tempdir();
+    git_repo(&ws);
+    std::fs::remove_dir_all(ws.join(".git/hooks")).unwrap();
+    for variant in ["HOOKS", "hoo\u{212A}s"] {
+        let dir = ws.join(".git").join(variant);
+        expect_denied(
+            &mut c,
+            &ws,
+            &format!(".git/{variant}/pre-commit"),
+            &format!("mkdir '.git/{variant}' && touch '.git/{variant}/pre-commit'"),
+            || !dir.join("pre-commit").exists(),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    for variant in ["MODULES", "module\u{17F}"] {
+        let dir = ws.join(".git").join(variant);
+        expect_denied(
+            &mut c,
+            &ws,
+            &format!(".git/{variant}/m/config"),
+            &format!("mkdir -p '.git/{variant}/m' && echo '[x]' > '.git/{variant}/m/config'"),
+            || !dir.join("m/config").exists(),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A workspace with no `.git` at all.
+    let (_d3, ws) = canonical_tempdir();
+    expect_denied(
+        &mut c,
+        &ws,
+        ".GIT/hooks/x (no .git)",
+        "mkdir -p .GIT/hooks && touch .GIT/hooks/x",
+        || !ws.join(".GIT").exists(),
+    )
+    .await;
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T2. nested `.git` directories cannot be replaced, removed or modified
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t02_nested_git_dirs_cannot_be_replaced_or_modified() {
+    if skip_if_nested("t02_nested_git_dirs_cannot_be_replaced_or_modified") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = canonical_tempdir();
+    for sub in ["mv", "rm", "ln", "w"] {
+        git_repo(&ws.join(sub));
+    }
+    let is_real_dir = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false)
+    };
+
+    expect_denied(
+        &mut c,
+        &ws,
+        "rename sub/.git",
+        "mv mv/.git mv/.git.bak",
+        || is_real_dir(&ws.join("mv/.git")) && !ws.join("mv/.git.bak").exists(),
+    )
+    .await;
+
+    expect_denied(&mut c, &ws, "rm -rf sub/.git", "rm -rf rm/.git", || {
+        is_real_dir(&ws.join("rm/.git")) && ws.join("rm/.git/config").exists()
+    })
+    .await;
+
+    expect_denied(
+        &mut c,
+        &ws,
+        "replace sub/.git with a symlink",
+        "mv ln/.git ln/moved && ln -s moved ln/.git",
+        || is_real_dir(&ws.join("ln/.git")),
+    )
+    .await;
+
+    let config = ws.join("w/.git/config");
+    let config_before = read(&config);
+    expect_denied(
+        &mut c,
+        &ws,
+        "sub/.git/config",
+        "echo '[x]' >> w/.git/config",
+        || read(&config) == config_before,
+    )
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        "sub/.git/hooks/x",
+        "touch w/.git/hooks/x",
+        || !ws.join("w/.git/hooks/x").exists(),
+    )
+    .await;
+
+    // Planting a new `.git` (dir, gitfile or symlink) anywhere in the workspace.
+    expect_denied(&mut c, &ws, "plant dir/.git", "mkdir -p p1/.git", || {
+        !ws.join("p1/.git").exists()
+    })
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        "plant dir/.git gitfile",
+        "mkdir -p p2 && printf 'gitdir: /tmp/x\\n' > p2/.git",
+        || !ws.join("p2/.git").exists(),
+    )
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        "plant dir/.git symlink",
+        "mkdir -p p3 && ln -s ../w/.git p3/.git",
+        || std::fs::symlink_metadata(ws.join("p3/.git")).is_err(),
+    )
+    .await;
+    expect_denied(&mut c, &ws, "plant dir/.GIT", "mkdir -p p4/.GIT", || {
+        std::fs::symlink_metadata(ws.join("p4/.GIT")).is_err()
+    })
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        "plant dir/.Git gitfile",
+        "mkdir -p p5 && printf 'gitdir: /tmp/x\\n' > p5/.Git",
+        || std::fs::symlink_metadata(ws.join("p5/.Git")).is_err(),
+    )
+    .await;
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T3. `.harness/`
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t03_harness_dir_is_protected() {
+    if skip_if_nested("t03_harness_dir_is_protected") {
+        return;
+    }
+    let mut c = Checks::default();
+
+    let (_d1, ws) = canonical_tempdir();
+    std::fs::create_dir(ws.join(".harness")).unwrap();
+    std::fs::write(ws.join(".harness/settings.toml"), "a = 1\n").unwrap();
+    expect_denied(&mut c, &ws, "write .harness/x", "touch .harness/x", || {
+        !ws.join(".harness/x").exists()
+    })
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        "overwrite .harness/settings.toml",
+        "echo 'a = 2' > .harness/settings.toml",
+        || read(&ws.join(".harness/settings.toml")) == b"a = 1\n",
+    )
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        "rename .harness away",
+        "mv .harness h2",
+        || ws.join(".harness/settings.toml").exists(),
+    )
+    .await;
+
+    let (_d2, ws) = canonical_tempdir();
+    for variant in [".harness", ".Harness"] {
+        expect_denied(
+            &mut c,
+            &ws,
+            &format!("mkdir {variant}"),
+            &format!("mkdir {variant}"),
+            || !ws.join(variant).exists(),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(ws.join(variant));
+    }
+    expect_denied(
+        &mut c,
+        &ws,
+        "rename a dir to .harness",
+        "mkdir d && touch d/settings.toml && mv d .harness",
+        || !ws.join(".harness").exists(),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(ws.join(".harness"));
+    expect_denied(&mut c, &ws, "symlink .harness", "ln -s d .harness", || {
+        std::fs::symlink_metadata(ws.join(".harness")).is_err()
+    })
+    .await;
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T4. everyday git still works
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t04_git_checkout_switch_and_commit_still_work() {
+    if skip_if_nested("t04_git_checkout_switch_and_commit_still_work") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = canonical_tempdir();
+    git_repo(&ws);
+    // The same steps in a nested repo, which the `.git` rules also cover.
+    git_repo(&ws.join("nested"));
+    const GIT: &str = "git -c user.email=t@t -c user.name=t";
+
+    for dir in [".", "nested"] {
+        for (label, step) in [
+            ("checkout -b", format!("{GIT} checkout -q -b b")),
+            ("checkout -", format!("{GIT} checkout -q -")),
+            ("switch", format!("{GIT} switch -q b")),
+            (
+                "commit after checkout",
+                format!("echo x > f && {GIT} add f && {GIT} commit -q -m on-b"),
+            ),
+            ("checkout main", format!("{GIT} checkout -q main")),
+            (
+                "commit after checkout main",
+                format!("{GIT} commit -q --allow-empty -m on-main"),
+            ),
+            ("switch -c", format!("{GIT} switch -q -c c")),
+            ("status", format!("{GIT} status --short")),
+        ] {
+            expect_allowed(
+                &mut c,
+                &ws,
+                &format!("[{dir}] {label}"),
+                &format!("cd {dir} && {step}"),
+            )
+            .await;
+        }
+    }
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T5. `.git/modules/*/{config,hooks}`
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t05_git_modules_config_and_hooks_are_denied() {
+    if skip_if_nested("t05_git_modules_config_and_hooks_are_denied") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = canonical_tempdir();
+    git_repo(&ws);
+    std::fs::create_dir_all(ws.join(".git/modules/m/hooks")).unwrap();
+    std::fs::write(ws.join(".git/modules/m/config"), "[core]\n").unwrap();
+
+    expect_denied(
+        &mut c,
+        &ws,
+        ".git/modules/m/config",
+        "echo '[x]' >> .git/modules/m/config",
+        || read(&ws.join(".git/modules/m/config")) == b"[core]\n",
+    )
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        ".git/modules/m/hooks/x",
+        "touch .git/modules/m/hooks/x",
+        || !ws.join(".git/modules/m/hooks/x").exists(),
+    )
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        "new .git/modules/n/config",
+        "mkdir -p .git/modules/n && echo '[x]' > .git/modules/n/config",
+        || !ws.join(".git/modules/n/config").exists(),
+    )
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        "nested .git/modules/a/modules/b/hooks/x",
+        "mkdir -p .git/modules/a/modules/b && mkdir .git/modules/a/modules/b/hooks",
+        || !ws.join(".git/modules/a/modules/b/hooks").exists(),
+    )
+    .await;
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T6. extra writable roots
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t06_extra_writable_root_is_writable_but_its_sibling_is_not() {
+    if skip_if_nested("t06_extra_writable_root_is_writable_but_its_sibling_is_not") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = canonical_tempdir();
+    let (_o, outside) = outside_tempdir(&ws).await;
+    let extra = outside.join("extra");
+    let sibling = outside.join("extra-sibling");
+    std::fs::create_dir(&extra).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    let settings = SandboxSettings {
+        extra_writable: vec![extra.clone()],
+        allow_localhost: false,
+    };
+
+    let (code, out) = sh_in(
+        &settings,
+        FsAccess::WorkspaceWrite,
+        &ws,
+        &format!("touch '{}/ok'", extra.display()),
+    )
+    .await;
+    c.check(code == Some(0) && extra.join("ok").exists(), || {
+        format!("write in the extra root should succeed: exit={code:?} output={out:?}")
+    });
+
+    for target in [sibling.join("no"), outside.join("no")] {
+        let (code, out) = sh_in(
+            &settings,
+            FsAccess::WorkspaceWrite,
+            &ws,
+            &format!("touch '{}'", target.display()),
+        )
+        .await;
+        c.check(code != Some(0) && !target.exists(), || {
+            format!("write to {target:?} should be denied: exit={code:?} output={out:?}")
+        });
+    }
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T7. `/tmp` and `/var/tmp` spellings
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t07_tmp_is_writable_under_every_spelling() {
+    if skip_if_nested("t07_tmp_is_writable_under_every_spelling") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = canonical_tempdir();
+    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let var_tmp = tempfile::tempdir_in("/private/var/tmp").unwrap();
+    let tmp_name = tmp.path().file_name().unwrap().to_str().unwrap();
+    let var_tmp_name = var_tmp.path().file_name().unwrap().to_str().unwrap();
+
+    for (spelling, real) in [
+        (format!("/tmp/{tmp_name}"), tmp.path()),
+        (format!("/private/tmp/{tmp_name}"), tmp.path()),
+        (format!("/var/tmp/{var_tmp_name}"), var_tmp.path()),
+        (format!("/private/var/tmp/{var_tmp_name}"), var_tmp.path()),
+    ] {
+        let leaf = spelling.replace('/', "_");
+        let script = format!("mkdir '{spelling}/{leaf}' && echo ok > '{spelling}/{leaf}/f'");
+        let (code, out) = ws_sh(&ws, &script).await;
+        c.check(
+            code == Some(0) && real.join(&leaf).join("f").exists(),
+            || format!("writing via {spelling} should succeed: exit={code:?} output={out:?}"),
+        );
+    }
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T8. hard links to files outside the writable roots
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t08a_hard_links_to_outside_or_protected_files_cannot_be_created() {
+    if skip_if_nested("t08a_hard_links_to_outside_or_protected_files_cannot_be_created") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = canonical_tempdir();
+    git_repo(&ws);
+    let (_o, outside) = outside_tempdir(&ws).await;
+    let target = outside.join("f");
+    std::fs::write(&target, "original\n").unwrap();
+
+    let (code, out) = ws_sh(&ws, &format!("ln '{}' f", target.display())).await;
+    c.check(code != Some(0) && !ws.join("f").exists(), || {
+        format!("ln <outside>/f ws/f should be denied: exit={code:?} output={out:?}")
+    });
+    let _ = ws_sh(&ws, "echo pwned > f").await;
+    c.check(
+        read(&target) == b"original\n" && std::fs::metadata(&target).unwrap().nlink() == 1,
+        || "the outside file changed or gained a link".to_string(),
+    );
+
+    // The same trick against a protected file inside the workspace.
+    let config = ws.join(".git/config");
+    let config_before = read(&config);
+    expect_denied(
+        &mut c,
+        &ws,
+        "hard link to .git/config",
+        "ln .git/config cfg && echo '[x]' >> cfg",
+        || read(&config) == config_before && !ws.join("cfg").exists(),
+    )
+    .await;
+
+    c.finish();
+}
+
+#[tokio::test]
+async fn t08b_preexisting_hard_link_to_outside_file_is_not_writable() {
+    if skip_if_nested("t08b_preexisting_hard_link_to_outside_file_is_not_writable") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = canonical_tempdir();
+    let (_o, outside) = outside_tempdir(&ws).await;
+
+    /// Everything a write through another name could change on the shared inode.
+    #[derive(Debug, PartialEq)]
+    struct Inode {
+        data: Vec<u8>,
+        mode: u32,
+        flags: u32,
+        mtime: i64,
+        xattrs: String,
+    }
+    let inode = |p: &Path| {
+        use std::os::macos::fs::MetadataExt as _;
+        let meta = std::fs::metadata(p).unwrap();
+        let xattrs = std::process::Command::new("/usr/bin/xattr")
+            .arg(p)
+            .output()
+            .unwrap();
+        Inode {
+            data: read(p),
+            mode: meta.mode() & 0o7777,
+            flags: meta.st_flags(),
+            mtime: meta.mtime(),
+            xattrs: String::from_utf8_lossy(&xattrs.stdout).into_owned(),
+        }
+    };
+
+    for (i, (label, script)) in [
+        ("overwrite", "echo pwned > g{i}"),
+        ("append", "echo more >> g{i}"),
+        (
+            "truncate",
+            "python3 -c \"import os; os.truncate('g{i}', 0)\"",
+        ),
+        ("chmod", "chmod 600 g{i}"),
+        ("xattr", "xattr -w com.example.k v g{i}"),
+        ("chflags", "chflags hidden g{i}"),
+        ("utimes", "touch -t 200001010000 g{i}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A fresh outside file and a hard link to it, created by the test,
+        // unsandboxed, before the sandboxed command runs.
+        let target = outside.join(format!("g{i}"));
+        std::fs::write(&target, "original\n").unwrap();
+        std::fs::hard_link(&target, ws.join(format!("g{i}"))).unwrap();
+        let before = inode(&target);
+        let script = script.replace("{i}", &i.to_string());
+        let (code, out) = ws_sh(&ws, &script).await;
+        let after = inode(&target);
+        c.check(code != Some(0) && after == before, || {
+            format!(
+                "{label} through a pre-existing hard link: `{script}` exit={code:?} \
+                 output={:?}\n      before={before:?}\n      after ={after:?}",
+                out.trim()
+            )
+        });
+    }
+
+    // Removing the extra name is harmless and must keep working.
+    let target = outside.join("r");
+    std::fs::write(&target, "original\n").unwrap();
+    std::fs::hard_link(&target, ws.join("r")).unwrap();
+    expect_allowed(&mut c, &ws, "rm the hard link", "rm r").await;
+    c.check(
+        read(&target) == b"original\n" && std::fs::metadata(&target).unwrap().nlink() == 1,
+        || "rm of the hard link disturbed the outside file".into(),
+    );
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T9. renames across the workspace boundary
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t09_renames_across_the_workspace_boundary_are_denied() {
+    if skip_if_nested("t09_renames_across_the_workspace_boundary_are_denied") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = canonical_tempdir();
+    let (_o, outside) = outside_tempdir(&ws).await;
+    std::fs::write(ws.join("f"), "inside\n").unwrap();
+    std::fs::create_dir(ws.join("d")).unwrap();
+    std::fs::write(outside.join("g"), "outside\n").unwrap();
+
+    expect_denied(
+        &mut c,
+        &ws,
+        "mv ws/f <outside>/f",
+        &format!("mv f '{}/f'", outside.display()),
+        || ws.join("f").exists() && !outside.join("f").exists(),
+    )
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        "mv ws/d <outside>/d",
+        &format!("mv d '{}/d'", outside.display()),
+        || ws.join("d").is_dir() && !outside.join("d").exists(),
+    )
+    .await;
+    expect_denied(
+        &mut c,
+        &ws,
+        "mv <outside>/g ws/g",
+        &format!("mv '{}/g' g", outside.display()),
+        || read(&outside.join("g")) == b"outside\n" && !ws.join("g").exists(),
+    )
+    .await;
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T10. outbound connections to localhost
+// ---------------------------------------------------------------------------
+
+/// Python that connects to `host:port` and prints `CONNECTED` (exit 0) or
+/// `ERRNO <n>` (exit 1).
+fn connect_script(host: &str, port: u16) -> String {
+    format!(
+        "python3 -c \"
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(2)
+try:
+    s.connect(('{host}', {port}))
+    print('CONNECTED')
+except OSError as e:
+    print('ERRNO', e.errno, e)
+    sys.exit(1)
+\""
+    )
+}
+
+#[tokio::test]
+async fn t10_outbound_localhost_follows_allow_localhost() {
+    if skip_if_nested("t10_outbound_localhost_follows_allow_localhost") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = canonical_tempdir();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+    let port = listener.local_addr().unwrap().port();
+
+    let denied = SandboxSettings::default();
+    let (code, out) = sh_in(
+        &denied,
+        FsAccess::WorkspaceWrite,
+        &ws,
+        &connect_script("127.0.0.1", port),
+    )
+    .await;
+    c.check(code != Some(0) && out.contains("ERRNO 1 "), || {
+        format!("connect 127.0.0.1 without allow_localhost should fail with EPERM: exit={code:?} output={out:?}")
+    });
+
+    let allowed = SandboxSettings {
+        allow_localhost: true,
+        ..SandboxSettings::default()
+    };
+    let (code, out) = sh_in(
+        &allowed,
+        FsAccess::WorkspaceWrite,
+        &ws,
+        &connect_script("127.0.0.1", port),
+    )
+    .await;
+    c.check(code == Some(0) && out.contains("CONNECTED"), || {
+        format!(
+            "connect 127.0.0.1 with allow_localhost should succeed: exit={code:?} output={out:?}"
+        )
+    });
+
+    // allow_localhost must not open anything else: an unroutable address is
+    // refused by the sandbox (EPERM) rather than timing out.
+    let (code, out) = sh_in(
+        &allowed,
+        FsAccess::WorkspaceWrite,
+        &ws,
+        &connect_script("10.255.255.1", 9),
+    )
+    .await;
+    c.check(code != Some(0) && out.contains("ERRNO 1 "), || {
+        format!("connect 10.255.255.1 with allow_localhost should fail with EPERM: exit={code:?} output={out:?}")
+    });
+
+    drop(listener);
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T11. process group
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t11_sandboxed_command_leads_its_own_process_group() {
+    if skip_if_nested("t11_sandboxed_command_leads_its_own_process_group") {
+        return;
+    }
+    let (_d, ws) = canonical_tempdir();
+    let sandbox = Seatbelt::new(SandboxSettings::default());
+    let mut cmd = sandbox
+        .command(
+            FsAccess::WorkspaceWrite,
+            &ws,
+            "/bin/sh",
+            // `/bin/ps` is setuid, and Seatbelt refuses to exec setuid binaries, so ask
+            // the process itself. `exec` keeps the spawned pid.
+            &[
+                "-c",
+                "exec python3 -c 'import os; print(\"pid\", os.getpid()); print(\"pgid\", os.getpgrp())'",
+            ],
+        )
+        .expect("build seatbelt command");
+    cmd.current_dir(&ws)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn().expect("spawn");
+    let spawned_pid = child.id().expect("child pid");
+    let output = child.wait_with_output().await.expect("wait");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    let field = |name: &str| -> Option<u32> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().parse().ok())
+    };
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    let pid = field("pid ").unwrap_or_else(|| panic!("no pid in {text:?}"));
+    let pgid = field("pgid ").unwrap_or_else(|| panic!("no pgid in {text:?}"));
+    // sandbox-exec and the shell both exec in place, so this is the spawned process.
+    assert_eq!(pid, spawned_pid, "{text}");
+    assert_eq!(
+        pgid, pid,
+        "the sandboxed child must lead its own process group: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T12. read-only mode
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t12_read_only_mode_denies_every_write_and_allows_reads() {
+    if skip_if_nested("t12_read_only_mode_denies_every_write_and_allows_reads") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = canonical_tempdir();
+    git_repo(&ws);
+    std::fs::write(ws.join("r.txt"), "hello\n").unwrap();
+    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let settings = SandboxSettings::default();
+    let ro = |script: String| {
+        let ws = ws.clone();
+        let settings = settings.clone();
+        async move { sh_in(&settings, FsAccess::ReadOnly, &ws, &script).await }
+    };
+
+    let (code, out) = ro("cat r.txt && git log -1 --format=%s".into()).await;
+    c.check(
+        code == Some(0) && out.contains("hello") && out.contains("init"),
+        || format!("reading the workspace should work: exit={code:?} output={out:?}"),
+    );
+
+    let config_before = read(&ws.join(".git/config"));
+    let head_before = read(&ws.join(".git/HEAD"));
+    let tmp_name = tmp.path().file_name().unwrap().to_str().unwrap();
+    for (label, script) in [
+        ("overwrite a workspace file", "echo x > r.txt".to_string()),
+        ("create a workspace file", "touch new".to_string()),
+        ("mkdir in the workspace", "mkdir d".to_string()),
+        ("/tmp", format!("touch '/tmp/{tmp_name}/x'")),
+        ("/private/tmp", format!("touch '/private/tmp/{tmp_name}/y'")),
+        ("$TMPDIR", format!("touch '{}/x'", tmpdir.path().display())),
+        (".git/config", "echo '[x]' >> .git/config".to_string()),
+        (".git/HEAD", "echo x > .git/HEAD".to_string()),
+        (
+            "git commit",
+            "git -c user.email=t@t -c user.name=t commit -q --allow-empty -m ro".to_string(),
+        ),
+    ] {
+        let (code, out) = ro(script.clone()).await;
+        c.check(code != Some(0), || {
+            format!("read-only {label}: `{script}` should be denied: exit={code:?} output={out:?}")
+        });
+    }
+    c.check(read(&ws.join("r.txt")) == b"hello\n", || {
+        "r.txt changed".into()
+    });
+    c.check(!ws.join("new").exists() && !ws.join("d").exists(), || {
+        "ws file created".into()
+    });
+    c.check(
+        !tmp.path().join("x").exists() && !tmp.path().join("y").exists(),
+        || "/tmp file created".into(),
+    );
+    c.check(!tmpdir.path().join("x").exists(), || {
+        "$TMPDIR file created".into()
+    });
+    c.check(
+        read(&ws.join(".git/config")) == config_before
+            && read(&ws.join(".git/HEAD")) == head_before,
+        || ".git changed".into(),
+    );
+
+    c.finish();
 }

@@ -46,7 +46,30 @@ impl CommandSandbox for Seatbelt {
     }
 
     fn is_denial(&self, exit_code: Option<i32>, output: &str) -> bool {
-        // External networking is always off inside the sandbox, so network-failure text counts.
-        looks_like_sandbox_denial(exit_code, output, true)
+        // Network-failure text points at the sandbox only when all networking is off. With
+        // `allow_localhost`, a failed connection to a local server that isn't running is an
+        // ordinary failure, not a denial.
+        looks_like_sandbox_denial(exit_code, output, !self.settings.allow_localhost)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REFUSED: &str = "curl: (7) Failed to connect to 127.0.0.1 port 9: Connection refused\n";
+
+    #[test]
+    fn network_failure_text_is_a_denial_only_when_localhost_is_off() {
+        let off = Seatbelt::new(SandboxSettings::default());
+        assert!(off.is_denial(Some(7), REFUSED));
+
+        let on = Seatbelt::new(SandboxSettings {
+            allow_localhost: true,
+            ..SandboxSettings::default()
+        });
+        assert!(!on.is_denial(Some(7), REFUSED));
+        // File-write denials count either way.
+        assert!(on.is_denial(Some(1), "touch: a: Operation not permitted\n"));
     }
 }

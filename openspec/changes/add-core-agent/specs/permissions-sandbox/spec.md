@@ -87,7 +87,7 @@ Except in `full-access` mode, the system SHALL run `bash` commands and command-f
 When no sandbox mechanism is available, the system SHALL warn the user at startup and require approval for every `bash` command in every mode except `full-access`. The system MUST NOT run a command unsandboxed without either `full-access` or an explicit approval.
 
 #### Scenario: Linux kernel without Landlock
-- **WHEN** harness starts on a Linux system where Landlock ABI 2 or later is not available, in `auto` mode
+- **WHEN** harness starts on a Linux system where Landlock ABI 3 or later is not available, in `auto` mode
 - **THEN** a warning is shown and each `bash` command asks for approval
 
 ### Requirement: File tools enforce the workspace boundary

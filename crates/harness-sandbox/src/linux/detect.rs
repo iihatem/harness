@@ -15,9 +15,12 @@
 const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 
 /// Landlock ABI 1 cannot correctly express cross-directory rename/link
-/// restrictions (see landlock(7), "Kernel compatibility" / ABI history), so
-/// this crate treats it as unusable and requires ABI >= 2.
-const MIN_SUPPORTED_ABI: i32 = 2;
+/// restrictions, and ABI 2 has no `LANDLOCK_ACCESS_FS_TRUNCATE` at all — a
+/// program denied write access could still `truncate(2)` or
+/// `open(O_TRUNC)` any file it can merely open (see landlock(7), "Kernel
+/// compatibility" / ABI history). This crate requires ABI >= 3 (kernel
+/// 6.2+), the first version that can restrict truncation.
+const MIN_SUPPORTED_ABI: i32 = 3;
 
 /// Probes the running kernel's Landlock ABI version.
 ///
@@ -45,15 +48,14 @@ pub fn landlock_abi() -> Option<i32> {
     }
 }
 
-/// Whether this process can rely on the Linux sandbox backend: the seccomp
-/// half requires a BPF-supported architecture we know how to target, and the
-/// Landlock half requires kernel ABI >= 2.
+/// Whether this process can rely on the Linux sandbox backend: the Landlock
+/// half requires kernel ABI >= 3. The architecture check that used to live
+/// here is now a compile-time gate instead: the whole `linux` module (see
+/// `lib.rs`) only builds on `x86_64`/`aarch64`, the two architectures the
+/// seccomp filter knows how to target, so by the time this function can even
+/// be called the architecture is already known-good.
 pub fn linux_sandbox_available() -> bool {
-    supported_arch() && landlock_abi().is_some_and(|abi| abi >= MIN_SUPPORTED_ABI)
-}
-
-fn supported_arch() -> bool {
-    cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64")
+    landlock_abi().is_some_and(|abi| abi >= MIN_SUPPORTED_ABI)
 }
 
 #[cfg(test)]
@@ -61,7 +63,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn min_supported_abi_rejects_abi_1() {
-        const { assert!(MIN_SUPPORTED_ABI > 1) };
+    fn min_supported_abi_rejects_abi_below_3() {
+        const { assert!(MIN_SUPPORTED_ABI >= 3) };
     }
 }

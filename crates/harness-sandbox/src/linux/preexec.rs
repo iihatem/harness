@@ -27,10 +27,10 @@
 //! by value, which would run `RulesetCreated`'s (and its `Compatibility`
 //! state's) `Drop` glue in the child — safe in the vast majority of cases,
 //! but not something this crate wants to rely on being allocation-free
-//! across every version of the `landlock` crate. Extracting the raw fd with
-//! `Option<OwnedFd>::from(ruleset_created)` in the parent (see
-//! `fs::build_ruleset_fd`) and calling the raw `landlock_restrict_self(2)`
-//! syscall here avoids the question entirely.
+//! across every version of the `landlock` crate. Extracting the raw fd in
+//! the parent (see `fs::build_ruleset_fd`, which also turns a missing fd
+//! into an `Err` there rather than here) and calling the raw
+//! `landlock_restrict_self(2)` syscall here avoids the question entirely.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -42,9 +42,10 @@ use super::fdcleanup;
 /// Everything [`apply`] needs, computed in the parent (see `fs.rs` and
 /// `seccomp.rs`) before the child is forked.
 pub(super) struct PreparedSandbox {
-    /// The Landlock ruleset fd, or `None` when the kernel has no Landlock
-    /// support at all (in which case there is nothing to restrict).
-    pub(super) landlock_ruleset_fd: Option<OwnedFd>,
+    /// The Landlock ruleset fd. Always present: [`super::fs::build_ruleset_fd`]
+    /// errors in the parent, before the child is ever forked, rather than
+    /// handing back a `PreparedSandbox` with nothing to restrict.
+    pub(super) landlock_ruleset_fd: OwnedFd,
     /// The compiled network-deny seccomp-BPF program.
     pub(super) seccomp_program: BpfProgram,
 }
@@ -62,8 +63,8 @@ pub(super) fn apply(prepared: &PreparedSandbox) -> io::Result<()> {
     // 2. Deny inheritance of any fd we did not explicitly wire up as
     //    stdio. Must happen before Landlock is restricted: it opens
     //    `/proc/self/fd` as a fallback path, which a restrictive ruleset
-    //    could otherwise deny.
-    fdcleanup::mark_inherited_fds_close_on_exec();
+    //    could otherwise deny. Fails closed: see `fdcleanup`'s module docs.
+    fdcleanup::mark_inherited_fds_close_on_exec()?;
 
     // 3. Required before `seccomp(2)` will install a filter; applied ahead
     //    of Landlock too so nothing between here and `execve` could regain
@@ -71,17 +72,30 @@ pub(super) fn apply(prepared: &PreparedSandbox) -> io::Result<()> {
     //    about to remove.
     set_no_new_privs()?;
 
-    // 4. Filesystem restriction. `None` means the kernel has no Landlock
-    //    support at all, so there is nothing to restrict.
-    if let Some(fd) = &prepared.landlock_ruleset_fd {
-        landlock_restrict_self(fd.as_raw_fd())?;
-    }
+    // 4. Filesystem restriction. `landlock_ruleset_fd` is always present
+    //    (see `PreparedSandbox`'s docs): a kernel that cannot enforce it was
+    //    already rejected in the parent, before fork.
+    landlock_restrict_self(prepared.landlock_ruleset_fd.as_raw_fd())?;
 
     // 5. Network restriction. Installed last so none of the syscalls above
     //    can themselves be filtered.
-    seccompiler::apply_filter(&prepared.seccomp_program).map_err(io::Error::other)?;
+    seccompiler::apply_filter(&prepared.seccomp_program).map_err(seccomp_apply_error)?;
 
     Ok(())
+}
+
+/// Maps a failed [`seccompiler::apply_filter`] to an `io::Error`, without
+/// allocating (this runs in the forked child; see the module docs).
+/// `Prctl`/`Seccomp` already carry the syscall's own `io::Error`, moved out
+/// as-is; every other variant (`apply_filter` only otherwise returns
+/// `EmptyFilter`, which cannot happen here since [`super::seccomp`] never
+/// builds an empty program) becomes a plain `EINVAL` — `io::Error::other`
+/// is avoided because it boxes its argument.
+fn seccomp_apply_error(err: seccompiler::Error) -> io::Error {
+    match err {
+        seccompiler::Error::Prctl(e) | seccompiler::Error::Seccomp(e) => e,
+        _ => io::Error::from_raw_os_error(libc::EINVAL),
+    }
 }
 
 fn setsid() -> io::Result<()> {

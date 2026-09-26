@@ -19,6 +19,15 @@
 //!
 //! Every syscall here (`close_range`, `open`, `getdents64`, `fcntl`) is on
 //! the POSIX async-signal-safe list; nothing in this module allocates.
+//!
+//! ## Fails closed
+//!
+//! If neither `close_range` nor the `/proc/self/fd` fallback can mark every
+//! inherited fd close-on-exec — the directory fails to open, `getdents64`
+//! errors, or an individual `fcntl(F_SETFD)` fails — this returns `Err`
+//! instead of continuing as if cleanup had succeeded. `pre_exec` propagates
+//! that `Err`, which aborts the exec: a command must not run with an
+//! inherited fd we failed to isolate, silently or otherwise.
 
 use std::ffi::CStr;
 use std::io;
@@ -26,12 +35,13 @@ use std::os::fd::RawFd;
 
 /// Marks every fd above stderr close-on-exec, preferring the one-shot
 /// `close_range(2)` syscall (Linux 5.11+) and falling back to walking
-/// `/proc/self/fd` on kernels that do not have it.
-pub(super) fn mark_inherited_fds_close_on_exec() {
+/// `/proc/self/fd` on kernels that do not have it. See the module docs for
+/// why a failure here is `Err`, not a silently-skipped best effort.
+pub(super) fn mark_inherited_fds_close_on_exec() -> io::Result<()> {
     if close_range_cloexec(3, u32::MAX) {
-        return;
+        return Ok(());
     }
-    mark_close_on_exec_via_proc();
+    mark_close_on_exec_via_proc()
 }
 
 /// Returns `true` on success. `close_range` is only available since Linux
@@ -53,7 +63,8 @@ fn close_range_cloexec(first: u32, last: u32) -> bool {
 /// Fallback for kernels without `close_range`: read this process's open fds
 /// out of `/proc/self/fd` (via the raw `getdents64` syscall, so no libc
 /// directory-reading allocation is involved) and `fcntl(F_SETFD)` each one.
-fn mark_close_on_exec_via_proc() {
+/// Closes the directory fd it opens on every path, success or failure.
+fn mark_close_on_exec_via_proc() -> io::Result<()> {
     // Opened after fork: a directory fd opened in the parent would iterate
     // the parent's (possibly different) descriptor table, not this child's.
     // SAFETY: the path is a static, NUL-terminated C string; `open` performs
@@ -65,10 +76,21 @@ fn mark_close_on_exec_via_proc() {
         )
     };
     if raw < 0 {
-        return;
+        return Err(io::Error::last_os_error());
     }
     let dir_fd = raw;
 
+    let result = read_and_mark_all(dir_fd);
+
+    // SAFETY: closes only the directory fd this function opened above.
+    unsafe {
+        libc::close(dir_fd);
+    }
+
+    result
+}
+
+fn read_and_mark_all(dir_fd: RawFd) -> io::Result<()> {
     let mut buf = [0u8; 4096];
     loop {
         // SAFETY: writes at most `buf.len()` bytes into stack storage owned
@@ -76,13 +98,14 @@ fn mark_close_on_exec_via_proc() {
         let count =
             unsafe { libc::syscall(libc::SYS_getdents64, dir_fd, buf.as_mut_ptr(), buf.len()) };
         if count == -1 {
-            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            break;
+            return Err(err);
         }
         if count == 0 {
-            break;
+            return Ok(());
         }
 
         let mut entries = &buf[..count as usize];
@@ -101,31 +124,28 @@ fn mark_close_on_exec_via_proc() {
                 && let Ok(name) = name.to_str()
                 && let Ok(fd) = name.parse::<RawFd>()
             {
-                mark_cloexec(dir_fd, fd);
+                mark_cloexec(dir_fd, fd)?;
             }
             entries = &entries[reclen..];
         }
     }
-
-    // SAFETY: closes only the directory fd this function opened above.
-    unsafe {
-        libc::close(dir_fd);
-    }
 }
 
-fn mark_cloexec(dir_fd: RawFd, fd: RawFd) {
+fn mark_cloexec(dir_fd: RawFd, fd: RawFd) -> io::Result<()> {
     if fd <= libc::STDERR_FILENO || fd == dir_fd {
-        return;
+        return Ok(());
     }
     // SAFETY: `fcntl(F_GETFD)`/`F_SETFD` on an fd this process owns; no
     // pointers, no allocation.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags == -1 {
-        return;
+        return Err(io::Error::last_os_error());
     }
     if flags & libc::FD_CLOEXEC == 0 {
-        unsafe {
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
         }
     }
+    Ok(())
 }

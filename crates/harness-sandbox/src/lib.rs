@@ -2,7 +2,14 @@
 //! Both implement [`harness_core::tool::CommandSandbox`]; [`detect`] picks the one this host supports.
 
 mod denial;
-#[cfg(target_os = "linux")]
+// Only x86_64/aarch64 are supported: `linux::seccomp` only knows how to
+// target those two architectures. Any other Linux architecture skips this
+// module entirely and compiles as if no sandbox backend were available,
+// rather than failing to build.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -17,7 +24,10 @@ use std::{
 use harness_core::tool::CommandSandbox;
 
 pub use denial::looks_like_sandbox_denial;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub use linux::{LinuxSandbox, landlock_abi, linux_sandbox_available, linux_sandbox_command};
 #[cfg(target_os = "macos")]
 pub use macos::{Seatbelt, seatbelt_available, seatbelt_command};
@@ -51,7 +61,10 @@ pub fn detect(settings: SandboxSettings) -> Option<Arc<dyn CommandSandbox>> {
     if seatbelt_available() {
         return Some(Arc::new(Seatbelt::new(settings)));
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     if linux_sandbox_available() {
         return Some(Arc::new(LinuxSandbox::new(settings)));
     }

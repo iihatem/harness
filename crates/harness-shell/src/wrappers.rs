@@ -26,8 +26,8 @@ pub(crate) fn runs_programs(var: &str) -> bool {
         )
 }
 
-/// Extract the variable name from an assignment word, stripping `+` from `+=` and `[index]` from `NAME[index]=`.
-fn assigned_name(word: &str) -> &str {
+/// The variable a `NAME=value` word sets: `A` for `A+=x` and `A[i]=x` (and for a bare `A`).
+pub(crate) fn assigned_name(word: &str) -> &str {
     let before_eq = word.split('=').next().unwrap_or(word);
     let before_bracket = before_eq.split('[').next().unwrap_or(before_eq);
     before_bracket.strip_suffix('+').unwrap_or(before_bracket)

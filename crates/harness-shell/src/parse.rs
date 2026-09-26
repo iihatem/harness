@@ -11,10 +11,12 @@ use crate::destructive;
 use crate::fallback;
 use crate::git;
 use crate::paths::{Cwd, Workspace};
-use crate::wrappers::{self, Next, runs_programs};
+use crate::wrappers::{self, Next, assigned_name, runs_programs};
 
 /// Longer input is not parsed (it is only roughly scanned for deny matches).
 const MAX_INPUT_CHARS: usize = 10_000;
+/// Builtins whose `NAME=value` operands set shell variables.
+const DECLARATION_BUILTINS: &[&str] = &["export", "declare", "typeset", "local", "readonly"];
 /// Nesting limit for wrapper commands (`sudo env nice …`).
 const MAX_LAYERS: usize = 16;
 /// Nesting limit for brackets, compound commands and command lists; keeps both the
@@ -38,13 +40,6 @@ pub(crate) struct Analysis {
     pub undecomposable: Vec<String>,
 }
 
-/// Extract the variable name from an assignment word, stripping `+` from `+=` and `[index]` from `NAME[index]=`.
-fn assigned_name(word: &str) -> &str {
-    let before_eq = word.split('=').next().unwrap_or(word);
-    let before_bracket = before_eq.split('[').next().unwrap_or(before_eq);
-    before_bracket.strip_suffix('+').unwrap_or(before_bracket)
-}
-
 pub(crate) fn analyze(src: &str, ws: &Workspace) -> Analysis {
     let mut walker = Walker {
         ws,
@@ -58,6 +53,13 @@ pub(crate) fn analyze(src: &str, ws: &Workspace) -> Analysis {
 fn push_unique(list: &mut Vec<String>, reason: String) {
     if !list.contains(&reason) {
         list.push(reason);
+    }
+}
+
+/// The variable an assignment sets (`A` for `A[i]=x`).
+fn assignment_name(assignment: &ast::Assignment) -> &str {
+    match &assignment.name {
+        ast::AssignmentName::VariableName(n) | ast::AssignmentName::ArrayElementName(n, _) => n,
     }
 }
 
@@ -112,7 +114,7 @@ impl Walker<'_> {
     fn rough_scan(&mut self, src: &str, depth: usize) {
         for words in fallback::rough_commands(src) {
             let argv = words.into_iter().map(Tok::Lit).collect();
-            self.exec(argv, &mut Cwd::unknown(), depth + 1, 0, false);
+            self.exec(argv, &[], &mut Cwd::unknown(), depth + 1, 0, false);
         }
     }
 
@@ -297,16 +299,7 @@ impl Walker<'_> {
         for item in cmd.prefix.iter().flat_map(|p| &p.0) {
             if let Item::AssignmentWord(assignment, _) = item {
                 assigns = true;
-                // Check if this prefix assignment is for a dangerous environment variable
-                let var_name = match &assignment.name {
-                    ast::AssignmentName::VariableName(n) => Some(n.as_str()),
-                    ast::AssignmentName::ArrayElementName(n, _) => Some(n.as_str()),
-                };
-                if let Some(name) = var_name
-                    && runs_programs(name)
-                {
-                    dangerous_env = true;
-                }
+                dangerous_env |= runs_programs(assignment_name(assignment));
                 self.assignment(assignment, cwd, depth);
             } else {
                 self.item(item, &mut argv, cwd, depth);
@@ -315,7 +308,23 @@ impl Walker<'_> {
         if let Some(name) = &cmd.word_or_name {
             argv.push(self.word(&name.value, cwd, depth));
         }
+        // bash expands `NAME=value` operands as assignments (no word splitting or
+        // pathname expansion, so NAME is what it looks like) only when a declaration
+        // builtin is the unquoted command word and no variable is assigned before it;
+        // otherwise `FOO=$x` may expand to several operands.
+        let expands_assignments = !assigns
+            && cmd
+                .word_or_name
+                .as_ref()
+                .is_some_and(|w| DECLARATION_BUILTINS.contains(&w.value.as_str()));
+        // Argv positions of those operands, with their literal NAME.
+        let mut assignments = Vec::new();
         for item in cmd.suffix.iter().flat_map(|s| &s.0) {
+            if let Item::AssignmentWord(assignment, _) = item
+                && expands_assignments
+            {
+                assignments.push((argv.len(), assignment_name(assignment)));
+            }
             self.item(item, &mut argv, cwd, depth);
         }
         if argv.is_empty() {
@@ -331,31 +340,14 @@ impl Walker<'_> {
         } else if assigns {
             self.unlisted("sets environment variables for the command".into());
         }
-        self.exec(argv, cwd, depth, 0, true);
+        self.exec(argv, &assignments, cwd, depth, 0, true);
     }
 
     fn item(&mut self, item: &Item, argv: &mut Vec<Tok>, cwd: &Cwd, depth: usize) {
         match item {
-            Item::Word(w) => argv.push(self.word(&w.value, cwd, depth)),
-            Item::AssignmentWord(assignment, _w) => {
-                // For AssignmentWord, the name is known from the AST even if the value is dynamic
-                // Only check if the name itself is dangerous
-                let var_name = match &assignment.name {
-                    ast::AssignmentName::VariableName(n) => n.as_str(),
-                    ast::AssignmentName::ArrayElementName(n, _) => n.as_str(),
-                };
-                if runs_programs(var_name) {
-                    self.undecomposable(format!(
-                        "sets `{var_name}`, which makes programs run other commands"
-                    ));
-                }
-                // Still process the value for command substitutions
-                self.assignment(assignment, cwd, depth);
-                // Don't push a token for safe AssignmentWords - their analysis is complete
-                // Push Dyn only if the name is dangerous (already marked undecomposable above)
-                if runs_programs(var_name) {
-                    argv.push(Tok::Dyn);
-                }
+            // An assignment-looking argument (`export A=1`) is an ordinary word here.
+            Item::Word(w) | Item::AssignmentWord(_, w) => {
+                argv.push(self.word(&w.value, cwd, depth))
             }
             Item::IoRedirect(r) => self.redirect(r, cwd, depth),
             Item::ProcessSubstitution(_, sub) => {
@@ -489,9 +481,12 @@ impl Walker<'_> {
     }
 
     /// Runs one argv: records its deny forms, then unwraps wrapper commands.
+    /// `assignments` lists the argv positions (and literal NAMEs) of `NAME=value`
+    /// operands the shell expands as assignments.
     fn exec(
         &mut self,
         argv: Vec<Tok>,
+        assignments: &[(usize, &str)],
         cwd: &mut Cwd,
         depth: usize,
         layer: usize,
@@ -505,7 +500,7 @@ impl Walker<'_> {
             return self.undecomposable("too many nested wrapper commands".into());
         }
         let Some(w) = wrappers::unwrap(&argv) else {
-            return self.run(argv, cwd, same_shell);
+            return self.run(argv, assignments, cwd, same_shell);
         };
         if let Some(why) = w.unlisted {
             self.unlisted(why);
@@ -529,14 +524,20 @@ impl Walker<'_> {
             let mut own_cwd = inner_cwd.clone();
             let target = if same_shell { &mut *cwd } else { &mut own_cwd };
             match next {
-                Next::Argv(inner) => self.exec(inner, target, depth, layer + 1, same_shell),
+                Next::Argv(inner) => self.exec(inner, &[], target, depth, layer + 1, same_shell),
                 Next::Script(src) => self.program(&src, target, depth + 1),
             }
         }
     }
 
     /// Records the command that actually runs once all wrappers are unwrapped.
-    fn run(&mut self, argv: Vec<Tok>, cwd: &mut Cwd, same_shell: bool) {
+    fn run(
+        &mut self,
+        argv: Vec<Tok>,
+        assignments: &[(usize, &str)],
+        cwd: &mut Cwd,
+        same_shell: bool,
+    ) {
         match &argv[0] {
             Tok::Lit(name) if name.contains('/') => self.unlisted(format!("runs `{name}` by path")),
             Tok::Lit(_) => {}
@@ -548,42 +549,8 @@ impl Walker<'_> {
                 "git `-c`/`--config-env`/`--exec-path` can run arbitrary programs".into(),
             );
         }
-        // Check for export/declare/typeset/local/readonly with dangerous env vars
-        if matches!(
-            name,
-            "export" | "declare" | "typeset" | "local" | "readonly"
-        ) {
-            for arg in argv.iter().skip(1) {
-                match arg {
-                    Tok::Lit(s) => {
-                        // Check both `NAME=value` and bare `NAME` forms
-                        let var_name = if s.contains('=') {
-                            assigned_name(s)
-                        } else {
-                            s.as_str()
-                        };
-                        if runs_programs(var_name) {
-                            self.undecomposable(format!(
-                                "sets `{var_name}`, which makes programs run other commands"
-                            ));
-                            break;
-                        }
-                    }
-                    Tok::Glob { .. } => {
-                        // Glob in export operand means computed variable name
-                        self.undecomposable(format!("`{name}` operand is only known at run time"));
-                        break;
-                    }
-                    // Tok::Dyn from AssignmentWords is handled in item() so we don't mark them as undecomposable here
-                    Tok::Dyn => {
-                        // Dyn token - could be from a plain computed word like $(echo FOO=x)
-                        // or from an AssignmentWord like FOO=$(pwd) which is handled in item()
-                        // For plain words without =, this is a computed operand
-                        self.undecomposable(format!("`{name}` operand is only known at run time"));
-                        break;
-                    }
-                }
-            }
+        if DECLARATION_BUILTINS.contains(&name) {
+            self.declaration_operands(name, &argv, assignments);
         }
         if same_shell {
             match name {
@@ -593,6 +560,32 @@ impl Walker<'_> {
             }
         }
         self.out.commands.push(argv);
+    }
+
+    /// Setting a variable that makes programs run other commands is as opaque as
+    /// running them; so is an operand whose NAME is only known at run time.
+    fn declaration_operands(&mut self, builtin: &str, argv: &[Tok], assignments: &[(usize, &str)]) {
+        for (i, arg) in argv.iter().enumerate().skip(1) {
+            let var = match arg {
+                Tok::Lit(s) => Some(assigned_name(s)),
+                _ => assignments
+                    .iter()
+                    .find(|&&(at, _)| at == i)
+                    .map(|&(_, name)| name),
+            };
+            match var {
+                Some(var) if runs_programs(var) => {
+                    return self.undecomposable(format!(
+                        "sets `{var}`, which makes programs run other commands"
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    return self
+                        .undecomposable(format!("`{builtin}` operand is only known at run time"));
+                }
+            }
+        }
     }
 
     fn add_forms(&mut self, argv: &[Tok], cwd: &Cwd) {

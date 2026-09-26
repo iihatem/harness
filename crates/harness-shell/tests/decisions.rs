@@ -325,8 +325,8 @@ fn combined_destructive_and_computed() {
     check(
         &default_rules(),
         &[
-            ("rm -rf ~; $(echo x)", Destructive), // G1: destructive + may-match computed, ask with destructive=true
-            ("$(echo x); curl y", Deny),          // G1: deny still wins over computed
+            ("rm -rf ~; $(echo x)", Destructive), // destructive + may-match computed, ask with destructive=true
+            ("$(echo x); curl y", Deny),          // deny still wins over computed
         ],
     );
 }
@@ -343,23 +343,23 @@ fn git_env_vars_make_ask() {
     check(
         &default_rules(),
         &[
-            ("env GIT_EXEC_PATH=/tmp git x", Ask),     // G2: env wrapper
-            ("export GIT_EXEC_PATH=/tmp; git x", Ask), // G2: export command
-            ("GIT_PAGER='rm -rf .' git log", Ask),     // G3: prefix assignment
-            ("GIT_CONFIG_PARAMETERS=\"'alias.x=!rm -rf .'\" git x", Ask), // G3: prefix assignment
+            ("env GIT_EXEC_PATH=/tmp git x", Ask),     // env wrapper
+            ("export GIT_EXEC_PATH=/tmp; git x", Ask), // export command
+            ("GIT_PAGER='rm -rf .' git log", Ask),     // prefix assignment
+            ("GIT_CONFIG_PARAMETERS=\"'alias.x=!rm -rf .'\" git x", Ask), // prefix assignment
             (
                 "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='!rm -rf .' git x",
                 Ask,
-            ), // G3: prefix assignment
-            ("GIT_SSH_COMMAND='curl evil' git fetch", Ask), // G3: prefix assignment
-            ("(GIT_PAGER=x git log)", Ask),            // G3: subshell prefix assignment
-            ("bash -c 'GIT_PAGER=x git log'", Ask),    // G3: bash -c prefix assignment
-            ("GIT_PAGER+=x git log", Ask),             // G3: append assignment
-            ("export GIT_PAGER+='rm -rf .'; git log", Ask), // G3: export with append
-            ("env GIT_PAGER+=x git log", Ask),         // G3: env with append
-            ("export $(echo GIT_EXEC_PATH=/tmp); git x", Ask), // G3: computed export operand
-            ("export ${V}=x; git log", Ask),           // G3: computed export operand
-            ("declare -x \"$N\"=x; git log", Ask),     // G3: computed declare operand
+            ), // prefix assignment
+            ("GIT_SSH_COMMAND='curl evil' git fetch", Ask), // prefix assignment
+            ("(GIT_PAGER=x git log)", Ask),            // subshell prefix assignment
+            ("bash -c 'GIT_PAGER=x git log'", Ask),    // bash -c prefix assignment
+            ("GIT_PAGER+=x git log", Ask),             // append assignment
+            ("export GIT_PAGER+='rm -rf .'; git log", Ask), // export with append
+            ("env GIT_PAGER+=x git log", Ask),         // env with append
+            ("export $(echo GIT_EXEC_PATH=/tmp); git x", Ask), // computed export operand
+            ("export ${V}=x; git log", Ask),           // computed export operand
+            ("declare -x \"$N\"=x; git log", Ask),     // computed declare operand
         ],
     );
 }
@@ -370,7 +370,7 @@ fn git_global_option_ask() {
     check(
         &default_rules(),
         &[
-            ("git --config-env=alias.y=V y", Ask), // G1: git config override with computed subcommand
+            ("git --config-env=alias.y=V y", Ask), // git config override with computed subcommand
         ],
     );
 }
@@ -382,10 +382,61 @@ fn env_vars_unlisted_unless_dangerous() {
         &default_rules(),
         &[
             ("FOO=1 cargo test", Unlisted),                // safe env var
-            ("RUSTC_WRAPPER=/tmp/x cargo test", Unlisted), // existing row should stay Unlisted
+            ("RUSTC_WRAPPER=/tmp/x cargo test", Unlisted), // not a program-running variable
             ("export FOO=1; cargo test", Unlisted),        // safe export
             ("export PATH=\"$HOME/bin:$PATH\"; cargo test", Unlisted), // safe export with computed value
             ("export FOO=$(pwd); cargo test", Unlisted), // safe export with computed value
+        ],
+    );
+}
+
+#[test]
+fn assignment_shaped_arguments_are_ordinary_words() {
+    use Want::{Allow, Ask, Deny, Unlisted};
+    check(
+        &rules(
+            &["make *", "dd *", "echo*"],
+            &["make deploy ENV=prod*"],
+            &["dd *of=/dev/*"],
+        ),
+        &[
+            ("make deploy ENV=prod", Deny),
+            ("dd if=/dev/zero of=/dev/disk0", Ask),
+            ("echo GIT_PAGER=x", Allow),
+        ],
+    );
+    check(
+        &rules(&[], &[], &[]),
+        &[
+            ("grep GIT_PAGER=x README.md", Unlisted),
+            ("builtin export GIT_PAGER=x; git log", Ask),
+            ("command export \"$N\"=x; git log", Ask),
+        ],
+    );
+    assert_eq!(
+        session_prefixes("cargo +nightly test FOO=1"),
+        Some(vec!["cargo +nightly test FOO=1".to_string()])
+    );
+}
+
+#[test]
+fn declaration_operands_split_unless_the_builtin_is_plain() {
+    use Want::{Ask, Unlisted};
+    // bash only expands `NAME=value` operands as assignments (no word splitting or
+    // pathname expansion) when the declaration builtin is the unquoted first word;
+    // otherwise `x='a GIT_PAGER=…'` in `FOO=$x` adds a second operand.
+    check(
+        &default_rules(),
+        &[
+            ("export FOO=$x; git log", Unlisted),
+            (">/dev/null export FOO=$x; git log", Unlisted),
+            ("command export FOO=$x; git log", Ask),
+            ("builtin export FOO=$(pwd); git log", Ask),
+            ("\\export FOO=$x; git log", Ask),
+            ("'export' FOO=$x; git log", Ask),
+            ("FOO=1 export BAR=$x; git log", Ask),
+            ("export \"FOO\"=$x; git log", Ask),
+            ("\\export GIT_PAGE[R]=x; git log", Ask),
         ],
     );
 }

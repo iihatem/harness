@@ -942,7 +942,9 @@ name = "harness-config"
 version = "0.1.0"
 dependencies = [
  "harness-core",
+ "hex",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror",
  "toml",

@@ -19,8 +19,10 @@ pub fn load() -> Result<Setup, String> {
         .and_then(|dir| dir.canonicalize())
         .map_err(|e| format!("cannot determine the working directory: {e}"))?;
     let paths = Paths::from_process_env().map_err(|e| e.to_string())?;
+    let trust =
+        harness_config::trust::TrustStore::load(&paths.data_dir).map_err(|e| e.to_string())?;
     let config =
-        config::load(&paths.global_config_file(), &workspace).map_err(|e| e.to_string())?;
+        config::load(&paths.global_config_file(), &workspace, &trust).map_err(|e| e.to_string())?;
     for warning in &config.warnings {
         eprintln!("warning: {warning}");
     }

@@ -985,6 +985,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-sandbox"
+version = "0.1.0"
+dependencies = [
+ "harness-core",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "harness-shell"
 version = "0.1.0"
 dependencies = [

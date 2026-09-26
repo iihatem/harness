@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     message::ToolSpec,
-    permission::{Action, resolve_path},
+    permission::{Action, FsAccess, resolve_path},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +101,23 @@ pub trait Tool: Send + Sync {
     /// What running this call would do, for the permission check. Called after schema validation.
     fn action(&self, args: &Value, ctx: &ToolContext) -> Action;
     async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput;
+}
+
+/// Wraps shell commands so they run inside an OS sandbox. Implemented by `harness-sandbox`.
+pub trait CommandSandbox: Send + Sync + std::fmt::Debug {
+    /// Mechanism name for messages, e.g. `seatbelt` or `landlock+seccomp`.
+    fn name(&self) -> &'static str;
+    /// A command that runs `program args…` in the sandbox with `access` for `workspace`, already set
+    /// up to lead its own process group. The caller sets the working directory, stdio, and environment.
+    fn command(
+        &self,
+        access: FsAccess,
+        workspace: &Path,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<tokio::process::Command>;
+    /// Whether a failed command's output looks like the sandbox blocked it.
+    fn is_denial(&self, exit_code: Option<i32>, output: &str) -> bool;
 }
 
 /// Tools in a fixed order, so tool definitions are byte-identical across requests.

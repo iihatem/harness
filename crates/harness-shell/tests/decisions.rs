@@ -320,6 +320,60 @@ fn computed_command_names_with_deny() {
 }
 
 #[test]
+fn combined_destructive_and_computed() {
+    use Want::{Deny, Destructive};
+    check(
+        &default_rules(),
+        &[
+            ("rm -rf ~; $(echo x)", Destructive), // G1: destructive + may-match computed, ask with destructive=true
+            ("$(echo x); curl y", Deny),          // G1: deny still wins over computed
+        ],
+    );
+}
+
+#[test]
+fn computed_confirm_without_deny() {
+    let r = rules(&["cargo *"], &[], &["cargo publish*"]);
+    assert_eq!(kind(&eval_with(&r, "cargo $(echo publish)")), Want::Ask);
+}
+
+#[test]
+fn git_env_vars_make_ask() {
+    use Want::Ask;
+    check(
+        &default_rules(),
+        &[
+            ("env GIT_EXEC_PATH=/tmp git x", Ask),     // G2: env wrapper
+            ("export GIT_EXEC_PATH=/tmp; git x", Ask), // G2: export command
+        ],
+    );
+}
+
+#[test]
+fn git_global_option_ask() {
+    use Want::Ask;
+    check(
+        &default_rules(),
+        &[
+            ("git --config-env=alias.y=V y", Ask), // G1: git config override with computed subcommand
+        ],
+    );
+}
+
+#[test]
+fn env_vars_unlisted_unless_dangerous() {
+    use Want::Unlisted;
+    check(
+        &default_rules(),
+        &[
+            ("FOO=1 cargo test", Unlisted),                // safe env var
+            ("RUSTC_WRAPPER=/tmp/x cargo test", Unlisted), // existing row should stay Unlisted
+            ("export FOO=1; cargo test", Unlisted),        // safe export
+        ],
+    );
+}
+
+#[test]
 fn reasons_name_the_rule() {
     match eval_with(&default_rules(), "cargo test && /usr/bin/curl x") {
         Verdict::Deny { reason } => assert!(reason.contains("bash:curl*"), "{reason}"),

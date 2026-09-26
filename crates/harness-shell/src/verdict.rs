@@ -33,11 +33,10 @@ pub enum Verdict {
 /// Decides how `command` may run. `workspace` is the project root; the command is
 /// assumed to start in it.
 ///
-/// Order: a deny match anywhere ⇒ `Deny`; undecomposable ⇒ `Ask` (flagged
-/// destructive if the best-effort scan found something destructive); destructive ⇒
-/// `Ask { destructive: true }`; confirm match, `sudo`-like wrappers, writes outside
-/// the workspace ⇒ `Ask`; every sub-command allow-listed and nothing blocking
-/// auto-allow ⇒ `Allow`; otherwise `Unlisted`.
+/// Order: definite deny ⇒ `Deny`; may-match deny / undecomposable / destructive ⇒ one
+/// `Ask` carrying every reason (destructive flag set when anything destructive was found);
+/// definite or may-match confirm, sudo-like wrappers, writes outside the workspace ⇒ `Ask`;
+/// all allow-listed ⇒ `Allow`; otherwise `Unlisted`.
 pub fn evaluate(command: &str, rules: &Rules, workspace: &Path) -> Verdict {
     let a = analyze(command, &Workspace::new(workspace));
     if let Some((form, rule)) = first_match(&a.forms, &rules.deny) {
@@ -45,32 +44,26 @@ pub fn evaluate(command: &str, rules: &Rules, workspace: &Path) -> Verdict {
             reason: format!("`{}` matches deny rule `bash:{rule}`", display(form)),
         };
     }
-    if let Some((form, rule)) = first_possible_match(&a.forms, &rules.deny) {
-        return Verdict::Ask {
-            reason: format!(
-                "`{}` may match deny rule `bash:{rule}` (part of it is only known at run time)",
-                display(form)
-            ),
-            destructive: false,
-        };
-    }
     let destructive = !a.destructive.is_empty();
+    let mut reasons = Vec::new();
+    if let Some((form, rule)) = first_possible_match(&a.forms, &rules.deny) {
+        reasons.push(format!(
+            "`{}` may match deny rule `bash:{rule}` (part of it is only known at run time)",
+            display(form)
+        ));
+    }
     if !a.undecomposable.is_empty() {
-        let mut reason = format!(
+        reasons.push(format!(
             "cannot fully analyze the command: {}",
             a.undecomposable.join("; ")
-        );
-        if destructive {
-            reason.push_str(&format!("; also destructive: {}", a.destructive.join("; ")));
-        }
-        return Verdict::Ask {
-            reason,
-            destructive,
-        };
+        ));
     }
     if destructive {
+        reasons.push(format!("destructive: {}", a.destructive.join("; ")));
+    }
+    if !reasons.is_empty() {
         return Verdict::Ask {
-            reason: format!("destructive: {}", a.destructive.join("; ")),
+            reason: reasons.join("; "),
             destructive,
         };
     }

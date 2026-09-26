@@ -11,7 +11,7 @@ use crate::destructive;
 use crate::fallback;
 use crate::git;
 use crate::paths::{Cwd, Workspace};
-use crate::wrappers::{self, Next};
+use crate::wrappers::{self, Next, runs_programs};
 
 /// Longer input is not parsed (it is only roughly scanned for deny matches).
 const MAX_INPUT_CHARS: usize = 10_000;
@@ -508,6 +508,24 @@ impl Walker<'_> {
             self.undecomposable(
                 "git `-c`/`--config-env`/`--exec-path` can run arbitrary programs".into(),
             );
+        }
+        // Check for export/declare/typeset/local/readonly with dangerous env vars
+        if matches!(
+            name,
+            "export" | "declare" | "typeset" | "local" | "readonly"
+        ) {
+            for arg in argv.iter().skip(1) {
+                if let Some(s) = arg.lit() {
+                    // Check both `NAME=value` and bare `NAME` forms
+                    let var_name = s.split('=').next().unwrap_or(s);
+                    if runs_programs(var_name) {
+                        self.undecomposable(format!(
+                            "sets `{var_name}`, which makes programs run other commands"
+                        ));
+                        break;
+                    }
+                }
+            }
         }
         if same_shell {
             match name {

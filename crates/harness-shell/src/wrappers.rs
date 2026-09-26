@@ -6,6 +6,26 @@
 
 use crate::argv::{Tok, basename};
 
+/// Environment variables whose value makes common tools run another program.
+pub(crate) fn runs_programs(var: &str) -> bool {
+    var.starts_with("GIT_CONFIG_")
+        || matches!(
+            var,
+            "GIT_EXEC_PATH"
+                | "GIT_PAGER"
+                | "GIT_SSH"
+                | "GIT_SSH_COMMAND"
+                | "GIT_EDITOR"
+                | "GIT_SEQUENCE_EDITOR"
+                | "GIT_EXTERNAL_DIFF"
+                | "GIT_ASKPASS"
+                | "GIT_PROXY_COMMAND"
+                | "PAGER"
+                | "EDITOR"
+                | "VISUAL"
+        )
+}
+
 /// What a wrapper runs.
 pub(crate) enum Next {
     /// An argv, analyzed like any simple command.
@@ -176,16 +196,26 @@ fn env(args: &[Tok]) -> Option<Unwrapped> {
         start += 1;
     }
     let mut assigns = false;
-    while args
-        .get(start)
-        .and_then(Tok::lit)
-        .is_some_and(is_assignment)
-    {
-        assigns = true;
-        start += 1;
+    let mut dangerous_env = false;
+    while let Some(Tok::Lit(s)) = args.get(start) {
+        if is_assignment(s) {
+            assigns = true;
+            if let Some(name) = s.split('=').next()
+                && runs_programs(name)
+            {
+                dangerous_env = true;
+            }
+            start += 1;
+        } else {
+            break;
+        }
     }
     let mut u = inner(args, start)?;
-    if assigns {
+    if dangerous_env {
+        u.opaque = Some(
+            "`env` sets an environment variable that makes programs run other commands".into(),
+        );
+    } else if assigns {
         u.unlisted = Some("`env` sets environment variables".into());
     }
     if has(&names, &["C", "chdir"]) {

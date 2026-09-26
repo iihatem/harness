@@ -118,7 +118,7 @@ pub struct Widening {
 pub fn widening(project: &ConfigFile) -> Option<Widening> {
     let mut items = Vec::new();
     if let Some(mode) = project.mode.filter(|m| !m.is_narrow()) {
-        items.push(format!("mode = {mode:?}"));
+        items.push(format!("mode = \"{mode}\""));
     }
     if let Some(model) = &project.model {
         items.push(format!("model = {model:?}"));
@@ -131,7 +131,7 @@ pub fn widening(project: &ConfigFile) -> Option<Widening> {
     }
     for (name, provider) in &project.providers {
         items.push(format!(
-            "providers.{name}: protocol = {:?}, base_url = {:?}, api_key_env = {:?}",
+            "providers.{name:?}: protocol = {:?}, base_url = {:?}, api_key_env = {:?}",
             provider.protocol, provider.base_url, provider.api_key_env
         ));
     }

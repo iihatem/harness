@@ -101,7 +101,12 @@ fn untrusted_project_widening_settings_are_ignored_with_one_warning() {
     assert_eq!(cfg.providers["mock"].base_url, "http://127.0.0.1:9/v1");
     assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
     let warning = &cfg.warnings[0];
-    for needle in ["harness trust", "model", "FullAccess", "providers.mock"] {
+    for needle in [
+        "harness trust",
+        "model",
+        "full-access",
+        "providers.\"mock\"",
+    ] {
         assert!(warning.contains(needle), "{warning}");
     }
 }
@@ -213,6 +218,42 @@ fn widening_fingerprint_is_not_fooled_by_embedded_newlines() {
     std::fs::write(
         ws_b.join(".harness/config.toml"),
         "model = \"m\"\n[permissions]\nallow = [\"x\"]\n",
+    )
+    .unwrap();
+
+    let widening_a = config::project_widening(&ws_a)
+        .unwrap()
+        .expect("config a has widening");
+    let widening_b = config::project_widening(&ws_b)
+        .unwrap()
+        .expect("config b has widening");
+
+    assert_ne!(
+        widening_a.fingerprint, widening_b.fingerprint,
+        "fingerprints should differ; a items: {:?}, b items: {:?}",
+        widening_a.items, widening_b.items
+    );
+}
+
+#[test]
+fn provider_names_cannot_forge_fingerprint_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws_a = dir.path().join("a");
+    let ws_b = dir.path().join("b");
+    std::fs::create_dir_all(ws_a.join(".harness")).unwrap();
+    std::fs::create_dir_all(ws_b.join(".harness")).unwrap();
+
+    // Config A: one provider with embedded newline in the key
+    std::fs::write(
+        ws_a.join(".harness/config.toml"),
+        "[providers.\"mock\\nmodel\"]\nprotocol = \"openai-chat\"\nbase_url = \"http://x/v1\"\n",
+    )
+    .unwrap();
+
+    // Config B: two separate providers (mock + model as distinct keys)
+    std::fs::write(
+        ws_b.join(".harness/config.toml"),
+        "[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"http://x/v1\"\n[providers.model]\nprotocol = \"openai-chat\"\nbase_url = \"http://y/v1\"\n",
     )
     .unwrap();
 

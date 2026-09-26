@@ -101,9 +101,18 @@ impl TrustStore {
             .mode(0o600)
             .open(&tmp_path)
             .map_err(io)?;
-        file.write_all(text.as_bytes()).map_err(io)?;
-        file.sync_all().map_err(io)?;
+        if let Err(e) = file.write_all(text.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(io(e));
+        }
+        if let Err(e) = file.sync_all() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(io(e));
+        }
         drop(file);
-        std::fs::rename(&tmp_path, path).map_err(io)
+        std::fs::rename(&tmp_path, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            io(e)
+        })
     }
 }

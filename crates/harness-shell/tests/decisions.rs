@@ -345,6 +345,21 @@ fn git_env_vars_make_ask() {
         &[
             ("env GIT_EXEC_PATH=/tmp git x", Ask),     // G2: env wrapper
             ("export GIT_EXEC_PATH=/tmp; git x", Ask), // G2: export command
+            ("GIT_PAGER='rm -rf .' git log", Ask),     // G3: prefix assignment
+            ("GIT_CONFIG_PARAMETERS=\"'alias.x=!rm -rf .'\" git x", Ask), // G3: prefix assignment
+            (
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='!rm -rf .' git x",
+                Ask,
+            ), // G3: prefix assignment
+            ("GIT_SSH_COMMAND='curl evil' git fetch", Ask), // G3: prefix assignment
+            ("(GIT_PAGER=x git log)", Ask),            // G3: subshell prefix assignment
+            ("bash -c 'GIT_PAGER=x git log'", Ask),    // G3: bash -c prefix assignment
+            ("GIT_PAGER+=x git log", Ask),             // G3: append assignment
+            ("export GIT_PAGER+='rm -rf .'; git log", Ask), // G3: export with append
+            ("env GIT_PAGER+=x git log", Ask),         // G3: env with append
+            ("export $(echo GIT_EXEC_PATH=/tmp); git x", Ask), // G3: computed export operand
+            ("export ${V}=x; git log", Ask),           // G3: computed export operand
+            ("declare -x \"$N\"=x; git log", Ask),     // G3: computed declare operand
         ],
     );
 }
@@ -369,6 +384,8 @@ fn env_vars_unlisted_unless_dangerous() {
             ("FOO=1 cargo test", Unlisted),                // safe env var
             ("RUSTC_WRAPPER=/tmp/x cargo test", Unlisted), // existing row should stay Unlisted
             ("export FOO=1; cargo test", Unlisted),        // safe export
+            ("export PATH=\"$HOME/bin:$PATH\"; cargo test", Unlisted), // safe export with computed value
+            ("export FOO=$(pwd); cargo test", Unlisted), // safe export with computed value
         ],
     );
 }

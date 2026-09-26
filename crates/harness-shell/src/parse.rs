@@ -38,6 +38,13 @@ pub(crate) struct Analysis {
     pub undecomposable: Vec<String>,
 }
 
+/// Extract the variable name from an assignment word, stripping `+` from `+=` and `[index]` from `NAME[index]=`.
+fn assigned_name(word: &str) -> &str {
+    let before_eq = word.split('=').next().unwrap_or(word);
+    let before_bracket = before_eq.split('[').next().unwrap_or(before_eq);
+    before_bracket.strip_suffix('+').unwrap_or(before_bracket)
+}
+
 pub(crate) fn analyze(src: &str, ws: &Workspace) -> Analysis {
     let mut walker = Walker {
         ws,
@@ -286,9 +293,20 @@ impl Walker<'_> {
     fn simple(&mut self, cmd: &ast::SimpleCommand, cwd: &mut Cwd, depth: usize) {
         let mut argv = Vec::new();
         let mut assigns = false;
+        let mut dangerous_env = false;
         for item in cmd.prefix.iter().flat_map(|p| &p.0) {
             if let Item::AssignmentWord(assignment, _) = item {
                 assigns = true;
+                // Check if this prefix assignment is for a dangerous environment variable
+                let var_name = match &assignment.name {
+                    ast::AssignmentName::VariableName(n) => Some(n.as_str()),
+                    ast::AssignmentName::ArrayElementName(n, _) => Some(n.as_str()),
+                };
+                if let Some(name) = var_name
+                    && runs_programs(name)
+                {
+                    dangerous_env = true;
+                }
                 self.assignment(assignment, cwd, depth);
             } else {
                 self.item(item, &mut argv, cwd, depth);
@@ -306,7 +324,11 @@ impl Walker<'_> {
             }
             return;
         }
-        if assigns {
+        if dangerous_env {
+            self.undecomposable(
+                "sets an environment variable that makes programs run other commands".into(),
+            );
+        } else if assigns {
             self.unlisted("sets environment variables for the command".into());
         }
         self.exec(argv, cwd, depth, 0, true);
@@ -314,9 +336,26 @@ impl Walker<'_> {
 
     fn item(&mut self, item: &Item, argv: &mut Vec<Tok>, cwd: &Cwd, depth: usize) {
         match item {
-            // An assignment-looking argument (`export A=1`) is an ordinary word here.
-            Item::Word(w) | Item::AssignmentWord(_, w) => {
-                argv.push(self.word(&w.value, cwd, depth))
+            Item::Word(w) => argv.push(self.word(&w.value, cwd, depth)),
+            Item::AssignmentWord(assignment, _w) => {
+                // For AssignmentWord, the name is known from the AST even if the value is dynamic
+                // Only check if the name itself is dangerous
+                let var_name = match &assignment.name {
+                    ast::AssignmentName::VariableName(n) => n.as_str(),
+                    ast::AssignmentName::ArrayElementName(n, _) => n.as_str(),
+                };
+                if runs_programs(var_name) {
+                    self.undecomposable(format!(
+                        "sets `{var_name}`, which makes programs run other commands"
+                    ));
+                }
+                // Still process the value for command substitutions
+                self.assignment(assignment, cwd, depth);
+                // Don't push a token for safe AssignmentWords - their analysis is complete
+                // Push Dyn only if the name is dangerous (already marked undecomposable above)
+                if runs_programs(var_name) {
+                    argv.push(Tok::Dyn);
+                }
             }
             Item::IoRedirect(r) => self.redirect(r, cwd, depth),
             Item::ProcessSubstitution(_, sub) => {
@@ -515,13 +554,32 @@ impl Walker<'_> {
             "export" | "declare" | "typeset" | "local" | "readonly"
         ) {
             for arg in argv.iter().skip(1) {
-                if let Some(s) = arg.lit() {
-                    // Check both `NAME=value` and bare `NAME` forms
-                    let var_name = s.split('=').next().unwrap_or(s);
-                    if runs_programs(var_name) {
-                        self.undecomposable(format!(
-                            "sets `{var_name}`, which makes programs run other commands"
-                        ));
+                match arg {
+                    Tok::Lit(s) => {
+                        // Check both `NAME=value` and bare `NAME` forms
+                        let var_name = if s.contains('=') {
+                            assigned_name(s)
+                        } else {
+                            s.as_str()
+                        };
+                        if runs_programs(var_name) {
+                            self.undecomposable(format!(
+                                "sets `{var_name}`, which makes programs run other commands"
+                            ));
+                            break;
+                        }
+                    }
+                    Tok::Glob { .. } => {
+                        // Glob in export operand means computed variable name
+                        self.undecomposable(format!("`{name}` operand is only known at run time"));
+                        break;
+                    }
+                    // Tok::Dyn from AssignmentWords is handled in item() so we don't mark them as undecomposable here
+                    Tok::Dyn => {
+                        // Dyn token - could be from a plain computed word like $(echo FOO=x)
+                        // or from an AssignmentWord like FOO=$(pwd) which is handled in item()
+                        // For plain words without =, this is a computed operand
+                        self.undecomposable(format!("`{name}` operand is only known at run time"));
                         break;
                     }
                 }

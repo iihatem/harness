@@ -26,6 +26,13 @@ pub(crate) fn runs_programs(var: &str) -> bool {
         )
 }
 
+/// Extract the variable name from an assignment word, stripping `+` from `+=` and `[index]` from `NAME[index]=`.
+fn assigned_name(word: &str) -> &str {
+    let before_eq = word.split('=').next().unwrap_or(word);
+    let before_bracket = before_eq.split('[').next().unwrap_or(before_eq);
+    before_bracket.strip_suffix('+').unwrap_or(before_bracket)
+}
+
 /// What a wrapper runs.
 pub(crate) enum Next {
     /// An argv, analyzed like any simple command.
@@ -200,9 +207,7 @@ fn env(args: &[Tok]) -> Option<Unwrapped> {
     while let Some(Tok::Lit(s)) = args.get(start) {
         if is_assignment(s) {
             assigns = true;
-            if let Some(name) = s.split('=').next()
-                && runs_programs(name)
-            {
+            if runs_programs(assigned_name(s)) {
                 dangerous_env = true;
             }
             start += 1;

@@ -92,6 +92,26 @@ impl Tool for Sleepy {
     }
 }
 
+/// Fails with a sandbox denial unless the context allows an unsandboxed re-run.
+pub struct Boxed;
+#[async_trait]
+impl Tool for Boxed {
+    fn spec(&self) -> ToolSpec {
+        spec("boxed", json!({"type": "object"}))
+    }
+    fn action(&self, _args: &Value, _ctx: &ToolContext) -> Action {
+        Action::Bash("curl https://example.com".into())
+    }
+    async fn run(&self, _args: Value, ctx: &ToolContext) -> ToolOutput {
+        if ctx.unsandboxed {
+            return ToolOutput::ok("ran without the sandbox");
+        }
+        let mut out = ToolOutput::error("exit code 6\ncurl: (6) Could not resolve host");
+        out.sandbox_denied = true;
+        out
+    }
+}
+
 pub struct AlwaysApprove;
 #[async_trait]
 impl Approver for AlwaysApprove {
@@ -100,24 +120,44 @@ impl Approver for AlwaysApprove {
     }
 }
 
-pub fn agent(
+pub struct ApproveForSession;
+#[async_trait]
+impl Approver for ApproveForSession {
+    async fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+        ApprovalDecision::ApproveForSession
+    }
+}
+
+pub struct DenyWith(pub &'static str);
+#[async_trait]
+impl Approver for DenyWith {
+    async fn decide(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+        ApprovalDecision::Deny {
+            feedback: Some(self.0.to_string()),
+        }
+    }
+}
+
+fn build(
     provider: Arc<MockProvider>,
     mode: Mode,
     approver: Arc<dyn Approver>,
     dir: &Path,
+    sandbox: bool,
 ) -> Agent {
     let tools = ToolRegistry::new(vec![
         Arc::new(Echo),
         Arc::new(Touch),
         Arc::new(Fail),
         Arc::new(Sleepy),
+        Arc::new(Boxed),
     ]);
     let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode,
         workspace: dir.to_path_buf(),
         read_dirs: vec![],
         rules: Default::default(),
-        sandbox_available: false,
+        sandbox_available: sandbox,
     }));
     let config = AgentConfig::new("mock/m1", "m1", "system prompt", dir.join(".spill"));
     Agent::new(
@@ -128,6 +168,24 @@ pub fn agent(
         config,
         ToolContext::new(dir),
     )
+}
+
+pub fn agent(
+    provider: Arc<MockProvider>,
+    mode: Mode,
+    approver: Arc<dyn Approver>,
+    dir: &Path,
+) -> Agent {
+    build(provider, mode, approver, dir, false)
+}
+
+pub fn agent_with_sandbox(
+    provider: Arc<MockProvider>,
+    mode: Mode,
+    approver: Arc<dyn Approver>,
+    dir: &Path,
+) -> Agent {
+    build(provider, mode, approver, dir, true)
 }
 
 pub async fn run(agent: &mut Agent, input: &str) -> (TurnEndReason, Vec<AgentEvent>) {

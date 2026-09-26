@@ -19,7 +19,7 @@ use crate::{
     permission::{Action, Decision, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
     retry::RetryPolicy,
-    tool::{ToolContext, ToolOutput, ToolRegistry},
+    tool::{Tool, ToolContext, ToolOutput, ToolRegistry},
 };
 
 /// Settings for one agent session.
@@ -66,6 +66,8 @@ pub struct ApprovalRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Approve,
+    /// Approve, and remember the approval for similar actions for the rest of the session.
+    ApproveForSession,
     Deny {
         feedback: Option<String>,
     },
@@ -451,6 +453,9 @@ impl Agent {
                 };
                 match self.approver.decide(&request).await {
                     ApprovalDecision::Approve => {}
+                    ApprovalDecision::ApproveForSession => {
+                        self.policy.remember(&request.action);
+                    }
                     ApprovalDecision::Deny {
                         feedback: Some(note),
                     } => {
@@ -471,7 +476,63 @@ impl Agent {
                 }
             }
         }
-        tool.run(args, &self.ctx).await
+        let output = tool.run(args.clone(), &self.ctx).await;
+        if output.sandbox_denied {
+            return self
+                .offer_unsandboxed_rerun(call, &tool, args, output, events)
+                .await;
+        }
+        output
+    }
+
+    /// A command failed inside the sandbox: ask whether to run it once without the sandbox.
+    async fn offer_unsandboxed_rerun(
+        &mut self,
+        call: &ToolCall,
+        tool: &Arc<dyn Tool>,
+        args: Value,
+        first: ToolOutput,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> ToolOutput {
+        let reason =
+            "the sandbox blocked this command; run it again without the sandbox?".to_string();
+        let _ = events.send(AgentEvent::ApprovalNeeded {
+            id: call.id.clone(),
+            reason: reason.clone(),
+        });
+        let request = ApprovalRequest {
+            call_id: call.id.clone(),
+            tool: call.name.clone(),
+            action: tool.action(&args, &self.ctx),
+            reason,
+        };
+        let note = match self.approver.decide(&request).await {
+            ApprovalDecision::Approve | ApprovalDecision::ApproveForSession => {
+                let mut ctx = self.ctx.clone();
+                ctx.unsandboxed = true;
+                return tool.run(args, &ctx).await;
+            }
+            ApprovalDecision::Deny {
+                feedback: Some(note),
+            } => {
+                format!("the user declined to run it without the sandbox: {note}")
+            }
+            ApprovalDecision::Deny { feedback: None } => {
+                "the user declined to run it without the sandbox".to_string()
+            }
+            ApprovalDecision::Unavailable => {
+                let reason = "the sandbox blocked this command and no user is available to approve running it without the sandbox";
+                let _ = events.send(AgentEvent::ActionBlocked {
+                    id: call.id.clone(),
+                    reason: reason.into(),
+                });
+                reason.to_string()
+            }
+        };
+        ToolOutput {
+            content: format!("{}\n[{note}]", first.content),
+            ..first
+        }
     }
 }
 

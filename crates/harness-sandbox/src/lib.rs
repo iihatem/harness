@@ -14,6 +14,18 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 mod policy;
+// Only used by `macos::profile` and `linux::fs`/`linux::mod` (the latter two
+// gated the same way `mod linux` above is); gated identically here so an
+// unsupported combination (e.g. a Linux build on some other architecture)
+// does not compile `roots`'s functions as unused (`dead_code`) instead of
+// simply not compiling this module at all.
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 mod roots;
 
 use std::{

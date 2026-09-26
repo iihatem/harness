@@ -68,7 +68,7 @@ pub fn linux_sandbox_command(
     args: &[&str],
 ) -> io::Result<Command> {
     let landlock_ruleset_fd = fs::build_ruleset_fd(policy)?;
-    let seccomp_program = seccomp::build_network_deny_filter().map_err(io::Error::other)?;
+    let seccomp_program = seccomp::build_network_deny_filter()?;
 
     let prepared = PreparedSandbox {
         landlock_ruleset_fd,

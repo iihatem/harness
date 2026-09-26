@@ -1,10 +1,11 @@
 //! Integration tests for the Linux sandbox backend.
 //!
-//! These only compile — and only run — on Linux (`cfg(target_os =
-//! "linux")` below strips the whole file to nothing on any other target,
-//! notably the macOS host this crate was authored on). They are exercised
-//! by `cargo test --target {aarch64,x86_64}-unknown-linux-gnu` in CI, never
-//! locally on this machine.
+//! These only compile — and only run — on Linux, and only on the two
+//! architectures the sandbox itself supports (the `cfg` below strips the
+//! whole file to nothing otherwise, notably on the macOS host this crate
+//! was authored on, and matches the same gate on `mod linux` in `lib.rs`).
+//! They are exercised by `cargo test --target {aarch64,x86_64}-unknown-linux-gnu`
+//! in CI, never locally on this machine.
 //!
 //! Every test calls [`skip_if_unavailable`] (or [`new_workspace`], which
 //! calls it) first and returns early rather than failing outright when a
@@ -15,9 +16,14 @@
 //! that is supposed to support the sandbox, but doesn't, fails the build
 //! loudly instead of every dependent test quietly no-op'ing.
 
-#![cfg(target_os = "linux")]
+#![cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 use std::ffi::OsStr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -188,20 +194,91 @@ fn stderr_of(output: &std::process::Output) -> std::borrow::Cow<'_, str> {
     String::from_utf8_lossy(&output.stderr)
 }
 
-/// An existing, numbered pty slave under `/dev/pts` (e.g. `/dev/pts/3`), or
-/// `None` if no pty has ever been allocated on this runner.
-fn find_existing_pts_node() -> Option<PathBuf> {
-    let entries = std::fs::read_dir("/dev/pts").ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|s| s.chars().all(|c| c.is_ascii_digit()))
-        {
-            return Some(entry.path());
+/// A pty this test process allocates for itself via `posix_openpt`, so the
+/// `/dev/pts/*` tests exercise a slave this process actually owns and can
+/// verify (via the control check) is otherwise writable — rather than an
+/// existing node that, on a hosted CI runner, either does not exist at all
+/// or belongs to someone else's session, where a denied write proves
+/// nothing about Landlock specifically (ordinary DAC permissions would deny
+/// it either way).
+struct Pty {
+    // Kept open for the pty's lifetime: closing the master would make the
+    // slave disappear.
+    _master: OwnedFd,
+    slave_path: PathBuf,
+}
+
+impl Pty {
+    /// `None` (after printing why) when `posix_openpt` or a later step
+    /// fails on this runner. Deliberately does not go through
+    /// `skip_or_require`: a missing pty subsystem is a test-environment
+    /// prerequisite, like a missing external tool, not a sandbox failure —
+    /// so this must never panic even under `HARNESS_REQUIRE_LINUX_SANDBOX=1`.
+    fn open() -> Option<Self> {
+        // SAFETY: `posix_openpt` takes only an integer flag; no pointers.
+        let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        if master_fd < 0 {
+            eprintln!(
+                "posix_openpt failed (test-environment prerequisite, not the sandbox): {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
         }
+        // SAFETY: `master_fd` was just returned by `posix_openpt` above and
+        // is a valid, open, owned fd from this point on.
+        let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
+
+        // SAFETY: `grantpt`/`unlockpt` take only the fd; no pointers.
+        if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
+            eprintln!(
+                "grantpt failed (test-environment prerequisite, not the sandbox): {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
+            eprintln!(
+                "unlockpt failed (test-environment prerequisite, not the sandbox): {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+
+        let mut buf = [0u8; 64];
+        // SAFETY: `buf` is a valid stack buffer of the given length;
+        // `ptsname_r` writes at most `buf.len()` bytes, including the NUL.
+        let rc = unsafe {
+            libc::ptsname_r(
+                master.as_raw_fd(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+            )
+        };
+        if rc != 0 {
+            eprintln!(
+                "ptsname_r failed (test-environment prerequisite, not the sandbox): {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        let Some(nul) = buf.iter().position(|&b| b == 0) else {
+            eprintln!(
+                "ptsname_r returned a name with no NUL terminator in {} bytes",
+                buf.len()
+            );
+            return None;
+        };
+        let slave_path = PathBuf::from(OsStr::from_bytes(&buf[..nul]));
+
+        Some(Self {
+            _master: master,
+            slave_path,
+        })
     }
-    None
+
+    fn slave_path(&self) -> &Path {
+        &self.slave_path
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +424,11 @@ async fn workspace_write_allows_creating_a_file_under_dev_shm() {
         return;
     };
     let policy = workspace_write_policy(ws.path());
-    let target = format!("/dev/shm/harness-sandbox-test-{}", unique_id());
+    let target = format!(
+        "/dev/shm/harness-sandbox-test-{}-{}",
+        std::process::id(),
+        unique_id()
+    );
 
     let output = run(&policy, "touch", &[&target]).await;
 
@@ -361,7 +442,11 @@ async fn read_only_denies_creating_a_file_under_dev_shm() {
         return;
     };
     let policy = read_only_policy(ws.path());
-    let target = format!("/dev/shm/harness-sandbox-test-{}", unique_id());
+    let target = format!(
+        "/dev/shm/harness-sandbox-test-{}-{}",
+        std::process::id(),
+        unique_id()
+    );
 
     let output = run(&policy, "touch", &[&target]).await;
 
@@ -370,35 +455,65 @@ async fn read_only_denies_creating_a_file_under_dev_shm() {
 }
 
 #[tokio::test]
-async fn workspace_write_denies_write_to_an_existing_dev_pts_node() {
+async fn workspace_write_denies_write_to_a_freshly_allocated_pty_slave() {
     let Some(ws) = new_workspace() else {
         return;
     };
-    let Some(pts) = find_existing_pts_node() else {
-        skip_or_require("no existing /dev/pts/* node on this runner");
+    let Some(pty) = Pty::open() else {
         return;
     };
+    // Control: the unsandboxed test process itself must be able to write to
+    // its own pty slave, so a denial below can only be attributed to the
+    // sandbox, not to ordinary DAC permissions.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(pty.slave_path())
+        .expect("test process should be able to open its own pty slave for writing");
     let policy = workspace_write_policy(ws.path());
 
-    let output = run(&policy, "sh", &["-c", &format!(": > {}", pts.display())]).await;
+    let output = run(
+        &policy,
+        "sh",
+        &["-c", &format!(": > {}", pty.slave_path().display())],
+    )
+    .await;
 
     assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("Permission denied"),
+        "stderr: {}",
+        stderr_of(&output)
+    );
 }
 
 #[tokio::test]
-async fn read_only_denies_write_to_an_existing_dev_pts_node() {
+async fn read_only_denies_write_to_a_freshly_allocated_pty_slave() {
     let Some(ws) = new_workspace() else {
         return;
     };
-    let Some(pts) = find_existing_pts_node() else {
-        skip_or_require("no existing /dev/pts/* node on this runner");
+    let Some(pty) = Pty::open() else {
         return;
     };
+    // Control: see the WorkspaceWrite variant above.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(pty.slave_path())
+        .expect("test process should be able to open its own pty slave for writing");
     let policy = read_only_policy(ws.path());
 
-    let output = run(&policy, "sh", &["-c", &format!(": > {}", pts.display())]).await;
+    let output = run(
+        &policy,
+        "sh",
+        &["-c", &format!(": > {}", pty.slave_path().display())],
+    )
+    .await;
 
     assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("Permission denied"),
+        "stderr: {}",
+        stderr_of(&output)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +552,70 @@ async fn workspace_write_denies_append_to_an_outside_file() {
     let output = run(&policy, "sh", &["-c", &script]).await;
 
     assert!(!output.status.success(), "stderr: {}", stderr_of(&output));
+    assert_eq!(
+        std::fs::read(&outside).expect("read outside file"),
+        b"original content"
+    );
+    let _ = std::fs::remove_file(&outside);
+}
+
+/// The two tests above go through coreutils `truncate`/shell `>>`, both of
+/// which open the file `O_WRONLY` (`truncate` internally, `>>` via
+/// `O_WRONLY|O_APPEND`) — denied by `WRITE_FILE`, a right that has existed
+/// since Landlock ABI 1, so those tests would also pass at ABI 2 and prove
+/// nothing about the ABI-3 `TRUNCATE` right this fix round exists for. This
+/// test instead exercises `TRUNCATE` specifically: `os.truncate(path, 0)`
+/// calls `truncate(2)` directly on the path (no `open()` involved at all),
+/// and `os.open(path, O_RDONLY | O_TRUNC)` opens read-only but still asks
+/// the kernel to truncate — a request `WRITE_FILE` alone does not gate.
+#[tokio::test]
+async fn workspace_write_denies_truncate_right_on_an_outside_file() {
+    let Some(ws) = new_workspace() else {
+        return;
+    };
+    if require_command("python3") {
+        return;
+    }
+    let outside = ws.outside("truncate-right");
+    std::fs::write(&outside, b"original content").expect("write outside file");
+    let policy = workspace_write_policy(ws.path());
+    let outside_literal = format!("{outside:?}");
+    let script = format!(
+        r#"
+import errno
+import os
+import sys
+
+path = {outside_literal}
+
+try:
+    os.truncate(path, 0)
+except OSError as exc:
+    if exc.errno != errno.EPERM:
+        print(f"os.truncate: expected EPERM, got {{exc.errno}}", file=sys.stderr)
+        sys.exit(1)
+else:
+    print("os.truncate unexpectedly succeeded", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_TRUNC)
+except OSError as exc:
+    if exc.errno != errno.EPERM:
+        print(f"os.open(O_RDONLY|O_TRUNC): expected EPERM, got {{exc.errno}}", file=sys.stderr)
+        sys.exit(1)
+else:
+    os.close(fd)
+    print("os.open(O_RDONLY|O_TRUNC) unexpectedly succeeded", file=sys.stderr)
+    sys.exit(1)
+
+print("ok")
+"#
+    );
+
+    let output = run(&policy, "python3", &["-c", &script]).await;
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
     assert_eq!(
         std::fs::read(&outside).expect("read outside file"),
         b"original content"
@@ -575,7 +754,7 @@ else:
 }
 
 #[tokio::test]
-async fn network_denies_io_uring_setup_with_eperm_or_enosys() {
+async fn network_denies_io_uring_setup_with_eperm() {
     let Some(ws) = new_workspace() else {
         return;
     };
@@ -585,7 +764,12 @@ async fn network_denies_io_uring_setup_with_eperm_or_enosys() {
     let policy = workspace_write_policy(ws.path());
     // `io_uring_setup` is syscall 425 on both x86_64 and aarch64 (the
     // "asm-generic" numbering both architectures share for syscalls added
-    // this recently).
+    // this recently). Seccomp runs in `syscall_enter_from_user_mode`,
+    // before the kernel dispatches to the syscall's own implementation, so
+    // `ENOSYS` is not an acceptable outcome here the way it might be for a
+    // syscall the *kernel* doesn't implement: if our filter is doing its
+    // job, this always returns `EPERM`, on every kernel that has `seccomp`
+    // at all. `ENOSYS` would mean the filter never matched this syscall.
     let script = r#"
 import ctypes
 import errno
@@ -595,12 +779,10 @@ libc = ctypes.CDLL(None, use_errno=True)
 rc = libc.syscall(425, 1, None)
 if rc == -1:
     err = ctypes.get_errno()
-    if err == errno.ENOSYS:
-        print("io_uring_setup: ENOSYS (disabled on this kernel), treating as pass")
-    elif err == errno.EPERM:
+    if err == errno.EPERM:
         print("ok")
     else:
-        print(f"expected EPERM or ENOSYS, got {err}", file=sys.stderr)
+        print(f"expected EPERM, got {err}", file=sys.stderr)
         sys.exit(1)
 else:
     print("io_uring_setup unexpectedly succeeded", file=sys.stderr)
@@ -614,7 +796,7 @@ else:
 
 #[cfg(target_arch = "x86_64")]
 #[tokio::test]
-async fn network_denies_x32_connect_with_eperm_or_enosys() {
+async fn network_denies_x32_socket_with_eperm() {
     let Some(ws) = new_workspace() else {
         return;
     };
@@ -622,10 +804,13 @@ async fn network_denies_x32_connect_with_eperm_or_enosys() {
         return;
     }
     let policy = workspace_write_policy(ws.path());
-    // 0x4000_0029 = `__X32_SYSCALL_BIT` | 41, the x32 ABI's own syscall
-    // number for `connect` (distinct from native x86_64's `connect` = 42).
+    // 0x4000_0029 = `__X32_SYSCALL_BIT` | 41, the x32 ABI's own number for
+    // `socket` (native x86_64's `socket` is also 41; x32 mostly reuses
+    // native numbers for syscalls like this one, just with the bit set).
     // See `linux::seccomp`'s module docs for why this needs its own filter
-    // logic beyond the ordinary per-syscall rules.
+    // logic beyond the ordinary per-syscall rules. As in the io_uring test
+    // above, `ENOSYS` is not accepted: seccomp runs before syscall
+    // dispatch, so a working filter always returns `EPERM` here.
     let script = r#"
 import ctypes
 import errno
@@ -635,15 +820,13 @@ libc = ctypes.CDLL(None, use_errno=True)
 rc = libc.syscall(0x40000029, 2, 1, 0)
 if rc == -1:
     err = ctypes.get_errno()
-    if err == errno.ENOSYS:
-        print("x32 connect: ENOSYS (x32 disabled on this kernel), treating as pass")
-    elif err == errno.EPERM:
+    if err == errno.EPERM:
         print("ok")
     else:
-        print(f"expected EPERM or ENOSYS, got {err}", file=sys.stderr)
+        print(f"expected EPERM, got {err}", file=sys.stderr)
         sys.exit(1)
 else:
-    print("x32 connect unexpectedly succeeded", file=sys.stderr)
+    print("x32 socket() unexpectedly succeeded", file=sys.stderr)
     sys.exit(1)
 "#;
 

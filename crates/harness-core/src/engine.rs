@@ -4,7 +4,7 @@
 use std::{
     collections::HashSet,
     ffi::OsStr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Mutex,
 };
 
@@ -35,7 +35,18 @@ pub struct PermissionEngine {
     mode: Mode,
     workspace: PathBuf,
     read_dirs: Vec<PathBuf>,
+    /// Raw config rules, exactly as given: used only for bash filtering (`bash_rules`) and
+    /// `unknown_rules`. Read/write matching uses the expanded `*_paths` below instead.
     rules: RuleSet,
+    /// Config `read:`/`write:` allow rules, `~`-expanded. Deliberately has no symlink-resolved
+    /// twin: an allow rule must never be widened by a symlink someone plants under a path it
+    /// names (see `path_rules`).
+    allow_paths: Vec<PathRule>,
+    /// Config `read:`/`write:` deny rules, `~`-expanded, each with a symlink-resolved twin glob
+    /// when the configured glob is absolute.
+    deny_paths: Vec<PathRule>,
+    /// Config `read:`/`write:` confirm rules, expanded the same way as `deny_paths`.
+    confirm_paths: Vec<PathRule>,
     sandbox_available: bool,
     /// Bash allow-glob prefixes added by approve-for-session.
     session_bash: Mutex<Vec<String>>,
@@ -43,6 +54,16 @@ pub struct PermissionEngine {
     /// paths rather than globs, so a literal `*` in an approved path is never treated as a
     /// wildcard over its siblings (a `glob_match` pattern has no escape syntax).
     session_paths: Mutex<HashSet<(&'static str, PathBuf)>>,
+}
+
+/// A single `read:`/`write:` rule, expanded for matching. `display` is exactly what the user
+/// configured (after `~` expansion) — used in every message, so a denial always names the rule
+/// as written, never an internal resolved form. `globs` holds the glob(s) actually compared
+/// against a candidate path: just `display`, or `display` plus its symlink-resolved twin.
+struct PathRule {
+    tool: &'static str,
+    display: String,
+    globs: Vec<String>,
 }
 
 /// Absolute, symlink-resolved form of `p` (which may not exist yet). If `p` is relative and
@@ -105,31 +126,65 @@ fn resolve_glob_prefix(glob: &str) -> Option<String> {
     }
 }
 
-/// Expands a leading `~/` using `$HOME`, then adds a symlink-resolved twin for any resulting
-/// absolute `read:`/`write:` glob, so e.g. a rule on `/etc/*` still matches macOS's real
-/// `/private/etc/*`, and `~/.ssh/*` matches the user's actual home directory. Leaves `bash:`
-/// rules and rules for tools other than `read`/`write` untouched.
-fn expand_path_rules(rules: &[String], home: Option<&Path>) -> Vec<String> {
-    let mut out = Vec::with_capacity(rules.len());
+/// Builds the `read:`/`write:` `PathRule`s out of a config rule list: expands a leading `~/`
+/// using `$HOME`, then — only when `twin_symlinks` is set — adds a symlink-resolved twin glob
+/// for any resulting absolute glob, so e.g. a rule on `/etc/*` still matches macOS's real
+/// `/private/etc/*`, and `~/.ssh/*` matches the user's actual home directory. `twin_symlinks`
+/// must be `false` for allow rules: an allow rule must match only the path exactly as
+/// configured, never widen its reach to wherever a symlink under that path happens to point
+/// (deny/confirm rules are safe to widen this way, since widening a refusal is conservative).
+/// Rules for tools other than `read`/`write` are dropped (bash filtering uses the raw config
+/// list directly; see `bash_rules`).
+fn path_rules(rules: &[String], home: Option<&Path>, twin_symlinks: bool) -> Vec<PathRule> {
+    let mut out = Vec::new();
     for rule in rules {
         let Some((tool, glob)) = rule.split_once(':') else {
-            out.push(rule.clone());
             continue;
         };
-        if tool != "read" && tool != "write" {
-            out.push(rule.clone());
-            continue;
-        }
+        let tool: &'static str = match tool {
+            "read" => "read",
+            "write" => "write",
+            _ => continue,
+        };
         let expanded = match (glob.strip_prefix("~/"), home) {
             (Some(rest), Some(home)) => format!("{}/{rest}", home.display()),
             _ => glob.to_string(),
         };
-        if expanded.starts_with('/')
+        let mut globs = vec![expanded.clone()];
+        if twin_symlinks
+            && expanded.starts_with('/')
             && let Some(resolved) = resolve_glob_prefix(&expanded)
         {
-            out.push(format!("{tool}:{resolved}"));
+            globs.push(resolved);
         }
-        out.push(format!("{tool}:{expanded}"));
+        out.push(PathRule {
+            tool,
+            display: expanded,
+            globs,
+        });
+    }
+    out
+}
+
+/// `path` joined to `workspace` if relative, normalized for `.` and `..` components, but with
+/// no symlink ever followed — unlike `resolve_path`. This lets a deny/confirm rule match a
+/// symlink by its own leaf name, even though the target it points to (what `resolve_path`
+/// would give) is a different path entirely.
+fn lexical_path(workspace: &Path, path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
     }
     out
 }
@@ -146,16 +201,17 @@ fn short(command: &str) -> String {
 impl PermissionEngine {
     pub fn new(config: EngineConfig) -> Self {
         let home = home_dir();
-        let rules = RuleSet {
-            allow: expand_path_rules(&config.rules.allow, home.as_deref()),
-            deny: expand_path_rules(&config.rules.deny, home.as_deref()),
-            confirm: expand_path_rules(&config.rules.confirm, home.as_deref()),
-        };
+        let allow_paths = path_rules(&config.rules.allow, home.as_deref(), false);
+        let deny_paths = path_rules(&config.rules.deny, home.as_deref(), true);
+        let confirm_paths = path_rules(&config.rules.confirm, home.as_deref(), true);
         PermissionEngine {
             mode: config.mode,
             workspace: resolved(&config.workspace),
             read_dirs: config.read_dirs.iter().map(|d| resolved(d)).collect(),
-            rules,
+            rules: config.rules,
+            allow_paths,
+            deny_paths,
+            confirm_paths,
             sandbox_available: config.sandbox_available,
             session_bash: Mutex::new(Vec::new()),
             session_paths: Mutex::new(HashSet::new()),
@@ -190,39 +246,82 @@ impl PermissionEngine {
             .collect()
     }
 
-    /// First `tool:` glob in `list` matching the path (workspace-relative or absolute text).
-    /// Deny and confirm rules match case-insensitively, since macOS's default filesystem is
-    /// case-insensitive and a denied path must not be reachable by changing its case; allow
-    /// rules stay case-sensitive, the stricter side.
-    fn path_rule(
-        &self,
-        list: &[String],
-        tool: &str,
-        target: &Path,
-        case_insensitive: bool,
-    ) -> Option<String> {
-        let fold = |s: &str| {
-            if case_insensitive {
-                s.to_lowercase()
-            } else {
-                s.to_string()
-            }
-        };
-        let absolute = fold(&target.display().to_string());
+    /// First allow rule for `tool` matching `target` (the fully resolved path). Case-sensitive,
+    /// and only ever matches the resolved target — never a symlink-resolved twin, and never a
+    /// lexical (symlink-unaware) form — so an allow rule can never be widened by a symlink
+    /// planted under a path it names.
+    fn allow_rule(&self, list: &[PathRule], tool: &str, target: &Path) -> Option<String> {
+        let absolute = target.display().to_string();
         let relative = target
             .strip_prefix(&self.workspace)
             .ok()
-            .map(|r| fold(&r.display().to_string()));
-        patterns(list, tool)
-            .into_iter()
-            .find(|glob| {
-                let folded = fold(glob);
-                harness_shell::glob_match(&folded, &absolute)
-                    || relative
-                        .as_deref()
-                        .is_some_and(|r| harness_shell::glob_match(&folded, r))
+            .map(|r| r.display().to_string());
+        list.iter()
+            .filter(|rule| rule.tool == tool)
+            .find(|rule| {
+                rule.globs.iter().any(|glob| {
+                    harness_shell::glob_match(glob, &absolute)
+                        || relative
+                            .as_deref()
+                            .is_some_and(|r| harness_shell::glob_match(glob, r))
+                })
             })
-            .map(|glob| format!("{tool}:{glob}"))
+            .map(|rule| format!("{tool}:{}", rule.display))
+    }
+
+    /// First deny/confirm rule for `tool` matching `target` (the fully resolved path) or
+    /// `lexical` (the symlink-unaware, `.`/`..`-normalized path) — as absolute text or
+    /// workspace-relative text, matched case-insensitively. Checking both `target` and
+    /// `lexical` means a rule matches whichever a symlink involves: naming what it points to
+    /// (`target`), or naming its own leaf (`lexical`). Returns the rule as configured
+    /// (`tool:display`), never a resolved twin, so messages always name the rule as written.
+    fn deny_confirm_rule(
+        &self,
+        list: &[PathRule],
+        tool: &str,
+        target: &Path,
+        lexical: &Path,
+    ) -> Option<String> {
+        let candidates: Vec<String> = [target, lexical]
+            .into_iter()
+            .flat_map(|p| {
+                let absolute = p.display().to_string().to_lowercase();
+                let relative = self
+                    .relative_ci(p)
+                    .map(|r| r.display().to_string().to_lowercase());
+                std::iter::once(absolute).chain(relative)
+            })
+            .collect();
+        list.iter()
+            .filter(|rule| rule.tool == tool)
+            .find(|rule| {
+                rule.globs.iter().any(|glob| {
+                    let glob = glob.to_lowercase();
+                    candidates
+                        .iter()
+                        .any(|c| harness_shell::glob_match(&glob, c))
+                })
+            })
+            .map(|rule| format!("{tool}:{}", rule.display))
+    }
+
+    /// `path` relative to the workspace, comparing each component case-insensitively (so a
+    /// target spelled with a different case than the configured workspace still strips).
+    /// `None` if `path` isn't under the workspace this way.
+    fn relative_ci(&self, path: &Path) -> Option<PathBuf> {
+        let mut remaining = path.components();
+        for ws_component in self.workspace.components() {
+            let target_component = remaining.next()?;
+            let ws_text = ws_component.as_os_str().to_string_lossy().to_lowercase();
+            let target_text = target_component
+                .as_os_str()
+                .to_string_lossy()
+                .to_lowercase();
+            if ws_text != target_text {
+                return None;
+            }
+        }
+        Some(remaining.as_path().to_path_buf())
     }
 
     /// Whether `target` was approved for `tool` ("read" or "write") for the rest of the session.
@@ -235,11 +334,13 @@ impl PermissionEngine {
 
     fn check_read(&self, path: &Path) -> Decision {
         let target = resolve_path(&self.workspace, path);
-        if let Some(rule) = self.path_rule(&self.rules.deny, "read", &target, true) {
+        let lexical = lexical_path(&self.workspace, path);
+        if let Some(rule) = self.deny_confirm_rule(&self.deny_paths, "read", &target, &lexical) {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
         if self.mode != Mode::FullAccess
-            && let Some(rule) = self.path_rule(&self.rules.confirm, "read", &target, true)
+            && let Some(rule) =
+                self.deny_confirm_rule(&self.confirm_paths, "read", &target, &lexical)
         {
             return Decision::Ask(format!("read {} (confirm rule `{rule}`)", target.display()));
         }
@@ -247,7 +348,7 @@ impl PermissionEngine {
             || target.starts_with(&self.workspace)
             || self.read_dirs.iter().any(|d| target.starts_with(d))
             || self
-                .path_rule(&self.rules.allow, "read", &target, false)
+                .allow_rule(&self.allow_paths, "read", &target)
                 .is_some()
             || self.session_path_allowed("read", &target)
         {
@@ -258,7 +359,8 @@ impl PermissionEngine {
 
     fn check_write(&self, path: &Path) -> Decision {
         let target = resolve_path(&self.workspace, path);
-        if let Some(rule) = self.path_rule(&self.rules.deny, "write", &target, true) {
+        let lexical = lexical_path(&self.workspace, path);
+        if let Some(rule) = self.deny_confirm_rule(&self.deny_paths, "write", &target, &lexical) {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
         if self.mode == Mode::FullAccess {
@@ -273,7 +375,8 @@ impl PermissionEngine {
         if inside.components().any(|c| is_dot_git(c.as_os_str())) {
             return Decision::Ask("write inside .git (hooks and config can run commands)".into());
         }
-        if let Some(rule) = self.path_rule(&self.rules.confirm, "write", &target, true) {
+        if let Some(rule) = self.deny_confirm_rule(&self.confirm_paths, "write", &target, &lexical)
+        {
             return Decision::Ask(format!(
                 "write {} (confirm rule `{rule}`)",
                 inside.display()
@@ -281,7 +384,7 @@ impl PermissionEngine {
         }
         if self.mode == Mode::Auto
             || self
-                .path_rule(&self.rules.allow, "write", &target, false)
+                .allow_rule(&self.allow_paths, "write", &target)
                 .is_some()
             || self.session_path_allowed("write", &target)
         {
@@ -357,12 +460,17 @@ impl PermissionEngine {
         true
     }
 
-    /// Remembers a write's resolved path as an exact session approval. Returns `false` for a
+    /// Remembers a write's resolved path as an exact session approval. Returns `false` in plan
+    /// or read-only mode (writes are refused outright, so an approval changes nothing), for a
     /// write outside the workspace, inside `.git`, or matching a deny/confirm rule — none of
     /// those decisions can be changed by an approval, since they're checked before the session
     /// approvals in `check_write`.
     fn remember_write(&self, path: &Path) -> bool {
+        if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
+            return false;
+        }
         let target = resolve_path(&self.workspace, path);
+        let lexical = lexical_path(&self.workspace, path);
         let Ok(inside) = target.strip_prefix(&self.workspace) else {
             return false;
         };
@@ -370,10 +478,10 @@ impl PermissionEngine {
             return false;
         }
         if self
-            .path_rule(&self.rules.deny, "write", &target, true)
+            .deny_confirm_rule(&self.deny_paths, "write", &target, &lexical)
             .is_some()
             || self
-                .path_rule(&self.rules.confirm, "write", &target, true)
+                .deny_confirm_rule(&self.confirm_paths, "write", &target, &lexical)
                 .is_some()
         {
             return false;
@@ -389,11 +497,12 @@ impl PermissionEngine {
     /// matches a deny/confirm rule, since remembering it couldn't change that decision.
     fn remember_read(&self, path: &Path) -> bool {
         let target = resolve_path(&self.workspace, path);
+        let lexical = lexical_path(&self.workspace, path);
         if self
-            .path_rule(&self.rules.deny, "read", &target, true)
+            .deny_confirm_rule(&self.deny_paths, "read", &target, &lexical)
             .is_some()
             || self
-                .path_rule(&self.rules.confirm, "read", &target, true)
+                .deny_confirm_rule(&self.confirm_paths, "read", &target, &lexical)
                 .is_some()
         {
             return false;

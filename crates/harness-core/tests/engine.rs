@@ -483,3 +483,111 @@ fn remembered_prefix_does_not_match_a_longer_word() {
     assert_eq!(e.check(&bash("cargo test --all")), Decision::Allow);
     assert!(is_ask(&e.check(&bash("cargo testx"))));
 }
+
+// --- Round 2, finding 1: allow rules must not widen through a symlink ---
+
+#[test]
+fn allow_rules_do_not_widen_through_a_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let link = ws.join("link");
+    symlink(&outside, &link).unwrap();
+
+    let allow_glob = format!("read:{}/*", link.display());
+    for mode in [Mode::Ask, Mode::Auto] {
+        let e = engine(mode, &ws, true, rules(&[allow_glob.as_str()], &[], &[]));
+        assert!(
+            is_ask(&e.check(&Action::Read(outside.join("secret")))),
+            "{mode}: via the resolved target"
+        );
+        assert!(
+            is_ask(&e.check(&Action::Read(PathBuf::from("link/secret")))),
+            "{mode}: via the symlink path"
+        );
+    }
+}
+
+// --- Round 2, finding 2: deny/confirm relative matching is case-insensitive even when the
+// --- workspace itself is spelled with different case than the target ---
+
+#[test]
+fn deny_relative_match_is_case_insensitive_even_when_the_workspace_case_differs() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let ws_upper = dir.path().join("WS");
+    let full = engine(
+        Mode::FullAccess,
+        &ws,
+        true,
+        rules(&[], &["read:.env", "write:secrets/*"], &[]),
+    );
+    assert!(is_deny(&full.check(&Action::Read(ws_upper.join(".env")))));
+    assert!(is_deny(
+        &full.check(&Action::Write(ws_upper.join("secrets/k")))
+    ));
+}
+
+// --- Round 2, finding 3: deny/confirm rules must also match a symlink's own leaf name,
+// --- not only its (fully symlink-resolved) target ---
+
+#[test]
+fn deny_matches_a_symlinked_leaf_lexically() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let shared = dir.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(shared.join(".env"), "secret").unwrap();
+    symlink(shared.join(".env"), ws.join(".env")).unwrap();
+
+    let full = engine(
+        Mode::FullAccess,
+        &ws,
+        true,
+        rules(&[], &["read:.env", "write:.env"], &[]),
+    );
+    assert!(is_deny(&full.check(&Action::Read(PathBuf::from(".env")))));
+    assert!(is_deny(&full.check(&Action::Write(PathBuf::from(".env")))));
+}
+
+// --- Round 2, finding 4: denial/confirm messages name the rule as configured, never a
+// --- resolved twin ---
+
+#[test]
+fn deny_message_names_the_configured_rule_not_the_resolved_twin() {
+    if !is_symlink("/etc") {
+        return; // not a symlink on this host; nothing to prove here.
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let full = engine(
+        Mode::FullAccess,
+        dir.path(),
+        true,
+        rules(&[], &["write:/etc/*"], &[]),
+    );
+    match full.check(&Action::Write(PathBuf::from("/etc/hosts"))) {
+        Decision::Deny(reason) => {
+            assert!(reason.contains("write:/etc/*"), "{reason}");
+            assert!(!reason.contains("/private/etc"), "{reason}");
+        }
+        other => panic!("expected Deny, got {other:?}"),
+    }
+}
+
+// --- Round 2, finding 5: remember() is a no-op for a write in plan or read-only mode ---
+
+#[test]
+fn remember_is_a_noop_for_a_write_in_plan_or_read_only_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    for mode in [Mode::Plan, Mode::ReadOnly] {
+        let e = engine(mode, dir.path(), true, RuleSet::default());
+        assert!(
+            !e.remember(&Action::Write(PathBuf::from("a.txt"))),
+            "{mode}"
+        );
+    }
+}

@@ -947,6 +947,7 @@ dependencies = [
  "harness-config",
  "harness-core",
  "harness-providers",
+ "harness-sandbox",
  "harness-tools",
  "nix",
  "predicates",

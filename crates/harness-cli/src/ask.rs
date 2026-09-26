@@ -6,7 +6,7 @@ use std::{
 
 use harness_core::{
     agent::{Agent, AgentConfig, NonInteractive},
-    engine::{EngineConfig, PermissionEngine},
+    engine::{EngineConfig, PermissionEngine, RuleSet},
     event::{AgentEvent, TurnEndReason},
     permission::Mode,
     tool::ToolContext,
@@ -97,17 +97,40 @@ pub async fn run(
         std::process::id()
     );
     let output_dir = setup.paths.state_dir.join("tool-output").join(run_id);
+    let sandbox =
+        if mode == Mode::FullAccess || std::env::var("HARNESS_SANDBOX").as_deref() == Ok("none") {
+            None
+        } else {
+            harness_sandbox::detect(harness_sandbox::SandboxSettings {
+                extra_writable: setup.config.writable_roots.clone(),
+                allow_localhost: setup.config.allow_localhost,
+            })
+        };
+    if mode != Mode::FullAccess && sandbox.is_none() {
+        eprintln!("warning: no OS sandbox is available; every shell command will need approval");
+    }
+    let mut read_dirs = setup.config.read_dirs.clone();
+    read_dirs.push(output_dir.clone());
     let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode,
         workspace: setup.workspace.clone(),
-        read_dirs: vec![output_dir.clone()],
-        rules: Default::default(),
-        sandbox_available: false,
+        read_dirs,
+        rules: RuleSet {
+            allow: setup.config.allow.clone(),
+            deny: setup.config.deny.clone(),
+            confirm: setup.config.confirm.clone(),
+        },
+        sandbox_available: sandbox.is_some(),
     }));
+    for rule in policy.unknown_rules() {
+        eprintln!("warning: rule `{rule}` names an unknown tool (use bash:, read:, or write:)");
+    }
+    let sandboxed = sandbox.is_some();
+    let ctx = ToolContext::new(&setup.workspace).with_sandbox(sandbox, mode.fs_access());
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),
-        prompt::system_prompt(&setup.workspace, &prompt::today_utc(), mode),
+        prompt::system_prompt(&setup.workspace, &prompt::today_utc(), mode, sandboxed),
         output_dir,
     );
     if let Some(steps) = setup.config.max_steps {
@@ -119,7 +142,7 @@ pub async fn run(
         policy,
         Arc::new(NonInteractive),
         config,
-        ToolContext::new(&setup.workspace),
+        ctx,
     );
 
     let (tx, rx) = mpsc::unbounded_channel();

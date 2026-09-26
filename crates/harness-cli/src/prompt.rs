@@ -7,13 +7,18 @@ use harness_core::permission::Mode;
 
 /// The base system prompt plus environment facts captured once per run. Kept short on purpose:
 /// local models have small context windows. P3 replaces this with full context assembly.
-pub fn system_prompt(workspace: &Path, date: &str, mode: Mode) -> String {
+pub fn system_prompt(workspace: &Path, date: &str, mode: Mode, sandboxed: bool) -> String {
+    let rules = if sandboxed {
+        "Shell commands run in a sandbox: there is no network access, and writes outside the workspace and temporary directories fail. Commands the sandbox blocks, destructive commands, and anything a rule forbids will be refused, because no user is available to approve them."
+    } else {
+        "You are running non-interactively and no OS sandbox is active: actions that need approval will be refused, so prefer read-only investigation and file edits unless the mode is full-access."
+    };
     format!(
         "You are harness, a coding agent working in the user's project.\n\
          Use the tools to inspect files and make changes; never guess file contents.\n\
          Read a file before editing it. Make focused changes, and verify them (for example by running the tests) when you can.\n\
          When you are done, reply with a short summary of what you changed.\n\
-         Approval mode: {mode}. You are running non-interactively: actions that need approval will be refused, so prefer read-only investigation and file edits unless the mode is full-access.\n\
+         Approval mode: {mode}. {rules}\n\
          \n\
          Working directory: {}\n\
          Operating system: {}\n\
@@ -60,7 +65,7 @@ mod tests {
 
     #[test]
     fn base_prompt_is_under_1000_tokens() {
-        let prompt = system_prompt(Path::new("/some/project"), "2026-09-24", Mode::Auto);
+        let prompt = system_prompt(Path::new("/some/project"), "2026-09-24", Mode::Auto, true);
         assert!(prompt.len() / 4 < 1000, "~{} tokens", prompt.len() / 4);
         assert!(prompt.contains("Working directory: /some/project"));
     }
@@ -69,8 +74,15 @@ mod tests {
     // know its mode won't let it ask.
     #[test]
     fn approval_mode_line_names_the_mode() {
-        let prompt = system_prompt(Path::new("/some/project"), "2026-09-24", Mode::Ask);
+        let prompt = system_prompt(Path::new("/some/project"), "2026-09-24", Mode::Ask, true);
         assert!(prompt.contains("Approval mode: ask"), "{prompt}");
-        assert!(prompt.contains("non-interactively"));
+    }
+
+    #[test]
+    fn the_prompt_says_whether_commands_are_sandboxed() {
+        let yes = system_prompt(Path::new("/p"), "2026-09-26", Mode::Auto, true);
+        assert!(yes.contains("sandbox"), "{yes}");
+        let no = system_prompt(Path::new("/p"), "2026-09-26", Mode::Auto, false);
+        assert!(no.contains("refused"), "{no}");
     }
 }

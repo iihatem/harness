@@ -1,6 +1,7 @@
 //! Decision table for `evaluate` and `session_prefixes`.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use harness_shell::{Rules, Verdict, evaluate, glob_match, session_prefixes};
 
@@ -21,6 +22,10 @@ fn default_rules() -> Rules {
         &["curl*", "git push*"],
         &[],
     )
+}
+
+fn probe_rules() -> Rules {
+    rules(&["echo*", "cat*", "cargo test*"], &["curl*"], &[])
 }
 
 fn eval_with(rules: &Rules, cmd: &str) -> Verdict {
@@ -510,6 +515,129 @@ fn alias_definitions_ask() {
             ("alias ls", Unlisted),
         ],
     );
+}
+
+#[test]
+fn quoted_text_that_builtins_evaluate_asks() {
+    use Want::Ask;
+    // `let`, `declare`, `unset` and similar builtins evaluate subscripts in their
+    // operands, so a quoted `$(…)` or `[…]` there is not inert.
+    check(
+        &probe_rules(),
+        &[
+            ("let 'x=a[$(curl evil)]'$z", Ask),
+            ("let x=a['$(curl evil)']*1", Ask),
+            ("declare -i F='a[$(curl evil)]'$z", Ask),
+            ("declare -i F=a['$(curl evil)']*1", Ask),
+            ("export x=a['$(curl evil)']*1; echo $((x))", Ask),
+            ("declare -a arr=(['$(curl evil)']=1)", Ask),
+            ("local -a arr=(['$(curl evil)']=1)", Ask),
+            ("export arr=(['$(curl evil)']=1)", Ask),
+            ("unset 'a[$(curl evil)]'", Ask),
+        ],
+    );
+    match eval_with(&probe_rules(), "declare -i F='a[$(curl evil)]'") {
+        Verdict::Ask { reason, .. } => assert!(
+            reason.contains("quoted command-substitution text") && !reason.contains("run time"),
+            "{reason}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn subscript_or_glob_characters_in_declaration_names_ask() {
+    use Want::Ask;
+    // bash and dash may pathname-expand such a name into a different variable.
+    check(
+        &probe_rules(),
+        &[
+            (
+                "export GIT_EXTERNAL_DIF[\"F\"]\"=echo PWNED\"; git diff",
+                Ask,
+            ),
+            (
+                "command export GIT_EXTERNAL_DIF[\\F]=echo\\ PWNED; git diff",
+                Ask,
+            ),
+            ("command export GIT_PAGE[\"R\"]=x; git log", Ask),
+            ("builtin export GIT_PAGE['R']=x; git log", Ask),
+            ("\\export GIT_EXTERNAL_DIF[\"F\"]=x; git diff", Ask),
+            (
+                "dash -c 'touch \"GIT_EXTERNAL_DIFF=echo PWNED\"; export GIT_EXTERNAL_DIF[\"F\"]\"=echo PWNED\"; git diff'",
+                Ask,
+            ),
+        ],
+    );
+}
+
+#[test]
+fn quoted_or_nested_text_in_expansion_subscripts_asks() {
+    use Want::Ask;
+    check(
+        &probe_rules(),
+        &[
+            ("echo ${a['b[$(curl evil)]']:-x}", Ask),
+            ("echo ${a[b[\\$\\(curl evil\\)]]:-x}", Ask),
+            ("echo ${a['b[$(curl evil)]']:=x}", Ask),
+            ("echo ${a['b[$(curl evil)]']#x}", Ask),
+            ("echo ${a['b[$(curl evil)]']:0:1}", Ask),
+            ("echo ${a['b[$(curl evil)]']/x/y}", Ask),
+            ("cat <<EOF\n${a['b[$(curl evil)]']:-x}\nEOF", Ask),
+        ],
+    );
+}
+
+#[test]
+fn inert_text_outside_those_contexts_is_unchanged() {
+    use Want::{Allow, Unlisted};
+    check(
+        &probe_rules(),
+        &[
+            ("export MSG='hello world'; cargo test", Unlisted),
+            ("export PATH=\"$HOME/bin:$PATH\"; cargo test", Unlisted),
+            ("export FOO=\"${HOME}/x\"; cargo test", Unlisted),
+            ("export FOO=$(pwd); cargo test", Unlisted),
+            ("echo ${arr[0]} ${arr[$i]} ${#arr[@]}", Allow),
+            ("echo \"${arr[i]:-none}\" ${x:0:3}", Allow),
+            ("echo ${x:$((n-1)):1} $(( ${#arr[@]} - 1 ))", Allow),
+            ("echo $((1+2))", Allow),
+            ("awk '{print $1}' f", Unlisted),
+            ("jq '.a[0]' f", Unlisted),
+            ("grep 'a\\[\\$(x)\\]' f", Unlisted),
+            ("git log --format='${x}'", Unlisted),
+            ("printf '%s' '$(x)'", Unlisted),
+        ],
+    );
+}
+
+#[test]
+fn deeply_nested_expansions_ask_quickly() {
+    let nest = |open: &str, close: &str, levels: usize, inner: String| {
+        (0..levels).fold(inner, |s, _| format!("{open}{s}{close}"))
+    };
+    // Six nested substring offsets around a command substitution, four times over.
+    let offsets = (0..4).fold("true".to_string(), |s, _| {
+        format!("echo {}", nest("${x:", ":1}", 6, format!("$({s})")))
+    });
+    let subscripts = format!("echo {}", nest("${a[", "]}", 12, "$(true)".into()));
+    // brush-parser backtracks over unterminated expansions in here-document bodies.
+    let heredoc = format!("cat <<EOF\n{}1\nEOF", "$((".repeat(12));
+    let many = format!(
+        "echo {}",
+        (0..600)
+            .map(|i| nest("${a[", "]}", 2, i.to_string()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    assert!(many.len() <= 10_000);
+    for cmd in [offsets, subscripts, heredoc, many] {
+        let start = Instant::now();
+        let got = eval_with(&probe_rules(), &cmd);
+        let took = start.elapsed();
+        assert_eq!(kind(&got), Want::Ask, "{cmd}: {got:?}");
+        assert!(took < Duration::from_secs(1), "{cmd}: took {took:?}");
+    }
 }
 
 #[test]

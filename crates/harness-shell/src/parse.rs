@@ -6,7 +6,7 @@ use brush_parser::ast::{
     IoFileRedirectKind as Kind, IoFileRedirectTarget as Target, IoRedirect, SeparatorOperator,
 };
 
-use crate::argv::{self, MAX_DEPTH, Tok, basename};
+use crate::argv::{self, Hidden, MAX_DEPTH, Scan, Tok, basename};
 use crate::destructive;
 use crate::fallback;
 use crate::git;
@@ -17,6 +17,20 @@ use crate::wrappers::{self, Next, assigned_name, runs_programs};
 const MAX_INPUT_CHARS: usize = 10_000;
 /// Builtins whose `NAME=value` operands set shell variables.
 const DECLARATION_BUILTINS: &[&str] = &["export", "declare", "typeset", "local", "readonly"];
+/// Builtins that evaluate their operands' text as arithmetic, subscripts or variable
+/// names (`printf` only with `-v`).
+const EVALUATING_BUILTINS: &[&str] = &[
+    "let",
+    "declare",
+    "typeset",
+    "local",
+    "readonly",
+    "export",
+    "unset",
+    "read",
+    "mapfile",
+    "readarray",
+];
 
 /// A declaration operand the shell expands as an assignment, at a known argv position.
 enum Operand<'a> {
@@ -26,6 +40,17 @@ enum Operand<'a> {
     /// not trustworthy.
     Array,
 }
+
+/// What the words of a simple command say about the operands of the argv it runs.
+#[derive(Default)]
+struct Operands<'a> {
+    /// `NAME=value` operands the shell expands as assignments, by argv position (only
+    /// for the argv as written, not once a wrapper is unwrapped).
+    assignments: Vec<(usize, Operand<'a>)>,
+    /// Literal text, in a word after the command name, that bash may evaluate later.
+    hidden: Option<Hidden>,
+}
+
 /// Nesting limit for wrapper commands (`sudo env nice …`).
 const MAX_LAYERS: usize = 16;
 /// Nesting limit for brackets, compound commands and command lists; keeps both the
@@ -104,6 +129,10 @@ impl Walker<'_> {
             self.undecomposable("nested too deeply".into());
             return self.rough_scan(src, depth);
         }
+        if let Some(why) = argv::program_too_nested(src) {
+            self.undecomposable(why.into());
+            return self.rough_scan(src, depth);
+        }
         let mut parser =
             brush_parser::Parser::new(std::io::Cursor::new(src), &argv::parser_options());
         match parser.parse_program() {
@@ -123,7 +152,8 @@ impl Walker<'_> {
     fn rough_scan(&mut self, src: &str, depth: usize) {
         for words in fallback::rough_commands(src) {
             let argv = words.into_iter().map(Tok::Lit).collect();
-            self.exec(argv, &[], &mut Cwd::unknown(), depth + 1, 0, false);
+            let operands = Operands::default();
+            self.exec(argv, &operands, &mut Cwd::unknown(), depth + 1, 0, false);
         }
     }
 
@@ -327,7 +357,7 @@ impl Walker<'_> {
                 .as_ref()
                 .is_some_and(|w| DECLARATION_BUILTINS.contains(&w.value.as_str()));
         // Those operands, by argv position.
-        let mut assignments = Vec::new();
+        let mut operands = Operands::default();
         for item in cmd.suffix.iter().flat_map(|s| &s.0) {
             if let Item::AssignmentWord(assignment, _) = item
                 && expands_assignments
@@ -336,9 +366,10 @@ impl Walker<'_> {
                     ast::AssignmentName::VariableName(n) => Operand::Name(n),
                     ast::AssignmentName::ArrayElementName(..) => Operand::Array,
                 };
-                assignments.push((argv.len(), operand));
+                operands.assignments.push((argv.len(), operand));
             }
-            self.item(item, &mut argv, cwd, depth);
+            let hidden = self.item(item, &mut argv, cwd, depth);
+            operands.hidden = operands.hidden.or(hidden);
         }
         if argv.is_empty() {
             if assigns {
@@ -353,14 +384,23 @@ impl Walker<'_> {
         } else if assigns {
             self.unlisted("sets environment variables for the command".into());
         }
-        self.exec(argv, &assignments, cwd, depth, 0, true);
+        self.exec(argv, &operands, cwd, depth, 0, true);
     }
 
-    fn item(&mut self, item: &Item, argv: &mut Vec<Tok>, cwd: &Cwd, depth: usize) {
+    /// Adds an argv word (if `item` is one) and returns its hidden literal text.
+    fn item(
+        &mut self,
+        item: &Item,
+        argv: &mut Vec<Tok>,
+        cwd: &Cwd,
+        depth: usize,
+    ) -> Option<Hidden> {
         match item {
             // An assignment-looking argument (`export A=1`) is an ordinary word here.
             Item::Word(w) | Item::AssignmentWord(_, w) => {
-                argv.push(self.word(&w.value, cwd, depth))
+                let (tok, hidden) = self.scan_word(&w.value, cwd, depth);
+                argv.push(tok);
+                return hidden;
             }
             Item::IoRedirect(r) => self.redirect(r, cwd, depth),
             Item::ProcessSubstitution(_, sub) => {
@@ -369,6 +409,7 @@ impl Walker<'_> {
                 argv.push(Tok::Dyn);
             }
         }
+        None
     }
 
     fn assignment(&mut self, assignment: &ast::Assignment, cwd: &Cwd, depth: usize) {
@@ -393,36 +434,60 @@ impl Walker<'_> {
     /// Converts a word; its command substitutions are analyzed as sub-commands
     /// (they run in a subshell, so `cd` inside them does not leak out).
     fn word(&mut self, raw: &str, cwd: &Cwd, depth: usize) -> Tok {
-        let mut subs = Vec::new();
-        let tok = argv::word_to_tok(raw, &mut subs).unwrap_or_else(|why| {
+        self.scan_word(raw, cwd, depth).0
+    }
+
+    /// Like [`Self::word`], also returning the word's hidden literal text.
+    fn scan_word(&mut self, raw: &str, cwd: &Cwd, depth: usize) -> (Tok, Option<Hidden>) {
+        if self.too_nested(raw, false, depth) {
+            return (Tok::Dyn, None);
+        }
+        let mut scan = Scan::default();
+        let tok = argv::word_to_tok(raw, &mut scan).unwrap_or_else(|why| {
             self.undecomposable(why);
             Tok::Dyn
         });
-        self.substitutions(subs, cwd, depth);
-        tok
+        let hidden = scan.hidden;
+        self.scanned(scan, cwd, depth);
+        (tok, hidden)
+    }
+
+    /// Text nested too deeply to parse in bounded time is undecomposable; it is only
+    /// roughly scanned for deny matches.
+    fn too_nested(&mut self, text: &str, heredoc: bool, depth: usize) -> bool {
+        let Some(why) = argv::too_nested(text, heredoc) else {
+            return false;
+        };
+        self.undecomposable(why.into());
+        self.rough_scan(text, depth);
+        true
     }
 
     /// Analyzes the command substitutions inside arithmetic or array-index text.
     fn expansion(&mut self, text: &str, cwd: &Cwd, depth: usize) {
-        let mut subs = Vec::new();
-        if let Err(why) = argv::substitutions_in(text, &mut subs) {
+        let mut scan = Scan::default();
+        if let Err(why) = argv::substitutions_in(text, &mut scan) {
             self.undecomposable(why);
         }
-        self.substitutions(subs, cwd, depth);
+        self.scanned(scan, cwd, depth);
     }
 
     /// Analyzes text the shell evaluates as arithmetic (a subscript, `let` operand, …);
     /// a substitution surviving quote removal there is undecomposable.
     fn arith(&mut self, text: &str, cwd: &Cwd, depth: usize) {
-        let mut subs = Vec::new();
-        if let Err(why) = argv::arithmetic_in(text, &mut subs) {
+        let mut scan = Scan::default();
+        if let Err(why) = argv::arithmetic_in(text, &mut scan) {
             self.undecomposable(why);
         }
-        self.substitutions(subs, cwd, depth);
+        self.scanned(scan, cwd, depth);
     }
 
-    fn substitutions(&mut self, subs: Vec<String>, cwd: &Cwd, depth: usize) {
-        for sub in subs {
+    /// Records what scanning a text found: reasons it is opaque, and substitutions.
+    fn scanned(&mut self, scan: Scan, cwd: &Cwd, depth: usize) {
+        for why in scan.opaque {
+            self.undecomposable(why);
+        }
+        for sub in scan.subs {
             self.program(&sub, &mut cwd.clone(), depth + 1);
         }
     }
@@ -461,12 +526,12 @@ impl Walker<'_> {
             }
             IoRedirect::HereDocument(_, doc) => {
                 // A quoted delimiter (`<<'EOF'`) makes the body literal.
-                if doc.requires_expansion {
-                    let mut subs = Vec::new();
-                    if let Err(why) = argv::heredoc_substitutions(&doc.doc.value, &mut subs) {
+                if doc.requires_expansion && !self.too_nested(&doc.doc.value, true, depth) {
+                    let mut scan = Scan::default();
+                    if let Err(why) = argv::heredoc_substitutions(&doc.doc.value, &mut scan) {
                         self.undecomposable(why);
                     }
-                    self.substitutions(subs, cwd, depth);
+                    self.scanned(scan, cwd, depth);
                 }
             }
             IoRedirect::HereString(_, w) => {
@@ -504,12 +569,10 @@ impl Walker<'_> {
     }
 
     /// Runs one argv: records its deny forms, then unwraps wrapper commands.
-    /// `assignments` lists the argv positions of `NAME=value` operands the shell
-    /// expands as assignments.
     fn exec(
         &mut self,
         argv: Vec<Tok>,
-        assignments: &[(usize, Operand)],
+        operands: &Operands,
         cwd: &mut Cwd,
         depth: usize,
         layer: usize,
@@ -523,7 +586,7 @@ impl Walker<'_> {
             return self.undecomposable("too many nested wrapper commands".into());
         }
         let Some(w) = wrappers::unwrap(&argv) else {
-            return self.run(argv, assignments, cwd, same_shell);
+            return self.run(argv, operands, cwd, same_shell);
         };
         if let Some(why) = w.unlisted {
             self.unlisted(why);
@@ -543,24 +606,25 @@ impl Walker<'_> {
             self.add_forms(alternative, &inner_cwd);
         }
         let same_shell = same_shell && w.same_shell;
+        // The wrapped command's operands come from the same words.
+        let inner_operands = Operands {
+            hidden: operands.hidden,
+            ..Default::default()
+        };
         for next in w.next {
             let mut own_cwd = inner_cwd.clone();
             let target = if same_shell { &mut *cwd } else { &mut own_cwd };
             match next {
-                Next::Argv(inner) => self.exec(inner, &[], target, depth, layer + 1, same_shell),
+                Next::Argv(inner) => {
+                    self.exec(inner, &inner_operands, target, depth, layer + 1, same_shell)
+                }
                 Next::Script(src) => self.program(&src, target, depth + 1),
             }
         }
     }
 
     /// Records the command that actually runs once all wrappers are unwrapped.
-    fn run(
-        &mut self,
-        argv: Vec<Tok>,
-        assignments: &[(usize, Operand)],
-        cwd: &mut Cwd,
-        same_shell: bool,
-    ) {
+    fn run(&mut self, argv: Vec<Tok>, operands: &Operands, cwd: &mut Cwd, same_shell: bool) {
         match &argv[0] {
             Tok::Lit(name) if name.contains('/') => self.unlisted(format!("runs `{name}` by path")),
             Tok::Lit(_) => {}
@@ -572,11 +636,20 @@ impl Walker<'_> {
                 "git `-c`/`--config-env`/`--exec-path` can run arbitrary programs".into(),
             );
         }
-        if DECLARATION_BUILTINS.contains(&name) {
-            self.declaration_operands(name, &argv, assignments);
+        if let Some(hidden) = operands.hidden
+            && evaluates_operands(name, &argv)
+        {
+            self.undecomposable(match hidden {
+                Hidden::Substitution => format!(
+                    "`{name}` operand contains quoted command-substitution text that bash may evaluate"
+                ),
+                Hidden::Subscript => format!(
+                    "`{name}` operand contains a quoted `[` or `]`, which bash may evaluate as a subscript"
+                ),
+            });
         }
-        if name == "let" {
-            self.let_operands(&argv);
+        if DECLARATION_BUILTINS.contains(&name) {
+            self.declaration_operands(name, &argv, &operands.assignments);
         }
         if name == "alias" {
             self.alias_operands(&argv);
@@ -592,49 +665,39 @@ impl Walker<'_> {
     }
 
     /// Setting a variable that makes programs run other commands is as opaque as
-    /// running them; so is an operand whose NAME is only known at run time, an
-    /// array-subscript operand (a shell without arrays glob-expands it), and a literal
-    /// value that bash may re-evaluate as arithmetic.
+    /// running them; so is an operand whose NAME is only known at run time, and one
+    /// whose NAME has a subscript or glob character (bash evaluates the subscript, and a
+    /// shell without arrays glob-expands the whole operand into another name).
     fn declaration_operands(
         &mut self,
         builtin: &str,
         argv: &[Tok],
         assignments: &[(usize, Operand)],
     ) {
-        let opaque = |walker: &mut Self| {
-            walker.undecomposable(format!("`{builtin}` operand is only known at run time"));
+        let subscripted = |walker: &mut Self| {
+            walker.undecomposable(format!(
+                "`{builtin}` operand name contains `[`, `]`, `*` or `?`, so the variable it sets is not known"
+            ));
         };
         for (i, arg) in argv.iter().enumerate().skip(1) {
             let recorded = assignments.iter().find(|&(at, _)| *at == i).map(|(_, o)| o);
-            if matches!(recorded, Some(Operand::Array)) {
-                return opaque(self);
-            }
             let var = match arg {
-                Tok::Lit(s) if argv::subst_marker(s) => return opaque(self),
-                Tok::Lit(s) => Some(assigned_name(s)),
+                Tok::Lit(s) if subscripted_or_glob_name(s) => return subscripted(self),
+                _ if matches!(recorded, Some(Operand::Array)) => return subscripted(self),
+                Tok::Lit(s) => assigned_name(s),
                 _ => match recorded {
-                    Some(Operand::Name(name)) => Some(*name),
-                    _ => return opaque(self),
+                    Some(Operand::Name(name)) => name,
+                    _ => {
+                        return self.undecomposable(format!(
+                            "`{builtin}` operand is only known at run time"
+                        ));
+                    }
                 },
             };
-            if let Some(var) = var
-                && runs_programs(var)
-            {
+            if runs_programs(var) {
                 return self.undecomposable(format!(
                     "sets `{var}`, which makes programs run other commands"
                 ));
-            }
-        }
-    }
-
-    /// `let` evaluates each operand as arithmetic; a substitution surviving quote
-    /// removal in one runs a command.
-    fn let_operands(&mut self, argv: &[Tok]) {
-        for arg in &argv[1..] {
-            if let Tok::Lit(s) = arg
-                && argv::subst_marker(s)
-            {
-                return self.undecomposable("`let` operand may run a command substitution".into());
             }
         }
     }
@@ -670,6 +733,23 @@ impl Walker<'_> {
             self.out.forms.push(form);
         }
     }
+}
+
+/// Whether the builtin `name` evaluates its operands' text (`printf` only assigns, and
+/// so evaluates a subscript, with `-v`, which a run-time first operand may be).
+fn evaluates_operands(name: &str, argv: &[Tok]) -> bool {
+    EVALUATING_BUILTINS.contains(&name)
+        || (name == "printf"
+            && argv
+                .get(1)
+                .is_some_and(|t| t.lit().is_none_or(|s| s.starts_with("-v"))))
+}
+
+/// Whether the NAME of a `NAME=value` operand (or a bare NAME) has a subscript or glob
+/// character.
+fn subscripted_or_glob_name(operand: &str) -> bool {
+    let name = operand.split('=').next().unwrap_or(operand);
+    name.contains(['[', ']', '*', '?'])
 }
 
 /// The directory `cd ARGS` changes to, or `None` if it cannot be known statically.

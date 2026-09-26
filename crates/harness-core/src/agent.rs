@@ -382,10 +382,7 @@ impl Agent {
             &self.config.output_dir,
             &call.id,
         );
-        let output = ToolOutput {
-            content,
-            is_error: raw.is_error,
-        };
+        let output = ToolOutput { content, ..raw };
         let _ = events.send(AgentEvent::ToolCallFinished {
             id: call.id.clone(),
             output: output.content.clone(),

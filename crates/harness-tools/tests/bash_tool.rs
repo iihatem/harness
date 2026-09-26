@@ -119,3 +119,89 @@ async fn cancellation_interrupts_a_running_command() {
     assert!(out.content.contains("interrupted"));
     assert!(started.elapsed() < Duration::from_secs(2));
 }
+
+use std::{path::Path, sync::Arc};
+
+use harness_core::permission::FsAccess;
+use harness_core::tool::CommandSandbox;
+
+/// Runs commands directly, marks them with an env var, and reports "FAKE-DENIED" output as a denial.
+#[derive(Debug)]
+struct FakeSandbox;
+
+impl CommandSandbox for FakeSandbox {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+
+    fn command(
+        &self,
+        _access: FsAccess,
+        _workspace: &Path,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<tokio::process::Command> {
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .env("HARNESS_FAKE_SANDBOX", "1")
+            .process_group(0);
+        Ok(cmd)
+    }
+
+    fn is_denial(&self, _exit_code: Option<i32>, output: &str) -> bool {
+        output.contains("FAKE-DENIED")
+    }
+}
+
+fn sandboxed() -> (tempfile::TempDir, harness_core::tool::ToolContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = harness_core::tool::ToolContext::new(dir.path())
+        .with_sandbox(Some(Arc::new(FakeSandbox)), FsAccess::WorkspaceWrite);
+    (dir, ctx)
+}
+
+#[tokio::test]
+async fn sandboxed_commands_go_through_the_sandbox() {
+    let (_dir, ctx) = sandboxed();
+    let out = BashTool
+        .run(json!({"command": "echo \"[$HARNESS_FAKE_SANDBOX]\""}), &ctx)
+        .await;
+    assert!(out.content.contains("[1]"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn an_unsandboxed_rerun_bypasses_the_sandbox() {
+    let (_dir, mut ctx) = sandboxed();
+    ctx.unsandboxed = true;
+    let out = BashTool
+        .run(json!({"command": "echo \"[$HARNESS_FAKE_SANDBOX]\""}), &ctx)
+        .await;
+    assert!(out.content.contains("[]"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn sandbox_denials_are_flagged() {
+    let (_dir, ctx) = sandboxed();
+    let out = BashTool
+        .run(json!({"command": "echo FAKE-DENIED; exit 1"}), &ctx)
+        .await;
+    assert!(out.is_error && out.sandbox_denied);
+    assert!(
+        out.content.contains("the sandbox blocked"),
+        "{}",
+        out.content
+    );
+    let ok = BashTool
+        .run(json!({"command": "echo FAKE-DENIED"}), &ctx)
+        .await;
+    assert!(!ok.sandbox_denied, "successful commands are never denials");
+}
+
+#[tokio::test]
+async fn commands_run_in_bash() {
+    let (_dir, ctx) = ctx();
+    let out = BashTool
+        .run(json!({"command": "echo \"[${BASH_VERSION:+bash}]\""}), &ctx)
+        .await;
+    assert!(out.content.contains("[bash]"), "{}", out.content);
+}

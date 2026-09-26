@@ -18,6 +18,8 @@ use crate::{
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// The command failed because the OS sandbox blocked it (the agent may offer an unsandboxed re-run).
+    pub sandbox_denied: bool,
 }
 
 impl ToolOutput {
@@ -25,6 +27,7 @@ impl ToolOutput {
         ToolOutput {
             content: content.into(),
             is_error: false,
+            sandbox_denied: false,
         }
     }
 
@@ -32,6 +35,7 @@ impl ToolOutput {
         ToolOutput {
             content: content.into(),
             is_error: true,
+            sandbox_denied: false,
         }
     }
 }
@@ -76,6 +80,12 @@ pub struct ToolContext {
     pub workspace: PathBuf,
     pub tracker: Arc<ReadTracker>,
     pub cancel: CancellationToken,
+    /// Sandbox for shell commands; `None` runs them directly (full-access, or no sandbox available).
+    pub sandbox: Option<Arc<dyn CommandSandbox>>,
+    /// What sandboxed commands may write.
+    pub access: FsAccess,
+    /// Set by the agent for a user-approved re-run outside the sandbox.
+    pub unsandboxed: bool,
 }
 
 impl ToolContext {
@@ -86,12 +96,25 @@ impl ToolContext {
                 .unwrap_or_else(|_| workspace.to_path_buf()),
             tracker: Arc::default(),
             cancel: CancellationToken::new(),
+            sandbox: None,
+            access: FsAccess::WorkspaceWrite,
+            unsandboxed: false,
         }
     }
 
     /// Resolves a path argument against the workspace, following symlinks.
     pub fn resolve(&self, path: &str) -> PathBuf {
         resolve_path(&self.workspace, Path::new(path))
+    }
+
+    pub fn with_sandbox(
+        mut self,
+        sandbox: Option<Arc<dyn CommandSandbox>>,
+        access: FsAccess,
+    ) -> Self {
+        self.sandbox = sandbox;
+        self.access = access;
+        self
     }
 }
 

@@ -1,4 +1,4 @@
-use std::{process::Stdio, sync::Arc, sync::Mutex, time::Duration};
+use std::{path::Path, process::Stdio, sync::Arc, sync::Mutex, time::Duration};
 
 use async_trait::async_trait;
 use harness_core::{
@@ -44,19 +44,38 @@ impl Tool for BashTool {
             .clamp(1, MAX_TIMEOUT_SECS);
 
         // `exec 2>&1` merges stderr into stdout for the whole script, preserving interleaving.
-        let mut child = match tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("exec 2>&1\n{command}"))
+        let script = format!("exec 2>&1\n{command}");
+        let (shell, mut args): (&str, Vec<&str>) = if Path::new("/bin/bash").exists() {
+            ("/bin/bash", vec!["--noprofile", "--norc", "-c"])
+        } else {
+            ("/bin/sh", vec!["-c"])
+        };
+        args.push(&script);
+
+        let sandbox = ctx.sandbox.as_ref().filter(|_| !ctx.unsandboxed);
+        let mut cmd = match sandbox {
+            Some(sandbox) => match sandbox.command(ctx.access, &ctx.workspace, shell, &args) {
+                Ok(cmd) => cmd,
+                Err(e) => return ToolOutput::error(format!("failed to prepare the sandbox: {e}")),
+            },
+            None => {
+                let mut cmd = tokio::process::Command::new(shell);
+                cmd.args(&args).process_group(0);
+                cmd
+            }
+        };
+        let mut child = match cmd
             .current_dir(&ctx.workspace)
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .process_group(0)
             .kill_on_drop(true)
             .spawn()
         {
             Ok(child) => child,
-            Err(e) => return ToolOutput::error(format!("failed to start sh: {e}")),
+            Err(e) => return ToolOutput::error(format!("failed to start {shell}: {e}")),
         };
         let pgid = child.id().map(|id| id as i32);
         let mut stdout = child.stdout.take().expect("stdout is piped");
@@ -98,7 +117,15 @@ impl Tool for BashTool {
                     Ok(status) => {
                         let code = status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
                         let body = format!("exit code {code}\n{text}");
-                        if status.success() { ToolOutput::ok(body) } else { ToolOutput::error(body) }
+                        if status.success() {
+                            ToolOutput::ok(body)
+                        } else if sandbox.is_some_and(|s| s.is_denial(status.code(), &text)) {
+                            let mut out = ToolOutput::error(format!("{body}\n[the sandbox blocked part of this command]"));
+                            out.sandbox_denied = true;
+                            out
+                        } else {
+                            ToolOutput::error(body)
+                        }
                     }
                     Err(e) => ToolOutput::error(format!("failed to wait for command: {e}\n{text}")),
                 }

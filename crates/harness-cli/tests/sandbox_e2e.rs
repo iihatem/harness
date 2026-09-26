@@ -160,6 +160,11 @@ async fn network_access_is_blocked_headless() {
     }
     let (_env, out) = run_bash("curl -sS --max-time 5 https://example.com", "", |_| {}).await;
     assert_eq!(out.status.code(), Some(3), "{}", tool_output(&out));
+    assert!(
+        tool_output(&out).contains("[the sandbox blocked"),
+        "{}",
+        tool_output(&out)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -204,8 +209,14 @@ async fn planting_a_git_hook_fails_in_the_sandbox() {
     if !host_has_sandbox() {
         return;
     }
-    let (env, _out) = run_bash("echo 'echo pwned' > .git/hooks/pre-commit", "", |_| {}).await;
+    let (env, out) = run_bash("echo 'echo pwned' > .git/hooks/pre-commit", "", |_| {}).await;
     assert!(!env.ws.path().join(".git/hooks/pre-commit").exists());
+    assert_eq!(out.status.code(), Some(3), "{}", tool_output(&out));
+    assert!(
+        tool_output(&out).contains("[the sandbox blocked"),
+        "{}",
+        tool_output(&out)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -241,7 +252,29 @@ async fn disabling_the_sandbox_makes_every_command_need_approval() {
             .args(["ask", "go"])
             .assert()
             .code(3)
-            .stderr(contains("no OS sandbox"));
+            .stderr(contains("sandbox is disabled by HARNESS_SANDBOX=none"));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_rule_tool_warns_once_and_json_output_stays_parseable() {
+    let server = MockServer::start().await;
+    bash_then_done(&server, "echo hi").await;
+    let env = Env::new(&server.uri(), "[permissions]\nallow = [\"shell:rm*\"]\n");
+    tokio::task::spawn_blocking(move || {
+        let out = env.cmd().args(["ask", "--json", "go"]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        for line in stdout.lines() {
+            assert!(
+                serde_json::from_str::<Value>(line).is_ok(),
+                "not JSON: {line}"
+            );
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let warnings = stderr.matches("names an unknown tool").count();
+        assert_eq!(warnings, 1, "{stderr}");
     })
     .await
     .unwrap();

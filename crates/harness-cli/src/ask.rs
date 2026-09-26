@@ -97,17 +97,27 @@ pub async fn run(
         std::process::id()
     );
     let output_dir = setup.paths.state_dir.join("tool-output").join(run_id);
-    let sandbox =
-        if mode == Mode::FullAccess || std::env::var("HARNESS_SANDBOX").as_deref() == Ok("none") {
-            None
+    let sandbox_disabled_by_env =
+        std::env::var("HARNESS_SANDBOX").as_deref() == Ok("none") && mode != Mode::FullAccess;
+    let sandbox = if mode == Mode::FullAccess || sandbox_disabled_by_env {
+        None
+    } else {
+        harness_sandbox::detect(harness_sandbox::SandboxSettings {
+            extra_writable: setup.config.writable_roots.clone(),
+            allow_localhost: setup.config.allow_localhost,
+        })
+    };
+    let sandboxed = sandbox.is_some();
+    if mode != Mode::FullAccess && !sandboxed {
+        if sandbox_disabled_by_env {
+            eprintln!(
+                "warning: the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval"
+            );
         } else {
-            harness_sandbox::detect(harness_sandbox::SandboxSettings {
-                extra_writable: setup.config.writable_roots.clone(),
-                allow_localhost: setup.config.allow_localhost,
-            })
-        };
-    if mode != Mode::FullAccess && sandbox.is_none() {
-        eprintln!("warning: no OS sandbox is available; every shell command will need approval");
+            eprintln!(
+                "warning: no OS sandbox is available; every shell command will need approval"
+            );
+        }
     }
     let mut read_dirs = setup.config.read_dirs.clone();
     read_dirs.push(output_dir.clone());
@@ -120,12 +130,11 @@ pub async fn run(
             deny: setup.config.deny.clone(),
             confirm: setup.config.confirm.clone(),
         },
-        sandbox_available: sandbox.is_some(),
+        sandbox_available: sandboxed,
     }));
     for rule in policy.unknown_rules() {
         eprintln!("warning: rule `{rule}` names an unknown tool (use bash:, read:, or write:)");
     }
-    let sandboxed = sandbox.is_some();
     let ctx = ToolContext::new(&setup.workspace).with_sandbox(sandbox, mode.fs_access());
     let mut config = AgentConfig::new(
         resolved.id.clone(),

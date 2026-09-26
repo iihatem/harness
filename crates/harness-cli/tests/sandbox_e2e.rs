@@ -260,18 +260,30 @@ async fn disabling_the_sandbox_makes_every_command_need_approval() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unknown_rule_tool_warns_once_and_json_output_stays_parseable() {
+    // `echo hi` is unlisted: it runs unapproved when this host has a sandbox (exit 0), and needs
+    // approval it can't get otherwise (exit 3) — either way the unknown-rule warning and JSON
+    // framing must hold.
+    let expect_success = host_has_sandbox();
     let server = MockServer::start().await;
     bash_then_done(&server, "echo hi").await;
     let env = Env::new(&server.uri(), "[permissions]\nallow = [\"shell:rm*\"]\n");
     tokio::task::spawn_blocking(move || {
         let out = env.cmd().args(["ask", "--json", "go"]).output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(!stdout.trim().is_empty(), "expected some JSON on stdout");
         for line in stdout.lines() {
             assert!(
                 serde_json::from_str::<Value>(line).is_ok(),
                 "not JSON: {line}"
             );
         }
+        let expected_code = if expect_success { 0 } else { 3 };
+        assert_eq!(
+            out.status.code(),
+            Some(expected_code),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let stderr = String::from_utf8_lossy(&out.stderr);
         let warnings = stderr.matches("names an unknown tool").count();
         assert_eq!(warnings, 1, "{stderr}");

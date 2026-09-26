@@ -49,7 +49,7 @@ crates/
   harness-core       agent loop, session model, event stream, Tool trait, permission engine, checkpoints
   harness-providers  Provider trait; openai-chat, openai-responses, anthropic-messages adapters; model profiles; credential store
   harness-tools      read, write, edit, bash, grep, glob
-  harness-sandbox    macOS Seatbelt; Linux Landlock + seccomp (bubblewrap when present)
+  harness-sandbox    macOS Seatbelt; Linux Landlock + seccomp
   harness-context    AGENTS.md/CLAUDE.md discovery; prompt assembly; slash-command discovery and expansion
   harness-config     XDG paths, config layering, workspace trust
   harness-cli        `harness` binary: clap subcommands, inline TUI, `ask`, NDJSON output
@@ -91,7 +91,7 @@ Six tools with short descriptions and a fixed definition order. `write`/`edit` e
 |---|---|---|---|
 | `plan` | rejected | read-only sandbox, no network | ask |
 | `read-only` | rejected | read-only sandbox, no network | ask |
-| `ask` | every write asks | every command asks; sandboxed | ask |
+| `ask` | every write asks unless allow-listed | every command asks unless allow-listed; sandboxed | ask |
 | `auto` | in-workspace allowed | sandboxed (workspace + temp writable, no network) without asking | ask |
 | `full-access` | allowed | unsandboxed, no prompts (explicit flag only, persistent warning) | allowed |
 

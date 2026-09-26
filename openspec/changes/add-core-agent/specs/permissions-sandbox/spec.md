@@ -5,7 +5,7 @@ Permissions and sandboxing protect the user's machine by controlling which actio
 ## ADDED Requirements
 
 ### Requirement: Five approval modes
-The system SHALL support the approval modes `plan`, `read-only`, `ask`, `auto`, and `full-access`. In `plan` and `read-only`, file writes MUST be rejected and shell commands MUST run with a read-only filesystem. In `ask`, every file write and shell command MUST require approval. In `auto`, file writes inside the workspace and sandboxed shell commands MUST proceed without approval. In `full-access`, actions MUST proceed without approval or sandbox, except for deny rules.
+The system SHALL support the approval modes `plan`, `read-only`, `ask`, `auto`, and `full-access`. In `plan` and `read-only`, file writes MUST be rejected and shell commands MUST run with a read-only filesystem. In `ask`, every file write and shell command MUST require approval unless an allow rule matches it. In `auto`, file writes inside the workspace and sandboxed shell commands MUST proceed without approval. In `full-access`, actions MUST proceed without approval or sandbox, except for deny rules.
 
 #### Scenario: Auto mode edit inside the workspace
 - **WHEN** the model edits a file inside the workspace in `auto` mode
@@ -87,7 +87,7 @@ Except in `full-access` mode, the system SHALL run `bash` commands and command-f
 When no sandbox mechanism is available, the system SHALL warn the user at startup and require approval for every `bash` command in every mode except `full-access`. The system MUST NOT run a command unsandboxed without either `full-access` or an explicit approval.
 
 #### Scenario: Linux kernel without Landlock
-- **WHEN** harness starts on a system where neither Landlock nor bubblewrap is available, in `auto` mode
+- **WHEN** harness starts on a Linux system where Landlock ABI 2 or later is not available, in `auto` mode
 - **THEN** a warning is shown and each `bash` command asks for approval
 
 ### Requirement: File tools enforce the workspace boundary

@@ -501,11 +501,11 @@ impl Walker<'_> {
         match &argv[0] {
             Tok::Lit(name) if name.contains('/') => self.unlisted(format!("runs `{name}` by path")),
             Tok::Lit(_) => {}
-            _ => self.unlisted("the command name is only known at run time".into()),
+            _ => self.undecomposable("the command name is only known at run time".into()),
         }
         let name = argv[0].lit().map(basename).unwrap_or_default();
         if name == "git" && git::parse(&argv).overrides_config {
-            self.unlisted(
+            self.undecomposable(
                 "git `-c`/`--config-env`/`--exec-path` can run arbitrary programs".into(),
             );
         }

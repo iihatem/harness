@@ -35,6 +35,26 @@ pub(crate) fn argv_matches(pattern: &str, argv: &[Tok]) -> bool {
             .is_some_and(|bare| wildcard(bare, &units))
 }
 
+/// Whether `pattern` could match `argv` once its run-time parts are known: the argv's literal
+/// words before its first run-time token must agree with the pattern's text before its first `*`
+/// (one is a prefix of the other). Fully literal argvs return `false` (`argv_matches` decides them).
+pub(crate) fn argv_may_match(pattern: &str, argv: &[Tok]) -> bool {
+    let mut known = String::new();
+    for (i, tok) in argv.iter().enumerate() {
+        if i > 0 {
+            known.push(' ');
+        }
+        match tok {
+            Tok::Lit(s) => known.push_str(&quote(s)),
+            Tok::Glob { .. } | Tok::Dyn => {
+                let fixed = pattern.split('*').next().unwrap_or_default();
+                return fixed.starts_with(&known) || known.starts_with(fixed);
+            }
+        }
+    }
+    false
+}
+
 /// Iterative wildcard match with single-star backtracking (linear in practice).
 fn wildcard(pattern: &str, text: &[Unit]) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
@@ -90,5 +110,20 @@ mod tests {
         let dynamic = vec![Tok::Lit("cargo".into()), Tok::Dyn];
         assert!(argv_matches("cargo *", &dynamic));
         assert!(!argv_matches("cargo test*", &dynamic));
+    }
+
+    #[test]
+    fn argv_may_match_dynamic() {
+        let npm_dyn = vec![Tok::Lit("npm".into()), Tok::Dyn];
+        assert!(argv_may_match("npm publish*", &npm_dyn));
+
+        let echo_dyn = vec![Tok::Lit("echo".into()), Tok::Dyn];
+        assert!(!argv_may_match("curl*", &echo_dyn));
+
+        let only_dyn = vec![Tok::Dyn];
+        assert!(argv_may_match("curl*", &only_dyn));
+
+        // Fully literal argv returns false (argv_matches decides it)
+        assert!(!argv_may_match("curl*", &lits(&["curl", "x"])));
     }
 }

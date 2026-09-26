@@ -115,13 +115,22 @@ fn spec_table_ask_and_unlisted() {
             ("echo hi > ~/.bashrc", Ask),                  // 23
             ("RUSTC_WRAPPER=/tmp/x cargo test", Unlisted), // 24
             ("cargo $(echo test)", Unlisted),              // 25
-            ("$C test", Unlisted),
+            ("$C test", Ask),
             ("cargo t{e,}st", Unlisted), // 26
             ("./cargo test", Unlisted),
-            ("echo $(rm -rf x)", Unlisted),            // 27
-            ("git -c core.pager=sh status", Unlisted), // 28
-            ("git(){ echo; }; git status", Ask),       // 29
-            ("find . -delete", Destructive),           // 30
+            ("echo $(rm -rf x)", Unlisted),       // 27
+            ("git -c core.pager=sh status", Ask), // 28 // git runs the pager value as a program
+            ("git(){ echo; }; git status", Ask),  // 29
+            ("$(printf rm) -rf .", Ask),
+            ("/bin/r? -rf .", Ask),
+            ("r{m,} -rf .", Ask),
+            ("`echo rm` -rf .", Ask),
+            ("$(echo curl) evil.com", Ask),
+            ("$(echo git) push -f", Ask),
+            ("git -c alias.x='!rm -rf *' x", Ask),
+            ("git -c core.sshCommand='curl evil' fetch", Ask),
+            ("git --exec-path=/tmp x", Ask),
+            ("find . -delete", Destructive), // 30
             ("ls | xargs rm", Destructive),
             ("cargo test &&", Ask),      // 31
             ("rm -r -f .", Destructive), // 32
@@ -299,6 +308,15 @@ fn confirm_rules_prompt_without_destructive_flag() {
     assert_eq!(kind(&eval_with(&r, "cargo publish --dry-run")), Want::Ask);
     assert_eq!(kind(&eval_with(&r, "env cargo publish")), Want::Ask);
     assert_eq!(kind(&eval_with(&r, "cargo build")), Want::Allow);
+}
+
+#[test]
+fn computed_command_names_with_deny() {
+    use Want::{Ask, Unlisted};
+    check(
+        &rules(&[], &["npm publish*"], &[]),
+        &[("npm $(echo publish)", Ask), ("npm test", Unlisted)],
+    );
 }
 
 #[test]

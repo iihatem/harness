@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::argv::{Tok, display, quote};
-use crate::matching::argv_matches;
+use crate::matching::{argv_matches, argv_may_match};
 use crate::parse::analyze;
 use crate::paths::Workspace;
 
@@ -45,6 +45,15 @@ pub fn evaluate(command: &str, rules: &Rules, workspace: &Path) -> Verdict {
             reason: format!("`{}` matches deny rule `bash:{rule}`", display(form)),
         };
     }
+    if let Some((form, rule)) = first_possible_match(&a.forms, &rules.deny) {
+        return Verdict::Ask {
+            reason: format!(
+                "`{}` may match deny rule `bash:{rule}` (part of it is only known at run time)",
+                display(form)
+            ),
+            destructive: false,
+        };
+    }
     let destructive = !a.destructive.is_empty();
     if !a.undecomposable.is_empty() {
         let mut reason = format!(
@@ -71,6 +80,15 @@ pub fn evaluate(command: &str, rules: &Rules, workspace: &Path) -> Verdict {
             destructive: false,
         };
     }
+    if let Some((form, rule)) = first_possible_match(&a.forms, &rules.confirm) {
+        return Verdict::Ask {
+            reason: format!(
+                "`{}` may match confirm rule `bash:{rule}` (part of it is only known at run time)",
+                display(form)
+            ),
+            destructive: false,
+        };
+    }
     if !a.ask.is_empty() {
         return Verdict::Ask {
             reason: a.ask.join("; "),
@@ -92,6 +110,16 @@ pub fn evaluate(command: &str, rules: &Rules, workspace: &Path) -> Verdict {
 fn first_match<'a>(forms: &'a [Vec<Tok>], patterns: &'a [String]) -> Option<(&'a [Tok], &'a str)> {
     forms.iter().find_map(|form| {
         let rule = patterns.iter().find(|p| argv_matches(p, form))?;
+        Some((form.as_slice(), rule.as_str()))
+    })
+}
+
+fn first_possible_match<'a>(
+    forms: &'a [Vec<Tok>],
+    patterns: &'a [String],
+) -> Option<(&'a [Tok], &'a str)> {
+    forms.iter().find_map(|form| {
+        let rule = patterns.iter().find(|p| argv_may_match(p, form))?;
         Some((form.as_slice(), rule.as_str()))
     })
 }

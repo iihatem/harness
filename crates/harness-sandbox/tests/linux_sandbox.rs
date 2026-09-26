@@ -24,6 +24,7 @@
 use std::ffi::OsStr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -216,7 +217,8 @@ impl Pty {
     /// so this must never panic even under `HARNESS_REQUIRE_LINUX_SANDBOX=1`.
     fn open() -> Option<Self> {
         // SAFETY: `posix_openpt` takes only an integer flag; no pointers.
-        let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        let master_fd =
+            unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
         if master_fd < 0 {
             eprintln!(
                 "posix_openpt failed (test-environment prerequisite, not the sandbox): {}",
@@ -464,9 +466,12 @@ async fn workspace_write_denies_write_to_a_freshly_allocated_pty_slave() {
     };
     // Control: the unsandboxed test process itself must be able to write to
     // its own pty slave, so a denial below can only be attributed to the
-    // sandbox, not to ordinary DAC permissions.
+    // sandbox, not to ordinary DAC permissions. `O_NOCTTY`: this process
+    // has no controlling terminal to give up, but opening a slave without
+    // it can make the slave become one — avoid that side effect.
     std::fs::OpenOptions::new()
         .write(true)
+        .custom_flags(libc::O_NOCTTY)
         .open(pty.slave_path())
         .expect("test process should be able to open its own pty slave for writing");
     let policy = workspace_write_policy(ws.path());
@@ -497,6 +502,7 @@ async fn read_only_denies_write_to_a_freshly_allocated_pty_slave() {
     // Control: see the WorkspaceWrite variant above.
     std::fs::OpenOptions::new()
         .write(true)
+        .custom_flags(libc::O_NOCTTY)
         .open(pty.slave_path())
         .expect("test process should be able to open its own pty slave for writing");
     let policy = read_only_policy(ws.path());
@@ -568,6 +574,9 @@ async fn workspace_write_denies_append_to_an_outside_file() {
 /// calls `truncate(2)` directly on the path (no `open()` involved at all),
 /// and `os.open(path, O_RDONLY | O_TRUNC)` opens read-only but still asks
 /// the kernel to truncate — a request `WRITE_FILE` alone does not gate.
+/// Both are denied by Landlock's own `hook_path_truncate`/`hook_file_truncate`
+/// with `-EACCES`, not `EPERM` (`EPERM` here would indicate the denial came
+/// from somewhere other than Landlock, e.g. ordinary DAC permissions).
 #[tokio::test]
 async fn workspace_write_denies_truncate_right_on_an_outside_file() {
     let Some(ws) = new_workspace() else {
@@ -591,8 +600,8 @@ path = {outside_literal}
 try:
     os.truncate(path, 0)
 except OSError as exc:
-    if exc.errno != errno.EPERM:
-        print(f"os.truncate: expected EPERM, got {{exc.errno}}", file=sys.stderr)
+    if exc.errno != errno.EACCES:
+        print(f"os.truncate: expected EACCES, got {{exc.errno}}", file=sys.stderr)
         sys.exit(1)
 else:
     print("os.truncate unexpectedly succeeded", file=sys.stderr)
@@ -601,8 +610,8 @@ else:
 try:
     fd = os.open(path, os.O_RDONLY | os.O_TRUNC)
 except OSError as exc:
-    if exc.errno != errno.EPERM:
-        print(f"os.open(O_RDONLY|O_TRUNC): expected EPERM, got {{exc.errno}}", file=sys.stderr)
+    if exc.errno != errno.EACCES:
+        print(f"os.open(O_RDONLY|O_TRUNC): expected EACCES, got {{exc.errno}}", file=sys.stderr)
         sys.exit(1)
 else:
     os.close(fd)

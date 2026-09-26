@@ -292,9 +292,14 @@ fn verify_prologue(program: &BpfProgram) -> io::Result<()> {
 /// nothing after this point ever jumps to a target before it. Inserting a
 /// fixed-size, self-contained block at this one fixed offset therefore
 /// cannot invalidate any jump target already computed elsewhere in the
-/// program — this is checked directly by
-/// [`x32_denial_block_lands_exactly_after_the_prologue`] and
-/// [`rules_after_the_x32_block_are_unchanged_and_still_reachable`] below.
+/// program. The tests below don't inspect jump resolution directly — that
+/// argument is the reasoning above, not something they execute — but they
+/// do check the two facts that argument depends on:
+/// [`x32_denial_block_lands_exactly_after_the_prologue`] checks the spliced
+/// block's own instructions and their index, and
+/// [`rules_after_the_x32_block_are_unchanged_and_still_reachable`] checks
+/// that everything after it is byte-identical to the unpatched program,
+/// merely shifted by exactly 3.
 #[cfg(target_arch = "x86_64")]
 fn deny_x32_syscalls(program: &mut BpfProgram) {
     use bpf_opcode::{JMP_JGE_K, LD_W_ABS, RET_K};

@@ -49,13 +49,28 @@ pub fn landlock_abi() -> Option<i32> {
 }
 
 /// Whether this process can rely on the Linux sandbox backend: the Landlock
-/// half requires kernel ABI >= 3. The architecture check that used to live
-/// here is now a compile-time gate instead: the whole `linux` module (see
-/// `lib.rs`) only builds on `x86_64`/`aarch64`, the two architectures the
-/// seccomp filter knows how to target, so by the time this function can even
-/// be called the architecture is already known-good.
+/// half requires kernel ABI >= 3, and the seccomp half requires the
+/// network-deny filter to actually build (see [`super::seccomp::build_network_deny_filter`],
+/// which includes its own prologue-shape check). The architecture check
+/// that used to live here is now a compile-time gate instead: the whole
+/// `linux` module (see `lib.rs`) only builds on `x86_64`/`aarch64`, the two
+/// architectures the seccomp filter knows how to target, so by the time
+/// this function can even be called the architecture is already known-good.
+///
+/// Building the filter here — the same filter [`super::linux_sandbox_command`]
+/// builds again, independently, at actual spawn time — is deliberately
+/// redundant: the point of this function is that callers use it to decide
+/// *whether* to offer the sandbox at all, before ever trying to spawn
+/// anything. If the filter can't build (e.g. a future `seccompiler` upgrade
+/// changed the shape [`super::seccomp::verify_prologue`] checks, without
+/// this crate's version pin being bumped deliberately — see the workspace
+/// manifest), this must report unavailable, not available-but-broken: with
+/// no sandbox detected, every `bash` call asks for approval instead; if this
+/// reported available anyway, every sandboxed spawn would instead fail
+/// outright.
 pub fn linux_sandbox_available() -> bool {
     landlock_abi().is_some_and(|abi| abi >= MIN_SUPPORTED_ABI)
+        && super::seccomp::build_network_deny_filter().is_ok()
 }
 
 #[cfg(test)]
@@ -65,5 +80,16 @@ mod tests {
     #[test]
     fn min_supported_abi_rejects_abi_below_3() {
         const { assert!(MIN_SUPPORTED_ABI >= 3) };
+    }
+
+    #[test]
+    fn network_deny_filter_builds_on_this_host_architecture() {
+        // Independent of Landlock support: `linux_sandbox_available`'s
+        // seccomp half should always succeed on x86_64/aarch64, the only
+        // architectures this module compiles for at all.
+        assert!(
+            crate::linux::seccomp::build_network_deny_filter().is_ok(),
+            "the seccomp filter should always build on this architecture"
+        );
     }
 }

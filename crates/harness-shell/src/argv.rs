@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use brush_parser::word::{WordPiece, WordPieceWithSource};
+use brush_parser::word::{Parameter, ParameterExpr, WordPiece, WordPieceWithSource};
 
 /// Nesting limit for command substitutions, `sh -c`, `eval` and similar re-parsing.
 pub(crate) const MAX_DEPTH: usize = 8;
@@ -61,6 +61,39 @@ pub(crate) fn substitutions_in(text: &str, subs: &mut Vec<String>) -> Result<(),
     scan_nested(text, subs, 0)
 }
 
+/// Whether `text` contains a command-substitution marker (`$(`, `${` or a backtick).
+/// bash may run it even from inside quotes when it re-evaluates the text as arithmetic.
+pub(crate) fn subst_marker(text: &str) -> bool {
+    text.contains("$(") || text.contains("${") || text.contains('`')
+}
+
+/// Scans text that bash evaluates as an arithmetic expression. Unquoted substitutions
+/// are collected as usual, but a marker surviving quote removal (single-quoted or
+/// escaped) means the arithmetic evaluation can run a command, which is undecomposable.
+pub(crate) fn arithmetic_in(text: &str, subs: &mut Vec<String>) -> Result<(), String> {
+    arith_scan(text, subs, 0)
+}
+
+fn arith_scan(text: &str, subs: &mut Vec<String>, depth: usize) -> Result<(), String> {
+    if !text.contains(['$', '`']) {
+        return Ok(());
+    }
+    let mut b = Builder::default();
+    match brush_parser::word::parse(text, &parser_options()) {
+        Ok(pieces) => b.pieces(text, &pieces, false, subs, depth)?,
+        Err(_) if subst_marker(text) => {
+            return Err("arithmetic text may run a command substitution".into());
+        }
+        Err(_) => return Ok(()),
+    }
+    // A marker left in the resolved text was quoted or escaped, so brush did not expose
+    // it as a live substitution, but the arithmetic evaluation still runs it.
+    if subst_marker(&b.text) {
+        return Err("arithmetic text may run a command substitution".into());
+    }
+    Ok(())
+}
+
 /// Collects command substitutions nested in expansion text such as `X:-$(cmd)` or an
 /// arithmetic expression.
 fn scan_nested(text: &str, subs: &mut Vec<String>, depth: usize) -> Result<(), String> {
@@ -116,12 +149,26 @@ impl Builder {
                     self.text.push_str(e.strip_prefix('\\').unwrap_or(e));
                 }
                 WordPiece::TildeExpansion(_) => self.dynamic = true,
-                WordPiece::ParameterExpansion(_) => {
+                WordPiece::ParameterExpansion(pe) => {
                     self.dynamic = true;
                     // `${X:-$(cmd)}` runs cmd: re-parse the braces' content.
                     let raw = src.get(p.start_index..p.end_index).unwrap_or_default();
                     if let Some(inner) = raw.strip_prefix("${").and_then(|r| r.strip_suffix('}')) {
                         scan_nested(inner, subs, depth + 1)?;
+                    }
+                    // An array subscript or a substring offset is evaluated as arithmetic.
+                    match pe {
+                        ParameterExpr::Parameter {
+                            parameter: Parameter::NamedWithIndex { index, .. },
+                            ..
+                        } => arith_scan(index, subs, depth + 1)?,
+                        ParameterExpr::Substring { offset, length, .. } => {
+                            arith_scan(&offset.value, subs, depth + 1)?;
+                            if let Some(length) = length {
+                                arith_scan(&length.value, subs, depth + 1)?;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 WordPiece::CommandSubstitution(c) | WordPiece::BackquotedCommandSubstitution(c) => {
@@ -130,7 +177,7 @@ impl Builder {
                 }
                 WordPiece::ArithmeticExpression(e) => {
                     self.dynamic = true;
-                    scan_nested(&e.value, subs, depth + 1)?;
+                    arith_scan(&e.value, subs, depth + 1)?;
                 }
             }
         }

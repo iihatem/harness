@@ -17,6 +17,15 @@ use crate::wrappers::{self, Next, assigned_name, runs_programs};
 const MAX_INPUT_CHARS: usize = 10_000;
 /// Builtins whose `NAME=value` operands set shell variables.
 const DECLARATION_BUILTINS: &[&str] = &["export", "declare", "typeset", "local", "readonly"];
+
+/// A declaration operand the shell expands as an assignment, at a known argv position.
+enum Operand<'a> {
+    /// `NAME=…`, whose NAME is literal.
+    Name(&'a str),
+    /// `NAME[i]=…`; a shell without arrays glob-expands the subscript, so the NAME is
+    /// not trustworthy.
+    Array,
+}
 /// Nesting limit for wrapper commands (`sudo env nice …`).
 const MAX_LAYERS: usize = 16;
 /// Nesting limit for brackets, compound commands and command lists; keeps both the
@@ -317,13 +326,17 @@ impl Walker<'_> {
                 .word_or_name
                 .as_ref()
                 .is_some_and(|w| DECLARATION_BUILTINS.contains(&w.value.as_str()));
-        // Argv positions of those operands, with their literal NAME.
+        // Those operands, by argv position.
         let mut assignments = Vec::new();
         for item in cmd.suffix.iter().flat_map(|s| &s.0) {
             if let Item::AssignmentWord(assignment, _) = item
                 && expands_assignments
             {
-                assignments.push((argv.len(), assignment_name(assignment)));
+                let operand = match &assignment.name {
+                    ast::AssignmentName::VariableName(n) => Operand::Name(n),
+                    ast::AssignmentName::ArrayElementName(..) => Operand::Array,
+                };
+                assignments.push((argv.len(), operand));
             }
             self.item(item, &mut argv, cwd, depth);
         }
@@ -360,7 +373,7 @@ impl Walker<'_> {
 
     fn assignment(&mut self, assignment: &ast::Assignment, cwd: &Cwd, depth: usize) {
         if let ast::AssignmentName::ArrayElementName(_, index) = &assignment.name {
-            self.expansion(index, cwd, depth);
+            self.arith(index, cwd, depth);
         }
         match &assignment.value {
             ast::AssignmentValue::Scalar(w) => {
@@ -393,6 +406,16 @@ impl Walker<'_> {
     fn expansion(&mut self, text: &str, cwd: &Cwd, depth: usize) {
         let mut subs = Vec::new();
         if let Err(why) = argv::substitutions_in(text, &mut subs) {
+            self.undecomposable(why);
+        }
+        self.substitutions(subs, cwd, depth);
+    }
+
+    /// Analyzes text the shell evaluates as arithmetic (a subscript, `let` operand, …);
+    /// a substitution surviving quote removal there is undecomposable.
+    fn arith(&mut self, text: &str, cwd: &Cwd, depth: usize) {
+        let mut subs = Vec::new();
+        if let Err(why) = argv::arithmetic_in(text, &mut subs) {
             self.undecomposable(why);
         }
         self.substitutions(subs, cwd, depth);
@@ -481,12 +504,12 @@ impl Walker<'_> {
     }
 
     /// Runs one argv: records its deny forms, then unwraps wrapper commands.
-    /// `assignments` lists the argv positions (and literal NAMEs) of `NAME=value`
-    /// operands the shell expands as assignments.
+    /// `assignments` lists the argv positions of `NAME=value` operands the shell
+    /// expands as assignments.
     fn exec(
         &mut self,
         argv: Vec<Tok>,
-        assignments: &[(usize, &str)],
+        assignments: &[(usize, Operand)],
         cwd: &mut Cwd,
         depth: usize,
         layer: usize,
@@ -534,7 +557,7 @@ impl Walker<'_> {
     fn run(
         &mut self,
         argv: Vec<Tok>,
-        assignments: &[(usize, &str)],
+        assignments: &[(usize, Operand)],
         cwd: &mut Cwd,
         same_shell: bool,
     ) {
@@ -552,6 +575,12 @@ impl Walker<'_> {
         if DECLARATION_BUILTINS.contains(&name) {
             self.declaration_operands(name, &argv, assignments);
         }
+        if name == "let" {
+            self.let_operands(&argv);
+        }
+        if name == "alias" {
+            self.alias_operands(&argv);
+        }
         if same_shell {
             match name {
                 "cd" => cwd.cd(cd_target(&argv[1..])),
@@ -563,27 +592,64 @@ impl Walker<'_> {
     }
 
     /// Setting a variable that makes programs run other commands is as opaque as
-    /// running them; so is an operand whose NAME is only known at run time.
-    fn declaration_operands(&mut self, builtin: &str, argv: &[Tok], assignments: &[(usize, &str)]) {
+    /// running them; so is an operand whose NAME is only known at run time, an
+    /// array-subscript operand (a shell without arrays glob-expands it), and a literal
+    /// value that bash may re-evaluate as arithmetic.
+    fn declaration_operands(
+        &mut self,
+        builtin: &str,
+        argv: &[Tok],
+        assignments: &[(usize, Operand)],
+    ) {
+        let opaque = |walker: &mut Self| {
+            walker.undecomposable(format!("`{builtin}` operand is only known at run time"));
+        };
         for (i, arg) in argv.iter().enumerate().skip(1) {
+            let recorded = assignments.iter().find(|&(at, _)| *at == i).map(|(_, o)| o);
+            if matches!(recorded, Some(Operand::Array)) {
+                return opaque(self);
+            }
             let var = match arg {
+                Tok::Lit(s) if argv::subst_marker(s) => return opaque(self),
                 Tok::Lit(s) => Some(assigned_name(s)),
-                _ => assignments
-                    .iter()
-                    .find(|&&(at, _)| at == i)
-                    .map(|&(_, name)| name),
+                _ => match recorded {
+                    Some(Operand::Name(name)) => Some(*name),
+                    _ => return opaque(self),
+                },
             };
-            match var {
-                Some(var) if runs_programs(var) => {
-                    return self.undecomposable(format!(
-                        "sets `{var}`, which makes programs run other commands"
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    return self
-                        .undecomposable(format!("`{builtin}` operand is only known at run time"));
-                }
+            if let Some(var) = var
+                && runs_programs(var)
+            {
+                return self.undecomposable(format!(
+                    "sets `{var}`, which makes programs run other commands"
+                ));
+            }
+        }
+    }
+
+    /// `let` evaluates each operand as arithmetic; a substitution surviving quote
+    /// removal in one runs a command.
+    fn let_operands(&mut self, argv: &[Tok]) {
+        for arg in &argv[1..] {
+            if let Tok::Lit(s) = arg
+                && argv::subst_marker(s)
+            {
+                return self.undecomposable("`let` operand may run a command substitution".into());
+            }
+        }
+    }
+
+    /// An alias definition can change what a later command runs.
+    fn alias_operands(&mut self, argv: &[Tok]) {
+        for arg in &argv[1..] {
+            let defines = match arg {
+                Tok::Lit(s) => s.contains('='),
+                _ => true,
+            };
+            if defines {
+                return self.undecomposable(
+                    "defines an alias, which can change what later commands run".into(),
+                );
             }
         }
     }

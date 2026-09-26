@@ -2,7 +2,7 @@
 
 A terminal-first, open-source coding agent written in Rust, built for **hybrid development**: mix local models with frontier models so you get work done while saving subscription usage.
 
-> **Status: early development.** Milestone 1, phase P1 (foundation) is complete: a headless `harness ask` that runs multi-step coding tasks against any OpenAI-compatible model. Safety sandboxing, sessions, more providers, and the interactive terminal UI are in progress. Not ready for daily use yet.
+> **Status: early development.** Milestone 1, phases P1 (foundation) and P2 (safety) are complete: a headless `harness ask` that runs multi-step coding tasks against any OpenAI-compatible model in a sandboxed environment. Sessions, more providers, and the interactive terminal UI are in progress. Not ready for daily use yet.
 
 ## What works today
 
@@ -12,7 +12,9 @@ A terminal-first, open-source coding agent written in Rust, built for **hybrid d
 - Approval modes: `plan`, `read-only`, `ask`, `auto`, `full-access`. Default is `auto` inside a git repository and `ask` elsewhere.
 - Exit codes for scripting: `0` success, `1` runtime error, `2` invalid usage or no model, `3` an action was blocked for lack of approval, `130` interrupted.
 
-**No OS sandbox yet.** Until phase P2 lands, every shell command needs approval, and headless runs refuse them unless you pass `--mode full-access`. Only use `full-access` in a disposable checkout.
+**Sandboxed by default.** In `auto`, `plan` and `read-only` modes every shell command runs in an OS sandbox (Seatbelt on macOS, Landlock + seccomp on Linux 6.2+): no network access, and writes only inside the workspace and temp directories (none in `plan`/`read-only`). On macOS, git hooks and `.git` configuration stay read-only inside the sandbox; on Linux they do not yet (see Known limitations). Destructive commands (force-push, `reset --hard`, `rm -rf` of the workspace), commands the analyser cannot fully parse, and commands the sandbox blocks all need approval; headless runs refuse them and exit `3`. If the system has no usable sandbox, harness warns and asks before every command.
+
+Set `HARNESS_SANDBOX=none` to turn the sandbox off (every shell command then needs approval).
 
 ## Quick start
 
@@ -33,7 +35,26 @@ model = "ollama/qwen3:14b"
 protocol = "openai-chat"
 base_url = "https://llm.example.com/v1"
 api_key_env = "WORK_API_KEY"
+
+[permissions]
+allow = ["bash:cargo test*", "write:docs/*"]
+deny = ["bash:git push*"]
+confirm = ["bash:terraform apply*"]
+
+[sandbox]
+writable_roots = ["~/.cargo"]
 ```
+
+Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, model, providers, sandbox) only apply after `harness trust`.
+
+## Known limitations
+
+- **Linux git metadata:** Landlock can only grant access, so inside a writable workspace it cannot keep `.git/hooks` and `.git/config` read-only. A sandboxed command could plant a git hook that runs on your next `git` command. A stronger Linux backend is planned.
+- **Linux kernels older than 6.2** (Landlock ABI < 3) get no sandbox, so harness asks before every command.
+- **Shell analysis is best effort.** Deny rules match the commands harness can see through wrappers such as `env`, `sudo`, `bash -c` and `xargs`. They do not see inside script files or interpreters (`python -c`, `node -e`), and wrappers such as `busybox` are not unwrapped. The OS sandbox is the security boundary; rules are guardrails.
+- **Hard links:** on macOS, files with more than one hard link cannot be modified inside the sandbox. On Linux, hard links that already point outside the workspace stay writable.
+- **Git inside the sandbox** cannot create repositories or worktrees in the workspace (`git init`, `git clone`, `git worktree add`). A nested repository can still be moved out of the workspace, edited and moved back.
+- **Path rules** are matched after resolving symlinks. On macOS, write `/private/tmp/...` rather than `/tmp/...` in `allow` rules.
 
 ## Roadmap
 

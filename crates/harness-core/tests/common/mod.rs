@@ -4,9 +4,10 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use harness_core::agent::{Agent, AgentConfig, ApprovalDecision, ApprovalRequest, Approver};
+use harness_core::engine::{EngineConfig, PermissionEngine};
 use harness_core::event::{AgentEvent, TurnEndReason};
 use harness_core::message::ToolSpec;
-use harness_core::permission::{Action, BaselinePolicy, Mode};
+use harness_core::permission::{Action, Mode};
 use harness_core::testing::MockProvider;
 use harness_core::tool::{Tool, ToolContext, ToolOutput, ToolRegistry};
 use serde_json::{Value, json};
@@ -111,7 +112,13 @@ pub fn agent(
         Arc::new(Fail),
         Arc::new(Sleepy),
     ]);
-    let policy = Arc::new(BaselinePolicy::new(mode, dir, vec![]));
+    let policy = Arc::new(PermissionEngine::new(EngineConfig {
+        mode,
+        workspace: dir.to_path_buf(),
+        read_dirs: vec![],
+        rules: Default::default(),
+        sandbox_available: false,
+    }));
     let config = AgentConfig::new("mock/m1", "m1", "system prompt", dir.join(".spill"));
     Agent::new(
         provider,

@@ -6,8 +6,9 @@ use std::{
 
 use harness_core::{
     agent::{Agent, AgentConfig, NonInteractive},
+    engine::{EngineConfig, PermissionEngine},
     event::{AgentEvent, TurnEndReason},
-    permission::{BaselinePolicy, Mode},
+    permission::Mode,
     tool::ToolContext,
 };
 use harness_providers::registry;
@@ -96,11 +97,13 @@ pub async fn run(
         std::process::id()
     );
     let output_dir = setup.paths.state_dir.join("tool-output").join(run_id);
-    let policy = Arc::new(BaselinePolicy::new(
+    let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode,
-        &setup.workspace,
-        vec![output_dir.clone()],
-    ));
+        workspace: setup.workspace.clone(),
+        read_dirs: vec![output_dir.clone()],
+        rules: Default::default(),
+        sandbox_available: false,
+    }));
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),

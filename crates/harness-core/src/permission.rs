@@ -23,6 +23,14 @@ impl Mode {
     pub fn is_narrow(self) -> bool {
         matches!(self, Mode::Plan | Mode::ReadOnly | Mode::Ask)
     }
+
+    /// What a sandboxed shell command may write in this mode.
+    pub fn fs_access(self) -> FsAccess {
+        match self {
+            Mode::Plan | Mode::ReadOnly => FsAccess::ReadOnly,
+            Mode::Ask | Mode::Auto | Mode::FullAccess => FsAccess::WorkspaceWrite,
+        }
+    }
 }
 
 impl FromStr for Mode {
@@ -67,6 +75,13 @@ pub enum Decision {
     Allow,
     Ask(String),
     Deny(String),
+}
+
+/// Filesystem access given to a sandboxed shell command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsAccess {
+    ReadOnly,
+    WorkspaceWrite,
 }
 
 /// Resolves `path` (absolute, or relative to `workspace`) to an absolute path. Symlinks are followed
@@ -142,91 +157,10 @@ pub fn resolve_path(workspace: &Path, path: &Path) -> PathBuf {
 /// Decides whether an action may run, must be approved, or is refused.
 pub trait PermissionPolicy: Send + Sync {
     fn check(&self, action: &Action) -> Decision;
-}
 
-/// The P1 policy: mode-based decisions with no OS sandbox. Because no sandbox exists yet, every shell
-/// command needs approval outside `full-access` (no silent unsandboxed fallback). P2 replaces this.
-#[derive(Debug, Clone)]
-pub struct BaselinePolicy {
-    mode: Mode,
-    workspace: PathBuf,
-    read_dirs: Vec<PathBuf>,
-}
-
-impl BaselinePolicy {
-    pub fn new(mode: Mode, workspace: &Path, read_dirs: Vec<PathBuf>) -> Self {
-        // The per-run tool-output dir may not exist yet when the policy is built, so we can't
-        // `canonicalize` it (that requires every component to exist). `resolve_path` follows
-        // symlinks component by component and tolerates a non-existent tail, so use it instead,
-        // resolving against `/` since these inputs are (or are made) absolute.
-        let root = Path::new("/");
-        let absolute = |p: &Path| -> PathBuf {
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(p)
-            }
-        };
-        let resolve = |p: &Path| resolve_path(root, &absolute(p));
-        BaselinePolicy {
-            mode,
-            workspace: resolve(workspace),
-            read_dirs: read_dirs.iter().map(|d| resolve(d)).collect(),
-        }
-    }
-
-    pub fn mode(&self) -> Mode {
-        self.mode
-    }
-}
-
-impl PermissionPolicy for BaselinePolicy {
-    fn check(&self, action: &Action) -> Decision {
-        if self.mode == Mode::FullAccess {
-            return Decision::Allow;
-        }
-        match action {
-            Action::Read(path) => {
-                let target = resolve_path(&self.workspace, path);
-                if target.starts_with(&self.workspace)
-                    || self.read_dirs.iter().any(|d| target.starts_with(d))
-                {
-                    Decision::Allow
-                } else {
-                    Decision::Ask(format!("read outside the workspace: {}", target.display()))
-                }
-            }
-            Action::Write(path) => {
-                if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
-                    return Decision::Deny(format!(
-                        "file writes are not allowed in {} mode",
-                        self.mode
-                    ));
-                }
-                let target = resolve_path(&self.workspace, path);
-                if !target.starts_with(&self.workspace) {
-                    Decision::Ask(format!("write outside the workspace: {}", target.display()))
-                } else if target
-                    .strip_prefix(&self.workspace)
-                    .ok()
-                    .into_iter()
-                    .flat_map(|rest| rest.components())
-                    .any(|c| c.as_os_str() == ".git")
-                {
-                    Decision::Ask(
-                        "write inside .git (hooks and config can run commands)".to_string(),
-                    )
-                } else if self.mode == Mode::Auto {
-                    Decision::Allow
-                } else {
-                    Decision::Ask(format!("write {}", target.display()))
-                }
-            }
-            Action::Bash(command) => {
-                Decision::Ask(format!("run `{command}` (no sandbox is available yet)"))
-            }
-        }
+    /// Records that the user approved `action` for the rest of the session. Returns whether anything
+    /// was remembered (destructive commands never are).
+    fn remember(&self, _action: &Action) -> bool {
+        false
     }
 }

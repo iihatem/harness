@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
+harness-shell.workspace = true
 hex.workspace = true
 jsonschema.workspace = true
 serde.workspace = true

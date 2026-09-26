@@ -83,7 +83,7 @@ Model ids are `<provider>/<model>` (e.g. `ollama/qwen3-coder:30b`, `chatgpt/<mod
 
 ### D4. Tools
 
-Six tools with short descriptions and a fixed definition order. `write`/`edit` enforce read-before-overwrite with a content hash. `bash` is non-interactive (`sh -c`) in its own process group. Tool output larger than 10 KB, or larger than the active model's output budget, is saved to `$XDG_STATE_HOME/harness/tool-output/<session>/<call-id>.txt`; the model receives the head, the tail, the omitted size, and the file path, which it may `read` without approval. `grep`/`glob` use ripgrep's `ignore` and `grep` crates.
+Six tools with short descriptions and a fixed definition order. `write`/`edit` enforce read-before-overwrite with a content hash. `bash` runs `bash --noprofile --norc -c` (falling back to `sh -c` only when bash is not installed) with `BASH_ENV` and `ENV` removed, so the shell that runs a command is the shell whose syntax the rules engine analysed (D16). Outside `full-access` the command is wrapped by the OS sandbox (D5); the child becomes the leader of its own process group so timeouts and interrupts kill everything it started. Tool output larger than 10 KB, or larger than the active model's output budget, is saved to `$XDG_STATE_HOME/harness/tool-output/<session>/<call-id>.txt`; the model receives the head, the tail, the omitted size, and the file path, which it may `read` without approval. `grep`/`glob` use ripgrep's `ignore` and `grep` crates.
 
 ### D5. Permissions and sandbox
 
@@ -101,7 +101,11 @@ Six tools with short descriptions and a fixed definition order. `write`/`edit` e
 - **Destructive commands** always require approval outside `full-access`, even in `auto` or when allow-listed: `git push --force`/`-f`, `git reset --hard`, `git clean` with `-f`, `git checkout -- .`/`git restore .`, `rm -r` targeting the workspace root or a path outside it, and any user-configured `confirm` patterns.
 - Reads (`read`, `grep`, `glob`) outside the workspace require approval except for harness's own tool-output directory and configured `read_dirs`.
 - When a sandboxed command fails because of a sandbox denial, the interactive UI offers to re-run it unsandboxed with approval. If no sandbox mechanism is available, every `bash` call requires approval (except in `full-access`). There is never a silent unsandboxed fallback.
-- macOS uses `sandbox-exec` with a generated Seatbelt profile (as Codex and Claude Code do). Linux uses Landlock for the filesystem and seccomp to deny network sockets, plus bubblewrap when installed.
+- **macOS** uses `/usr/bin/sandbox-exec` (absolute path) with a generated Seatbelt profile, as Codex and Claude Code do. **Linux** uses Landlock for the filesystem and seccomp to refuse non-`AF_UNIX` sockets, applied in the forked child before exec (no helper binary); Landlock ABI ≥ 2 is required. bubblewrap is deferred past M1 because Ubuntu 24.04+ restricts the unprivileged user namespaces it needs. On Linux the network denial also covers localhost; `sandbox.allow_localhost` works on macOS only.
+- **Workspace-write sandboxes** allow writes under the workspace, `$TMPDIR`, `/tmp`, `/var/tmp`, the macOS user cache directory, and `sandbox.writable_roots`; they deny writes to `.git/config`, `.git/hooks/`, the `.git` entry itself, a top-level `HEAD`, and `.harness/`, so hooks and repository config cannot be planted while `git commit`, `checkout` and `stash` still work. Inherited file descriptors above 2 are closed before exec.
+- **Classification in `auto`:** the rules engine (D16) returns allow-listed, unlisted, must-ask, or denied. `auto`, `plan` and `read-only` run allow-listed and unlisted commands sandboxed without a prompt; `ask` prompts for unlisted commands; must-ask always prompts outside `full-access`.
+- **Sandbox denials** are recognised heuristically (non-zero exit plus "operation not permitted", "permission denied", "read-only file system", "sandbox", or, with network off, name-resolution and "network is unreachable" phrases). The agent then asks to re-run the command outside the sandbox; headless runs report the command as blocked.
+- **Approve for session** remembers per-sub-command prefixes (the program, plus the first argument for subcommand-style tools such as `git`, `cargo`, `npm`), never for destructive commands.
 
 ### D6. Context and commands
 
@@ -127,7 +131,7 @@ ratatui inline viewport (as in Codex): a live region at the bottom (input, strea
 
 Paths follow the XDG base-directory spec on macOS and Linux: config `$XDG_CONFIG_HOME/harness` (default `~/.config/harness`), data `$XDG_DATA_HOME/harness` (default `~/.local/share/harness`: sessions, checkpoints, trust list, credential fallback), state `$XDG_STATE_HOME/harness` (default `~/.local/state/harness`: logs, tool output). `HARNESS_HOME`, when set, overrides all three with subdirectories of one path.
 
-TOML layering: global `config.toml` ← project `.harness/config.toml` ← CLI flags. Project settings that could widen the harness's reach (a `mode` other than `plan`/`read-only`/`ask`, `allow` rules, `read_dirs`, provider definitions or `base_url` overrides, and `full-access`) are applied only after the user trusts the workspace. On first interactive use of a workspace with such settings, harness shows them and asks; the decision is stored in the data directory. Headless runs ignore untrusted widening settings with a warning. Narrowing settings (`deny`, `confirm`, stricter modes) always apply.
+TOML layering: global `config.toml` ← project `.harness/config.toml` ← CLI flags. Project settings that could widen the harness's reach (a `mode` other than `plan`/`read-only`/`ask`, `model`, `[permissions].allow`, `read_dirs`, provider definitions or `base_url` overrides, and any `[sandbox]` setting) are applied only after the user trusts the workspace. Trust is stored in the data directory as a fingerprint (SHA-256) of those settings; if they change, the workspace is untrusted again. `harness trust` shows the settings and records trust; the interactive first-use prompt arrives with the terminal UI. Headless runs ignore untrusted widening settings with a warning. Narrowing settings (`deny`, `confirm`, stricter modes) always apply.
 
 Example global config:
 
@@ -180,6 +184,10 @@ Before the first mutating action of each turn (`write`, `edit`, or `bash` outsid
 ### D15. Cache-stable prompt prefix
 
 Local servers and hosted providers both reuse cached prompt prefixes, and cache misses dominate latency on Macs. Within a session, the system prompt and tool definitions are byte-identical across turns: the date and git status are captured once at session start, tool definitions keep a fixed order, and instruction files are read at session start. Mode changes, plan instructions, and similar context are appended as messages rather than edited into the prefix. Only compaction or a model switch rebuilds the prefix. Conversation history is append-only on the active branch.
+
+### D16. Shell command analysis
+
+`harness-shell` parses commands with `brush-parser` (pure Rust, bash grammar) and walks lists, `&&`/`||`, pipelines, subshells, brace groups, and command substitutions (recursively, depth ≤ 8). Words are split into literal and dynamic tokens after quote removal (`$'…'` decoded); a dynamic token only matches a `*` in a rule. Wrappers (`command`, `builtin`, `exec`, `nohup`, `time`, `nice`, `timeout`, `stdbuf`, `env`, `sudo`, `sh|bash -c`, `eval`, `xargs`, `find -exec`) are unwrapped so deny rules and destructive detection see the inner command; path prefixes and leading backslashes are stripped from command names. Rules match the shell-quoted argv. Loops, conditionals, functions, process substitution, parse errors and inputs over 10,000 characters are undecomposable and always prompt (after a best-effort deny/destructive scan). Destructive detection understands git global options, long-option abbreviations and short-flag clusters (`push -f/--force*/--mirror/--delete/+ref`, `reset --hard`, `clean` without `-n`, `checkout -f`/pathspecs, `restore` of the worktree) and recursive `rm` whose target is the workspace root, an ancestor, or outside it, tracking `cd` within the command.
 
 ### Design principles adopted from the research
 

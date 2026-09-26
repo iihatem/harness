@@ -27,7 +27,7 @@ The system SHALL read TOML configuration from the global `config.toml`, then the
 - **THEN** harness reports the unknown key with its file and line
 
 ### Requirement: Widening project settings require workspace trust
-The system SHALL apply project-level settings that widen what the agent may do (a `mode` other than `plan`, `read-only`, or `ask`; `allow` rules; `read_dirs`; provider definitions or `base_url` overrides) only when the user has trusted the workspace. On first interactive use of a workspace with such settings, the system MUST display them and ask whether to trust the workspace, and MUST remember the decision in the data directory. Headless runs MUST ignore untrusted widening settings with a warning. Narrowing settings (`deny`, `confirm`, stricter modes) MUST always apply.
+The system SHALL apply project-level settings that widen what the agent may do (a `mode` other than `plan`, `read-only`, or `ask`; `model`; `allow` rules; `read_dirs`; provider definitions or `base_url` overrides; `[sandbox]` settings) only when the user has trusted the workspace with the current set of those settings. Trust MUST be recorded in the data directory as a fingerprint of the widening settings; when they change, the workspace MUST be treated as untrusted until trusted again. On first interactive use of a workspace with such settings, the system MUST display them and ask whether to trust the workspace. Headless runs MUST ignore untrusted widening settings with a warning. Narrowing settings (`deny`, `confirm`, stricter modes) MUST always apply.
 
 #### Scenario: Cloned repository redirects a provider
 - **WHEN** a cloned repository's `.harness/config.toml` sets `providers.openai.base_url` to an unknown host and the workspace is not trusted
@@ -37,3 +37,14 @@ The system SHALL apply project-level settings that widen what the agent may do (
 #### Scenario: Deny rules apply without trust
 - **WHEN** an untrusted project config contains `deny = ["bash:git push*"]`
 - **THEN** `git push` is blocked in that project
+
+#### Scenario: Settings change after trust
+- **WHEN** a trusted workspace's project config later gains `providers.x.base_url`
+- **THEN** the widening settings are ignored with a warning until the workspace is trusted again
+
+### Requirement: Trusting a workspace from the command line
+The system SHALL provide `harness trust`, which displays the workspace's widening project settings and records trust after the user confirms interactively or passes `--yes`, and `harness trust --revoke`, which removes it. Without a terminal and without `--yes`, `harness trust` MUST exit with code 2 and explain how to confirm.
+
+#### Scenario: Trusting non-interactively
+- **WHEN** the user runs `harness trust --yes` in a workspace whose project config has an `allow` rule
+- **THEN** later runs in that workspace apply the rule without a warning

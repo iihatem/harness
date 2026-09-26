@@ -61,6 +61,10 @@ When approval is required interactively, the system SHALL offer: approve once; a
 - **WHEN** the user approves `cargo test` for the session and the model later runs `cargo test --all`
 - **THEN** the second command runs without a prompt
 
+#### Scenario: Session approval is scoped to the command prefix
+- **WHEN** the user approves `git status` for the session and the model later runs `git push`
+- **THEN** `git push` still requires approval
+
 ### Requirement: Non-interactive runs deny actions that need approval
 When no user can answer an approval prompt, the system SHALL deny the action, tell the model it was denied for lack of approval, and record that an action was blocked.
 
@@ -69,7 +73,7 @@ When no user can answer an approval prompt, the system SHALL deny the action, te
 - **THEN** the write is denied, the model is informed, and the process exits with code 3
 
 ### Requirement: Shell commands run in an OS sandbox
-Except in `full-access` mode, the system SHALL run `bash` commands and command-file shell expansions inside an OS sandbox (Seatbelt on macOS; Landlock and seccomp on Linux, or bubblewrap when installed) that permits writes only to the workspace and temporary directories (none in `plan` and `read-only`) and denies outbound network access. When a command fails because of a sandbox denial, the interactive interface MUST offer to re-run it without the sandbox, subject to approval.
+Except in `full-access` mode, the system SHALL run `bash` commands and command-file shell expansions inside an OS sandbox (Seatbelt on macOS; Landlock and seccomp on Linux) that permits writes only to the workspace, temporary directories, and configured writable roots (none in `plan` and `read-only`) and denies outbound network access. When a command fails because of a sandbox denial, the system MUST ask whether to re-run it without the sandbox; the re-run MUST NOT happen without approval.
 
 #### Scenario: Write outside the workspace
 - **WHEN** a sandboxed command runs `touch ../outside.txt`
@@ -92,3 +96,36 @@ The system SHALL resolve `write` and `edit` target paths to canonical absolute p
 #### Scenario: Symlink escape
 - **WHEN** the model edits `link/file.txt` where `link` is a symlink to a directory outside the workspace, in `auto` mode
 - **THEN** the edit requires approval
+
+### Requirement: Shell commands are classified before they run
+The system SHALL classify every shell command as allow-listed (every sub-command matches an allow rule), unlisted (fully decomposed with no deny, destructive, or confirm match), must-ask (undecomposable, destructive, or matching a `confirm` rule), or denied. In `auto`, `plan`, and `read-only` modes, allow-listed and unlisted commands MUST run in the sandbox without a prompt; in `ask` mode only allow-listed commands MAY run without a prompt; must-ask commands MUST prompt in every mode except `full-access`.
+
+#### Scenario: Unlisted command in auto mode
+- **WHEN** no rules are configured and the model runs `cargo build` in `auto` mode
+- **THEN** the command runs in the sandbox without an approval prompt
+
+#### Scenario: Unlisted command in ask mode
+- **WHEN** no rules are configured and the model runs `cargo build` in `ask` mode
+- **THEN** the user is asked to approve it
+
+#### Scenario: Undecomposable command in auto mode
+- **WHEN** the model runs `for f in *; do echo "$f"; done` in `auto` mode
+- **THEN** the user is asked to approve it
+
+### Requirement: The sandbox protects repository hooks and config
+In workspace-write sandboxes the system SHALL deny writes to `.git/config`, `.git/hooks`, the `.git` directory entry itself, a top-level `HEAD` file, and `.harness/` inside the workspace, while allowing other writes under `.git` so that commit, checkout, and stash work.
+
+#### Scenario: Planting a hook
+- **WHEN** a sandboxed command runs `echo x > .git/hooks/pre-commit` in `auto` mode
+- **THEN** the write fails
+
+#### Scenario: Committing
+- **WHEN** a sandboxed command runs `git commit --allow-empty -m test` in `auto` mode
+- **THEN** the commit succeeds
+
+### Requirement: Commands run in bash without startup files
+The system SHALL run shell commands with `bash --noprofile --norc -c` with `BASH_ENV` and `ENV` removed from the environment, falling back to `sh -c` only when bash is not installed.
+
+#### Scenario: BASH_ENV is ignored
+- **WHEN** `BASH_ENV` points to a script that creates a file and the model runs `true`
+- **THEN** the file is not created

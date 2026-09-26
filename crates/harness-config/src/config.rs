@@ -118,28 +118,28 @@ pub struct Widening {
 pub fn widening(project: &ConfigFile) -> Option<Widening> {
     let mut items = Vec::new();
     if let Some(mode) = project.mode.filter(|m| !m.is_narrow()) {
-        items.push(format!("mode = \"{mode}\""));
+        items.push(format!("mode = {mode:?}"));
     }
     if let Some(model) = &project.model {
-        items.push(format!("model = \"{model}\""));
+        items.push(format!("model = {model:?}"));
     }
     for rule in &project.permissions.allow {
-        items.push(format!("permissions.allow: \"{rule}\""));
+        items.push(format!("permissions.allow: {rule:?}"));
     }
     for dir in &project.permissions.read_dirs {
-        items.push(format!("permissions.read_dirs: \"{dir}\""));
+        items.push(format!("permissions.read_dirs: {dir:?}"));
     }
     for (name, provider) in &project.providers {
         items.push(format!(
-            "providers.{name}: protocol = {:?}, base_url = \"{}\", api_key_env = {:?}",
+            "providers.{name}: protocol = {:?}, base_url = {:?}, api_key_env = {:?}",
             provider.protocol, provider.base_url, provider.api_key_env
         ));
     }
     for root in &project.sandbox.writable_roots {
-        items.push(format!("sandbox.writable_roots: \"{root}\""));
+        items.push(format!("sandbox.writable_roots: {root:?}"));
     }
-    if let Some(allow) = project.sandbox.allow_localhost {
-        items.push(format!("sandbox.allow_localhost = {allow}"));
+    if let Some(true) = project.sandbox.allow_localhost {
+        items.push("sandbox.allow_localhost = true".to_string());
     }
     if items.is_empty() {
         return None;
@@ -192,6 +192,9 @@ pub fn load(
         }
         if let Some(mode) = project.mode.filter(|m| m.is_narrow()) {
             cfg.mode = Some(mode);
+        }
+        if let Some(false) = project.sandbox.allow_localhost {
+            cfg.allow_localhost = false;
         }
         match widening(&project) {
             None => {}

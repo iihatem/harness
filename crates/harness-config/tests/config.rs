@@ -101,7 +101,7 @@ fn untrusted_project_widening_settings_are_ignored_with_one_warning() {
     assert_eq!(cfg.providers["mock"].base_url, "http://127.0.0.1:9/v1");
     assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
     let warning = &cfg.warnings[0];
-    for needle in ["harness trust", "model", "full-access", "providers.mock"] {
+    for needle in ["harness trust", "model", "FullAccess", "providers.mock"] {
         assert!(warning.contains(needle), "{warning}");
     }
 }
@@ -192,6 +192,58 @@ fn a_typo_in_permissions_reports_file_and_line() {
         err.contains("config.toml") && err.contains("line 2") && err.contains("alow"),
         "{err}"
     );
+}
+
+#[test]
+fn widening_fingerprint_is_not_fooled_by_embedded_newlines() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws_a = dir.path().join("a");
+    let ws_b = dir.path().join("b");
+    std::fs::create_dir_all(ws_a.join(".harness")).unwrap();
+    std::fs::create_dir_all(ws_b.join(".harness")).unwrap();
+
+    // Config A: one allow rule with embedded newline and quote
+    std::fs::write(
+        ws_a.join(".harness/config.toml"),
+        "[permissions]\nallow = [\"x\\\"\\nmodel = \\\"m\"]\n",
+    )
+    .unwrap();
+
+    // Config B: two separate items (allow + model)
+    std::fs::write(
+        ws_b.join(".harness/config.toml"),
+        "model = \"m\"\n[permissions]\nallow = [\"x\"]\n",
+    )
+    .unwrap();
+
+    let widening_a = config::project_widening(&ws_a)
+        .unwrap()
+        .expect("config a has widening");
+    let widening_b = config::project_widening(&ws_b)
+        .unwrap()
+        .expect("config b has widening");
+
+    assert_ne!(
+        widening_a.fingerprint, widening_b.fingerprint,
+        "fingerprints should differ; a items: {:?}, b items: {:?}",
+        widening_a.items, widening_b.items
+    );
+}
+
+#[test]
+fn allow_localhost_false_narrows_and_applies_without_trust() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    std::fs::write(&global, "[sandbox]\nallow_localhost = true\n").unwrap();
+    std::fs::create_dir_all(dir.path().join(".harness")).unwrap();
+    std::fs::write(
+        dir.path().join(".harness/config.toml"),
+        "[sandbox]\nallow_localhost = false\n",
+    )
+    .unwrap();
+    let cfg = config::load(&global, dir.path(), &TrustStore::default()).unwrap();
+    assert!(!cfg.allow_localhost);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
 }
 
 #[test]

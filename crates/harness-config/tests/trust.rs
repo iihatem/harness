@@ -39,3 +39,13 @@ fn trust_is_keyed_by_the_canonical_path() {
     store.trust(&alias, "fp").unwrap();
     assert!(store.is_trusted(&ws, "fp"));
 }
+
+#[test]
+fn malformed_trust_store_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("trust.toml"), "invalid toml ][}{").unwrap();
+    let err = TrustStore::load(&data).unwrap_err().to_string();
+    assert!(err.contains("trust.toml"), "{err}");
+}

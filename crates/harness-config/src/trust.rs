@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeMap,
-    os::unix::fs::PermissionsExt,
+    fs::OpenOptions,
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    process,
 };
 
 use serde::{Deserialize, Serialize};
@@ -86,7 +89,21 @@ impl TrustStore {
             path: path.clone(),
             message: e.to_string(),
         })?;
-        std::fs::write(path, text).map_err(io)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(io)
+        let tmp_path = path.with_file_name(format!(
+            "{}.tmp-{}",
+            path.file_name().unwrap().to_string_lossy(),
+            process::id()
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(io)?;
+        file.write_all(text.as_bytes()).map_err(io)?;
+        file.sync_all().map_err(io)?;
+        drop(file);
+        std::fs::rename(&tmp_path, path).map_err(io)
     }
 }

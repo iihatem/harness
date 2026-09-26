@@ -10,6 +10,11 @@ publish = false
 harness-core.workspace = true
 tokio.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+libc.workspace = true
+seccompiler.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true

@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::policy::{FsAccess, SandboxPolicy};
+use crate::roots::{home_dir, safe_root};
 
 /// Absolute path, so a `getconf` earlier on PATH can never pick a writable root.
 const GETCONF_PATH: &str = "/usr/bin/getconf";
@@ -116,27 +117,6 @@ impl CanonPaths {
             extra_writable,
         })
     }
-}
-
-/// The canonical `$HOME`, when it is set to an absolute path.
-fn home_dir() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    if !home.is_absolute() {
-        return None;
-    }
-    Some(std::fs::canonicalize(&home).unwrap_or(home))
-}
-
-/// Canonicalizes a candidate temp/cache root taken from the environment or
-/// `getconf`. Returns `None` when it is relative, does not exist, or is too
-/// broad to make writable: `/`, `home`, or an ancestor of `home`.
-fn safe_root(candidate: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    if !candidate.is_absolute() {
-        return None;
-    }
-    let canon = std::fs::canonicalize(candidate).ok()?;
-    let too_broad = canon.parent().is_none() || home.is_some_and(|home| home.starts_with(&canon));
-    (!too_broad).then_some(canon)
 }
 
 /// The `TMPDIR` root: `env_tmpdir` if [`safe_root`] accepts it, otherwise
@@ -357,40 +337,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let canon = dir.path().canonicalize().unwrap();
         (dir, canon)
-    }
-
-    #[test]
-    fn safe_root_rejects_root_home_and_its_ancestors() {
-        let (_d, home) = canon_tempdir();
-        let parent = home.parent().unwrap().to_path_buf();
-        assert_eq!(safe_root(Path::new("/"), Some(&home)), None);
-        assert_eq!(safe_root(Path::new("/"), None), None);
-        assert_eq!(safe_root(&home, Some(&home)), None);
-        assert_eq!(safe_root(&parent, Some(&home)), None);
-        // Non-canonical spellings are canonicalized before the check.
-        std::fs::create_dir(home.join("sub")).unwrap();
-        assert_eq!(safe_root(&home.join("."), Some(&home)), None);
-        assert_eq!(safe_root(&home.join("sub/.."), Some(&home)), None);
-        assert_eq!(safe_root(&home.join("sub/../.."), Some(&home)), None);
-    }
-
-    #[test]
-    fn safe_root_accepts_a_directory_inside_home_or_elsewhere() {
-        let (_d, home) = canon_tempdir();
-        let inside = home.join("tmp");
-        std::fs::create_dir(&inside).unwrap();
-        assert_eq!(safe_root(&inside, Some(&home)), Some(inside.clone()));
-        let (_e, other) = canon_tempdir();
-        assert_eq!(safe_root(&other, Some(&home)), Some(other.clone()));
-        assert_eq!(safe_root(&other, None), Some(other));
-    }
-
-    #[test]
-    fn safe_root_rejects_relative_and_missing_paths() {
-        let (_d, home) = canon_tempdir();
-        assert_eq!(safe_root(Path::new("."), Some(&home)), None);
-        assert_eq!(safe_root(Path::new("tmp"), Some(&home)), None);
-        assert_eq!(safe_root(&home.join("missing"), Some(&home)), None);
     }
 
     #[test]

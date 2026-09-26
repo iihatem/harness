@@ -25,7 +25,16 @@ pub enum Verdict {
     Unlisted,
     /// Must prompt regardless of mode: undecomposable input, destructive command, or
     /// a `confirm` rule match.
-    Ask { reason: String, destructive: bool },
+    Ask {
+        reason: String,
+        destructive: bool,
+        /// Whether a `deny` rule could apply here even though it didn't definitely match: a
+        /// possible deny match, or an undecomposable command while any `deny` rule exists (it
+        /// could be hiding a denied one). Callers that let destructive/confirm-only asks
+        /// through in a fully trusted mode must still refuse when this is set, since deny
+        /// rules are meant to win in every mode.
+        may_deny: bool,
+    },
     /// A deny rule matched (deny still wins over everything).
     Deny { reason: String },
 }
@@ -46,17 +55,21 @@ pub fn evaluate(command: &str, rules: &Rules, workspace: &Path) -> Verdict {
     }
     let destructive = !a.destructive.is_empty();
     let mut reasons = Vec::new();
+    let mut may_deny = false;
     if let Some((form, rule)) = first_possible_match(&a.forms, &rules.deny) {
         reasons.push(format!(
             "`{}` may match deny rule `bash:{rule}` (part of it is only known at run time)",
             display(form)
         ));
+        may_deny = true;
     }
     if !a.undecomposable.is_empty() {
         reasons.push(format!(
             "cannot fully analyze the command: {}",
             a.undecomposable.join("; ")
         ));
+        // An undecomposable command could be hiding a denied one.
+        may_deny = may_deny || !rules.deny.is_empty();
     }
     if destructive {
         reasons.push(format!("destructive: {}", a.destructive.join("; ")));
@@ -65,12 +78,14 @@ pub fn evaluate(command: &str, rules: &Rules, workspace: &Path) -> Verdict {
         return Verdict::Ask {
             reason: reasons.join("; "),
             destructive,
+            may_deny,
         };
     }
     if let Some((form, rule)) = first_match(&a.forms, &rules.confirm) {
         return Verdict::Ask {
             reason: format!("`{}` matches confirm rule `bash:{rule}`", display(form)),
             destructive: false,
+            may_deny: false,
         };
     }
     if let Some((form, rule)) = first_possible_match(&a.forms, &rules.confirm) {
@@ -80,12 +95,14 @@ pub fn evaluate(command: &str, rules: &Rules, workspace: &Path) -> Verdict {
                 display(form)
             ),
             destructive: false,
+            may_deny: false,
         };
     }
     if !a.ask.is_empty() {
         return Verdict::Ask {
             reason: a.ask.join("; "),
             destructive: false,
+            may_deny: false,
         };
     }
     let listed = !a.commands.is_empty()

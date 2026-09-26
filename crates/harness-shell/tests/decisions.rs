@@ -650,9 +650,47 @@ fn reasons_name_the_rule() {
         Verdict::Ask {
             reason,
             destructive: true,
+            ..
         } => assert!(reason.contains("ancestor"), "{reason}"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn may_deny_flags_hidden_or_possible_deny_matches() {
+    fn may_deny(v: &Verdict) -> bool {
+        match v {
+            Verdict::Ask { may_deny, .. } => *may_deny,
+            other => panic!("expected Ask, got {other:?}"),
+        }
+    }
+
+    let deny_rules = rules(&[], &["curl*", "git push*"], &[]);
+
+    // A possible deny match (the command name, or an argument, is only known at run time):
+    // may_deny is set even though the match isn't definite.
+    assert!(may_deny(&eval_with(&deny_rules, "$(echo curl) https://x")));
+    assert!(may_deny(&eval_with(&deny_rules, "c=curl; $c https://x")));
+    assert!(may_deny(&eval_with(&deny_rules, "git $X origin")));
+
+    // Undecomposable (not a possible-match, just unanalyzable) while any deny rule exists:
+    // it could be hiding a denied command, so may_deny is set too.
+    assert!(may_deny(&eval_with(&deny_rules, "echo curl x | sh")));
+    assert!(may_deny(&eval_with(&deny_rules, "git -c alias.p=push p")));
+
+    // Destructive-only ask with no deny rules configured: nothing to hide, never may_deny.
+    let no_deny = rules(&[], &[], &[]);
+    assert!(!may_deny(&eval_with(&no_deny, "git reset --hard HEAD~1")));
+
+    // Undecomposable, but no deny rules configured: still nothing to hide.
+    assert!(!may_deny(&eval_with(&no_deny, "echo curl x | sh")));
+
+    // A confirm-only ask is not a deny concern.
+    let confirm_rules = rules(&[], &["curl*"], &["terraform apply*"]);
+    assert!(!may_deny(&eval_with(
+        &confirm_rules,
+        "terraform apply -auto-approve"
+    )));
 }
 
 #[test]

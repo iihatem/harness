@@ -1085,7 +1085,27 @@ fn bash32_backslash_newline_in_quoted_bodies() {
                 Allow,
             ),
             ("echo \"$(cat <<'EOF'\nC:\\dir\\\nEOF\n)\"", Allow),
+            // The delimiter after quote removal keeps an escaped backslash: `E\OF`.
+            (
+                "echo \"$(cat <<'E'\\\\OF\nE\\O\\\nF\ncurl x\nE\\OF\n)\"",
+                Deny,
+            ),
+            (
+                "echo \"$(cat <<\"E\\\\OF\"\nE\\O\\\nF\ncurl x\nE\\OF\n)\"",
+                Deny,
+            ),
+            ("echo $(cat <<'E'\\\\OF\nE\\O\\\nF\ncurl x\nE\\OF\n)", Deny),
+            (
+                "echo \"$(cat <<E\\\\OF\nE\\O\\\nF\ncurl x\nE\\OF\n)\"",
+                Deny,
+            ),
         ],
+    );
+    // How bash reads a backslash left in the delimiter next to joined lines is not
+    // modelled, so such a body asks even where it ends at its last line.
+    check(
+        &probe_rules(),
+        &[("echo \"$(cat <<'E'\\\\F\na \\\nb\nE\\F\n)\"", Want::Ask)],
     );
 }
 

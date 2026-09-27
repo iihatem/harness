@@ -622,23 +622,24 @@ impl Walker<'_> {
                             .collect::<String>(),
                     )
                 };
-                // bash 3.2 removes backslash-newlines while it reads a `$(…)`, before it
-                // reads the here-documents in it, so it joins the lines of a body with a
-                // quoted delimiter there too.
+                // bash 3.2 removes backslash-newlines while it reads a `$(…)`, and every bash
+                // while it reads a backquoted command, before it reads the here-documents in
+                // it: so it joins the lines of a body with a quoted delimiter there too.
                 let joins = doc.requires_expansion || self.comsub > 0;
                 let continued = joins && body.lines().any(|l| l.ends_with('\\'));
                 let raw = if continued { raw() } else { None };
                 if continued && !doc.requires_expansion {
-                    let unquoted: String = delimiter
-                        .chars()
-                        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
-                        .collect();
-                    let early = raw.as_deref().is_none_or(|raw| {
-                        argv::joined_ends_earlier(raw, &unquoted, doc.remove_tabs)
-                    });
+                    // bash compares the lines with the delimiter after quote removal. How it
+                    // reads a backslash left in it, next to the joined lines, is not modelled:
+                    // such a body counts as ending early.
+                    let unquoted = bash32::delimiter(delimiter);
+                    let early = unquoted.contains('\\')
+                        || raw.as_deref().is_none_or(|raw| {
+                            argv::joined_ends_earlier(raw, &unquoted, doc.remove_tabs)
+                        });
                     if early {
                         self.rescan = Some(
-                            "bash 3.2 (macOS /bin/bash) joins lines of this here-document and may end it earlier",
+                            "bash joins the lines of this here-document inside a command substitution and may end it earlier",
                         );
                     }
                 }

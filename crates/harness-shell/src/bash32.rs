@@ -1079,7 +1079,16 @@ fn read_body(b: &[char], from: usize, doc: &Heredoc) -> (Vec<char>, usize, bool)
     (body, at, false)
 }
 
-/// The here-document delimiter word `w` after bash's quote removal.
+/// The here-document delimiter word `word`, as written, after bash's quote removal
+/// (`string_quote_removal`), which is what bash compares the body's lines with.
+pub(crate) fn delimiter(word: &str) -> String {
+    let w: Vec<char> = word.chars().collect();
+    quote_removal(&w).into_iter().collect()
+}
+
+/// bash's `string_quote_removal (w, 0)`: an escaped character stands for itself, single
+/// quotes keep their text, and in double quotes a backslash escapes only `$`, a backtick,
+/// `"`, a backslash or a newline.
 fn quote_removal(w: &[char]) -> Vec<char> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -1087,7 +1096,8 @@ fn quote_removal(w: &[char]) -> Vec<char> {
         i += 1;
         match c {
             '\\' => {
-                out.extend(w.get(i));
+                // A trailing backslash stays.
+                out.push(w.get(i).copied().unwrap_or('\\'));
                 i += 1;
             }
             '\'' => {
@@ -1452,6 +1462,22 @@ mod tests {
         assert_eq!(substitution_misread("echo a # c\n"), None);
         assert_eq!(substitution_misread("git log --format='#%h'"), None);
         assert_eq!(substitution_misread(" # c \\\n x"), Some(COMMENT_CONTINUES));
+    }
+
+    #[test]
+    fn delimiters_after_quote_removal() {
+        for (word, removed) in [
+            ("EOF", "EOF"),
+            ("'EOF'", "EOF"),
+            ("'E'\\\\OF", "E\\OF"),
+            ("\"E\\\\OF\"", "E\\OF"),
+            ("\"E\\OF\"", "E\\OF"),
+            ("E\\\"F", "E\"F"),
+            ("'E\"F'", "E\"F"),
+            ("EOF\\", "EOF\\"),
+        ] {
+            assert_eq!(delimiter(word), removed, "{word:?}");
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-use super::read::read_regular;
+use super::read::{missing, read_regular};
 
 /// Symlinks followed on one path before giving up, as the kernel does for a
 /// loop.
@@ -42,6 +42,24 @@ pub(crate) struct LinkedGitdirs {
     /// holds it and everything above that: the profile and the guard protect
     /// every `.git` entry already.
     pub entries: Vec<PathBuf>,
+    /// Whether a gitfile or `commondir` file on the way is there but could
+    /// not be read, so a gitdir may be missing. (The profile has no use for
+    /// it; the Linux guard reports it.)
+    pub unreadable: bool,
+}
+
+/// A gitfile or `commondir` file that is there but cannot be read through
+/// [`read_regular`]: not a regular file, not readable, or behind a symlink
+/// loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Unreadable;
+
+/// `found`, noting in `unreadable` when it is [`Unreadable`].
+pub(super) fn noting<T>(found: Result<Option<T>, Unreadable>, unreadable: &mut bool) -> Option<T> {
+    found.unwrap_or_else(|Unreadable| {
+        *unreadable = true;
+        None
+    })
 }
 
 /// The gitdirs `<workspace>/.git` leads to when it is a symlink or a gitfile.
@@ -71,8 +89,9 @@ pub(crate) fn linked_gitdirs_at(holder: &Path, workspace: &Path) -> LinkedGitdir
 
     let mut visited = Vec::new();
     let mut gitdirs = Vec::new();
-    if let Some(gitdir) = gitdir_of(holder, &dot_git, &mut visited) {
-        let common = common_dir(&gitdir, &mut visited);
+    let mut unreadable = false;
+    if let Some(gitdir) = noting(gitdir_of(holder, &dot_git, &mut visited), &mut unreadable) {
+        let common = noting(common_dir(&gitdir, &mut visited), &mut unreadable);
         gitdirs.push(gitdir);
         gitdirs.extend(common);
     }
@@ -88,48 +107,70 @@ pub(crate) fn linked_gitdirs_at(holder: &Path, workspace: &Path) -> LinkedGitdir
         }
     }
     gitdirs.retain(|gitdir| within(gitdir, workspace));
-    LinkedGitdirs { gitdirs, entries }
+    LinkedGitdirs {
+        gitdirs,
+        entries,
+        unreadable,
+    }
 }
 
 /// Where the `.git` in `holder` leads, inside the workspace or not: the
 /// directory it is or resolves to, or the path its gitfile names.
-pub(super) fn gitdir_at(holder: &Path) -> Option<PathBuf> {
+pub(super) fn gitdir_at(holder: &Path) -> Result<Option<PathBuf>, Unreadable> {
     gitdir_of(holder, &holder.join(".git"), &mut Vec::new())
 }
 
 /// The directory `gitdir`'s `commondir` file names, relative to `gitdir`, as
 /// git resolves it. Every entry on the way is pushed to `visited`.
-pub(super) fn common_dir(gitdir: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
-    pointer(&gitdir.join("commondir"), b"").and_then(|common| follow(&gitdir.join(common), visited))
+pub(super) fn common_dir(
+    gitdir: &Path,
+    visited: &mut Vec<PathBuf>,
+) -> Result<Option<PathBuf>, Unreadable> {
+    Ok(pointer(&gitdir.join("commondir"), b"")?
+        .and_then(|common| follow(&gitdir.join(common), visited)))
 }
 
 /// Where git finds the gitdir through `dot_git`: the directory it resolves
 /// to, or, when it resolves to a regular file, the path that gitfile names.
-fn gitdir_of(holder: &Path, dot_git: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
-    let target = follow(dot_git, visited)?;
+fn gitdir_of(
+    holder: &Path,
+    dot_git: &Path,
+    visited: &mut Vec<PathBuf>,
+) -> Result<Option<PathBuf>, Unreadable> {
+    let Some(target) = follow(dot_git, visited) else {
+        return Ok(None);
+    };
     if !std::fs::metadata(&target).is_ok_and(|m| m.is_file()) {
         // A directory, a path that does not exist, or something git cannot
         // read a gitfile from (a FIFO is never opened).
-        return Some(target);
+        return Ok(Some(target));
     }
-    let named = pointer(&target, b"gitdir: ")?;
+    let Some(named) = pointer(&target, b"gitdir: ")? else {
+        return Ok(None);
+    };
     // Relative to the directory holding `.git`, even through a symlink.
-    follow(&holder.join(named), visited)
+    Ok(follow(&holder.join(named), visited))
 }
 
 /// The path a gitfile (`prefix` `gitdir: `) or a `commondir` file (no prefix)
 /// holds, as git reads it: up to the first NUL, without trailing newlines.
-/// `None` if it does not resolve to a regular file (git follows a symlinked
-/// `commondir`), lacks the prefix, or names nothing.
-fn pointer(file: &Path, prefix: &[u8]) -> Option<PathBuf> {
-    let file = follow(file, &mut Vec::new())?;
-    let bytes = read_regular(&file, MAX_POINTER_BYTES).ok()?;
+/// `None` if there is no such file (git follows a symlinked `commondir`), or
+/// it lacks the prefix or names nothing.
+fn pointer(file: &Path, prefix: &[u8]) -> Result<Option<PathBuf>, Unreadable> {
+    let file = follow(file, &mut Vec::new()).ok_or(Unreadable)?;
+    let bytes = match read_regular(&file, MAX_POINTER_BYTES) {
+        Ok(bytes) => bytes,
+        Err(err) if missing(&err) => return Ok(None),
+        Err(_) => return Err(Unreadable),
+    };
     let text = bytes.split(|&b| b == 0).next().unwrap_or_default();
-    let mut path = text.strip_prefix(prefix)?;
+    let Some(mut path) = text.strip_prefix(prefix) else {
+        return Ok(None);
+    };
     while let [rest @ .., b'\n' | b'\r'] = path {
         path = rest;
     }
-    (!path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(path)))
+    Ok((!path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(path))))
 }
 
 /// Resolves the absolute `path` as the kernel would, following every symlink

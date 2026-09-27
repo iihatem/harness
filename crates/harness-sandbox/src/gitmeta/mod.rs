@@ -1,12 +1,13 @@
 //! Where git keeps its metadata in a workspace. Platform-neutral: the macOS
 //! Seatbelt profile uses `linked_gitdirs` for a symlinked or gitfile `.git`,
-//! and the Linux sandbox uses [`discover`] for the guard and the mounts.
+//! and the Linux sandbox uses [`discover`] for the guard and the mounts, with
+//! the [`IgnoreRules`] it reads once per session ([`read_ignore_rules`]).
 
 mod index;
 mod linked;
 mod read;
 
-pub use index::{GitIndex, discover};
+pub use index::{GitIndex, IgnoreRules, discover, read_ignore_rules};
 #[cfg(target_os = "macos")]
 pub(crate) use linked::{LinkedGitdirs, linked_gitdirs};
 

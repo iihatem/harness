@@ -1,9 +1,10 @@
 //! `gitmeta::discover` on real directory trees. Platform-neutral: runs on macOS and Linux.
 //!
 //! The workspace is hostile: a sandboxed command can write any of it. Every
-//! `discover` here runs on a helper thread that must finish within [`LIMIT`],
-//! so a probe that would block the harness (a FIFO, `/dev/zero`) fails its
-//! test instead of hanging the run. Every probe stays inside a temp dir.
+//! `read_ignore_rules` and `discover` here runs on a helper thread that must
+//! finish within [`LIMIT`], so a probe that would block the harness (a FIFO,
+//! `/dev/zero`) fails its test instead of hanging the run. Every probe stays
+//! inside a temp dir.
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -11,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use harness_sandbox::gitmeta::{GitIndex, discover};
+use harness_sandbox::gitmeta::{GitIndex, IgnoreRules, discover, read_ignore_rules};
 
 /// How long one `discover` of these small trees may take.
 const LIMIT: Duration = Duration::from_secs(10);
@@ -47,22 +48,43 @@ fn set(ws: &Path, rels: &[&str]) -> BTreeSet<PathBuf> {
     rels.iter().map(|rel| ws.join(rel)).collect()
 }
 
-/// `discover`, which must finish within [`LIMIT`]. A thread that does not
-/// is left behind, blocked; the test fails either way.
-fn index(ws: &Path, skip: Option<&Path>) -> GitIndex {
-    let (ws, skip) = (ws.to_path_buf(), skip.map(Path::to_path_buf));
+/// `run()`, on a thread that must finish within [`LIMIT`]. A thread that
+/// does not is left behind, blocked; the test fails either way.
+fn bounded<T: Send + 'static>(run: impl FnOnce() -> T + Send + 'static) -> T {
     let (tx, rx) = mpsc::channel();
     let thread = std::thread::spawn(move || {
-        let _ = tx.send(discover(&ws, skip.as_deref()));
+        let _ = tx.send(run());
     });
     match rx.recv_timeout(LIMIT) {
-        Ok(index) => index,
-        Err(mpsc::RecvTimeoutError::Timeout) => panic!("discover took longer than {LIMIT:?}"),
+        Ok(value) => value,
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("took longer than {LIMIT:?}"),
         Err(mpsc::RecvTimeoutError::Disconnected) => match thread.join() {
             Err(panic) => std::panic::resume_unwind(panic),
-            Ok(()) => unreachable!("discover returned nothing"),
+            Ok(()) => unreachable!("returned nothing"),
         },
     }
+}
+
+/// The ignore rules, read as at the start of a session.
+fn rules(ws: &Path) -> IgnoreRules {
+    let ws = ws.to_path_buf();
+    bounded(move || read_ignore_rules(&ws, None))
+}
+
+/// `discover` with the `rules` read earlier.
+fn index_with(ws: &Path, skip: Option<&Path>, rules: &IgnoreRules) -> GitIndex {
+    let (ws, skip, rules) = (ws.to_path_buf(), skip.map(Path::to_path_buf), rules.clone());
+    bounded(move || discover(&ws, skip.as_deref(), &rules))
+}
+
+/// The rules read, then `discover` with them, as when nothing changed in
+/// between.
+fn index(ws: &Path, skip: Option<&Path>) -> GitIndex {
+    let (ws, skip) = (ws.to_path_buf(), skip.map(Path::to_path_buf));
+    bounded(move || {
+        let rules = read_ignore_rules(&ws, skip.as_deref());
+        discover(&ws, skip.as_deref(), &rules)
+    })
 }
 
 /// [`index`], asserting that nothing kept the walk from seeing everything.
@@ -71,6 +93,24 @@ fn complete(ws: &Path, skip: Option<&Path>) -> GitIndex {
     let index = index(ws, skip);
     assert!(!index.incomplete, "{index:?}");
     index
+}
+
+/// [`index_with`], asserting that nothing kept the walk from seeing
+/// everything.
+#[track_caller]
+fn complete_with(ws: &Path, rules: &IgnoreRules) -> GitIndex {
+    let index = index_with(ws, None, rules);
+    assert!(!index.incomplete, "{index:?}");
+    index
+}
+
+fn append(ws: &Path, rel: &str, text: &str) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(ws.join(rel))
+        .unwrap();
+    file.write_all(text.as_bytes()).unwrap();
 }
 
 #[test]
@@ -395,9 +435,33 @@ fn a_fifo_commondir_is_never_opened() {
     mkfifo(&ws.join("meta/wt/commondir"));
     let gitfile = format!("gitdir: {}\n", ws.join("meta/wt").display());
     write(&ws, "wt/.git", &gitfile);
-    let index = complete(&ws, None);
+    let index = index(&ws, None);
     assert_eq!(index.dot_gits, set(&ws, &["wt/.git"]));
     assert_eq!(index.gitdirs, set(&ws, &["meta/wt"]));
+    // Where it leads is unknown.
+    assert!(index.incomplete, "{index:?}");
+}
+
+#[test]
+fn an_unreadable_gitfile_makes_the_index_incomplete() {
+    let (_d, ws) = workspace();
+    gitdir(&ws, "meta/wt");
+    write(&ws, "wt/.git", "gitdir: ../meta/wt\n");
+    let rules = rules(&ws);
+    assert!(!rules.incomplete(), "{rules:?}");
+    // A command makes it unreadable.
+    let gitfile = ws.join("wt/.git");
+    std::fs::set_permissions(&gitfile, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read(&gitfile).is_ok();
+    let index = index_with(&ws, None, &rules);
+    std::fs::set_permissions(&gitfile, std::fs::Permissions::from_mode(0o644)).unwrap();
+    if readable {
+        eprintln!("running as root: skipping");
+        return;
+    }
+    assert_eq!(index.dot_gits, set(&ws, &["wt/.git"]));
+    assert!(index.gitdirs.is_empty(), "{index:?}");
+    assert!(index.incomplete, "{index:?}");
 }
 
 #[test]
@@ -489,5 +553,122 @@ fn below_32_nested_gitignores_no_rules_apply() {
         index.dot_gits,
         set(&ws, &[".git", &format!("{dir}ignored/r/.git")])
     );
+    assert!(index.incomplete, "{index:?}");
+}
+
+#[test]
+fn an_unreadable_commondir_makes_the_index_incomplete() {
+    let (_d, ws) = workspace();
+    gitdir(&ws, ".git");
+    gitdir(&ws, ".git/worktrees/wt");
+    let rules = rules(&ws);
+    // A command plants one that cannot be read.
+    mkfifo(&ws.join(".git/worktrees/wt/commondir"));
+    let index = index_with(&ws, None, &rules);
+    assert_eq!(index.gitdirs, set(&ws, &[".git", ".git/worktrees/wt"]));
+    assert!(index.incomplete, "{index:?}");
+}
+
+// Ignore rules are read once, when the session starts: a command can write
+// `.gitignore` and `info/exclude`, so rules read later could hide the
+// repository it makes.
+
+#[test]
+fn a_rule_added_after_the_rules_were_read_does_not_apply() {
+    let (_d, ws) = workspace();
+    gitdir(&ws, ".git");
+    write(&ws, ".gitignore", "build/\n");
+    let rules = rules(&ws);
+    append(&ws, ".gitignore", "sub/\n");
+    gitdir(&ws, "sub/.git");
+    let index = complete_with(&ws, &rules);
+    assert_eq!(index.dot_gits, set(&ws, &[".git", "sub/.git"]));
+}
+
+#[test]
+fn a_gitignore_in_a_directory_made_later_does_not_apply() {
+    let (_d, ws) = workspace();
+    gitdir(&ws, ".git");
+    let rules = rules(&ws);
+    write(&ws, "n/.gitignore", "*\n");
+    gitdir(&ws, "n/r/.git");
+    let index = complete_with(&ws, &rules);
+    assert_eq!(index.dot_gits, set(&ws, &[".git", "n/r/.git"]));
+}
+
+#[test]
+fn an_info_exclude_rewritten_after_the_rules_were_read_does_not_apply() {
+    let (_d, ws) = workspace();
+    gitdir(&ws, ".git");
+    write(&ws, ".git/info/exclude", "# nothing\n");
+    let rules = rules(&ws);
+    write(&ws, ".git/info/exclude", "hidden/\n");
+    gitdir(&ws, "hidden/r/.git");
+    let index = complete_with(&ws, &rules);
+    assert_eq!(index.dot_gits, set(&ws, &[".git", "hidden/r/.git"]));
+}
+
+#[test]
+fn a_repository_made_later_in_a_directory_ignored_at_the_start_stays_hidden() {
+    // The accepted residual: rules read when the session started still apply.
+    let (_d, ws) = workspace();
+    gitdir(&ws, ".git");
+    write(&ws, ".gitignore", "target/\n");
+    let rules = rules(&ws);
+    gitdir(&ws, "target/x/.git");
+    let index = complete_with(&ws, &rules);
+    assert_eq!(index.dot_gits, set(&ws, &[".git"]));
+}
+
+#[test]
+fn a_repository_removed_later_still_stops_the_rules_above_it() {
+    let (_d, ws) = workspace();
+    gitdir(&ws, ".git");
+    write(&ws, ".gitignore", "build/\n");
+    gitdir(&ws, "lib/.git");
+    let rules = rules(&ws);
+    // Without `lib/.git`, the rule above would reach `lib/build` now.
+    std::fs::rename(ws.join("lib/.git"), ws.join("lib/old")).unwrap();
+    gitdir(&ws, "lib/build/r/.git");
+    let index = complete_with(&ws, &rules);
+    assert_eq!(index.dot_gits, set(&ws, &[".git", "lib/build/r/.git"]));
+}
+
+#[test]
+fn a_workspace_inside_a_repository_applies_its_own_gitignore() {
+    let (_d, base) = workspace();
+    gitdir(&base, ".git");
+    let ws = base.join("ws");
+    write(&ws, ".gitignore", "node_modules/\n");
+    gitdir(&ws, "node_modules/pkg/.git");
+    gitdir(&ws, "lib/.git");
+    let index = complete(&ws, None);
+    assert_eq!(index.dot_gits, set(&ws, &["lib/.git"]));
+}
+
+#[test]
+fn without_rules_everything_is_walked() {
+    let (_d, ws) = workspace();
+    gitdir(&ws, ".git");
+    write(&ws, ".gitignore", "ignored/\n");
+    write(&ws, ".git/info/exclude", "excluded/\n");
+    gitdir(&ws, "ignored/r/.git");
+    gitdir(&ws, "excluded/r/.git");
+    let index = complete_with(&ws, &IgnoreRules::default());
+    assert_eq!(
+        index.dot_gits,
+        set(&ws, &[".git", "ignored/r/.git", "excluded/r/.git"])
+    );
+}
+
+#[test]
+fn rules_that_could_not_all_be_read_make_every_index_incomplete() {
+    let (_d, ws) = workspace();
+    gitdir(&ws, ".git");
+    mkfifo(&ws.join("sub/.gitignore"));
+    let rules = rules(&ws);
+    assert!(rules.incomplete(), "{rules:?}");
+    std::fs::remove_file(ws.join("sub/.gitignore")).unwrap();
+    let index = index_with(&ws, None, &rules);
     assert!(index.incomplete, "{index:?}");
 }

@@ -206,3 +206,215 @@ async fn commands_run_in_bash() {
         .await;
     assert!(out.content.contains("[bash]"), "{}", out.content);
 }
+
+use std::sync::Mutex;
+
+use harness_core::tool::{CommandGuard, GuardReport, SandboxedCommand};
+
+/// Records what happened to the guards a [`GuardedSandbox`] hands out.
+#[derive(Debug, Default)]
+struct GuardLog {
+    events: Mutex<Vec<String>>,
+}
+
+impl GuardLog {
+    fn events(&self) -> Vec<String> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+/// Runs `program` (or `/nonexistent/program` with `broken`) directly, with a guard that logs
+/// `finish` and returns `report`.
+#[derive(Debug)]
+struct GuardedSandbox {
+    log: Arc<GuardLog>,
+    report: Option<GuardReport>,
+    broken: bool,
+    fail_prepare: bool,
+}
+
+struct LoggingGuard {
+    log: Arc<GuardLog>,
+    report: Option<GuardReport>,
+}
+
+impl CommandGuard for LoggingGuard {
+    fn finish(self: Box<Self>) -> Option<GuardReport> {
+        self.log.events.lock().unwrap().push("finished".into());
+        self.report
+    }
+}
+
+impl CommandSandbox for GuardedSandbox {
+    fn name(&self) -> &'static str {
+        "guarded"
+    }
+
+    fn command(
+        &self,
+        _access: FsAccess,
+        _workspace: &Path,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<tokio::process::Command> {
+        let program = if self.broken {
+            "/nonexistent/program"
+        } else {
+            program
+        };
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args).process_group(0);
+        Ok(cmd)
+    }
+
+    fn is_denial(&self, _exit_code: Option<i32>, _output: &str) -> bool {
+        false
+    }
+
+    fn prepare(
+        &self,
+        access: FsAccess,
+        workspace: &Path,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<SandboxedCommand> {
+        if self.fail_prepare {
+            return Err(std::io::Error::other("no way"));
+        }
+        self.log.events.lock().unwrap().push("prepared".into());
+        Ok(SandboxedCommand {
+            command: self.command(access, workspace, program, args)?,
+            guard: Some(Box::new(LoggingGuard {
+                log: self.log.clone(),
+                report: self.report.clone(),
+            })),
+        })
+    }
+}
+
+fn guarded(
+    report: Option<GuardReport>,
+    broken: bool,
+) -> (tempfile::TempDir, ToolContext, Arc<GuardLog>) {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(GuardLog::default());
+    let sandbox = GuardedSandbox {
+        log: log.clone(),
+        report,
+        broken,
+        fail_prepare: false,
+    };
+    let ctx = ToolContext::new(dir.path())
+        .with_sandbox(Some(Arc::new(sandbox)), FsAccess::WorkspaceWrite);
+    (dir, ctx, log)
+}
+
+fn blocking_report() -> Option<GuardReport> {
+    Some(GuardReport {
+        message: "[the sandbox undid changes: .git/hooks/pre-commit]\n".into(),
+        blocked: true,
+    })
+}
+
+#[tokio::test]
+async fn a_guard_report_is_appended_and_a_blocking_one_marks_the_command_blocked() {
+    let (_dir, ctx, log) = guarded(blocking_report(), false);
+    let out = BashTool.run(json!({"command": "echo hi"}), &ctx).await;
+    assert_eq!(log.events(), ["prepared", "finished"]);
+    assert!(out.is_error && out.guard_blocked && !out.sandbox_denied);
+    assert_eq!(
+        out.content,
+        "exit code 0\nhi\n\n[the sandbox undid changes: .git/hooks/pre-commit]\n"
+    );
+}
+
+#[tokio::test]
+async fn a_report_that_blocks_nothing_leaves_the_result_as_it_was() {
+    let report = GuardReport {
+        message: "[before this command ran, harness found …]\n".into(),
+        blocked: false,
+    };
+    let (_dir, ctx, _log) = guarded(Some(report), false);
+    let out = BashTool.run(json!({"command": "echo hi"}), &ctx).await;
+    assert!(
+        !out.is_error && !out.guard_blocked && !out.sandbox_denied,
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content
+            .ends_with("[before this command ran, harness found …]\n")
+    );
+}
+
+#[tokio::test]
+async fn no_report_leaves_the_output_unchanged() {
+    let (_dir, ctx, log) = guarded(None, false);
+    let out = BashTool.run(json!({"command": "echo hi"}), &ctx).await;
+    assert_eq!(log.events(), ["prepared", "finished"]);
+    assert_eq!(out.content, "exit code 0\nhi\n");
+}
+
+#[tokio::test]
+async fn the_guard_finishes_after_a_timeout() {
+    let (_dir, ctx, log) = guarded(blocking_report(), false);
+    let out = BashTool
+        .run(json!({"command": "sleep 30", "timeout_secs": 1}), &ctx)
+        .await;
+    assert_eq!(log.events(), ["prepared", "finished"]);
+    assert!(out.content.contains("timed out"), "{}", out.content);
+    assert!(out.guard_blocked && !out.sandbox_denied);
+}
+
+#[tokio::test]
+async fn the_guard_finishes_after_an_interrupt() {
+    let (_dir, ctx, log) = guarded(None, false);
+    let cancel = ctx.cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+    });
+    let out = BashTool.run(json!({"command": "sleep 30"}), &ctx).await;
+    assert_eq!(log.events(), ["prepared", "finished"]);
+    assert!(out.content.contains("interrupted"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn the_guard_finishes_when_the_command_cannot_start() {
+    let (_dir, ctx, log) = guarded(None, true);
+    let out = BashTool.run(json!({"command": "echo hi"}), &ctx).await;
+    assert_eq!(log.events(), ["prepared", "finished"]);
+    assert!(
+        out.is_error && out.content.contains("failed to start"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn an_unsandboxed_rerun_starts_no_guard() {
+    let (_dir, mut ctx, log) = guarded(blocking_report(), false);
+    ctx.unsandboxed = true;
+    let out = BashTool.run(json!({"command": "echo hi"}), &ctx).await;
+    assert!(log.events().is_empty());
+    assert!(!out.sandbox_denied);
+}
+
+#[tokio::test]
+async fn a_sandbox_that_cannot_prepare_runs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let sandbox = GuardedSandbox {
+        log: Arc::new(GuardLog::default()),
+        report: None,
+        broken: false,
+        fail_prepare: true,
+    };
+    let ctx = ToolContext::new(dir.path())
+        .with_sandbox(Some(Arc::new(sandbox)), FsAccess::WorkspaceWrite);
+    let out = BashTool
+        .run(json!({"command": "touch made.txt"}), &ctx)
+        .await;
+    assert!(out.is_error);
+    assert_eq!(out.content, "failed to prepare the sandbox: no way");
+    assert!(!dir.path().join("made.txt").exists());
+}

@@ -440,3 +440,44 @@ async fn read_only_modes_report_a_sandbox_denial_instead_of_offering_a_rerun() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_guard_blocked_command_is_reported_blocked_and_never_rerun() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("c1", "guard_blocked", json!({})),
+        Script::text("ok"),
+    ]);
+    // An approver that would approve anything: it must never be asked, because a guard-blocked
+    // result offers no re-run to approve.
+    let mut agent = agent_with_sandbox(provider, Mode::Auto, Arc::new(AlwaysApprove), dir.path());
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Completed);
+
+    const REASON: &str = "the sandbox's git-metadata guard undid changes this command made";
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ActionBlocked { id, reason } if id == "c1" && reason == REASON
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ApprovalNeeded { .. })),
+        "an approver must never be asked about a guard-blocked result: {events:?}"
+    );
+
+    let (output, is_error) = &finished_outputs(&events)[0];
+    assert!(
+        *is_error && output.contains("the sandbox's git-metadata guard undid changes"),
+        "{output}"
+    );
+
+    let log = std::fs::read_to_string(dir.path().join("guard_blocked_calls.log")).unwrap();
+    assert_eq!(
+        log, "sandboxed\n",
+        "the tool must run exactly once, and never with ctx.unsandboxed"
+    );
+}

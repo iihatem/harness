@@ -20,6 +20,9 @@ pub struct ToolOutput {
     pub is_error: bool,
     /// The command failed because the OS sandbox blocked it (the agent may offer an unsandboxed re-run).
     pub sandbox_denied: bool,
+    /// The sandbox's git-metadata guard undid something this command did. The command counts as
+    /// blocked, and it must never be re-run outside the sandbox.
+    pub guard_blocked: bool,
 }
 
 impl ToolOutput {
@@ -28,6 +31,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             sandbox_denied: false,
+            guard_blocked: false,
         }
     }
 
@@ -36,6 +40,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             sandbox_denied: false,
+            guard_blocked: false,
         }
     }
 }
@@ -126,6 +131,39 @@ pub trait Tool: Send + Sync {
     async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput;
 }
 
+/// What a [`CommandGuard`] did around one command, for the tool output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardReport {
+    /// Appended to the command's output, so the model and the user both see it.
+    pub message: String,
+    /// The guard undid something the command did: the command counts as blocked.
+    pub blocked: bool,
+}
+
+/// Checks and repairs protected git metadata around one sandboxed command. Implemented by
+/// `harness-sandbox` on Linux.
+pub trait CommandGuard: Send {
+    /// Called once the command has ended: it exited, timed out, was interrupted, or never started.
+    fn finish(self: Box<Self>) -> Option<GuardReport>;
+}
+
+/// A sandboxed command, and the guard to finish once it has ended.
+pub struct SandboxedCommand {
+    pub command: tokio::process::Command,
+    pub guard: Option<Box<dyn CommandGuard>>,
+}
+
+/// How a sandbox protects git metadata (hooks, config, `commondir`, `.harness/`, a top-level
+/// `HEAD`) inside a writable workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitProtection {
+    /// Writes to protected git metadata fail: Seatbelt on macOS, the full tier on Linux.
+    Full,
+    /// Protected git metadata is checked after each command, and changes are moved to quarantine
+    /// or restored: the Linux basic tier. `reason` says why the full tier is unavailable.
+    Basic { reason: String },
+}
+
 /// Wraps shell commands so they run inside an OS sandbox. Implemented by `harness-sandbox`.
 pub trait CommandSandbox: Send + Sync + std::fmt::Debug {
     /// Mechanism name for messages, e.g. `seatbelt` or `landlock+seccomp`.
@@ -141,6 +179,25 @@ pub trait CommandSandbox: Send + Sync + std::fmt::Debug {
     ) -> std::io::Result<tokio::process::Command>;
     /// Whether a failed command's output looks like the sandbox blocked it.
     fn is_denial(&self, exit_code: Option<i32>, output: &str) -> bool;
+    /// [`command`](Self::command), plus a guard already started for it. The caller must finish the
+    /// guard after the command ends, however it ends. The default starts no guard.
+    fn prepare(
+        &self,
+        access: FsAccess,
+        workspace: &Path,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<SandboxedCommand> {
+        Ok(SandboxedCommand {
+            command: self.command(access, workspace, program, args)?,
+            guard: None,
+        })
+    }
+    /// How git metadata is protected in workspace-write mode. The default is
+    /// [`GitProtection::Full`].
+    fn git_protection(&self) -> GitProtection {
+        GitProtection::Full
+    }
 }
 
 /// Tools in a fixed order, so tool definitions are byte-identical across requests.

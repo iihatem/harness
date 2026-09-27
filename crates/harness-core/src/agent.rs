@@ -480,6 +480,14 @@ impl Agent {
             }
         }
         let output = tool.run(args.clone(), &self.ctx).await;
+        if output.guard_blocked {
+            let reason = "the sandbox's git-metadata guard undid changes this command made";
+            let _ = events.send(AgentEvent::ActionBlocked {
+                id: call.id.clone(),
+                reason: reason.to_string(),
+            });
+            return output;
+        }
         if output.sandbox_denied && self.ctx.access == FsAccess::ReadOnly {
             return ToolOutput {
                 content: format!(

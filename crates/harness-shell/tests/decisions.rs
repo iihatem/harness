@@ -903,6 +903,31 @@ fn heredoc_delimiters_the_parser_mishandles_ask_quickly() {
         ("cat << 'EOF'\n$(curl x)\nEOF", Unlisted),
         ("cat <<-\"EOF\"\n\thi\n\tEOF", Unlisted),
         ("echo $(cat <<EOF\nhi\nEOF\n)", Unlisted),
+        // Single-quoted text is not searched for operators.
+        ("grep -rn '<<[A-Z]' .", Unlisted),
+        ("rg 'x << (1' src", Unlisted),
+        ("awk 'BEGIN{print 1<<2}'", Unlisted),
+        (
+            "echo \"$HOME\" '<<$(( )' ${PWD} $(printf '<<`x`')",
+            Unlisted,
+        ),
+        // Unless the tokenizer might not read the quote as one.
+        ("echo \"'\" <<$(( ) '", Ask),
+        ("echo \"$(echo \"'\")\" <<$(( ) '", Ask),
+        ("\\$'a\\'' <<$(( ) '", Ask),
+        ("echo $'\\'' <<$(( ) '", Ask),
+        ("echo $\\\n'x' <<$(( ) '", Ask),
+        ("echo a#'b\n' <<$(( ) '", Ask),
+        ("# it's\nx <<$(( )\n'", Ask),
+        ("echo `echo '` <<$(( ) '", Ask),
+        ("echo ${x:-'} <<$(( ) '} '", Ask),
+        ("echo $((1<<2)) ' <<$(( ) '", Ask),
+        ("cat <<EOF\nit's\nEOF\nx <<$(( )\n'", Ask),
+        // An escaped `<` is a word character, so the operator starts after it.
+        ("$(\\<<<  ", Ask),
+        ("echo \")}'${x\\<<<'' ", Ask),
+        ("x \\\\<<'' $(", Ask),
+        ("cat \\<<<< \"${y}\"", Unlisted),
     ];
     for (cmd, want) in table {
         let (tx, rx) = mpsc::channel();

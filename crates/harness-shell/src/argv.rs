@@ -1,6 +1,7 @@
 //! Shell words → argv tokens, plus the canonical quoting used for display and rule matching.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use brush_parser::word::{Parameter, ParameterExpr, WordPiece, WordPieceWithSource};
 
@@ -355,10 +356,22 @@ const MAX_DELIMITER: usize = 1024;
 /// from a delimiter, and inside a substitution can take a blank as one; with an empty
 /// delimiter and a construct left open it loops, allocating without bound, and with a
 /// delimiter that ends a construct it panics (`x <<$(( )`, `cat <<'' $(`, `cat <<)|$(`).
+/// A `<<` in single-quoted text (see [`single_quoted`]) is not an operator, and neither is
+/// one whose first `<` is escaped.
 pub(crate) fn unsafe_heredoc(src: &str) -> Option<&'static str> {
     let b = src.as_bytes();
+    let quoted = single_quoted(b);
+    let in_quotes = |at: usize| {
+        let k = quoted.partition_point(|r| r.end <= at);
+        quoted.get(k).is_some_and(|r| r.contains(&at))
+    };
     let mut i = 0;
     while let Some(at) = src[i..].find("<<") {
+        let backslashes = b[..i + at].iter().rev().take_while(|&&c| c == b'\\');
+        if backslashes.count() % 2 == 1 || in_quotes(i + at) {
+            i += at + 1;
+            continue;
+        }
         let mut j = i + at + 2;
         if b.get(j) == Some(&b'<') {
             // A here-string (`<<<`).
@@ -385,6 +398,69 @@ pub(crate) fn unsafe_heredoc(src: &str) -> Option<&'static str> {
         i = j;
     }
     None
+}
+
+/// Byte ranges of the text between single quotes, as brush-parser's tokenizer reads them.
+/// Only quotes before the first construct whose quoting this scan does not follow are
+/// reported: a here-document operator (its body is literal text), a comment, a backtick,
+/// `$'…'` (which the tokenizer also starts after an escaped `$`), a line continuation,
+/// arithmetic, `$[…]`, a `${…}` holding more than a name, or a substitution inside double
+/// quotes.
+fn single_quoted(b: &[u8]) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut double = false;
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        let next = b.get(i + 1).copied();
+        match c {
+            b'\\' if next == Some(b'\n') => break,
+            b'\\' => i += 1,
+            b'"' => double = !double,
+            b'\'' if !double => {
+                if i > 0 && b[i - 1] == b'$' {
+                    break;
+                }
+                let end = b[i + 1..]
+                    .iter()
+                    .position(|&c| c == b'\'')
+                    .map_or(b.len(), |n| i + 1 + n);
+                ranges.push(i + 1..end);
+                i = end;
+            }
+            b'`' => break,
+            // A comment starts where no word has.
+            b'#' if !double && (i == 0 || b" \t\n;&|()<>".contains(&b[i - 1])) => break,
+            b'(' if !double && next == Some(b'(') => break,
+            b'<' if next == Some(b'<') => {
+                if double || b.get(i + 2) != Some(&b'<') {
+                    break;
+                }
+                i += 2;
+            }
+            b'$' => match next {
+                Some(b'{') => match name_brace_end(b, i + 2) {
+                    Some(end) => i = end,
+                    None => break,
+                },
+                Some(b'[') => break,
+                Some(b'(') if double || b.get(i + 2) == Some(&b'(') => break,
+                _ => {}
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    ranges
+}
+
+/// The index of the `}` ending a `${…}` whose text, from `b[from]`, is just a parameter
+/// name (`${HOME}`, `${#}`).
+fn name_brace_end(b: &[u8], from: usize) -> Option<usize> {
+    let len = b[from..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || b"_@*#?$!-".contains(c))
+        .count();
+    (b.get(from + len) == Some(&b'}')).then_some(from + len)
 }
 
 /// Whether the here-document delimiter word at the start of `b` is missing, has no
@@ -798,5 +874,37 @@ mod tests {
         assert_eq!(quote("it's"), r"'it'\''s'");
         assert_eq!(quote(""), "''");
         assert_eq!(quote("~x"), "'~x'");
+    }
+
+    #[test]
+    fn single_quoted_text() {
+        let quoted = |s: &'static str| -> Vec<&'static str> {
+            single_quoted(s.as_bytes())
+                .into_iter()
+                .map(|r| &s[r])
+                .collect()
+        };
+        assert_eq!(quoted("a '<<x' \"'\" \\'b 'c'"), ["<<x", "c"]);
+        assert_eq!(
+            quoted("a#'b' <<< 'c' ${HOME} $(d 'e') 'f"),
+            ["b", "c", "e", "f"]
+        );
+        // The scan stops where the tokenizer might read quotes differently.
+        for (src, before) in [
+            ("'x' $'y' 'z'", 1),
+            ("'x' \\$'y' 'z'", 1),
+            ("'x' # 'y'", 1),
+            ("'x' <<E 'y'", 1),
+            ("'x' \"<<\" 'y'", 1),
+            ("'x' `y` 'z'", 1),
+            ("'x' \\\n 'y'", 1),
+            ("'x' $((1)) 'y'", 1),
+            ("'x' ((1)) 'y'", 1),
+            ("'x' $[1] 'y'", 1),
+            ("'x' ${y:-'z'} 'w'", 1),
+            ("'x' \"$(y)\" 'z'", 1),
+        ] {
+            assert_eq!(quoted(src).len(), before, "{src:?}");
+        }
     }
 }

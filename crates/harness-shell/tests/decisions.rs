@@ -1142,6 +1142,29 @@ fn shell_option_changes_ask() {
 }
 
 #[test]
+fn bash32_reads_assignment_subscripts_as_text() {
+    use Want::Unlisted;
+    // Where an assignment may start a command, bash 3.2 reads `name[…]` by pairing only
+    // brackets and quotes: the `$(` there is text, so the word ends at the `]`, and the
+    // lines after it run. brush-parser and bash 5 read the `$(…)`, with its comment.
+    check_asks_may_deny(
+        &probe_rules(),
+        &[
+            "a[$( \n# '\n'x]=1 true\ncurl x\n' )]=1 true",
+            "a[$(  # # '\n'x]=1 true\ncurl x\n' )]=1 true",
+        ],
+    );
+    check(
+        &probe_rules(),
+        &[
+            ("a[$(echo 1)]=x echo hi", Unlisted),
+            ("a[`echo 1`]=x echo hi", Unlisted),
+            ("a[1]=x echo hi", Unlisted),
+        ],
+    );
+}
+
+#[test]
 fn brush_misreads_comments_in_substitutions() {
     use Want::Deny;
     // bash 5 bypasses: bash reads a comment in these substitutions and runs `curl x`;

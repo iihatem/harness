@@ -47,6 +47,7 @@ const COMMENT_CONTINUES: &str =
 const COMMENT_MISREAD: &str =
     "bash reads a comment in a `$(…)` here and ends it elsewhere than the analysis does";
 const TOO_DEEP: &str = "command substitutions are nested too deeply to compare with bash 3.2";
+const SUBSCRIPT_ELSEWHERE: &str = "bash 3.2 (macOS /bin/bash) ends the subscript of an assignment here elsewhere than the analysis does";
 
 /// Why bash 3.2 may read a command substitution of the program `src` differently from the
 /// analysis, if it may. `src` is a program bash parses from its start: a command, or `bash
@@ -132,6 +133,8 @@ enum Kind {
     Brace,
     /// `` `…` ``.
     Backtick,
+    /// The subscript of a `name[…]` that may be an assignment.
+    Subscript,
 }
 
 /// Where a construct is: from its `$`, `<`, `>` or opening backtick to its closing
@@ -667,6 +670,62 @@ struct Word {
     /// The word's text: backslash-newlines removed, `$'…'` translated, `CTLESC` added.
     text: Vec<char>,
     constructs: Vec<Construct>,
+    /// An assignment where one is acceptable (`ASSIGNMENT_WORD`).
+    assignment: bool,
+}
+
+/// The reserved words after which a command may start (`reserved_word_acceptable`).
+const RESERVED: &[&[char]] = &[
+    &['{'],
+    &['}'],
+    &['!'],
+    &['d', 'o'],
+    &['d', 'o', 'n', 'e'],
+    &['e', 'l', 'i', 'f'],
+    &['e', 'l', 's', 'e'],
+    &['e', 's', 'a', 'c'],
+    &['f', 'i'],
+    &['i', 'f'],
+    &['t', 'h', 'e', 'n'],
+    &['t', 'i', 'm', 'e'],
+    &['u', 'n', 't', 'i', 'l'],
+    &['w', 'h', 'i', 'l', 'e'],
+];
+
+/// bash's `legal_identifier`: a name.
+fn legal_identifier(t: &[char]) -> bool {
+    t.first()
+        .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
+        && t.iter().all(|c| c.is_ascii_alphanumeric() || *c == '_')
+}
+
+/// Whether the word text `t` is an assignment, as bash's `assignment` reads it: a name,
+/// perhaps with a subscript, then `=` or `+=`.
+fn is_assignment(t: &[char]) -> bool {
+    let name = t
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+        .count();
+    if !legal_identifier(&t[..name]) {
+        return false;
+    }
+    let mut rest = &t[name..];
+    if rest.first() == Some(&'[') {
+        // The subscript ends at the matching `]`.
+        let mut depth = 0usize;
+        let Some(end) = rest.iter().position(|&c| {
+            depth = match c {
+                '[' => depth + 1,
+                ']' => depth - 1,
+                _ => depth,
+            };
+            depth == 0
+        }) else {
+            return false;
+        };
+        rest = &rest[end + 1..];
+    }
+    rest.starts_with(&['=']) || rest.starts_with(&['+', '='])
 }
 
 /// Reads a program as bash 3.2 does, checking each construct as it goes.
@@ -692,6 +751,9 @@ impl Reader<'_> {
     fn walk(&self) -> Result<(), Stop> {
         let b = self.b;
         let mut pending: Vec<Heredoc> = Vec::new();
+        // Where a command may start, so an assignment is acceptable
+        // (`command_token_position`).
+        let mut command = true;
         let mut i = 0;
         loop {
             // Blanks, and backslash-newlines that `shell_getc` removes.
@@ -717,6 +779,7 @@ impl Reader<'_> {
                 }
                 '\n' => {
                     i += 1;
+                    command = true;
                     for doc in pending.drain(..) {
                         let (body, end, ended) = read_body(b, i, &doc);
                         i = end;
@@ -729,10 +792,24 @@ impl Reader<'_> {
                         }
                     }
                 }
-                '(' if next == Some('(') => i = self.arithmetic_command(i, next_at)?,
-                ';' | '&' | '|' | '(' | ')' => i += 1,
+                '(' if next == Some('(') => {
+                    i = self.arithmetic_command(i, next_at)?;
+                    command = false;
+                }
+                // `;;` ends a `case` item: a pattern follows.
+                ';' if next == Some(';') => {
+                    i = next_at + 1;
+                    command = false;
+                }
+                ';' | '&' | '|' | '(' | ')' => {
+                    i += 1;
+                    command = true;
+                }
                 // Process substitution is read as a word.
-                '<' | '>' if next == Some('(') => self.word(&mut i)?,
+                '<' | '>' if next == Some('(') => {
+                    self.word(&mut i, false)?;
+                    command = false;
+                }
                 '<' if next == Some('<') => {
                     let third_at = skip_continuations(b, next_at + 1);
                     match b.get(third_at) {
@@ -750,9 +827,13 @@ impl Reader<'_> {
                             }
                         }
                     }
+                    command = false;
                 }
-                '<' | '>' => i += 1,
-                _ => self.word(&mut i)?,
+                '<' | '>' => {
+                    i += 1;
+                    command = false;
+                }
+                _ => command = self.word(&mut i, command)?,
             }
         }
     }
@@ -773,7 +854,7 @@ impl Reader<'_> {
         if !word_starts {
             return Ok(None);
         }
-        let word = self.read_word(i)?;
+        let word = self.read_word(i, false)?;
         let quoted = word.text.iter().any(|c| matches!(c, '\'' | '"' | '\\'));
         Ok(Some(Heredoc {
             delimiter: quote_removal(&word.text),
@@ -798,21 +879,41 @@ impl Reader<'_> {
         }
     }
 
-    /// Reads a word and checks its constructs.
-    fn word(&self, i: &mut usize) -> Result<(), Stop> {
-        let word = self.read_word(i)?;
-        self.check(&word)
+    /// Reads a word and checks its constructs. `command` tells whether a command may start
+    /// at it; returns whether one may start after it: after a reserved word that starts
+    /// commands (`reserved_word_acceptable`) or an assignment.
+    fn word(&self, i: &mut usize, command: bool) -> Result<bool, Stop> {
+        let word = self.read_word(i, command)?;
+        self.check(&word)?;
+        Ok(command && (RESERVED.contains(&word.text.as_slice()) || word.assignment))
     }
 
     /// bash 3.2's `read_token_word`, from `b[*i]`: builds the word's text and notes its
-    /// constructs.
-    fn read_word(&self, i: &mut usize) -> Result<Word, Stop> {
+    /// constructs. Where an assignment is acceptable (`command`), a `[` after a name opens a
+    /// subscript.
+    fn read_word(&self, i: &mut usize, command: bool) -> Result<Word, Stop> {
         let b = self.b;
+        let start = *i;
         let mut w = Word::default();
         while let Some(&c) = b.get(*i) {
             let next_at = skip_continuations(b, *i + 1);
             let next = b.get(next_at).copied();
             match c {
+                // `name[…]`: bash reads the subscript by pairing brackets and quotes only
+                // (`assignment_acceptable` and `token_is_ident`).
+                '[' if command && legal_identifier(&w.text) => {
+                    let inner = pair(b, *i + 1, None, '[', ']', Flags::default(), 0)?;
+                    let at = w.text.len();
+                    w.text.push('[');
+                    w.text.extend(inner.text);
+                    w.constructs.push(Construct {
+                        kind: Kind::Subscript,
+                        raw: (start, inner.end),
+                        text: (at, w.text.len() - 1),
+                        in_dquote: false,
+                    });
+                    *i = inner.end + 1;
+                }
                 '\\' => {
                     *i += 1;
                     if b.get(*i) == Some(&'\n') {
@@ -928,6 +1029,7 @@ impl Reader<'_> {
                 }
             }
         }
+        w.assignment = command && is_assignment(&w.text);
         Ok(w)
     }
 
@@ -979,6 +1081,20 @@ impl Reader<'_> {
                 Kind::Backtick => {
                     self.run(&backquoted_text(&t[start + 1..end], c.in_dquote))?;
                 }
+                Kind::Subscript => {
+                    let subscript = &t[start + 1..end];
+                    if !subscript.iter().any(|&c| c == '$' || c == '`') {
+                        continue;
+                    }
+                    // brush-parser reads a `$(…)` or `${…}` in it as a construct, where bash
+                    // 3.2 reads text: the word must still end at the same `]`.
+                    if !brush_reads_one_word(&self.b[c.raw.0..=c.raw.1]) || !self.in_one_word(c.raw)
+                    {
+                        return Err(Stop::Diverges(SUBSCRIPT_ELSEWHERE));
+                    }
+                    // bash expands the subscript as arithmetic when it assigns.
+                    self.expand_text(subscript, false)?;
+                }
             }
         }
         Ok(())
@@ -1021,6 +1137,12 @@ impl Reader<'_> {
     /// delimiter (`Q_HERE_DOCUMENT`): quotes are literal, and a backslash quotes only `$`,
     /// a backtick or a backslash.
     fn expand_body(&self, body: &[char]) -> Result<(), Stop> {
+        self.expand_text(body, true)
+    }
+
+    /// Like [`Reader::expand_body`], for text brush-parser's word parser reads for the
+    /// analysis as a here-document body when `heredoc`, and as a word otherwise.
+    fn expand_text(&self, body: &[char], heredoc: bool) -> Result<(), Stop> {
         let mut i = 0;
         while let Some(&c) = body.get(i) {
             let next = body.get(i + 1);
@@ -1042,7 +1164,7 @@ impl Reader<'_> {
                                 at: i,
                                 end,
                             };
-                            self.expanded(body, &[found], true)?;
+                            self.expanded(body, &[found], heredoc)?;
                             i = end + 1;
                         }
                         Ext::Bad if !extract.too_deep => return Ok(()),
@@ -1530,6 +1652,39 @@ mod tests {
         assert_eq!(substitution_misread("echo a # c\n"), None);
         assert_eq!(substitution_misread("git log --format='#%h'"), None);
         assert_eq!(substitution_misread(" # c \\\n x"), Some(COMMENT_CONTINUES));
+    }
+
+    #[test]
+    fn assignment_subscripts_are_text_to_bash_3_2() {
+        let hidden = "a[$( \n# '\n'x]=1 true\nx\n' )]=1 true";
+        // Where an assignment may start a command.
+        for before in [
+            "", "true; ", "b=1 ", "if ", "x | ", "{ ", "! ", "(", "x && ",
+        ] {
+            let src = format!("{before}{hidden}");
+            assert_eq!(divergence(&src), Some(SUBSCRIPT_ELSEWHERE), "{src:?}");
+        }
+        // Elsewhere, bash 3.2 reads `[` as text and the `$(…)` as a substitution.
+        for before in ["echo ", "case a in a) x;; ", ">f ", ">", "for "] {
+            let src = format!("{before}{hidden}");
+            assert_ne!(divergence(&src), Some(SUBSCRIPT_ELSEWHERE), "{src:?}");
+        }
+        assert_eq!(divergence("a[$(echo 1)]=x echo hi"), None);
+        // bash 3.2 runs the substitutions of the subscript when it assigns.
+        assert_eq!(
+            divergence("a[$(echo $(echo ${y:-)}))]=1"),
+            Some(EXPANDS_ELSEWHERE)
+        );
+        for (t, assignment) in [
+            ("a=1", true),
+            ("a[x]+=1", true),
+            ("_a[$(x)]=", true),
+            ("a[x]", false),
+            ("1a=2", false),
+            ("a+b=1", false),
+        ] {
+            assert_eq!(is_assignment(&chars(t)), assignment, "{t:?}");
+        }
     }
 
     #[test]

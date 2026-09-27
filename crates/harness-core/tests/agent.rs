@@ -405,3 +405,31 @@ async fn approve_for_session_skips_later_prompts_for_the_same_action() {
         .count();
     assert_eq!(prompts, 1, "the second identical write must not prompt");
 }
+
+#[tokio::test]
+async fn read_only_modes_report_a_sandbox_denial_instead_of_offering_a_rerun() {
+    for mode in [Mode::Plan, Mode::ReadOnly] {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            Script::tool_call("c1", "boxed", json!({})),
+            Script::text("ok"),
+        ]);
+        let mut agent = agent_with_sandbox(provider, mode, Arc::new(AlwaysApprove), dir.path());
+        let (reason, events) = run(&mut agent, "go").await;
+        assert_eq!(reason, TurnEndReason::Completed, "{mode}");
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ApprovalNeeded { .. } | AgentEvent::ActionBlocked { .. }
+            )),
+            "{mode}: {events:?}"
+        );
+        let (output, is_error) = &finished_outputs(&events)[0];
+        assert!(
+            *is_error
+                && output.contains("Could not resolve host")
+                && output.contains("read-only sandbox"),
+            "{mode}: {output}"
+        );
+    }
+}

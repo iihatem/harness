@@ -16,11 +16,14 @@ use crate::{
     event::{AgentEvent, ErrorKind, TurnEndReason},
     message::{ChatRequest, Message, ToolCall},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
-    permission::{Action, Decision, PermissionPolicy},
+    permission::{Action, Decision, FsAccess, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
     retry::RetryPolicy,
     tool::{Tool, ToolContext, ToolOutput, ToolRegistry},
 };
+
+/// Model calls allowed per turn unless configured otherwise.
+pub const DEFAULT_MAX_STEPS: u32 = 50;
 
 /// Settings for one agent session.
 #[derive(Debug, Clone)]
@@ -47,7 +50,7 @@ impl AgentConfig {
             model_id: model_id.into(),
             model_name: model_name.into(),
             system_prompt: system_prompt.into(),
-            max_steps: 50,
+            max_steps: DEFAULT_MAX_STEPS,
             output_limit: DEFAULT_OUTPUT_LIMIT,
             output_dir,
             retry: RetryPolicy::default(),
@@ -477,6 +480,15 @@ impl Agent {
             }
         }
         let output = tool.run(args.clone(), &self.ctx).await;
+        if output.sandbox_denied && self.ctx.access == FsAccess::ReadOnly {
+            return ToolOutput {
+                content: format!(
+                    "{}\n[this mode runs commands only in a read-only sandbox, so it cannot be run without it]",
+                    output.content
+                ),
+                ..output
+            };
+        }
         if output.sandbox_denied {
             return self
                 .offer_unsandboxed_rerun(call, &tool, args, output, events)

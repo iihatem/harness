@@ -24,6 +24,21 @@ impl Mode {
         matches!(self, Mode::Plan | Mode::ReadOnly | Mode::Ask)
     }
 
+    /// Whether this mode lets the agent do no more than `other` does. Plan and read-only rank
+    /// lowest (and equal), then ask, auto, and full-access.
+    pub fn grants_at_most(self, other: Mode) -> bool {
+        self.rank() <= other.rank()
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Mode::Plan | Mode::ReadOnly => 0,
+            Mode::Ask => 1,
+            Mode::Auto => 2,
+            Mode::FullAccess => 3,
+        }
+    }
+
     /// What a sandboxed shell command may write in this mode.
     pub fn fs_access(self) -> FsAccess {
         match self {

@@ -4,6 +4,7 @@
 use std::{
     collections::HashSet,
     ffi::OsStr,
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::Mutex,
 };
@@ -48,6 +49,9 @@ pub struct PermissionEngine {
     /// Config `read:`/`write:` confirm rules, expanded the same way as `deny_paths`.
     confirm_paths: Vec<PathRule>,
     sandbox_available: bool,
+    /// Where `<workspace>/.git` sends git when it is a symlink or a `gitdir:` file, resolved.
+    /// Writes under it are guarded like writes under `.git`.
+    linked_gitdir: Option<PathBuf>,
     /// Bash allow-glob prefixes added by approve-for-session.
     session_bash: Mutex<Vec<String>>,
     /// Exact (tool, resolved path) approvals added by approve-for-session. Stored as exact
@@ -96,12 +100,64 @@ fn own(v: Vec<&str>) -> Vec<String> {
     v.into_iter().map(str::to_string).collect()
 }
 
-/// Whether `component` is `.git`, case-insensitively (macOS's default filesystem is
-/// case-insensitive, so `.GIT` reaches the same directory as `.git`).
+/// Whether `component` names `name` on a case-insensitive filesystem (macOS's default), where
+/// `.GIT` reaches `.git`. Folds beyond ASCII too, as APFS does: `ſ` matches `s` and the Kelvin
+/// sign matches `k`.
+fn same_name(component: &OsStr, name: &str) -> bool {
+    fn fold(s: &str) -> String {
+        s.chars()
+            .flat_map(char::to_uppercase)
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    component.to_str().is_some_and(|c| fold(c) == fold(name))
+}
+
 fn is_dot_git(component: &OsStr) -> bool {
-    component
-        .to_str()
-        .is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+    same_name(component, ".git")
+}
+
+/// `path` relative to `base`, comparing each component case-insensitively. `None` if `path`
+/// isn't under `base` this way.
+fn strip_prefix_ci(path: &Path, base: &Path) -> Option<PathBuf> {
+    let mut remaining = path.components();
+    for base_component in base.components() {
+        let component = remaining.next()?;
+        let base_text = base_component.as_os_str().to_string_lossy().to_lowercase();
+        let text = component.as_os_str().to_string_lossy().to_lowercase();
+        if base_text != text {
+            return None;
+        }
+    }
+    Some(remaining.as_path().to_path_buf())
+}
+
+/// The gitdir `<workspace>/.git` points git to when it is a symlink or a `gitdir:` file, resolved
+/// (it may not exist yet). `None` when `.git` is missing, a plain directory, or a file git would
+/// not accept.
+fn linked_gitdir(workspace: &Path) -> Option<PathBuf> {
+    let dot_git = workspace.join(".git");
+    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    let target = if meta.file_type().is_symlink() {
+        let resolved = resolve_path(workspace, Path::new(".git"));
+        if !std::fs::metadata(&resolved).is_ok_and(|m| m.is_file()) {
+            return Some(resolved);
+        }
+        resolved
+    } else if meta.is_file() {
+        dot_git
+    } else {
+        return None;
+    };
+    let mut text = String::new();
+    std::fs::File::open(&target)
+        .ok()?
+        .take(4096)
+        .read_to_string(&mut text)
+        .ok()?;
+    let gitdir = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+    // Git resolves a relative gitdir against the directory holding `.git`.
+    (!gitdir.is_empty()).then(|| resolve_path(workspace, Path::new(gitdir)))
 }
 
 /// Resolves the literal directory prefix of an absolute glob — the text before its first `*`,
@@ -204,9 +260,11 @@ impl PermissionEngine {
         let allow_paths = path_rules(&config.rules.allow, home.as_deref(), false);
         let deny_paths = path_rules(&config.rules.deny, home.as_deref(), true);
         let confirm_paths = path_rules(&config.rules.confirm, home.as_deref(), true);
+        let workspace = resolved(&config.workspace);
         PermissionEngine {
             mode: config.mode,
-            workspace: resolved(&config.workspace),
+            linked_gitdir: linked_gitdir(&workspace),
+            workspace,
             read_dirs: config.read_dirs.iter().map(|d| resolved(d)).collect(),
             rules: config.rules,
             allow_paths,
@@ -309,19 +367,42 @@ impl PermissionEngine {
     /// target spelled with a different case than the configured workspace still strips).
     /// `None` if `path` isn't under the workspace this way.
     fn relative_ci(&self, path: &Path) -> Option<PathBuf> {
-        let mut remaining = path.components();
-        for ws_component in self.workspace.components() {
-            let target_component = remaining.next()?;
-            let ws_text = ws_component.as_os_str().to_string_lossy().to_lowercase();
-            let target_text = target_component
-                .as_os_str()
-                .to_string_lossy()
-                .to_lowercase();
-            if ws_text != target_text {
-                return None;
-            }
+        strip_prefix_ci(path, &self.workspace)
+    }
+
+    /// Why a write inside the workspace needs approval whatever the mode's defaults: it lands in
+    /// git metadata (hooks and config can run commands) or in `.harness/`, or creates a top-level
+    /// `HEAD`, which would make git take the workspace for a repository. The same set the sandbox
+    /// protects. `target` is the resolved path and `lexical` the symlink-unaware one; either
+    /// matching is enough.
+    fn protected_write(&self, target: &Path, lexical: &Path) -> Option<&'static str> {
+        let inside: Vec<PathBuf> = [target, lexical]
+            .into_iter()
+            .filter_map(|p| self.relative_ci(p))
+            .collect();
+        let first_is = |name: &str| {
+            inside.iter().any(|r| {
+                r.components()
+                    .next()
+                    .is_some_and(|c| same_name(c.as_os_str(), name))
+            })
+        };
+        if inside
+            .iter()
+            .any(|r| r.components().any(|c| is_dot_git(c.as_os_str())))
+            || self
+                .linked_gitdir
+                .as_deref()
+                .is_some_and(|gitdir| strip_prefix_ci(target, gitdir).is_some())
+        {
+            Some("write inside .git (hooks and config can run commands)")
+        } else if first_is(".harness") {
+            Some("write inside .harness (harness's project settings)")
+        } else if first_is("HEAD") {
+            Some("write a top-level HEAD (git would take the workspace for a repository)")
+        } else {
+            None
         }
-        Some(remaining.as_path().to_path_buf())
     }
 
     /// Whether `target` was approved for `tool` ("read" or "write") for the rest of the session.
@@ -372,8 +453,8 @@ impl PermissionEngine {
         let Ok(inside) = target.strip_prefix(&self.workspace) else {
             return Decision::Ask(format!("write outside the workspace: {}", target.display()));
         };
-        if inside.components().any(|c| is_dot_git(c.as_os_str())) {
-            return Decision::Ask("write inside .git (hooks and config can run commands)".into());
+        if let Some(reason) = self.protected_write(&target, &lexical) {
+            return Decision::Ask(reason.into());
         }
         if let Some(rule) = self.deny_confirm_rule(&self.confirm_paths, "write", &target, &lexical)
         {
@@ -417,6 +498,11 @@ impl PermissionEngine {
                 ..
             } if self.mode == Mode::FullAccess => Decision::Ask(reason),
             _ if self.mode == Mode::FullAccess => Decision::Allow,
+            _ if !self.sandbox_available && matches!(self.mode, Mode::Plan | Mode::ReadOnly) => {
+                Decision::Deny(
+                    "shell commands need the OS sandbox in plan and read-only mode".into(),
+                )
+            }
             _ if !self.sandbox_available => Decision::Ask(format!(
                 "run `{}` (no sandbox is available on this system)",
                 short(command)
@@ -462,19 +548,18 @@ impl PermissionEngine {
 
     /// Remembers a write's resolved path as an exact session approval. Returns `false` in plan
     /// or read-only mode (writes are refused outright, so an approval changes nothing), for a
-    /// write outside the workspace, inside `.git`, or matching a deny/confirm rule — none of
-    /// those decisions can be changed by an approval, since they're checked before the session
-    /// approvals in `check_write`.
+    /// write outside the workspace, to a protected path (`protected_write`), or matching a
+    /// deny/confirm rule — none of those decisions can be changed by an approval, since they're
+    /// checked before the session approvals in `check_write`.
     fn remember_write(&self, path: &Path) -> bool {
         if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
             return false;
         }
         let target = resolve_path(&self.workspace, path);
         let lexical = lexical_path(&self.workspace, path);
-        let Ok(inside) = target.strip_prefix(&self.workspace) else {
-            return false;
-        };
-        if inside.components().any(|c| is_dot_git(c.as_os_str())) {
+        if target.strip_prefix(&self.workspace).is_err()
+            || self.protected_write(&target, &lexical).is_some()
+        {
             return false;
         }
         if self

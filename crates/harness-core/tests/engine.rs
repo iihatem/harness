@@ -591,3 +591,128 @@ fn remember_is_a_noop_for_a_write_in_plan_or_read_only_mode() {
         );
     }
 }
+
+// --- Plan and read-only never run a shell command without the sandbox ---
+
+#[test]
+fn plan_and_read_only_refuse_commands_without_a_sandbox() {
+    let dir = tempfile::tempdir().unwrap();
+    for mode in [Mode::Plan, Mode::ReadOnly] {
+        let e = engine(
+            mode,
+            dir.path(),
+            false,
+            rules(&["bash:ls*"], &["bash:curl*"], &[]),
+        );
+        for cmd in [
+            "ls -la",
+            "cargo build",
+            "git reset --hard",
+            "for f in *; do rm \"$f\"; done",
+        ] {
+            assert_eq!(
+                e.check(&bash(cmd)),
+                Decision::Deny(
+                    "shell commands need the OS sandbox in plan and read-only mode".into()
+                ),
+                "{mode}: {cmd}"
+            );
+        }
+        match e.check(&bash("curl x")) {
+            Decision::Deny(reason) => assert!(reason.contains("curl"), "{mode}: {reason}"),
+            other => panic!("{mode}: expected Deny, got {other:?}"),
+        }
+    }
+    for mode in [Mode::Ask, Mode::Auto] {
+        let e = engine(mode, dir.path(), false, RuleSet::default());
+        assert!(is_ask(&e.check(&bash("ls -la"))), "{mode}");
+    }
+}
+
+// --- A symlinked or gitfile `.git` guards the gitdir it points to ---
+
+fn write(path: &str) -> Action {
+    Action::Write(PathBuf::from(path))
+}
+
+#[test]
+fn writes_into_a_symlinked_gitdir_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join("gitstuff/hooks")).unwrap();
+    symlink("gitstuff", ws.join(".git")).unwrap();
+    let e = engine(Mode::Auto, &ws, true, RuleSet::default());
+    for path in [
+        "gitstuff/hooks/pre-commit",
+        "gitstuff/config",
+        ".git/hooks/pre-commit",
+        "GITSTUFF/config",
+    ] {
+        assert!(is_ask(&e.check(&write(path))), "{path}");
+        assert!(!e.remember(&write(path)), "{path}");
+    }
+    assert_eq!(e.check(&write("src/main.rs")), Decision::Allow);
+    assert_eq!(e.check(&write("gitstuff2/x")), Decision::Allow);
+}
+
+#[test]
+fn writes_into_a_gitfile_gitdir_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join("meta/repo")).unwrap();
+    std::fs::write(ws.join(".git"), "gitdir: meta/repo\n").unwrap();
+    let e = engine(Mode::Auto, &ws, true, RuleSet::default());
+    assert!(is_ask(&e.check(&write("meta/repo/hooks/pre-commit"))));
+    assert!(is_ask(&e.check(&write("meta/repo/config"))));
+    assert_eq!(e.check(&write("meta/other.txt")), Decision::Allow);
+
+    let ws2 = dir.path().join("ws2");
+    std::fs::create_dir_all(ws2.join("g")).unwrap();
+    std::fs::write(
+        ws2.join(".git"),
+        format!("gitdir: {}\n", ws2.join("g").display()),
+    )
+    .unwrap();
+    let e = engine(Mode::Auto, &ws2, true, RuleSet::default());
+    assert!(is_ask(&e.check(&write("g/config"))));
+    assert_eq!(e.check(&write("src/lib.rs")), Decision::Allow);
+}
+
+// --- The write tools ask before writing into `.harness/` or a top-level `HEAD` ---
+
+#[test]
+fn writes_to_harness_metadata_or_a_top_level_head_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let e = engine(Mode::Auto, &ws, true, RuleSet::default());
+    for path in [
+        ".harness/config.toml",
+        ".harness",
+        ".HARNESS/config.toml",
+        ".harne\u{17f}s/config.toml",
+        "HEAD",
+        "head",
+        "HEAD/x",
+    ] {
+        assert!(is_ask(&e.check(&write(path))), "{path}");
+        assert!(!e.remember(&write(path)), "{path}");
+    }
+    for path in [
+        "src/HEAD",
+        "docs/.harness/config.toml",
+        "HEADER",
+        ".harnessx/y",
+    ] {
+        assert_eq!(e.check(&write(path)), Decision::Allow, "{path}");
+    }
+
+    // Reached through a symlink, in either direction.
+    symlink(".harness", ws.join("alias")).unwrap();
+    assert!(is_ask(&e.check(&write("alias/config.toml"))));
+    let ws2 = dir.path().join("ws2");
+    std::fs::create_dir_all(ws2.join("cfg")).unwrap();
+    symlink("cfg", ws2.join(".harness")).unwrap();
+    let e = engine(Mode::Auto, &ws2, true, RuleSet::default());
+    assert!(is_ask(&e.check(&write(".harness/config.toml"))));
+}

@@ -166,7 +166,7 @@ fn build(
         policy,
         approver,
         config,
-        ToolContext::new(dir),
+        ToolContext::new(dir).with_sandbox(None, mode.fs_access()),
     )
 }
 

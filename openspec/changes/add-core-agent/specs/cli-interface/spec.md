@@ -72,8 +72,21 @@ The system SHALL honour `NO_COLOR` and MUST NOT emit ANSI escape sequences when 
 - **WHEN** the user runs `harness ask "hi" > out.txt`
 - **THEN** `out.txt` contains no ANSI escape sequences
 
+### Requirement: Sandbox diagnosis
+The system SHALL provide `harness sandbox doctor`. It reports:
+
+- which sandbox mechanism is active;
+- on Linux, which git-protection tier the session gets and why;
+- the exact commands that would enable the full tier, such as an AppArmor profile for the harness binary or the user-namespace sysctl.
+
+It MUST NOT change system files itself.
+
+#### Scenario: Blocked user namespaces
+- **WHEN** the user runs `harness sandbox doctor` on a Linux system where unprivileged user namespaces are blocked
+- **THEN** it reports the basic tier, the reason, and the commands that would enable the full tier
+
 ### Requirement: Management subcommands
-The system SHALL provide `harness models`, `harness login <provider>`, `harness logout <provider>`, `harness auth add <provider>`, `harness auth use <provider> <profile>`, and `harness trust [--yes] [--revoke]`, with `--profile` accepted by `login`, `logout`, and `auth add`, and the flags `--model`, `--mode`, `-c`, and `--resume`.
+The system SHALL provide `harness models`, `harness login <provider>`, `harness logout <provider>`, `harness auth add <provider>`, `harness auth use <provider> <profile>`, `harness trust [--yes] [--revoke]`, and `harness sandbox doctor`, with `--profile` accepted by `login`, `logout`, and `auth add`, and the flags `--model`, `--mode`, `-c`, and `--resume`.
 
 #### Scenario: Help output
 - **WHEN** the user runs `harness --help`

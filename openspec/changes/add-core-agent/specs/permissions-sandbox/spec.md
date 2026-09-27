@@ -131,15 +131,32 @@ The system SHALL classify every shell command as allow-listed (every sub-command
 - **THEN** the user is asked to approve it
 
 ### Requirement: The sandbox protects repository hooks and config
-In workspace-write sandboxes the system SHALL deny writes to `.git/config`, `.git/hooks`, the `.git` directory entry itself, a top-level `HEAD` file, and `.harness/` inside the workspace, while allowing other writes under `.git` so that commit, checkout, and stash work.
+In workspace-write sandboxes the system SHALL protect `.git/config`, `.git/hooks`, `commondir`, the `.git` directory entry itself, a top-level `HEAD` file, and `.harness/` inside the workspace, while allowing other writes under `.git` so that commit, checkout, and stash work.
+
+On macOS, and on Linux when unprivileged user namespaces are available (the full tier), writes to these paths MUST fail. On Linux, names that do not exist yet MUST be caught by a guard that moves them to a quarantine directory, never deleting them, and reports it in the tool result.
+
+When user namespaces are unavailable (the basic tier), the system MUST warn at startup and point to `harness sandbox doctor`, and the guard MUST also restore changed protected files after each command. With `sandbox.linux_git_protection = "required"`, the basic tier MUST require approval for every shell command.
 
 #### Scenario: Planting a hook
-- **WHEN** a sandboxed command runs `echo x > .git/hooks/pre-commit` in `auto` mode
+- **WHEN** a sandboxed command runs `echo x > .git/hooks/pre-commit` in `auto` mode on macOS, or on Linux in the full tier
 - **THEN** the write fails
 
 #### Scenario: Committing
 - **WHEN** a sandboxed command runs `git commit --allow-empty -m test` in `auto` mode
 - **THEN** the commit succeeds
+
+#### Scenario: Planting a hook in the Linux basic tier
+- **WHEN** user namespaces are blocked and a sandboxed command in `auto` mode writes `.git/hooks/pre-commit`
+- **THEN** the file is moved to the quarantine directory after the command
+- **AND** the tool result says so
+
+#### Scenario: A new nested repository on Linux
+- **WHEN** a sandboxed command runs `git init sub` in `auto` mode on Linux
+- **THEN** `sub/.git` is moved to the quarantine directory and the tool result says so
+
+#### Scenario: Strict git protection without user namespaces
+- **WHEN** user namespaces are blocked, `sandbox.linux_git_protection = "required"`, and the model runs `ls` in `auto` mode
+- **THEN** the user is asked to approve it
 
 ### Requirement: Commands run in bash without startup files
 The system SHALL run shell commands with `bash --noprofile --norc -c` with `BASH_ENV` and `ENV` removed from the environment. Bash MUST be looked for only at `/bin/bash`, `/usr/bin/bash`, and `/run/current-system/sw/bin/bash`, never on `PATH`, and `/bin/sh -c` MUST be used only when none of them exists.

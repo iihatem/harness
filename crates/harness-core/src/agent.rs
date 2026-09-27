@@ -497,7 +497,8 @@ impl Agent {
         output
     }
 
-    /// A command failed inside the sandbox: ask whether to run it once without the sandbox.
+    /// A command failed inside the sandbox in a way that looks like a denial: ask whether to run
+    /// it once without the sandbox. Denials are recognised heuristically, so the wording hedges.
     async fn offer_unsandboxed_rerun(
         &mut self,
         call: &ToolCall,
@@ -506,8 +507,8 @@ impl Agent {
         first: ToolOutput,
         events: &UnboundedSender<AgentEvent>,
     ) -> ToolOutput {
-        let reason =
-            "the sandbox blocked this command; run it again without the sandbox?".to_string();
+        let reason = "the sandbox may have blocked this command; run it again without the sandbox?"
+            .to_string();
         let _ = events.send(AgentEvent::ApprovalNeeded {
             id: call.id.clone(),
             reason: reason.clone(),
@@ -533,7 +534,7 @@ impl Agent {
                 "the user declined to run it without the sandbox".to_string()
             }
             ApprovalDecision::Unavailable => {
-                let reason = "the sandbox blocked this command and no user is available to approve running it without the sandbox";
+                let reason = "the sandbox may have blocked this command and no user is available to approve running it without the sandbox";
                 let _ = events.send(AgentEvent::ActionBlocked {
                     id: call.id.clone(),
                     reason: reason.into(),

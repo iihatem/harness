@@ -335,9 +335,15 @@ async fn an_approved_rerun_runs_outside_the_sandbox() {
     ]);
     let mut agent = agent_with_sandbox(provider, Mode::Auto, Arc::new(AlwaysApprove), dir.path());
     let (_, events) = run(&mut agent, "go").await;
-    assert!(events.iter().any(
-        |e| matches!(e, AgentEvent::ApprovalNeeded { reason, .. } if reason.contains("without the sandbox"))
-    ));
+    // The denial is a heuristic guess, so the prompt must not state it as fact.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ApprovalNeeded { reason, .. }
+                if reason == "the sandbox may have blocked this command; run it again without the sandbox?"
+        )),
+        "{events:?}"
+    );
     assert_eq!(
         finished_outputs(&events),
         vec![("ran without the sandbox".to_string(), false)]
@@ -354,16 +360,17 @@ async fn headless_sandbox_denials_are_blocked_not_rerun() {
     let mut agent = agent_with_sandbox(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
     let (reason, events) = run(&mut agent, "go").await;
     assert_eq!(reason, TurnEndReason::Completed);
+    const BLOCKED: &str = "the sandbox may have blocked this command and no user is available to approve running it without the sandbox";
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ActionBlocked { id, .. } if id == "c1"))
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ActionBlocked { id, reason } if id == "c1" && reason == BLOCKED
+        )),
+        "{events:?}"
     );
     let (output, is_error) = &finished_outputs(&events)[0];
     assert!(
-        *is_error
-            && output.contains("Could not resolve host")
-            && output.contains("no user is available"),
+        *is_error && output.contains("Could not resolve host") && output.contains(BLOCKED),
         "{output}"
     );
 }

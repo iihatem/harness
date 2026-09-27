@@ -18,13 +18,22 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 - [x] 1.12 Retries and interruption; verify `cargo test -p harness-core --test resilience`
 - [x] 1.13 `harness ask` and `harness models`; verify `cargo test -p harness-cli --test ask_e2e` and `cargo deny check`
 
-## 2. P2 Safety (plan written after P1)
+## 2. P2 Safety (`docs/superpowers/plans/2026-09-26-m1-p2-safety.md`)
 
-- [ ] 2.1 Rule engine with `allow`/`deny`/`confirm` patterns and compound-command decomposition; verify the permissions-sandbox "Allow and deny rules" and "Compound shell commands" scenarios as tests
-- [ ] 2.2 Destructive-command confirmation, reads-outside-workspace approval, and approve-for-session; verify the matching permissions-sandbox scenarios as tests
-- [ ] 2.3 macOS Seatbelt sandbox for `bash` and command shell expansion; verify sandbox escape tests (write outside, network) on macOS CI
-- [ ] 2.4 Linux Landlock + seccomp sandbox (bubblewrap when installed) and the no-sandbox fallback; verify sandbox escape tests on Ubuntu CI
-- [ ] 2.5 Workspace trust for widening project settings; verify the configuration "Widening project settings require workspace trust" scenarios as tests
+- [x] 2.1 Spec updates for P2 decisions; verify `openspec validate add-core-agent --strict`
+- [x] 2.2 `harness-shell` command analysis; verify `cargo test -p harness-shell` (bypass table)
+- [x] 2.3 `[permissions]`/`[sandbox]` config, trust store, fingerprints; verify `cargo test -p harness-config`
+- [x] 2.4 `harness trust`; verify `cargo test -p harness-cli --test trust_e2e`
+- [x] 2.5 PermissionEngine (modes × rules × sandbox availability, session approvals); verify `cargo test -p harness-core --test engine`
+- [x] 2.6 `harness-sandbox` API, detection, denial heuristic, macOS Seatbelt; verify `cargo test -p harness-sandbox` on macOS
+- [x] 2.7 Linux Landlock + seccomp; verify `cargo test -p harness-sandbox` on ubuntu-24.04 CI
+- [x] 2.8 `bash` tool: bash without startup files, sandbox wrapping, denial flag; verify `cargo test -p harness-tools --test bash_tool`
+- [x] 2.9 Agent: approve-for-session and sandbox-denial re-run; verify `cargo test -p harness-core --test agent`
+- [x] 2.10 CLI wiring and end-to-end sandbox behaviour; verify `cargo test -p harness-cli --test sandbox_e2e`
+- [x] 2.11 CI pinned to ubuntu-24.04, README safety section; verify CI green on the P2 pull request
+- [ ] 2.12 (deferred past M1) macOS kernel-log denial correlation
+- [ ] 2.13 Linux git-metadata protection (required for M1): a mount-namespace/bubblewrap backend with read-only binds over `.git` config, hooks and commondir, `.harness/` and a top-level `HEAD`, used when available, with Landlock + seccomp as the fallback; verify with Linux integration tests in CI
+- [ ] 2.14 P2 follow-ups from the final review: here-document tracking in the fallback scan must not turn deny matches into prompts; a quote-aware heredoc pre-screen so quoted `<<` patterns stay decomposable; escape config parse errors before printing; the write tool asks before editing dotfiles when the workspace is `$HOME`; fix the design.md wording on nested symlinked gitdirs
 
 ## 3. P3 Memory (plan written after P2)
 

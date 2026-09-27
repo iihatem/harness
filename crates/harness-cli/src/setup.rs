@@ -1,10 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use harness_config::{
     config::{self, Config},
     paths::Paths,
 };
-use harness_core::permission::Mode;
 
 /// Everything a command needs about where it runs.
 pub struct Setup {
@@ -19,25 +18,18 @@ pub fn load() -> Result<Setup, String> {
         .and_then(|dir| dir.canonicalize())
         .map_err(|e| format!("cannot determine the working directory: {e}"))?;
     let paths = Paths::from_process_env().map_err(|e| e.to_string())?;
+    let trust =
+        harness_config::trust::TrustStore::load(&paths.data_dir).map_err(|e| e.to_string())?;
     let config =
-        config::load(&paths.global_config_file(), &workspace).map_err(|e| e.to_string())?;
+        config::load(&paths.global_config_file(), &workspace, &trust).map_err(|e| e.to_string())?;
     for warning in &config.warnings {
-        eprintln!("warning: {warning}");
+        eprintln!("warning: {}", crate::term::terminal_safe(warning));
     }
     Ok(Setup {
         paths,
         config,
         workspace,
     })
-}
-
-/// `auto` inside a git work tree (changes are recoverable), `ask` elsewhere.
-pub fn default_mode(workspace: &Path) -> Mode {
-    if workspace.ancestors().any(|dir| dir.join(".git").exists()) {
-        Mode::Auto
-    } else {
-        Mode::Ask
-    }
 }
 
 pub fn env(key: &str) -> Option<String> {

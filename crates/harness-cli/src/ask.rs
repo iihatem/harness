@@ -4,17 +4,19 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use harness_config::config;
 use harness_core::{
     agent::{Agent, AgentConfig, NonInteractive},
+    engine::{EngineConfig, PermissionEngine, RuleSet},
     event::{AgentEvent, TurnEndReason},
-    permission::{BaselinePolicy, Mode},
+    permission::{FsAccess, Mode},
     tool::ToolContext,
 };
 use harness_providers::registry;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{models, prompt, setup};
+use crate::{models, prompt, setup, term::terminal_safe};
 
 pub async fn run(
     model_flag: Option<String>,
@@ -83,7 +85,7 @@ pub async fn run(
 
     let mode = mode_flag
         .or(setup.config.mode)
-        .unwrap_or_else(|| setup::default_mode(&setup.workspace));
+        .unwrap_or_else(|| config::default_mode(&setup.workspace));
     if mode == Mode::FullAccess {
         eprintln!("warning: full-access mode: commands run without approval or sandbox");
     }
@@ -96,15 +98,61 @@ pub async fn run(
         std::process::id()
     );
     let output_dir = setup.paths.state_dir.join("tool-output").join(run_id);
-    let policy = Arc::new(BaselinePolicy::new(
+    let sandbox_disabled_by_env =
+        std::env::var("HARNESS_SANDBOX").as_deref() == Ok("none") && mode != Mode::FullAccess;
+    // Write access to `/`, `$HOME` or an ancestor of it would cover the user's dotfiles. Plan and
+    // read-only modes keep their read-only sandbox.
+    let workspace_too_broad = mode.fs_access() == FsAccess::WorkspaceWrite
+        && harness_sandbox::workspace_is_too_broad(&setup.workspace);
+    let sandbox = if mode == Mode::FullAccess || sandbox_disabled_by_env || workspace_too_broad {
+        None
+    } else {
+        harness_sandbox::detect(harness_sandbox::SandboxSettings {
+            extra_writable: setup.config.writable_roots.clone(),
+            allow_localhost: setup.config.allow_localhost,
+        })
+    };
+    let sandboxed = sandbox.is_some();
+    if mode != Mode::FullAccess && !sandboxed {
+        if sandbox_disabled_by_env {
+            eprintln!(
+                "warning: the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval"
+            );
+        } else if workspace_too_broad {
+            eprintln!(
+                "warning: the workspace {} is your home directory or above, where the sandbox would make your dotfiles writable, so it is off; every shell command will need approval",
+                terminal_safe(&setup.workspace.display().to_string())
+            );
+        } else {
+            eprintln!(
+                "warning: no OS sandbox is available; every shell command will need approval"
+            );
+        }
+    }
+    let mut read_dirs = setup.config.read_dirs.clone();
+    read_dirs.push(output_dir.clone());
+    let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode,
-        &setup.workspace,
-        vec![output_dir.clone()],
-    ));
+        workspace: setup.workspace.clone(),
+        read_dirs,
+        rules: RuleSet {
+            allow: setup.config.allow.clone(),
+            deny: setup.config.deny.clone(),
+            confirm: setup.config.confirm.clone(),
+        },
+        sandbox_available: sandboxed,
+    }));
+    for rule in policy.unknown_rules() {
+        eprintln!(
+            "warning: rule `{}` names an unknown tool (use bash:, read:, or write:)",
+            terminal_safe(&rule)
+        );
+    }
+    let ctx = ToolContext::new(&setup.workspace).with_sandbox(sandbox, mode.fs_access());
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),
-        prompt::system_prompt(&setup.workspace, &prompt::today_utc(), mode),
+        prompt::system_prompt(&setup.workspace, &prompt::today_utc(), mode, sandboxed),
         output_dir,
     );
     if let Some(steps) = setup.config.max_steps {
@@ -116,7 +164,7 @@ pub async fn run(
         policy,
         Arc::new(NonInteractive),
         config,
-        ToolContext::new(&setup.workspace),
+        ctx,
     );
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -268,23 +316,28 @@ async fn render(
             AgentEvent::ActionBlocked { reason, .. } => {
                 blocked = true;
                 if !json {
-                    eprintln!("blocked: {reason}");
+                    eprintln!("blocked: {}", terminal_safe(reason));
                 }
             }
             AgentEvent::ToolCallRequested {
                 name, arguments, ..
             } if !json => {
                 let shown: String = arguments.chars().take(120).collect();
-                eprintln!("-> {name} {shown}");
+                eprintln!("-> {} {}", terminal_safe(name), terminal_safe(&shown));
             }
             AgentEvent::Retrying {
                 attempt,
                 reason,
                 delay_ms,
             } if !json => {
-                eprintln!("retrying (attempt {attempt}) in {delay_ms} ms: {reason}");
+                eprintln!(
+                    "retrying (attempt {attempt}) in {delay_ms} ms: {}",
+                    terminal_safe(reason)
+                );
             }
-            AgentEvent::Error { message, .. } if !json => eprintln!("error: {message}"),
+            AgentEvent::Error { message, .. } if !json => {
+                eprintln!("error: {}", terminal_safe(message))
+            }
             AgentEvent::TurnFinished {
                 reason: TurnEndReason::StepLimit,
             } if !json => {

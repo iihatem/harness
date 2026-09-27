@@ -2,6 +2,8 @@ mod ask;
 mod models;
 mod prompt;
 mod setup;
+mod term;
+mod trust;
 
 use std::process::ExitCode;
 
@@ -38,6 +40,15 @@ enum Command {
     },
     /// List models from local servers and configured providers
     Models,
+    /// Review the workspace's project settings that widen what the agent may do, and trust them
+    Trust {
+        /// Trust without asking (for scripts)
+        #[arg(long)]
+        yes: bool,
+        /// Remove trust for this workspace
+        #[arg(long, conflicts_with = "yes")]
+        revoke: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -49,6 +60,7 @@ fn main() -> ExitCode {
                 ask::run(cli.model, cli.mode, prompt.join(" "), json).await
             }
             Some(Command::Models) => models::run().await,
+            Some(Command::Trust { yes, revoke }) => trust::run(yes, revoke),
             None => {
                 eprintln!("Interactive mode is not available yet; use `harness ask \"...\"`.");
                 2

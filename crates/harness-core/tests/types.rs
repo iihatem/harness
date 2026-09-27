@@ -30,8 +30,20 @@ fn modes_parse_from_kebab_case() {
     assert_eq!("read-only".parse::<Mode>().unwrap(), Mode::ReadOnly);
     assert_eq!(Mode::ReadOnly.to_string(), "read-only");
     assert!("yolo".parse::<Mode>().is_err());
-    assert!(Mode::Ask.is_narrow());
-    assert!(!Mode::Auto.is_narrow());
+}
+
+#[test]
+fn modes_rank_from_plan_and_read_only_up_to_full_access() {
+    use Mode::*;
+    assert!(Plan.grants_at_most(ReadOnly) && ReadOnly.grants_at_most(Plan));
+    assert!(ReadOnly.grants_at_most(Ask) && !Ask.grants_at_most(ReadOnly));
+    assert!(!Ask.grants_at_most(Plan));
+    assert!(Ask.grants_at_most(Auto) && !Auto.grants_at_most(Ask));
+    assert!(Auto.grants_at_most(FullAccess) && !FullAccess.grants_at_most(Auto));
+    for mode in [Plan, ReadOnly, Ask, Auto, FullAccess] {
+        assert!(mode.grants_at_most(mode), "{mode}");
+        assert!(mode.grants_at_most(FullAccess), "{mode}");
+    }
 }
 
 #[test]

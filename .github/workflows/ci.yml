@@ -9,7 +9,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # ubuntu-24.04: kernel 6.8+ with Landlock ABI ≥ 4 (harness needs ≥ 3); pinned so the sandbox suite keeps running on a known kernel.
+        os: [ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -19,6 +20,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
+        env:
+          HARNESS_REQUIRE_LINUX_SANDBOX: ${{ runner.os == 'Linux' && '1' || '0' }}
   deny:
     runs-on: ubuntu-latest
     steps:

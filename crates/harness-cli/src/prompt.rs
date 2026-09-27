@@ -7,13 +7,30 @@ use harness_core::permission::Mode;
 
 /// The base system prompt plus environment facts captured once per run. Kept short on purpose:
 /// local models have small context windows. P3 replaces this with full context assembly.
-pub fn system_prompt(workspace: &Path, date: &str, mode: Mode) -> String {
+pub fn system_prompt(workspace: &Path, date: &str, mode: Mode, sandboxed: bool) -> String {
+    let sandbox_line = if !sandboxed && mode == Mode::FullAccess {
+        "No OS sandbox is active."
+    } else if !sandboxed && matches!(mode, Mode::Plan | Mode::ReadOnly) {
+        "No OS sandbox is active, so shell commands and file edits are refused; use the read, grep and glob tools instead."
+    } else if !sandboxed {
+        "No OS sandbox is active, so every shell command needs approval and will be refused; use the file tools instead."
+    } else if matches!(mode, Mode::Plan | Mode::ReadOnly) {
+        "Shell commands run in a read-only sandbox with no network access, and file edits are refused."
+    } else {
+        "Shell commands run in a sandbox with no network access; they can write only inside the workspace, temporary directories, and any configured writable roots."
+    };
+    let approval_line = if mode == Mode::FullAccess {
+        "In full-access mode actions run without approval, except those a deny rule forbids or may match."
+    } else {
+        "You are running non-interactively, so actions that need approval will be refused, including destructive commands, commands harness cannot fully analyse, commands the sandbox blocks, anything a rule forbids or asks to confirm, and in ask mode any unlisted command or file edit."
+    };
+    let rules = format!("{sandbox_line} {approval_line}");
     format!(
         "You are harness, a coding agent working in the user's project.\n\
          Use the tools to inspect files and make changes; never guess file contents.\n\
          Read a file before editing it. Make focused changes, and verify them (for example by running the tests) when you can.\n\
          When you are done, reply with a short summary of what you changed.\n\
-         Approval mode: {mode}. You are running non-interactively: actions that need approval will be refused, so prefer read-only investigation and file edits unless the mode is full-access.\n\
+         Approval mode: {mode}. {rules}\n\
          \n\
          Working directory: {}\n\
          Operating system: {}\n\
@@ -60,7 +77,7 @@ mod tests {
 
     #[test]
     fn base_prompt_is_under_1000_tokens() {
-        let prompt = system_prompt(Path::new("/some/project"), "2026-09-24", Mode::Auto);
+        let prompt = system_prompt(Path::new("/some/project"), "2026-09-24", Mode::Auto, true);
         assert!(prompt.len() / 4 < 1000, "~{} tokens", prompt.len() / 4);
         assert!(prompt.contains("Working directory: /some/project"));
     }
@@ -69,8 +86,82 @@ mod tests {
     // know its mode won't let it ask.
     #[test]
     fn approval_mode_line_names_the_mode() {
-        let prompt = system_prompt(Path::new("/some/project"), "2026-09-24", Mode::Ask);
+        let prompt = system_prompt(Path::new("/some/project"), "2026-09-24", Mode::Ask, true);
         assert!(prompt.contains("Approval mode: ask"), "{prompt}");
-        assert!(prompt.contains("non-interactively"));
+    }
+
+    #[test]
+    fn the_prompt_says_whether_commands_are_sandboxed() {
+        let yes = system_prompt(Path::new("/p"), "2026-09-26", Mode::Auto, true);
+        assert!(yes.contains("run in a sandbox"), "{yes}");
+        let no = system_prompt(Path::new("/p"), "2026-09-26", Mode::Auto, false);
+        assert!(no.contains("No OS sandbox is active"), "{no}");
+        assert!(!no.contains("run in a sandbox"), "{no}");
+    }
+
+    // Review Focus: without a sandbox, `check_bash` asks for every shell command outside
+    // full-access, so a headless run refuses them all — the prompt must say so plainly instead of
+    // implying ordinary commands still run.
+    #[test]
+    fn without_a_sandbox_the_prompt_says_every_command_needs_approval_unless_full_access() {
+        let auto = system_prompt(Path::new("/p"), "2026-09-26", Mode::Auto, false);
+        assert!(
+            auto.contains("every shell command needs approval"),
+            "{auto}"
+        );
+        let full_access = system_prompt(Path::new("/p"), "2026-09-26", Mode::FullAccess, false);
+        assert!(!full_access.contains("every shell command needs approval"));
+    }
+
+    #[test]
+    fn plan_and_read_only_without_a_sandbox_say_commands_are_refused() {
+        for mode in [Mode::Plan, Mode::ReadOnly] {
+            let prompt = system_prompt(Path::new("/p"), "2026-09-26", mode, false);
+            assert!(
+                prompt.contains("shell commands and file edits are refused"),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("needs approval"), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn plan_and_read_only_get_a_read_only_sandbox_line() {
+        for mode in [Mode::Plan, Mode::ReadOnly] {
+            let prompt = system_prompt(Path::new("/p"), "2026-09-26", mode, true);
+            assert!(prompt.contains("read-only sandbox"), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn plan_mode_sandboxed_says_file_edits_are_refused() {
+        let prompt = system_prompt(Path::new("/p"), "2026-09-26", Mode::Plan, true);
+        assert!(prompt.contains("file edits are refused"), "{prompt}");
+    }
+
+    // Review Focus: a headless run refuses actions it can't get approval for; the model must be
+    // told this plainly, in every mode that can actually ask (sandboxed or not).
+    #[test]
+    fn ask_and_auto_state_the_refusal_rule_sandboxed_or_not() {
+        for mode in [Mode::Ask, Mode::Auto] {
+            for sandboxed in [true, false] {
+                let prompt = system_prompt(Path::new("/p"), "2026-09-26", mode, sandboxed);
+                assert!(prompt.contains("non-interactively"), "{prompt}");
+                assert!(
+                    prompt.contains("actions that need approval will be refused"),
+                    "{prompt}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_access_states_the_full_access_rule_instead_of_the_refusal_rule() {
+        let prompt = system_prompt(Path::new("/p"), "2026-09-26", Mode::FullAccess, false);
+        assert!(
+            prompt.contains("full-access mode actions run without approval"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("actions that need approval will be refused"));
     }
 }

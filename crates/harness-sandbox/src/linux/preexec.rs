@@ -46,8 +46,10 @@ pub(super) struct PreparedSandbox {
     /// errors in the parent, before the child is ever forked, rather than
     /// handing back a `PreparedSandbox` with nothing to restrict.
     pub(super) landlock_ruleset_fd: OwnedFd,
-    /// The compiled network-deny seccomp-BPF program.
+    /// The compiled seccomp-BPF programs: network, mounts and namespaces;
+    /// then `clone3`.
     pub(super) seccomp_program: BpfProgram,
+    pub(super) clone3_program: BpfProgram,
 }
 
 /// Installs the sandbox in the calling process. Must only be invoked from a
@@ -77,9 +79,10 @@ pub(super) fn apply(prepared: &PreparedSandbox) -> io::Result<()> {
     //    already rejected in the parent, before fork.
     landlock_restrict_self(prepared.landlock_ruleset_fd.as_raw_fd())?;
 
-    // 5. Network restriction. Installed last so none of the syscalls above
-    //    can themselves be filtered.
+    // 5. Network, mount and namespace restriction. Installed last so none of
+    //    the syscalls above can themselves be filtered.
     seccompiler::apply_filter(&prepared.seccomp_program).map_err(seccomp_apply_error)?;
+    seccompiler::apply_filter(&prepared.clone3_program).map_err(seccomp_apply_error)?;
 
     Ok(())
 }

@@ -1,5 +1,5 @@
-//! Linux sandbox backend: a Landlock ruleset (filesystem) plus a
-//! seccomp-BPF program (network) installed from `pre_exec`, in the
+//! Linux sandbox backend: a Landlock ruleset (filesystem) plus seccomp-BPF
+//! programs (network, mounts, namespaces) installed from `pre_exec`, in the
 //! forked child, before `execve`.
 //!
 //! ## Split between parent and child
@@ -7,7 +7,7 @@
 //! Everything that can allocate, open files, or otherwise take locks (the
 //! Landlock ruleset with its `path_beneath` rules, the compiled seccomp-BPF
 //! program) is built in the **parent**, by [`fs::build_ruleset_fd`] and
-//! [`seccomp::build_network_deny_filter`]. [`linux_sandbox_command`] hands
+//! [`seccomp::build_deny_filter`]. [`linux_sandbox_command`] hands
 //! the results to [`preexec::apply`], which is the only code that runs in
 //! the forked child's `pre_exec` closure. That function is restricted to
 //! async-signal-safe operations: raw syscalls (`setsid`, `prctl`,
@@ -29,8 +29,8 @@
 //!    install a filter, and applied before Landlock too so nothing between
 //!    here and `execve` could regain privileges via a setuid/setgid binary.
 //! 4. `landlock_restrict_self` on the ruleset fd built in the parent.
-//! 5. Install the seccomp-BPF program. Last, so none of the syscalls above
-//!    can be filtered by it.
+//! 5. Install the seccomp-BPF programs. Last, so none of the syscalls above
+//!    can be filtered by them.
 
 mod detect;
 mod fdcleanup;
@@ -50,7 +50,7 @@ pub use detect::{landlock_abi, linux_sandbox_available};
 /// Builds a [`tokio::process::Command`] for `program`/`args` with `policy`'s
 /// Landlock + seccomp sandbox installed via `pre_exec`.
 ///
-/// The Landlock ruleset and the seccomp-BPF program are both compiled here,
+/// The Landlock ruleset and the seccomp-BPF programs are all compiled here,
 /// in the caller's process, before the child ever exists; `pre_exec` only
 /// has to hand already-prepared data to the kernel. See the [`linux`
 /// module docs](self) for the full ordering rationale.
@@ -68,11 +68,13 @@ pub fn linux_sandbox_command(
     args: &[&str],
 ) -> io::Result<Command> {
     let landlock_ruleset_fd = fs::build_ruleset_fd(policy)?;
-    let seccomp_program = seccomp::build_network_deny_filter()?;
+    let seccomp_program = seccomp::build_deny_filter()?;
+    let clone3_program = seccomp::build_clone3_filter()?;
 
     let prepared = PreparedSandbox {
         landlock_ruleset_fd,
         seccomp_program,
+        clone3_program,
     };
 
     let mut command = Command::new(program);

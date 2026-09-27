@@ -7,6 +7,7 @@ mod index;
 mod linked;
 mod read;
 
+pub(crate) use index::nested_gitdirs;
 pub use index::{GitIndex, IgnoreRules, discover, read_ignore_rules};
 #[cfg(target_os = "macos")]
 pub(crate) use linked::{LinkedGitdirs, linked_gitdirs};

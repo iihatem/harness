@@ -3,6 +3,7 @@
 
 mod denial;
 pub mod gitmeta;
+pub mod guard;
 // Only x86_64/aarch64 are supported: `linux::seccomp` only knows how to
 // target those two architectures. Any other Linux architecture skips this
 // module entirely and compiles as if no sandbox backend were available,

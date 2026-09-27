@@ -341,10 +341,6 @@ pub(crate) struct Meter {
 /// `worktrees/`) and submodules (every directory below `modules/` that holds
 /// a `HEAD`, down to 64 levels, and not in the [`DATA_DIRS`] of another).
 /// Symlinks are not followed.
-#[expect(
-    dead_code,
-    reason = "for the Linux guard's re-check of the gitdirs it knows; drop this once it calls it"
-)]
 pub(crate) fn nested_gitdirs(gitdir: &Path) -> Vec<PathBuf> {
     Walk::new(Budget::DEFAULT).nested_gitdirs(gitdir)
 }

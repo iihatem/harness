@@ -119,6 +119,8 @@ struct Splitter {
     depth: usize,
     /// Outer contexts of the open `$(…)`/backtick substitutions.
     stack: Vec<Frame>,
+    /// Open backtick substitutions.
+    backticks: usize,
 }
 
 struct Frame {
@@ -153,6 +155,7 @@ impl Splitter {
             lost: None,
             depth,
             stack: Vec::new(),
+            backticks: 0,
         }
     }
 
@@ -385,9 +388,8 @@ impl Splitter {
             return;
         }
         // bash reads backtick text only when it runs it, and may end `((…))` elsewhere.
-        let trusted = self.arithmetic_commands == 0
-            && self.depth < MAX_HEREDOC_DEPTH
-            && !self.stack.iter().any(|f| f.opener == '`');
+        let trusted =
+            self.arithmetic_commands == 0 && self.depth < MAX_HEREDOC_DEPTH && self.backticks == 0;
         match self.delimiter() {
             Some(doc) if trusted && self.track && self.lost.is_none() => self.heredocs.push(doc),
             _ => self.lose_track(),
@@ -428,12 +430,9 @@ impl Splitter {
     /// Splits the bodies of the here-documents started in this substitution on the line
     /// that just ended.
     fn heredoc_bodies(&mut self) {
+        // Pending here-documents are in operator order, so their levels never decrease.
         let level = self.stack.len();
-        let first = self
-            .heredocs
-            .iter()
-            .position(|d| d.level == level)
-            .unwrap_or(self.heredocs.len());
+        let first = self.heredocs.partition_point(|d| d.level < level);
         for doc in self.heredocs.split_off(first) {
             let start = self.at;
             let (body, continued) = self.read_body(&doc);
@@ -519,6 +518,7 @@ impl Splitter {
     }
 
     fn open(&mut self, opener: char) {
+        self.backticks += usize::from(opener == '`');
         self.stack.push(Frame {
             words: take(&mut self.words),
             word: take(&mut self.word),
@@ -547,6 +547,7 @@ impl Splitter {
             self.lose_track();
         }
         if let Some(f) = self.stack.pop() {
+            self.backticks -= usize::from(f.opener == '`');
             self.words = f.words;
             self.word = f.word;
             self.undecodable = f.undecodable;
@@ -661,6 +662,19 @@ mod tests {
                 cmd(&["curl", "y"], true),
             ]
         );
+    }
+
+    #[test]
+    fn deep_substitutions_split_in_linear_time() {
+        for src in [
+            format!("{}{}", "$(".repeat(40_000), "cat <<X ".repeat(40_000)),
+            format!("{}{}", "cat <<X ".repeat(40_000), "$(\n".repeat(40_000)),
+        ] {
+            let start = std::time::Instant::now();
+            rough_commands(&src);
+            let took = start.elapsed();
+            assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+        }
     }
 
     #[test]

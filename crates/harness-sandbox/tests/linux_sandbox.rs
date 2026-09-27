@@ -966,23 +966,6 @@ print("ok")
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
 }
 
-#[tokio::test]
-async fn child_proc_status_reports_both_seccomp_filters() {
-    let Some(ws) = new_workspace() else {
-        return;
-    };
-    let policy = workspace_write_policy(ws.path());
-
-    let output = run(&policy, "cat", &["/proc/self/status"]).await;
-
-    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.lines().any(|line| line == "Seccomp_filters:\t2"),
-        "missing Seccomp_filters:\\t2 in:\n{stdout}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Process hierarchy
 // ---------------------------------------------------------------------------
@@ -1115,5 +1098,43 @@ async fn child_proc_status_reports_no_new_privs_and_seccomp_filter_active() {
     assert!(
         stdout.lines().any(|line| line == "Seccomp:\t2"),
         "missing Seccomp:\\t2 in:\n{stdout}"
+    );
+}
+
+/// The sandboxed child reports exactly 2 more seccomp filters than the test process did when it
+/// spawned it. The test process could be running under Docker, Podman, or harness's own sandbox
+/// (which adds 2 filters of its own), so we measure the difference rather than assert a fixed count.
+#[tokio::test]
+async fn child_proc_status_reports_two_more_seccomp_filters_than_parent() {
+    let Some(ws) = new_workspace() else {
+        return;
+    };
+    let policy = workspace_write_policy(ws.path());
+
+    // Read the parent process's own Seccomp_filters value.
+    let parent_status = std::fs::read_to_string("/proc/self/status")
+        .expect("failed to read parent /proc/self/status");
+    let parent_filters: u32 = parent_status
+        .lines()
+        .find_map(|line| line.strip_prefix("Seccomp_filters:\t"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let output = run(&policy, "cat", &["/proc/self/status"]).await;
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    let child_stdout = String::from_utf8_lossy(&output.stdout);
+    let child_filters: u32 = child_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Seccomp_filters:\t"))
+        .and_then(|s| s.parse().ok())
+        .expect("missing Seccomp_filters in child output");
+
+    assert_eq!(
+        child_filters,
+        parent_filters + 2,
+        "expected child to have parent_filters ({}) + 2, but got {}",
+        parent_filters,
+        child_filters
     );
 }

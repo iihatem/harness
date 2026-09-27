@@ -46,9 +46,9 @@ pub(super) struct PreparedSandbox {
     /// errors in the parent, before the child is ever forked, rather than
     /// handing back a `PreparedSandbox` with nothing to restrict.
     pub(super) landlock_ruleset_fd: OwnedFd,
-    /// The compiled seccomp-BPF programs: network, mounts and namespaces;
-    /// then `clone3`.
+    /// The main seccomp-BPF program: network, mounts and namespaces.
     pub(super) seccomp_program: BpfProgram,
+    /// The `clone3`-specific seccomp-BPF program that makes it fail with `ENOSYS`.
     pub(super) clone3_program: BpfProgram,
 }
 

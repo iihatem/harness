@@ -72,7 +72,7 @@ use seccompiler::{
 };
 
 /// `open_tree_attr` (Linux 6.15), which `libc` does not name yet. New
-/// syscalls share one number on every architecture.
+/// syscalls share one number on the architectures harness supports.
 const SYS_OPEN_TREE_ATTR: i64 = 467;
 
 /// Syscalls denied unconditionally (regardless of arguments): the rest of

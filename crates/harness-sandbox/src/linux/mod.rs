@@ -5,9 +5,9 @@
 //! ## Split between parent and child
 //!
 //! Everything that can allocate, open files, or otherwise take locks (the
-//! Landlock ruleset with its `path_beneath` rules, the compiled seccomp-BPF
-//! program) is built in the **parent**, by [`fs::build_ruleset_fd`] and
-//! [`seccomp::build_deny_filter`]. [`linux_sandbox_command`] hands
+//! Landlock ruleset with its `path_beneath` rules, and the compiled seccomp-BPF
+//! programs) is built in the **parent**, by [`fs::build_ruleset_fd`],
+//! [`seccomp::build_deny_filter`] and [`seccomp::build_clone3_filter`]. [`linux_sandbox_command`] hands
 //! the results to [`preexec::apply`], which is the only code that runs in
 //! the forked child's `pre_exec` closure. That function is restricted to
 //! async-signal-safe operations: raw syscalls (`setsid`, `prctl`,

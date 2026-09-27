@@ -84,13 +84,17 @@ mod tests {
     }
 
     #[test]
-    fn network_deny_filter_builds_on_this_host_architecture() {
+    fn seccomp_filters_build_on_this_host_architecture() {
         // Independent of Landlock support: `linux_sandbox_available`'s
-        // seccomp half should always succeed on x86_64/aarch64, the only
+        // seccomp filters should always succeed on x86_64/aarch64, the only
         // architectures this module compiles for at all.
         assert!(
             crate::linux::seccomp::build_deny_filter().is_ok(),
-            "the seccomp filter should always build on this architecture"
+            "the deny filter should always build on this architecture"
+        );
+        assert!(
+            crate::linux::seccomp::build_clone3_filter().is_ok(),
+            "the clone3 filter should always build on this architecture"
         );
     }
 }

@@ -84,11 +84,20 @@ pub(crate) fn parser_options() -> brush_parser::ParserOptions {
     }
 }
 
+/// A command substitution found in a word, to be analyzed as a sub-command.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Sub {
+    /// The text it runs.
+    pub text: String,
+    /// Written with backticks rather than `$(…)`.
+    pub backquoted: bool,
+}
+
 /// What scanning a word found besides its token.
 #[derive(Default)]
 pub(crate) struct Scan {
     /// Command substitutions, to be analyzed as sub-commands.
-    pub subs: Vec<String>,
+    pub subs: Vec<Sub>,
     /// Why the text cannot be fully analyzed, although scanning went on.
     pub opaque: Vec<String>,
     /// Text of the word that bash reads literally but may evaluate later.
@@ -235,7 +244,7 @@ fn scan_nested(text: &str, scan: &mut Scan, depth: usize) -> Result<(), String> 
 
 /// Parses a word or a here-document body into pieces (`None` if brush-parser rejects
 /// it), unless it nests expansions too deeply to parse in bounded time.
-fn parse(text: &str, heredoc: bool) -> Result<Option<Vec<WordPieceWithSource>>, String> {
+pub(crate) fn parse(text: &str, heredoc: bool) -> Result<Option<Vec<WordPieceWithSource>>, String> {
     if let Some(why) = too_nested(text, heredoc) {
         return Err(why.into());
     }
@@ -586,18 +595,20 @@ fn delimiters_agree(raw: &str) -> bool {
     quote.is_none()
 }
 
+/// `line` without its leading tabs when `tabs` (for `<<-`).
+fn stripped(line: &str, tabs: bool) -> &str {
+    if tabs {
+        line.trim_start_matches('\t')
+    } else {
+        line
+    }
+}
+
 /// Whether bash ends a here-document of an unquoted delimiter elsewhere than at the last
 /// line of `raw`, its text as written through the delimiter line, where brush-parser ends
 /// it. bash joins each line ending in an odd number of backslashes with the next and, for
 /// `<<-`, strips the leading tabs of the joined line before comparing it.
 fn ends_elsewhere(raw: &str, delimiter: &str, strip_tabs: bool) -> bool {
-    fn stripped(line: &str, tabs: bool) -> &str {
-        if tabs {
-            line.trim_start_matches('\t')
-        } else {
-            line
-        }
-    }
     let lines: Vec<&str> = raw.split_terminator('\n').collect();
     if lines
         .last()
@@ -606,6 +617,21 @@ fn ends_elsewhere(raw: &str, delimiter: &str, strip_tabs: bool) -> bool {
         // Not the text brush-parser read.
         return true;
     }
+    joined_delimiter_line(&lines, delimiter, strip_tabs).is_none_or(|i| i + 1 < lines.len())
+}
+
+/// Whether joining the lines of `raw` (a body as written through its delimiter line) that
+/// end in an odd number of backslashes makes a line equal `delimiter` before the last line.
+/// bash 3.2 removes backslash-newlines while it reads a `$(…)`, before it reads the
+/// here-documents in it, whatever their delimiter; a body that never ends only hides text.
+pub(crate) fn joined_ends_earlier(raw: &str, delimiter: &str, strip_tabs: bool) -> bool {
+    let lines: Vec<&str> = raw.split_terminator('\n').collect();
+    joined_delimiter_line(&lines, delimiter, strip_tabs).is_some_and(|i| i + 1 < lines.len())
+}
+
+/// The index of the first of `lines` at which a line joined as bash joins continuation
+/// lines equals `delimiter` (for `<<-`, once its leading tabs are stripped).
+fn joined_delimiter_line(lines: &[&str], delimiter: &str, strip_tabs: bool) -> Option<usize> {
     let mut joined = String::new();
     for (i, line) in lines.iter().enumerate() {
         if continued(line) {
@@ -614,11 +640,11 @@ fn ends_elsewhere(raw: &str, delimiter: &str, strip_tabs: bool) -> bool {
         }
         joined.push_str(line);
         if stripped(&joined, strip_tabs) == delimiter {
-            return i + 1 < lines.len();
+            return Some(i);
         }
         joined.clear();
     }
-    true
+    None
 }
 
 /// Whether the here-document delimiter word at the start of `b` is missing, has no
@@ -755,7 +781,10 @@ impl Builder {
                 }
                 WordPiece::CommandSubstitution(c) | WordPiece::BackquotedCommandSubstitution(c) => {
                     self.dynamic = true;
-                    scan.subs.push(c.clone());
+                    scan.subs.push(Sub {
+                        text: c.clone(),
+                        backquoted: matches!(p.piece, WordPiece::BackquotedCommandSubstitution(_)),
+                    });
                 }
                 WordPiece::ArithmeticExpression(e) => {
                     self.dynamic = true;
@@ -1005,7 +1034,15 @@ mod tests {
     fn nested_substitutions_are_collected() {
         let mut scan = Scan::default();
         word_to_tok("${X:-$(curl a)}$(( $(curl b) ))`curl c`", &mut scan).unwrap();
-        assert_eq!(scan.subs, ["curl a", "curl b", "curl c"]);
+        let subs: Vec<_> = scan
+            .subs
+            .iter()
+            .map(|s| (s.text.as_str(), s.backquoted))
+            .collect();
+        assert_eq!(
+            subs,
+            [("curl a", false), ("curl b", false), ("curl c", true)]
+        );
     }
 
     #[test]
@@ -1102,6 +1139,12 @@ mod tests {
         assert!(!ends_elsewhere("foo\\\\\nEOF\n", "EOF", false));
         assert!(!ends_elsewhere("a \\\nb\nEOF", "EOF", false));
         assert!(!ends_elsewhere("\\\nEOF\n", "EOF", false));
+        // bash 3.2 joins the lines of a body with a quoted delimiter in `$(…)` too; only
+        // a body it ends before the last line matters.
+        assert!(joined_ends_earlier("EO\\\nF\nx\nEOF\n", "EOF", false));
+        assert!(joined_ends_earlier("\tEO\\\nF\nx\n\tEOF\n", "EOF", true));
+        assert!(!joined_ends_earlier("a \\\nb\nEOF\n", "EOF", false));
+        assert!(!joined_ends_earlier("C:\\dir\\\nEOF\n", "EOF", false));
         // bash joins an unquoted body's continuation lines before expanding it.
         assert_eq!(join_continuations("a\nb"), "a\nb");
         assert_eq!(join_continuations("$\\\n(x)\n"), "$(x)\n");

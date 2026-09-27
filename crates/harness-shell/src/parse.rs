@@ -7,6 +7,7 @@ use brush_parser::ast::{
 };
 
 use crate::argv::{self, Hidden, MAX_DEPTH, Scan, Tok, basename, command_name};
+use crate::bash32;
 use crate::destructive;
 use crate::fallback;
 use crate::git;
@@ -89,6 +90,7 @@ pub(crate) fn analyze(src: &str, ws: &Workspace) -> Analysis {
         data: 0,
         rescan: None,
         sources: Vec::new(),
+        comsub: 0,
     };
     walker.program(src, &mut Cwd::at(ws.root()), 0);
     walker.out
@@ -120,6 +122,9 @@ struct Walker<'a> {
     rescan: Option<&'static str>,
     /// The text of the programs being walked, innermost last.
     sources: Vec<String>,
+    /// Command substitutions being walked, since the last program bash parses from its
+    /// start (the command itself, or `bash -c` or `eval` text).
+    comsub: usize,
 }
 
 impl Walker<'_> {
@@ -183,7 +188,17 @@ impl Walker<'_> {
                 let rescan = self.rescan;
                 self.rescan = outer.or(rescan);
                 let panicked = argv::parser_panics() > panics;
-                if let Some(why) = rescan.or(panicked.then_some(argv::PARSER_PANICKED)) {
+                // bash 3.2 reads the command substitutions of a program it parses from the
+                // start its own way; the text of each is checked with that program.
+                let bash32 = if self.comsub == 0 {
+                    bash32::divergence(src)
+                } else {
+                    None
+                };
+                let why = rescan
+                    .or(panicked.then_some(argv::PARSER_PANICKED))
+                    .or(bash32);
+                if let Some(why) = why {
                     self.undecomposable(why.into());
                     self.rough_scan(src, depth);
                 }
@@ -546,7 +561,17 @@ impl Walker<'_> {
             self.undecomposable(why);
         }
         for sub in scan.subs {
-            self.program(&sub, &mut cwd.clone(), depth + 1);
+            // Where bash may end a `$(…)` at another `)`, it runs text this analysis did not
+            // read as a command, in this program or an enclosing one.
+            if !sub.backquoted
+                && let Some(why) = bash32::substitution_misread(&sub.text)
+            {
+                self.undecomposable(why.into());
+                self.rescan = Some(why);
+            }
+            self.comsub += 1;
+            self.program(&sub.text, &mut cwd.clone(), depth + 1);
+            self.comsub -= 1;
         }
     }
 
@@ -597,8 +622,26 @@ impl Walker<'_> {
                             .collect::<String>(),
                     )
                 };
-                let continued = doc.requires_expansion && body.lines().any(|l| l.ends_with('\\'));
+                // bash 3.2 removes backslash-newlines while it reads a `$(…)`, before it
+                // reads the here-documents in it, so it joins the lines of a body with a
+                // quoted delimiter there too.
+                let joins = doc.requires_expansion || self.comsub > 0;
+                let continued = joins && body.lines().any(|l| l.ends_with('\\'));
                 let raw = if continued { raw() } else { None };
+                if continued && !doc.requires_expansion {
+                    let unquoted: String = delimiter
+                        .chars()
+                        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+                        .collect();
+                    let early = raw.as_deref().is_none_or(|raw| {
+                        argv::joined_ends_earlier(raw, &unquoted, doc.remove_tabs)
+                    });
+                    if early {
+                        self.rescan = Some(
+                            "bash 3.2 (macOS /bin/bash) joins lines of this here-document and may end it earlier",
+                        );
+                    }
+                }
                 if let Some(why) = argv::heredoc_misread(
                     delimiter,
                     body,
@@ -705,7 +748,12 @@ impl Walker<'_> {
                 Next::Argv(inner) => {
                     self.exec(inner, &inner_operands, target, depth, layer + 1, same_shell)
                 }
-                Next::Script(src) => self.program(&src, target, depth + 1),
+                Next::Script(src) => {
+                    // bash parses this text from its start.
+                    let comsub = std::mem::take(&mut self.comsub);
+                    self.program(&src, target, depth + 1);
+                    self.comsub = comsub;
+                }
             }
         }
     }

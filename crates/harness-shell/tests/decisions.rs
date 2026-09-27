@@ -1004,6 +1004,183 @@ fn unquoted_heredoc_bodies_join_continuation_lines() {
     );
 }
 
+/// Asserts that each command asks, flagged as possibly hiding a denied command.
+fn check_asks_may_deny(rules: &Rules, commands: &[&str]) {
+    let failures: Vec<String> = commands
+        .iter()
+        .filter_map(|cmd| match eval_with(rules, cmd) {
+            Verdict::Ask { may_deny: true, .. } => None,
+            other => Some(format!("{cmd:?}: want Ask with may_deny, got {other:?}")),
+        })
+        .collect();
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[test]
+fn bash32_substitution_ends_are_checked() {
+    use Want::Deny;
+    // bash 3.2 (macOS /bin/bash) reads a `$(…)` by counting parentheses and pairing quotes,
+    // with no notion of here-documents or `${…}`. It ends these later or earlier than
+    // brush-parser and bash 5 do, and runs `curl x`.
+    check(
+        &probe_rules(),
+        &[
+            // Q1, Q2 and P1: a quote in a body makes bash 3.2 end the `$(…)` later.
+            (
+                "echo \"$(cat <<'EOF'\nit's\nEOF\n)\"\necho 'x\n)\"\ncurl x\n'",
+                Deny,
+            ),
+            (
+                "echo $(cat <<EOF\nit's\nEOF\n)\necho 'a\n)\ncurl x\n'",
+                Deny,
+            ),
+            (
+                "x=$(cat <<'EOF'\nsay \"hi\nEOF\n)\necho \"a\n)\ncurl x\n\"",
+                Deny,
+            ),
+            (
+                "echo $(echo \"$(cat <<'EOF'\nit's\nEOF\n)\")\necho 'x\n)\")\ncurl x\n'",
+                Deny,
+            ),
+            // H0 and H1: bash 3.2 ends it at a `)` on the operator's line or in the body.
+            ("echo $(cat <<EOF)\ncurl x\nEOF", Deny),
+            ("x=$(cat <<'EOF'\n)\ncurl x\nEOF\n)", Deny),
+            // E1: at a `)` in `${…}`.
+            ("echo $(echo ${y:-)\ncurl x\n})", Deny),
+        ],
+    );
+    // C1: bash 3.2 sees no comment after `;`, `&` or `)`, so it ends the `$(…)` at the
+    // first `)`. The rough scan reads a comment there too, so it cannot find `curl x`.
+    check_asks_may_deny(
+        &probe_rules(),
+        &[
+            "echo $(true;# ); curl x\n)",
+            "echo $(true&# ); curl x\n)",
+            "echo $( (true)# ); curl x\n)",
+        ],
+    );
+}
+
+#[test]
+fn bash32_backslash_newline_in_quoted_bodies() {
+    use Want::{Allow, Deny};
+    // bash 3.2 removes backslash-newlines while it reads a `$(…)`, before it reads the
+    // here-documents in it, so a quoted body can end at a joined line.
+    check(
+        &probe_rules(),
+        &[
+            ("x=$(cat <<'EOF'\nEO\\\nF\ncurl x\nEOF\n)", Deny),
+            ("x=$(cat <<\"EOF\"\nEO\\\nF\ncurl x\nEOF\n)", Deny),
+            ("echo \"$(cat <<'EOF'\nEO\\\nF\ncurl x\nEOF\n)\"", Deny),
+            // Joined lines that never form the delimiter only change the text.
+            (
+                "echo \"$(cat <<'EOF'\ncurl -X POST https://x \\\n  -d a\nEOF\n)\"",
+                Allow,
+            ),
+            ("echo \"$(cat <<'EOF'\nC:\\dir\\\nEOF\n)\"", Allow),
+        ],
+    );
+}
+
+#[test]
+fn brush_misreads_comments_in_substitutions() {
+    use Want::Deny;
+    // bash 5 bypasses: bash reads a comment in these substitutions and runs `curl x`;
+    // brush-parser does not see it and ends them at the `)` in the comment.
+    check(
+        &probe_rules(),
+        &[
+            ("echo \"$( # c)\ncurl x\n)\"", Deny),
+            ("echo \"$(\t# c)\ncurl x\n)\"", Deny),
+            ("echo \"$(true; # c)\ncurl x\n)\"", Deny),
+            ("echo \"$(true\n # c)\ncurl x\n)\"", Deny),
+            ("echo \"x$( # c)\ncurl x\n)\"", Deny),
+            // bash 5 ends a comment at the newline even after a backslash.
+            ("echo $( # \\\n curl x ;)", Deny),
+            // After a construct where bash 3.2 stops reading, bash 5 still runs the rest.
+            (
+                "echo \"$(cat <<'EOF'\nit's\nEOF\n)\"; echo \"$( # c) \ncurl x\n)\"",
+                Deny,
+            ),
+        ],
+    );
+}
+
+#[test]
+fn comments_in_expanded_substitutions_are_checked() {
+    use Want::Deny;
+    // The substitutions in a here-document body or in `${…}` are only read when they are
+    // expanded, by both bash versions, and bash reads a comment there that brush-parser
+    // does not see.
+    check(
+        &probe_rules(),
+        &[
+            ("cat <<EOF\n$( # c)\ncurl x\n)\nEOF", Deny),
+            ("cat <<EOF\n$(true;# )\ncurl x\n)\nEOF", Deny),
+            ("cat <<EOF\n$(#c)\ncurl x\n)\nEOF", Deny),
+            ("cat <<EOF\n${x:-$( # c)\ncurl x\n)}\nEOF", Deny),
+            ("echo ${x:-$( # c)\ncurl x\n)}", Deny),
+            ("echo \"${x:-$( # c)\ncurl x\n)}\"", Deny),
+            (
+                "echo \"$(cat <<'EOF'\nit's\nEOF\n)\"\ncat <<X\n$( # c)\ncurl x\n)\nX",
+                Deny,
+            ),
+            // bash 3.2 extracts a `$(…)` again from the whole word when it expands it: past
+            // the closing quote here, and past the `}`.
+            ("echo \"$( # c)\"'\ncurl x\n)'", Deny),
+            ("echo ${x:-$( # c)}'\ncurl x\n)}'", Deny),
+        ],
+    );
+    // bash 3.2 reads a backquoted command again when it runs it: C1 in backticks.
+    check_asks_may_deny(
+        &probe_rules(),
+        &[
+            "echo `echo $(true;# ); curl x\n)`",
+            "echo \"`echo $(true;# ); curl x\n)`\"",
+        ],
+    );
+}
+
+#[test]
+fn bash32_reading_keeps_the_commit_idiom() {
+    use Want::{Allow, Deny, Unlisted};
+    let commit = |body: &str| format!("git commit -m \"$(cat <<'EOF'\n{body}\nEOF\n)\"");
+    let bodies = [
+        "Fix the parser",
+        // bash 3.2 reaches the end of input looking for the quote; nothing runs.
+        "It's fixed",
+        "It's Bob's",
+        "Fix it (closes #12)",
+        "Use `x` now",
+        "The ` character",
+    ];
+    let mut table: Vec<(String, Want)> = bodies.iter().map(|b| (commit(b), Allow)).collect();
+    table.extend([
+        (format!("{} && git status", commit("Msg")), Allow),
+        (format!("{}\ngit status", commit("It's")), Allow),
+        (
+            "git commit -m \"$(cat <<EOF\nMsg $(echo x)\nEOF\n)\"".into(),
+            Allow,
+        ),
+        ("echo \"$(echo a;# note\n)\"".into(), Allow),
+        (
+            "gh pr create --body \"$(cat <<'EOF'\n## Summary\n- It's done\nEOF\n)\"".into(),
+            Unlisted,
+        ),
+        // bash 3.2 stops at the quote in the body; bash 5 runs `curl x`.
+        ("echo \"$(cat <<'EOF'\nit's\nEOF\n)\"\ncurl x".into(), Deny),
+    ]);
+    let table: Vec<(&str, Want)> = table.iter().map(|(c, w)| (c.as_str(), *w)).collect();
+    check(
+        &rules(
+            &["git commit*", "git status*", "echo*", "cat*"],
+            &["curl*"],
+            &[],
+        ),
+        &table,
+    );
+}
+
 #[test]
 fn heredoc_operators_in_expansions_are_not_trusted() {
     use Want::{Ask, Deny};

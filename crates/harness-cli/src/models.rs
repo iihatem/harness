@@ -3,7 +3,10 @@ use harness_providers::{
     registry,
 };
 
-use crate::setup::{self, Setup};
+use crate::{
+    setup::{self, Setup},
+    term::terminal_safe,
+};
 
 /// Models from local servers and configured providers, local first.
 pub async fn available(setup: &Setup) -> Vec<DiscoveredModel> {
@@ -21,7 +24,7 @@ pub async fn run() -> u8 {
     let setup = match setup::load() {
         Ok(setup) => setup,
         Err(message) => {
-            eprintln!("error: {message}");
+            eprintln!("error: {}", terminal_safe(&message));
             return 2;
         }
     };
@@ -33,7 +36,7 @@ pub async fn run() -> u8 {
         );
     }
     for model in found {
-        println!("{}", model.id());
+        println!("{}", terminal_safe(&model.id()));
     }
     0
 }

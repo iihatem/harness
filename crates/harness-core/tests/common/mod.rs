@@ -158,6 +158,7 @@ fn build(
         read_dirs: vec![],
         rules: Default::default(),
         sandbox_available: sandbox,
+        writes_need_approval: false,
     }));
     let config = AgentConfig::new("mock/m1", "m1", "system prompt", dir.join(".spill"));
     Agent::new(

@@ -103,6 +103,31 @@ async fn ask_runs_a_multi_step_task_and_prints_the_final_answer() {
     );
 }
 
+// Review Focus: the model's final answer is model-controlled text, so a prompt-injected ANSI/OSC
+// escape in it must never reach the terminal raw — but an ordinary multi-line answer must still
+// print as multiple lines, not one line full of literal `\n`s.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_final_answer_escapes_ansi_but_keeps_newlines() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(stream(&[text_chunk("\u{1b}[31mred\nline two")]))
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri(), "model = \"mock/test-model\"");
+    let output =
+        tokio::task::spawn_blocking(move || env.cmd().args(["ask", "hi"]).output().unwrap())
+            .await
+            .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "raw ESC byte in stdout: {stdout:?}"
+    );
+    assert!(stdout.contains("\\u{1b}[31m"), "{stdout:?}");
+    assert!(stdout.contains("red\nline two"), "{stdout:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn json_output_is_one_event_per_line_ending_with_turn_finished() {
     let server = MockServer::start().await;
@@ -616,6 +641,50 @@ async fn control_characters_reach_the_terminal_only_escaped() {
         line("blocked:").contains("echo \\u{1b}c\\u{7}ok"),
         "{stderr}"
     );
+}
+
+// Review Focus: a config parse error echoes a snippet of the offending source line. If that line
+// contains a raw control byte (e.g. pasted from a terminal capture), it must reach stderr escaped,
+// not raw — the same guarantee `terminal_safe` already gives rule text and model output.
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_config_with_an_escape_byte_is_escaped_on_stderr() {
+    let server = MockServer::start().await;
+    let env = Env::new(&server.uri(), "mdo\u{1b}e = \"auto\"");
+    let output =
+        tokio::task::spawn_blocking(move || env.cmd().args(["ask", "hi"]).output().unwrap())
+            .await
+            .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("config.toml"), "{stderr}");
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "raw ESC byte on stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("\\u{1b}"), "{stderr}");
+}
+
+// Review Focus: `registry::resolve`'s errors (BadId/UnknownProvider) embed the raw model id or
+// provider name verbatim, and that text can come straight from the config's `model = "…"`. It
+// must reach stderr escaped, exactly like the config-parse-error case above.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_id_with_an_escape_byte_is_escaped_on_stderr() {
+    let server = MockServer::start().await;
+    // TOML basic strings disallow a literal control byte; `\u001b` is the escape sequence that
+    // decodes to a real ESC character in the resulting config string.
+    let env = Env::new(&server.uri(), "model = \"unknownprov\\u001b/x\"");
+    let output =
+        tokio::task::spawn_blocking(move || env.cmd().args(["ask", "hi"]).output().unwrap())
+            .await
+            .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("unknown provider"), "{stderr}");
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "raw ESC byte on stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("\\u{1b}"), "{stderr}");
 }
 
 #[test]

@@ -2,25 +2,30 @@ use std::io::{BufRead, IsTerminal, Write};
 
 use harness_config::{config, paths::Paths, trust::TrustStore};
 
+use crate::term::terminal_safe;
+
 pub fn run(yes: bool, revoke: bool) -> u8 {
     let workspace = match std::env::current_dir().and_then(|d| d.canonicalize()) {
         Ok(dir) => dir,
         Err(e) => {
-            eprintln!("error: cannot determine the working directory: {e}");
+            eprintln!(
+                "error: cannot determine the working directory: {}",
+                terminal_safe(&e.to_string())
+            );
             return 2;
         }
     };
     let paths = match Paths::from_process_env() {
         Ok(paths) => paths,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", terminal_safe(&e.to_string()));
             return 2;
         }
     };
     let mut store = match TrustStore::load(&paths.data_dir) {
         Ok(store) => store,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", terminal_safe(&e.to_string()));
             return 1;
         }
     };
@@ -35,7 +40,7 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
                 0
             }
             Err(e) => {
-                eprintln!("error: {e}");
+                eprintln!("error: {}", terminal_safe(&e.to_string()));
                 1
             }
         };
@@ -47,7 +52,7 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
             return 0;
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", terminal_safe(&e.to_string()));
             return 2;
         }
     };
@@ -78,7 +83,7 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
             0
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", terminal_safe(&e.to_string()));
             1
         }
     }

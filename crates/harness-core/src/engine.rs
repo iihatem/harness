@@ -30,6 +30,14 @@ pub struct EngineConfig {
     pub read_dirs: Vec<PathBuf>,
     pub rules: RuleSet,
     pub sandbox_available: bool,
+    /// Set when the workspace is `/`, `$HOME`, or an ancestor of `$HOME`
+    /// (`harness_sandbox::workspace_is_too_broad`), where a writable sandbox would cover the
+    /// user's dotfiles and so is never used. In `auto` mode, every file write then needs
+    /// approval, exactly as it would in `ask` mode. It has no effect in any other mode: deny
+    /// rules always win, plan/read-only always deny writes outright, and `full-access` keeps its
+    /// spec semantics (everything runs without approval except what a deny rule forbids) — the
+    /// user explicitly opted into that.
+    pub writes_need_approval: bool,
 }
 
 pub struct PermissionEngine {
@@ -49,6 +57,7 @@ pub struct PermissionEngine {
     /// Config `read:`/`write:` confirm rules, expanded the same way as `deny_paths`.
     confirm_paths: Vec<PathRule>,
     sandbox_available: bool,
+    writes_need_approval: bool,
     /// Where `<workspace>/.git` sends git when it is a symlink or a `gitdir:` file, resolved.
     /// Writes under it are guarded like writes under `.git`.
     linked_gitdir: Option<PathBuf>,
@@ -271,6 +280,7 @@ impl PermissionEngine {
             deny_paths,
             confirm_paths,
             sandbox_available: config.sandbox_available,
+            writes_need_approval: config.writes_need_approval,
             session_bash: Mutex::new(Vec::new()),
             session_paths: Mutex::new(HashSet::new()),
         }
@@ -463,7 +473,7 @@ impl PermissionEngine {
                 inside.display()
             ));
         }
-        if self.mode == Mode::Auto
+        if (self.mode == Mode::Auto && !self.writes_need_approval)
             || self
                 .allow_rule(&self.allow_paths, "write", &target)
                 .is_some()

@@ -368,6 +368,65 @@ async fn a_workspace_at_or_above_home_gets_no_writable_sandbox() {
     }
 }
 
+/// Runs the `write` tool through `harness ask --json` with `$HOME` set to `home(workspace)`.
+async fn run_write_with_home(
+    mode: &str,
+    home: impl FnOnce(&std::path::Path) -> std::path::PathBuf,
+) -> (Env, std::process::Output) {
+    let server = MockServer::start().await;
+    let args = json!({"path": "made.txt", "content": "hi\n"}).to_string();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(stream(&[json!({"choices": [{"index": 0, "delta": {"content": "done"}, "finish_reason": "stop"}]})]))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(stream(&[json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "c1",
+            "type": "function", "function": {"name": "write", "arguments": args}}]}, "finish_reason": "tool_calls"}]})]))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri(), "");
+    let home = home(env.ws.path());
+    std::fs::create_dir_all(&home).unwrap();
+    let mode = mode.to_string();
+    tokio::task::spawn_blocking(move || {
+        let out = env
+            .cmd()
+            .env("HOME", &home)
+            .args(["--mode", &mode, "ask", "--json", "go"])
+            .output()
+            .unwrap();
+        (env, out)
+    })
+    .await
+    .unwrap()
+}
+
+// Review Focus: a too-broad workspace (`/`, `$HOME`, or an ancestor of it) gets no writable
+// sandbox, but before this fix the write tool still wrote unapproved — including dotfiles, since
+// `check_write`'s decision never consulted `sandbox_available`. It must now ask, exactly as `ask`
+// mode would, even though the actual mode here is `auto`.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_tool_needs_approval_when_the_workspace_is_too_broad() {
+    for home_below in [false, true] {
+        let (env, out) = run_write_with_home("auto", |ws| {
+            if home_below {
+                ws.join("me")
+            } else {
+                ws.to_path_buf()
+            }
+        })
+        .await;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{stderr}");
+        assert!(!env.ws.path().join("made.txt").exists(), "{stderr}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn plan_mode_in_a_workspace_at_home_keeps_the_read_only_sandbox() {
     if !host_has_sandbox() {

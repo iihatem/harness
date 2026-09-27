@@ -83,6 +83,8 @@ pub(crate) fn analyze(src: &str, ws: &Workspace) -> Analysis {
         out: Analysis::default(),
         lists: 0,
         data: 0,
+        rescan: None,
+        sources: Vec::new(),
     };
     walker.program(src, &mut Cwd::at(ws.root()), 0);
     walker.out
@@ -108,6 +110,12 @@ struct Walker<'a> {
     lists: usize,
     /// Rough commands from possible here-document data currently being walked.
     data: usize,
+    /// Why the program being walked must also be roughly scanned: a here-document bash
+    /// may end elsewhere, or a process substitution, whose here-documents bash may end
+    /// elsewhere too.
+    rescan: Option<&'static str>,
+    /// The text of the programs being walked, innermost last.
+    sources: Vec<String>,
 }
 
 impl Walker<'_> {
@@ -139,15 +147,38 @@ impl Walker<'_> {
             self.undecomposable(why.into());
             return self.rough_scan(src, depth);
         }
+        if fallback::heredoc_in_expansion(src) {
+            self.undecomposable(
+                "the parser would take a `<<` in `${…}` or `$[…]` for a here-document".into(),
+            );
+            return self.rough_scan(src, depth);
+        }
+        let panics = argv::parser_panics();
         let mut parser =
             brush_parser::Parser::new(std::io::Cursor::new(src), &argv::parser_options());
-        match parser.parse_program() {
-            Ok(program) => {
+        match argv::guarded(|| parser.parse_program()) {
+            None => {
+                self.undecomposable(argv::PARSER_PANICKED.into());
+                self.rough_scan(src, depth);
+            }
+            Some(Ok(program)) => {
+                let outer = self.rescan.take();
+                self.sources.push(src.to_owned());
                 for list in &program.complete_commands {
                     self.list(list, cwd, depth);
                 }
+                self.sources.pop();
+                // What follows a here-document bash may end elsewhere may be commands
+                // brush-parser took for its body, in this program or in any enclosing one.
+                let rescan = self.rescan;
+                self.rescan = outer.or(rescan);
+                let panicked = argv::parser_panics() > panics;
+                if let Some(why) = rescan.or(panicked.then_some(argv::PARSER_PANICKED)) {
+                    self.undecomposable(why.into());
+                    self.rough_scan(src, depth);
+                }
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 self.undecomposable(format!("shell syntax not understood ({e})"));
                 self.rough_scan(src, depth);
             }
@@ -417,6 +448,7 @@ impl Walker<'_> {
             Item::IoRedirect(r) => self.redirect(r, cwd, depth),
             Item::ProcessSubstitution(_, sub) => {
                 self.undecomposable("uses process substitution".into());
+                self.rescan = Some("uses process substitution");
                 self.list(&sub.list, &mut cwd.clone(), depth);
                 argv.push(Tok::Dyn);
             }
@@ -536,11 +568,36 @@ impl Walker<'_> {
                     }
                     Target::ProcessSubstitution(_, sub) => {
                         self.undecomposable("uses process substitution".into());
+                        self.rescan = Some("uses process substitution");
                         self.list(&sub.list, &mut cwd.clone(), depth);
                     }
                 }
             }
             IoRedirect::HereDocument(_, doc) => {
+                let (delimiter, body) = (&doc.here_end.value, &doc.doc.value);
+                // The body as written, through the delimiter line, if lines may join.
+                let raw = || {
+                    let loc = doc.doc.loc.as_ref()?;
+                    let src = self.sources.last()?;
+                    let len = loc.end.index.checked_sub(loc.start.index)?;
+                    Some(
+                        src.chars()
+                            .skip(loc.start.index)
+                            .take(len)
+                            .collect::<String>(),
+                    )
+                };
+                let continued = doc.requires_expansion && body.lines().any(|l| l.ends_with('\\'));
+                let raw = if continued { raw() } else { None };
+                if let Some(why) = argv::heredoc_misread(
+                    delimiter,
+                    body,
+                    raw.as_deref(),
+                    doc.requires_expansion,
+                    doc.remove_tabs,
+                ) {
+                    self.rescan = Some(why);
+                }
                 // A quoted delimiter (`<<'EOF'`) makes the body literal.
                 if doc.requires_expansion && !self.too_nested(&doc.doc.value, true, depth) {
                     let mut scan = Scan::default();

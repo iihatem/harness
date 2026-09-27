@@ -833,6 +833,224 @@ fn heredoc_data_never_denies() {
 }
 
 #[test]
+fn rough_scan_tracks_here_documents_as_bash_does() {
+    use Want::{Ask, Deny};
+    // bash runs `curl x` as a command of its own in each of these.
+    let later = [
+        // Delimiters other than plain text, or plain text in one pair of quotes.
+        "cat <<$'EOF'\nbody\nEOF\ncurl x",
+        "cat <<$'E\\x4fF'\nbody\nEOF\ncurl x",
+        "cat <<$\"EOF\"\nbody\nEOF\ncurl x",
+        "cat <<\"E\\OF\"\nbody\nE\\OF\ncurl x",
+        "cat <<'E\"OF'\nbody\nE\"OF\ncurl x",
+        "cat <<$(x)\nbody\n$(x)\ncurl x",
+        "cat <<${X}\nbody\n${X}\ncurl x",
+        "cat <<\\EOF\nbody\nEOF\ncurl x",
+        "cat <<E\\OF\nbody\nEOF\ncurl x",
+        "cat <<'E'OF\nbody\nEOF\ncurl x",
+        "cat <<'END OF'\nbody\nEND OF\ncurl x",
+        "cat <<$'EOF'\nit's\nEOF\ncurl x",
+        // `<<` inside `${…}`, `$[…]` or arithmetic is not an operator.
+        "echo ${x:-<<EOF}\ncurl x\nEOF",
+        "echo ${x:-\"}\"<<EOF}\ncurl x\nEOF",
+        "echo \"${x:-'}'<<EOF}\"\ncurl x\nEOF",
+        "echo $[1<<2]\ncurl x\n2]",
+        "echo $[a[1]<<2]\ncurl x\n2]",
+        "(( x <<= 1 ))\ncurl x",
+        // bash joins a body line ending in a backslash with the next before comparing.
+        "cat <<EOF\nEO\\\nF\ncurl x\nEOF",
+        "cat <<-EOF\n\tEO\\\nF\ncurl x\n\tEOF",
+        "cat <<EOF\nit's\\\nEOF\nEOF\ncurl x",
+        // A body starts after the next newline of the substitution holding the operator,
+        // and bash 3.2 ends a `$(…)` at a `)` in a here-document body.
+        "echo $(cat <<EOF)\ncurl x\nEOF",
+        "echo `cat <<EOF`\ncurl x\nEOF",
+        "cat <<EOF $(\ncurl x\n)\nbody\nEOF",
+        "cat <<'EOF' ${x:-\n$(curl x)}\nbody\nEOF",
+        "cat <<'EOF' $((1+\n$(curl x)))\nbody\nEOF",
+        "x=$(cat <<EOF\n)\ncurl x\nEOF\n)",
+        "x=$(cat <<EOF\nit's\nEOF\n)\ncurl x",
+    ];
+    // `curl x` is here-document data in each of these.
+    let data = [
+        "cat <<EOF\ncurl x\nEOF",
+        "cat <<'EOF'\ncurl x\nEOF",
+        "cat <<\"EOF\"\ncurl x\nEOF",
+        "cat << EOF_1.x\ncurl x\nEOF_1.x",
+        "echo \"${HOME}\" ${x:-a} $[1+2] $((3<<1))\ncat <<EOF\ncurl x\nEOF",
+        "x=$(cat <<EOF\ncurl x\nEOF\n)",
+        "cat <<EOF $(echo a\necho b)\ncurl x\nEOF",
+        "cat <<A <<'B'\ncurl a\nA\ncurl b\nB",
+    ];
+    // Each program is refused as a whole, so the rough scan decides.
+    let mut table = Vec::new();
+    for refusal in ["(", "export a[${a[${b}]}]=1"] {
+        table.extend(later.map(|p| (format!("{p}\n{refusal}"), Deny)));
+        table.extend(data.map(|p| (format!("{p}\n{refusal}"), Ask)));
+    }
+    let table: Vec<(&str, Want)> = table.iter().map(|(c, w)| (c.as_str(), *w)).collect();
+    check(&default_rules(), &table);
+    for (cmd, _) in table.iter().filter(|(_, want)| *want == Ask) {
+        match eval_with(&default_rules(), cmd) {
+            Verdict::Ask { may_deny, .. } => assert!(may_deny, "{cmd:?}"),
+            other => panic!("{cmd:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn here_documents_bash_ends_elsewhere_are_not_trusted() {
+    use Want::{Allow, Deny, Unlisted};
+    // brush-parser takes these bodies to run to the last line; bash ends them earlier or
+    // later and runs `curl x`.
+    check(
+        &probe_rules(),
+        &[
+            ("cat <<$'EOF'\nbody\nEOF\ncurl x\n$EOF", Deny),
+            ("cat <<$\"EOF\"\nbody\nEOF\ncurl x\n$EOF", Deny),
+            ("cat <<\"E\\OF\"\nbody\nE\\OF\ncurl x\nEOF", Deny),
+            ("cat <<\"E'OF\"\nbody\nE'OF\ncurl x\nEOF", Deny),
+            ("cat <<'E\"OF'\nbody\nE\"OF\ncurl x\nEOF", Deny),
+            ("cat <<'E\\OF'\nbody\nE\\OF\ncurl x\nEOF", Deny),
+            ("cat <<EOF\nEO\\\nF\ncurl x\nEOF", Deny),
+            ("cat <<EOF\nfoo\\\nEOF\ncat <<X\nEOF\ncurl x\nX", Deny),
+            ("cat <<-EOF\n\tEO\\\nF\ncurl x\n\tEOF", Deny),
+            ("echo \"$(cat <<EOF\nEO\\\nF\ncurl x\nEOF\n)\"", Deny),
+            // bash reads no body for a here-document still waiting when a process
+            // substitution ends.
+            ("cat <(cat <<EOF)\ncurl x\nEOF", Deny),
+            ("cat >(cat <<EOF)\ncurl x\nEOF", Deny),
+            ("cat <(cat <<EOF)\ncurl x\nEOF\n(", Deny),
+            // Delimiters and bodies both read alike.
+            ("cat <<\\EOF\nbody\nEOF", Allow),
+            ("cat <<E\\OF\nbody\nEOF", Allow),
+            ("cat <<E\"OF\"\nbody\nEOF", Allow),
+            ("cat <<\"E\\$OF\"\nbody\nE$OF", Allow),
+            ("cat <<'EOF'\nEO\\\nF\nEOF", Allow),
+            ("cat <<EOF\nfoo\\\\\nEOF", Allow),
+            (
+                "cat > Dockerfile <<EOF\nRUN apt-get update && \\\n    apt-get install -y x\nEOF",
+                Unlisted,
+            ),
+            // Under `<<-`, bash strips tabs from the joined line, not from each line.
+            ("cat <<-EOF\n\tEO\\\n\tF\ncurl x\n\tEOF", Allow),
+            (
+                "cat > Dockerfile <<-EOF\n\tFROM debian\n\tRUN apt-get update && \\\n\t    apt-get install -y x\n\tEOF",
+                Unlisted,
+            ),
+            (
+                "cat > deploy.sh <<-EOF\n\tcurl -fsSL https://x/install.sh \\\n\t  -o install.sh\n\tEOF",
+                Unlisted,
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_lost_here_document_does_not_hide_later_commands() {
+    use Want::Deny;
+    // The scan cannot tell where bash ends these bodies. Their quotes would flip the
+    // quote state of text after them, where a quoted string spans lines before `curl x`.
+    let mut programs = Vec::new();
+    for delimiter in ["\\EOF", "E\\OF", "'E'OF", "E\"OF\""] {
+        for body in ["it's", "say \"hi"] {
+            for later in ["echo 'a\n'; curl x", "echo \"a\n\"; curl x"] {
+                programs.push(format!("cat <<{delimiter}\n{body}\nEOF\n{later}"));
+            }
+        }
+    }
+    programs.extend(
+        [
+            "cat <<$'EOF'\nit's\nEOF\necho 'a\n'; curl x",
+            "cat <<EOF\nit's \\\nx\nEOF\necho 'a\n'; curl x",
+            "x=$(cat <<EOF\nit's\nEOF\n)\necho 'a\n'; curl x",
+            "echo \"${x:-'a'}\"\ncat <<EOF\nit's\nEOF\necho 'a\n'; curl x",
+            "cat <<\\A\nit's\nA\ncat <<B\nx\nB\necho 'a\n'; curl x",
+            "cat <<A $(cat <<B)\nit's\nA\necho 'a\n'; curl x",
+            "echo ${x:-<<EOF}\nEOF\necho 'a\n'; curl x",
+            "cat <(cat <<EOF)\nit's\nEOF\necho 'a\n'; curl x",
+            // Only the line joined across a continuation ends the second body.
+            "cat <<\\A\nA\ncat <<EOF\nit's\nEO\\\nF\necho 'a\n'; curl x",
+            // The `<<` in `((…))` is no here-document, so the body of the next one starts
+            // after this line, not after an end of the first.
+            "(( y <<= 1 )); cat <<$'EOF'\nit's\nEOF\necho 'a\n'; curl x",
+        ]
+        .map(String::from),
+    );
+    let mut table = Vec::new();
+    for refusal in ["(", "export a[${a[${b}]}]=1"] {
+        table.extend(programs.iter().map(|p| (format!("{p}\n{refusal}"), Deny)));
+    }
+    let table: Vec<(&str, Want)> = table.iter().map(|(c, w)| (c.as_str(), *w)).collect();
+    check(&default_rules(), &table);
+}
+
+#[test]
+fn heredoc_operators_in_expansions_are_not_trusted() {
+    use Want::{Ask, Deny};
+    // brush-parser takes a `<<` in `${…}` for a here-document, so it reads `curl x` as
+    // body text; to bash the `<<` is text and `curl x` runs.
+    let programs = [
+        "echo ${x:-a <<EOF b}\ncurl x\nEOF",
+        "echo ${x:=a <<EOF b}\ncurl x\nEOF",
+        "echo ${x//a/<<EOF b}\ncurl x\nEOF",
+        "echo \"${x:-a <<EOF b}\"\ncurl x\nEOF",
+        "echo $(echo ${x:-a <<EOF b})\ncurl x\nEOF",
+        "echo ${<<EOF\n}\nEOF\ncurl x",
+        "x\r#${<<EOF\n}\nEOF\ncurl x",
+    ];
+    let denied: Vec<(&str, Want)> = programs.iter().map(|p| (*p, Deny)).collect();
+    check(&default_rules(), &denied);
+    let asked: Vec<(&str, Want)> = programs.iter().map(|p| (*p, Ask)).collect();
+    check(&rules(&["echo*"], &[], &[]), &asked);
+}
+
+#[test]
+fn parser_panics_ask_and_are_scanned() {
+    use Want::{Ask, Deny};
+    // brush-parser 0.4 panics on these (`tokenizer.rs:674` and `:1018`).
+    let panics = [
+        "$(\tEOF$(<<EOF $y| ${#}|\tEOF\nEOF",
+        "$(<<-EOF\tEOF ${y}\"$( ${#}\nEOF\n",
+        "cat <<< $(<<EOF ${#} ${#}\nEOF",
+        "echo \"'\"  $y<<EOF ${#}\tEOF<<EOF ${#}$(\nEOF",
+        "echo \"'\" |$(<<EOF ${#}x\nEOF",
+        "$(<<-EOF $y) ${#}\"$( ${ ${y}\nEOF",
+        "x\r# ${y}<<-EOF|;${  ${#};\nEOF",
+        "$(;<<-EOF ${y}\n<<EOFEOF\n\tEOF",
+        "$(\nx\n<<EOF $y)${<<EOF\nEOF",
+        "cat <<< $(cat <<-EOF\tEOF ${y}EOF$( $(\n\tEOF",
+        "cat <<EOF;|$(  ${#} ${y}x${\nEOF",
+        "echo \"'\" )${<<EOF ${#}\n<<-EOF\nEOF",
+        "$\"|$(;<<-EOF\n) \n\tEOF",
+        "$(<<'EOF' ${y}<<EOF<<EOF\nEOF",
+        "$(cat <<'EOF' ${y}$(\nEOF\n",
+        "$(<<EOF ${#}<<EOF\nEOF",
+        "x\r#<<EOF; ${#}\"${<<-EOF<<EOF\tEOF}\"$(\nEOF",
+        "echo \"'\" }` ${#}\n<<-EOF )${  ${#}<<'EOF'\nEOF`",
+        "x\r#${<<EOF\n}\nEOF",
+        "$(cat <<EOF ${y}\nEOF",
+    ];
+    let mut table = Vec::new();
+    for cmd in panics {
+        table.push((cmd.to_string(), Ask));
+        table.push((format!("curl x; {cmd}"), Deny));
+    }
+    let failures: Vec<String> = table
+        .iter()
+        .filter_map(|(cmd, want)| {
+            let got = std::panic::catch_unwind(|| eval_with(&default_rules(), cmd));
+            match got {
+                Ok(v) if kind(&v) == *want => None,
+                Ok(v) => Some(format!("{cmd:?}: want {want:?}, got {v:?}")),
+                Err(_) => Some(format!("{cmd:?}: evaluate panicked")),
+            }
+        })
+        .collect();
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[test]
 fn brackets_in_declaration_values_are_inert() {
     use Want::{Ask, Unlisted};
     check(
@@ -903,6 +1121,32 @@ fn heredoc_delimiters_the_parser_mishandles_ask_quickly() {
         ("cat << 'EOF'\n$(curl x)\nEOF", Unlisted),
         ("cat <<-\"EOF\"\n\thi\n\tEOF", Unlisted),
         ("echo $(cat <<EOF\nhi\nEOF\n)", Unlisted),
+        // Single-quoted text is not searched for operators.
+        ("grep -rn '<<[A-Z]' .", Unlisted),
+        ("rg 'x << (1' src", Unlisted),
+        ("awk 'BEGIN{print 1<<2}'", Unlisted),
+        (
+            "echo \"$HOME\" '<<$(( )' ${PWD} $(printf '<<`x`')",
+            Unlisted,
+        ),
+        // Unless the tokenizer might not read the quote as one.
+        ("echo \"'\" <<$(( ) '", Ask),
+        ("echo \"$(echo \"'\")\" <<$(( ) '", Ask),
+        ("\\$'a\\'' <<$(( ) '", Ask),
+        ("echo $'\\'' <<$(( ) '", Ask),
+        ("echo $\\\n'x' <<$(( ) '", Ask),
+        ("echo a#'<<$(( )'", Unlisted),
+        ("echo x #'\nx <<$(( )\n'", Ask),
+        ("# it's\nx <<$(( )\n'", Ask),
+        ("echo `echo '` <<$(( ) '", Ask),
+        ("echo ${x:-'} <<$(( ) '} '", Ask),
+        ("echo $((1<<2)) ' <<$(( ) '", Ask),
+        ("cat <<EOF\nit's\nEOF\nx <<$(( )\n'", Ask),
+        // An escaped `<` is a word character, so the operator starts after it.
+        ("$(\\<<<  ", Ask),
+        ("echo \")}'${x\\<<<'' ", Ask),
+        ("x \\\\<<'' $(", Ask),
+        ("cat \\<<<< \"${y}\"", Unlisted),
     ];
     for (cmd, want) in table {
         let (tx, rx) = mpsc::channel();

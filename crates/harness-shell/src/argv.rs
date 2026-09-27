@@ -1,6 +1,10 @@
 //! Shell words → argv tokens, plus the canonical quoting used for display and rule matching.
 
 use std::borrow::Cow;
+use std::cell::Cell;
+use std::ops::Range;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::Once;
 
 use brush_parser::word::{Parameter, ParameterExpr, WordPiece, WordPieceWithSource};
 
@@ -8,7 +12,7 @@ use brush_parser::word::{Parameter, ParameterExpr, WordPiece, WordPieceWithSourc
 pub(crate) const MAX_DEPTH: usize = 8;
 
 /// One argv element after quote removal.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Tok {
     /// Fully known text.
     Lit(String),
@@ -27,6 +31,47 @@ impl Tok {
             _ => None,
         }
     }
+}
+
+/// Why text is undecomposable when brush-parser panicked on it.
+pub(crate) const PARSER_PANICKED: &str = "the shell parser failed on this text";
+
+thread_local! {
+    /// Whether this thread is inside a brush-parser call, whose panics go unreported.
+    static QUIET: Cell<bool> = const { Cell::new(false) };
+    /// brush-parser panics caught on this thread.
+    static PANICS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Runs a brush-parser call, `None` if it panicked: brush-parser 0.4 panics on some input
+/// (`tokenizer.rs:674` and `:1018`), which must not take down the session.
+///
+/// A panic hook installed once keeps these panics off stderr and passes every other panic
+/// to the hook it replaced. Setting and restoring a hook around each call instead would
+/// race with panics on other threads, which could go unreported or get the wrong hook
+/// restored after them.
+pub(crate) fn guarded<T>(call: impl FnOnce() -> T) -> Option<T> {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if !QUIET.get() {
+                previous(info);
+            }
+        }));
+    });
+    let quiet = QUIET.replace(true);
+    let result = panic::catch_unwind(AssertUnwindSafe(call));
+    QUIET.set(quiet);
+    if result.is_err() {
+        PANICS.set(PANICS.get() + 1);
+    }
+    result.ok()
+}
+
+/// How many brush-parser panics [`guarded`] has caught on this thread.
+pub(crate) fn parser_panics() -> usize {
+    PANICS.get()
 }
 
 /// Parser options matching a non-interactive `bash -c`.
@@ -195,11 +240,14 @@ fn parse(text: &str, heredoc: bool) -> Result<Option<Vec<WordPieceWithSource>>, 
         return Err(why.into());
     }
     let options = parser_options();
-    let pieces = if heredoc {
-        brush_parser::word::parse_heredoc(text, &options)
-    } else {
-        brush_parser::word::parse(text, &options)
-    };
+    let pieces = guarded(|| {
+        if heredoc {
+            brush_parser::word::parse_heredoc(text, &options)
+        } else {
+            brush_parser::word::parse(text, &options)
+        }
+    })
+    .ok_or(PARSER_PANICKED)?;
     Ok(pieces.ok())
 }
 
@@ -328,10 +376,14 @@ pub(crate) fn too_nested(text: &str, heredoc: bool) -> Option<&'static str> {
 }
 
 /// Like [`too_nested`], for the words brush-parser word-parses while parsing the
-/// program itself: those shaped like an array-element assignment (`name[…]…`).
+/// program itself: those shaped like an array-element assignment (`name[…]…`). Also
+/// refuses a program the tokenizer panics on.
 pub(crate) fn program_too_nested(src: &str) -> Option<&'static str> {
     let options = parser_options().tokenizer_options();
-    let tokens = brush_parser::tokenize_str_with_options(src, &options).ok()?;
+    let Some(tokens) = guarded(|| brush_parser::tokenize_str_with_options(src, &options)) else {
+        return Some(PARSER_PANICKED);
+    };
+    let tokens = tokens.ok()?;
     tokens.iter().find_map(|token| match token {
         brush_parser::Token::Word(w, _) => {
             let name = name_len(w.as_bytes(), 0);
@@ -355,10 +407,22 @@ const MAX_DELIMITER: usize = 1024;
 /// from a delimiter, and inside a substitution can take a blank as one; with an empty
 /// delimiter and a construct left open it loops, allocating without bound, and with a
 /// delimiter that ends a construct it panics (`x <<$(( )`, `cat <<'' $(`, `cat <<)|$(`).
+/// A `<<` in single-quoted text (see [`single_quoted`]) is not an operator, and neither is
+/// one whose first `<` is escaped.
 pub(crate) fn unsafe_heredoc(src: &str) -> Option<&'static str> {
     let b = src.as_bytes();
+    let quoted = single_quoted(b);
+    let in_quotes = |at: usize| {
+        let k = quoted.partition_point(|r| r.end <= at);
+        quoted.get(k).is_some_and(|r| r.contains(&at))
+    };
     let mut i = 0;
     while let Some(at) = src[i..].find("<<") {
+        let backslashes = b[..i + at].iter().rev().take_while(|&&c| c == b'\\');
+        if backslashes.count() % 2 == 1 || in_quotes(i + at) {
+            i += at + 1;
+            continue;
+        }
         let mut j = i + at + 2;
         if b.get(j) == Some(&b'<') {
             // A here-string (`<<<`).
@@ -385,6 +449,158 @@ pub(crate) fn unsafe_heredoc(src: &str) -> Option<&'static str> {
         i = j;
     }
     None
+}
+
+/// Byte ranges of the text between single quotes, as brush-parser's tokenizer reads them.
+/// Only quotes before the first construct whose quoting this scan does not follow are
+/// reported: a here-document operator (its body is literal text), a comment, a backtick,
+/// `$'…'` (which the tokenizer also starts after an escaped `$`), a line continuation,
+/// arithmetic, `$[…]`, a `${…}` holding more than a name, or a substitution inside double
+/// quotes.
+fn single_quoted(b: &[u8]) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut double = false;
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        let next = b.get(i + 1).copied();
+        match c {
+            b'\\' if next == Some(b'\n') => break,
+            b'\\' => i += 1,
+            b'"' => double = !double,
+            b'\'' if !double => {
+                if i > 0 && b[i - 1] == b'$' {
+                    break;
+                }
+                let end = b[i + 1..]
+                    .iter()
+                    .position(|&c| c == b'\'')
+                    .map_or(b.len(), |n| i + 1 + n);
+                ranges.push(i + 1..end);
+                i = end;
+            }
+            b'`' => break,
+            // A comment starts where no word has.
+            b'#' if !double && (i == 0 || b" \t\n;&|()<>".contains(&b[i - 1])) => break,
+            b'(' if !double && next == Some(b'(') => break,
+            b'<' if next == Some(b'<') => {
+                if double || b.get(i + 2) != Some(&b'<') {
+                    break;
+                }
+                i += 2;
+            }
+            b'$' => match next {
+                Some(b'{') => match name_brace_end(b, i + 2) {
+                    Some(end) => i = end,
+                    None => break,
+                },
+                Some(b'[') => break,
+                Some(b'(') if double || b.get(i + 2) == Some(&b'(') => break,
+                _ => {}
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    ranges
+}
+
+/// The index of the `}` ending a `${…}` whose text, from `b[from]`, is just a parameter
+/// name (`${HOME}`, `${#}`).
+fn name_brace_end(b: &[u8], from: usize) -> Option<usize> {
+    let len = b[from..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || b"_@*#?$!-".contains(c))
+        .count();
+    (b.get(from + len) == Some(&b'}')).then_some(from + len)
+}
+
+/// Why bash may end a here-document elsewhere than brush-parser does, if it may.
+/// brush-parser compares each line with the delimiter word stripped of every quote
+/// character and backslash, and never joins lines. bash decodes `$'…'`, keeps quote
+/// characters and most backslashes that are themselves quoted, and in the body of an
+/// unquoted delimiter joins a line ending in an odd number of backslashes with the next
+/// before comparing. `raw` is the body as written through its delimiter line (brush-parser
+/// strips tabs from `body` for `<<-`); without it, a line that may join counts as a
+/// disagreement.
+pub(crate) fn heredoc_misread(
+    delimiter: &str,
+    body: &str,
+    raw: Option<&str>,
+    expands: bool,
+    strip_tabs: bool,
+) -> Option<&'static str> {
+    let joins = expands && body.lines().any(continued);
+    if !delimiters_agree(delimiter) {
+        Some("bash may read the here-document delimiter differently")
+    } else if joins && raw.is_none_or(|raw| ends_elsewhere(raw, delimiter, strip_tabs)) {
+        Some("a here-document body line ends in a backslash, so bash may end it elsewhere")
+    } else {
+        None
+    }
+}
+
+/// Whether bash joins `line` with the next: it ends in an odd number of backslashes.
+pub(crate) fn continued(line: &str) -> bool {
+    line.bytes().rev().take_while(|&c| c == b'\\').count() % 2 == 1
+}
+
+/// Whether bash and brush-parser read the here-document delimiter word `raw` alike.
+fn delimiters_agree(raw: &str) -> bool {
+    let (mut quote, mut prev) = (None, None);
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\\') => {
+                chars.next();
+            }
+            (None, '\'' | '"') if prev == Some('$') => return false,
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (Some('\''), '"' | '\\') | (Some('"'), '\'') => return false,
+            (Some(_), '\\') => match chars.next() {
+                Some('$' | '`' | '"' | '\\') => {}
+                _ => return false,
+            },
+            _ => {}
+        }
+        prev = Some(c);
+    }
+    quote.is_none()
+}
+
+/// Whether bash ends a here-document of an unquoted delimiter elsewhere than at the last
+/// line of `raw`, its text as written through the delimiter line, where brush-parser ends
+/// it. bash joins each line ending in an odd number of backslashes with the next and, for
+/// `<<-`, strips the leading tabs of the joined line before comparing it.
+fn ends_elsewhere(raw: &str, delimiter: &str, strip_tabs: bool) -> bool {
+    fn stripped(line: &str, tabs: bool) -> &str {
+        if tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        }
+    }
+    let lines: Vec<&str> = raw.split_terminator('\n').collect();
+    if lines
+        .last()
+        .is_none_or(|last| stripped(last, strip_tabs) != delimiter)
+    {
+        // Not the text brush-parser read.
+        return true;
+    }
+    let mut joined = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if continued(line) {
+            joined.push_str(&line[..line.len() - 1]);
+            continue;
+        }
+        joined.push_str(line);
+        if stripped(&joined, strip_tabs) == delimiter {
+            return i + 1 < lines.len();
+        }
+        joined.clear();
+    }
+    true
 }
 
 /// Whether the here-document delimiter word at the start of `b` is missing, has no
@@ -798,5 +1014,79 @@ mod tests {
         assert_eq!(quote("it's"), r"'it'\''s'");
         assert_eq!(quote(""), "''");
         assert_eq!(quote("~x"), "'~x'");
+    }
+
+    #[test]
+    fn single_quoted_text() {
+        let quoted = |s: &'static str| -> Vec<&'static str> {
+            single_quoted(s.as_bytes())
+                .into_iter()
+                .map(|r| &s[r])
+                .collect()
+        };
+        assert_eq!(quoted("a '<<x' \"'\" \\'b 'c'"), ["<<x", "c"]);
+        assert_eq!(
+            quoted("a#'b' <<< 'c' ${HOME} $(d 'e') 'f"),
+            ["b", "c", "e", "f"]
+        );
+        // The scan stops where the tokenizer might read quotes differently.
+        for (src, before) in [
+            ("'x' $'y' 'z'", 1),
+            ("'x' \\$'y' 'z'", 1),
+            ("'x' # 'y'", 1),
+            ("'x' <<E 'y'", 1),
+            ("'x' \"<<\" 'y'", 1),
+            ("'x' `y` 'z'", 1),
+            ("'x' \\\n 'y'", 1),
+            ("'x' $((1)) 'y'", 1),
+            ("'x' ((1)) 'y'", 1),
+            ("'x' $[1] 'y'", 1),
+            ("'x' ${y:-'z'} 'w'", 1),
+            ("'x' \"$(y)\" 'z'", 1),
+        ] {
+            assert_eq!(quoted(src).len(), before, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn here_document_ends_bash_reads_differently() {
+        for alike in [
+            "EOF",
+            "'EOF'",
+            "\"EOF\"",
+            r"\EOF",
+            r"E\OF",
+            "E\"OF\"",
+            r#""E\$OF""#,
+            r#""E\"OF""#,
+            r"\$'EOF'",
+            "'E$OF'",
+            "$X",
+            "EOF$",
+        ] {
+            assert!(delimiters_agree(alike), "{alike}");
+        }
+        for differs in [
+            "$'EOF'",
+            "$\"EOF\"",
+            r#""E\OF""#,
+            "\"E'OF\"",
+            "'E\"OF'",
+            r"'E\OF'",
+            "'EOF",
+        ] {
+            assert!(!delimiters_agree(differs), "{differs}");
+        }
+        // The body as written, through the delimiter line brush-parser ends it at.
+        assert!(ends_elsewhere("EO\\\nF\nx\nEOF\n", "EOF", false));
+        assert!(ends_elsewhere("foo\\\nEOF\n", "EOF", false));
+        assert!(ends_elsewhere("\tEO\\\nF\nx\n\tEOF\n", "EOF", true));
+        assert!(!ends_elsewhere("foo\\\\\nEOF\n", "EOF", false));
+        assert!(!ends_elsewhere("a \\\nb\nEOF", "EOF", false));
+        assert!(!ends_elsewhere("\\\nEOF\n", "EOF", false));
+        // For `<<-`, the joined line's own tabs are stripped, not those of its parts.
+        assert!(!ends_elsewhere("\tEO\\\n\tF\nx\n\tEOF\n", "EOF", true));
+        assert!(!ends_elsewhere("\ta \\\n\t  b\n\tEOF\n", "EOF", true));
+        assert!(ends_elsewhere("\ta\n\tEOF\\\n\tEOF\n", "EOF", true));
     }
 }

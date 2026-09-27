@@ -16,7 +16,10 @@ use harness_providers::registry;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{models, prompt, setup, term::terminal_safe};
+use crate::{
+    models, prompt, setup,
+    term::{terminal_safe, terminal_safe_text},
+};
 
 pub async fn run(
     model_flag: Option<String>,
@@ -32,7 +35,7 @@ pub async fn run(
     let setup = match setup::load() {
         Ok(setup) => setup,
         Err(message) => {
-            eprintln!("error: {message}");
+            eprintln!("error: {}", terminal_safe(&message));
             return 2;
         }
     };
@@ -46,7 +49,7 @@ pub async fn run(
         } else {
             eprintln!("Available models:");
             for model in &found {
-                eprintln!("  {}", model.id());
+                eprintln!("  {}", terminal_safe(&model.id()));
             }
         }
         eprintln!(
@@ -58,7 +61,7 @@ pub async fn run(
     let resolved = match registry::resolve(&model_id, &setup.config.providers, setup::env) {
         Ok(resolved) => resolved,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", terminal_safe(&e.to_string()));
             return 2;
         }
     };
@@ -141,6 +144,7 @@ pub async fn run(
             confirm: setup.config.confirm.clone(),
         },
         sandbox_available: sandboxed,
+        writes_need_approval: workspace_too_broad,
     }));
     for rule in policy.unknown_rules() {
         eprintln!(
@@ -173,8 +177,15 @@ pub async fn run(
     drop(tx);
     let (final_text, blocked) = renderer.await.unwrap_or_default();
     if !json && !final_text.is_empty() {
-        // A closed stdout pipe must not panic (and so must not lose `blocked`/the exit code).
-        let _ = writeln!(std::io::stdout().lock(), "{final_text}");
+        // A closed stdout pipe must not panic (and so must not lose `blocked`/the exit code). The
+        // model's answer can contain prompt-injected ANSI/OSC escapes or bidi overrides, so it is
+        // escaped before printing — `terminal_safe_text` keeps `\n`/`\t` so a normal multi-line
+        // answer still prints as multiple lines.
+        let _ = writeln!(
+            std::io::stdout().lock(),
+            "{}",
+            terminal_safe_text(&final_text)
+        );
     }
     exit_code(reason, blocked)
 }

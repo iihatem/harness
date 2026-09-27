@@ -257,6 +257,33 @@ impl Snapshot {
             .any(|dir| matches!(self.nodes.get(dir), Some(Node::Dir { .. })))
     }
 
+    /// Takes `from`'s record of `path` and everything below it in place of
+    /// this one's: an earlier version, kept while it is still to be put
+    /// back.
+    pub(crate) fn adopt(&mut self, from: &Snapshot, path: &Path) {
+        let below = |(recorded, _): &(&PathBuf, &Node)| recorded.starts_with(path);
+        let mine: Vec<PathBuf> = self
+            .nodes
+            .range(path.to_path_buf()..)
+            .take_while(below)
+            .map(|(recorded, _)| recorded.clone())
+            .collect();
+        for recorded in mine {
+            self.nodes.remove(&recorded);
+        }
+        for (recorded, node) in from.nodes.range(path.to_path_buf()..).take_while(below) {
+            self.nodes.insert(recorded.clone(), node.clone());
+        }
+    }
+
+    /// How the entry at `path` differs from its record: `None` when it is
+    /// not recorded, `Some(None)` when it is as recorded.
+    pub(crate) fn state_of(&self, tree: &Tree, path: &Path) -> Option<Option<Difference>> {
+        self.nodes
+            .get(path)
+            .map(|node| difference(tree, path, node))
+    }
+
     /// Whether `path` is a regular file whose bytes were saved.
     pub(crate) fn saved(&self, path: &Path) -> bool {
         matches!(

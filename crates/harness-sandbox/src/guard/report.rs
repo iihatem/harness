@@ -93,6 +93,8 @@ pub(super) enum Outcome {
     Restored(Option<PathBuf>),
     /// The owner's read, write and search permission given back.
     Unlocked,
+    /// Said once, and left: it does not block the command.
+    Note(String),
     /// Not handled: what is there is left as it is.
     Failed(String),
 }
@@ -107,6 +109,7 @@ impl Outcome {
             ),
             Outcome::Restored(None) => "restored the earlier version".into(),
             Outcome::Unlocked => "gave them back".into(),
+            Outcome::Note(why) => why.clone(),
             Outcome::Failed(why) => why.clone(),
         }
     }
@@ -162,6 +165,9 @@ pub(super) struct Findings {
     pub(super) undone: Vec<(PathBuf, What)>,
     /// The most changes one check makes.
     pub(super) max_changes: usize,
+    /// What an earlier command could not move or restore, and this one
+    /// could not either: recalled, without blocking.
+    pub(super) stuck: Vec<PathBuf>,
 }
 
 impl Findings {
@@ -236,6 +242,28 @@ impl Findings {
                 .iter()
                 .map(|path| format!("{}: {GONE_LINE}", rel(path)));
             section(&mut message, GONE, lines, gone.len(), MAX_LINES);
+        }
+        if !self.stuck.is_empty() {
+            let count = self.stuck.len();
+            let (entries, is, was) = if count == 1 {
+                ("entry", "is", "it was")
+            } else {
+                ("entries", "are", "they were")
+            };
+            let mut listed: Vec<String> = self
+                .stuck
+                .iter()
+                .take(MAX_LISTED)
+                .map(|path| rel(path))
+                .collect();
+            if count > MAX_LISTED {
+                listed.push(format!("and {} more", count - MAX_LISTED));
+            }
+            let _ = writeln!(
+                message,
+                "[{count} {entries} harness could not move or restore {is} still as {was}: {}]",
+                listed.join(", ")
+            );
         }
         if self.incomplete {
             message.push_str(INCOMPLETE);

@@ -454,3 +454,254 @@ fn what_is_left_undone_stays_unknown_until_it_is_moved() {
     );
     assert!(!planted.exists());
 }
+
+/// Lets the next command's guard make as many changes as it likes.
+fn uncap(env: &Env) {
+    lock(&env.session.hooks).max_changes = None;
+}
+
+#[test]
+fn a_capped_config_change_is_restored_at_the_next_begin() {
+    let env = env();
+    cap(&env, 0);
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    std::fs::write(env.ws.join(".git/config"), EVIL).unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(
+        report.message.contains("\n- .git/config: changed]"),
+        "{}",
+        report.message
+    );
+    uncap(&env);
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(
+        report.message.contains(
+            "\n- .git/config: changed; restored the earlier version (the changed one is in "
+        ),
+        "{}",
+        report.message
+    );
+    assert_eq!(
+        read(&env.ws.join(".git/config")),
+        "[core]\n\tbare = false\n"
+    );
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+}
+
+#[test]
+fn a_failed_config_move_is_retried_at_the_next_begin() {
+    let env = env();
+    let config = env.ws.join(".git/config");
+    lock(&env.session.hooks).stuck.insert(config.clone());
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    std::fs::write(&config, EVIL).unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(report.blocked);
+    assert!(
+        report
+            .message
+            .contains("\n- .git/config: changed; could not move it"),
+        "{}",
+        report.message
+    );
+    lock(&env.session.hooks).stuck.clear();
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(
+        report.message.contains(
+            "\n- .git/config: changed; restored the earlier version (the changed one is in "
+        ),
+        "{}",
+        report.message
+    );
+    assert_eq!(read(&config), "[core]\n\tbare = false\n");
+}
+
+#[test]
+fn a_replaced_gitfile_left_undone_is_put_back_at_the_next_begin() {
+    let env = env();
+    std::fs::create_dir_all(env.ws.join(".git/modules/sub")).unwrap();
+    std::fs::write(env.ws.join(".git/modules/sub/HEAD"), "ref: x\n").unwrap();
+    std::fs::create_dir_all(env.ws.join("sub")).unwrap();
+    let gitfile = env.ws.join("sub/.git");
+    std::fs::write(&gitfile, "gitdir: ../.git/modules/sub\n").unwrap();
+    cap(&env, 0);
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    std::fs::remove_file(&gitfile).unwrap();
+    std::fs::write(&gitfile, "gitdir: /tmp/evil\n").unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(
+        report.message.contains("\n- sub/.git: moved or replaced]"),
+        "{}",
+        report.message
+    );
+    uncap(&env);
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(
+        report.message.contains(
+            "\n- sub/.git: moved or replaced; restored the earlier version (the changed one is in "
+        ),
+        "{}",
+        report.message
+    );
+    assert_eq!(read(&gitfile), "gitdir: ../.git/modules/sub\n");
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+}
+
+#[test]
+fn a_capped_restore_in_the_full_tier_is_done_at_the_next_command() {
+    let env = env();
+    let hooks = env.ws.join(".git/hooks");
+    std::fs::rename(&hooks, env.ws.join("tracked-hooks")).unwrap();
+    std::os::unix::fs::symlink("../tracked-hooks", &hooks).unwrap();
+    cap(&env, 0);
+    let guard = env.session.begin(&env.ws, false, |_| {});
+    std::fs::remove_file(&hooks).unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(report.blocked);
+    assert!(
+        report.message.contains("\n- .git/hooks: deleted]"),
+        "{}",
+        report.message
+    );
+    uncap(&env);
+    let report = env
+        .session
+        .begin(&env.ws, false, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report
+            .message
+            .contains("\n- .git/hooks: deleted; restored the earlier version"),
+        "{}",
+        report.message
+    );
+    assert_eq!(
+        std::fs::read_link(&hooks).unwrap(),
+        PathBuf::from("../tracked-hooks")
+    );
+    assert_eq!(env.session.begin(&env.ws, false, |_| {}).finish(), None);
+}
+
+#[test]
+fn a_restore_nothing_can_do_is_reported_once_then_dropped() {
+    let env = env();
+    std::fs::create_dir_all(env.ws.join("sub/.git/hooks")).unwrap();
+    std::fs::write(env.ws.join("sub/.git/HEAD"), "ref: x\n").unwrap();
+    std::fs::write(env.ws.join("sub/.git/config"), "[core]\n").unwrap();
+    cap(&env, 0);
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    std::fs::write(env.ws.join("sub/.git/config"), EVIL).unwrap();
+    assert!(guard.finish().expect("a report").blocked);
+    // The user removes the repository between commands.
+    std::fs::remove_dir_all(env.ws.join("sub")).unwrap();
+    uncap(&env);
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert_eq!(
+        report
+            .message
+            .matches("\n- sub/.git/config: changed; ")
+            .count(),
+        1,
+        "{}",
+        report.message
+    );
+    assert!(
+        report
+            .message
+            .contains("harness can no longer put the earlier version back"),
+        "{}",
+        report.message
+    );
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+}
+
+/// How many lookups in the undone record the next `begin` makes, with `n`
+/// planted hooks left undone.
+fn lookups_at_begin(n: usize) -> usize {
+    let env = env();
+    cap(&env, 0);
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    for i in 0..n {
+        std::fs::write(env.ws.join(format!(".git/hooks/h{i:05}")), "x").unwrap();
+    }
+    let _ = guard.finish();
+    LOOKUPS.with(|looks| looks.set(0));
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    let looks = LOOKUPS.with(std::cell::Cell::get);
+    assert_eq!(lock(&guard.state).undone.len(), n);
+    looks
+}
+
+#[test]
+fn the_work_at_begin_grows_linearly_with_what_was_left_undone() {
+    let small = lookups_at_begin(500);
+    let large = lookups_at_begin(2000);
+    eprintln!("lookups at begin: {small} for 500 left undone, {large} for 2000");
+    assert!(small > 0);
+    assert!(
+        large <= small * 5,
+        "{small} lookups for 500, {large} for 2000"
+    );
+}
+
+#[test]
+fn a_move_that_keeps_failing_blocks_only_the_first_command() {
+    let env = env();
+    let planted = env.ws.join("zz/.git");
+    lock(&env.session.hooks).stuck.insert(planted.clone());
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    std::fs::create_dir_all(&planted).unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(report.blocked);
+    assert!(
+        report
+            .message
+            .contains("\n- zz/.git: a new repository; could not move it"),
+        "{}",
+        report.message
+    );
+    for _ in 0..2 {
+        let report = env
+            .session
+            .begin(&env.ws, true, |_| {})
+            .finish()
+            .expect("a reminder");
+        assert!(!report.blocked, "{}", report.message);
+        assert_eq!(
+            report.message,
+            "[1 entry harness could not move or restore is still as it was: zz/.git]\n"
+        );
+    }
+    lock(&env.session.hooks).stuck.clear();
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(
+        report
+            .message
+            .contains("\n- zz/.git: a new repository; moved to "),
+        "{}",
+        report.message
+    );
+    assert!(!planted.exists());
+}

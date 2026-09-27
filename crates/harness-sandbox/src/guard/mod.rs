@@ -60,6 +60,12 @@ use snapshot::{Difference, Next, Snapshot};
 /// reports how many more there were: the check holds the guard's lock.
 const MAX_CHANGES: usize = 10_000;
 
+#[cfg(test)]
+thread_local! {
+    /// Lookups in the record of what the checks left undone, on this thread.
+    static LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// How many linked-worktree and submodule gitdirs the guard records beyond
 /// the ones the scan found.
 const MAX_NESTED: usize = 10_000;
@@ -231,19 +237,17 @@ impl GuardSession {
         let mut quarantine = self.quarantine(workspace);
         let mut findings = Findings::default();
         let mut undone = BTreeMap::new();
+        let mut earlier = None;
         if let Some(mut kept) = self.take_kept(workspace) {
             let survivors = self.survivors();
-            kept.check(&tree, &mut quarantine, survivors);
+            kept.check(&tree, &mut quarantine, survivors, self.max_changes());
             findings.before = kept.found;
             undone = kept.undone;
+            earlier = Some(kept.snapshot);
         }
         // What is still to be moved is new, whatever the scan finds: a
         // repository or gitdir left undone is not taken for a known one.
-        let unknown = |path: &Path| {
-            undone
-                .iter()
-                .any(|(left, undone): (&PathBuf, &Undone)| undone.moved && path.starts_with(left))
-        };
+        let unknown = |path: &Path| to_move(&undone, path);
 
         let mut index = self.scan(workspace, &rules);
         index.dot_gits.retain(|path| !unknown(path));
@@ -266,7 +270,17 @@ impl GuardSession {
             .iter()
             .chain(&index.gitdirs)
             .chain(&index.links)
-            .map(|path| (path.clone(), Tracked::new(Identity::of(&tree, path))))
+            .map(|path| {
+                // What is still to be put back keeps what it was.
+                let identity = match undone.get(path) {
+                    Some(Undone {
+                        todo: Todo::PutBack(original),
+                        ..
+                    }) => original.clone(),
+                    _ => Identity::of(&tree, path),
+                };
+                (path.clone(), Tracked::new(identity))
+            })
             .collect();
         let top = workspace.join(".git");
         let top_existed = !unknown(&top) && may_exist(&tree, &top);
@@ -277,8 +291,16 @@ impl GuardSession {
             .cloned()
             .chain(gitfiles(&tree, &index.dot_gits))
             .collect();
-        // Entries still to be moved are left out, so they count as new.
-        let snapshot = Snapshot::take(&tree, &roots, save_all, unknown);
+        // Entries still to be moved are left out, so they count as new; what
+        // is still to be restored or put back keeps its earlier version.
+        let mut snapshot = Snapshot::take(&tree, &roots, save_all, unknown);
+        if let Some(earlier) = &earlier {
+            for (path, undone) in &undone {
+                if !matches!(undone.todo, Todo::Move) {
+                    snapshot.adopt(earlier, path);
+                }
+            }
+        }
         findings.incomplete = index.incomplete && self.first_report_of_incomplete(workspace);
         GitGuard {
             session: Arc::clone(self),
@@ -364,7 +386,12 @@ impl GuardSession {
         if let Some(used) = kept.quarantine.take() {
             quarantine = used;
         }
-        kept.check(&Tree::new(workspace), &mut quarantine, survivors);
+        kept.check(
+            &Tree::new(workspace),
+            &mut quarantine,
+            survivors,
+            self.max_changes(),
+        );
         kept.quarantine = Some(quarantine);
     }
 
@@ -445,8 +472,16 @@ impl GitGuard {
         state.findings.undone = state
             .undone
             .iter()
-            .filter(|(_, undone)| undone.capped)
+            .filter(|(_, undone)| undone.capped && !undone.earlier)
             .map(|(path, undone)| (path.clone(), undone.what))
+            .collect();
+        // Failing again, what an earlier command could not move or restore
+        // is only recalled.
+        state.findings.stuck = state
+            .undone
+            .iter()
+            .filter(|(_, undone)| undone.earlier && !undone.capped)
+            .map(|(path, _)| path.clone())
             .collect();
         state.finished = true;
         state.quarantine.close();
@@ -492,7 +527,7 @@ impl WatchHandle {
                 generation,
             } => session
                 .with_kept(workspace, *generation, |kept| {
-                    watched_dirs(&Tree::new(workspace), &kept.gitdirs, kept.snapshot.as_ref())
+                    watched_dirs(&Tree::new(workspace), &kept.gitdirs, Some(&kept.snapshot))
                 })
                 .unwrap_or_default(),
         }
@@ -521,7 +556,7 @@ impl WatchHandle {
                 generation,
             } => session
                 .with_kept(workspace, *generation, |kept| {
-                    relevant(workspace, &kept.gitdirs, kept.snapshot.as_ref(), dir, name)
+                    relevant(workspace, &kept.gitdirs, Some(&kept.snapshot), dir, name)
                 })
                 .unwrap_or(false),
         }
@@ -646,7 +681,8 @@ impl State {
     /// before this command, which the guard restored, never what is on disk
     /// now. The names that existed before the command and still may; the
     /// gitdirs that were directories then and are still the ones indexed;
-    /// and in the basic tier the snapshot taken before the command.
+    /// the snapshot taken before the command; and what the checks left
+    /// undone, now left by an earlier command.
     fn keep(&mut self, survivors: bool) -> Kept {
         let gitdirs: BTreeSet<PathBuf> = self
             .gitdirs
@@ -668,16 +704,22 @@ impl State {
             .filter(|path| may_exist(&self.tree, path))
             .cloned()
             .collect();
-        let snapshot = self.save_all.then(|| std::mem::take(&mut self.snapshot));
+        let undone = std::mem::take(&mut self.undone)
+            .into_iter()
+            .map(|(path, mut undone)| {
+                undone.earlier = true;
+                (path, undone)
+            })
+            .collect();
         Kept {
             gitdirs,
             candidates,
             existing,
-            snapshot,
+            snapshot: std::mem::take(&mut self.snapshot),
+            save_all: self.save_all,
             detached: self.detached.clone(),
             survivors,
-            undone: self.undone.clone(),
-            max_changes: self.max_changes,
+            undone,
             found: List::default(),
             quarantine: None,
         }
@@ -698,13 +740,6 @@ fn check_identities(
         if now == tracked.expected {
             continue;
         }
-        let finding = |what, outcome| {
-            Some(Finding {
-                path: path.clone(),
-                what,
-                outcome,
-            })
-        };
         match now {
             Identity::Missing => {
                 findings.gone.insert(path.clone());
@@ -713,70 +748,102 @@ fn check_identities(
                 continue;
             }
             Identity::Unreachable => {
-                findings
-                    .after
-                    .push(finding(What::Unreachable, pass.unreachable(path)));
+                findings.after.push(Some(Finding {
+                    path: path.clone(),
+                    what: What::Unreachable,
+                    outcome: pass.unreachable(path),
+                }));
                 detached.insert(path.clone());
                 tracked.expected = now;
                 continue;
             }
             Identity::Symlink { .. } | Identity::Inode { .. } => {}
         }
-        let moved = match pass.move_out(path, What::Replaced) {
-            None => continue,
-            Some(Ok(moved)) => moved,
-            Some(Err(err)) if nothing_there(&err) => {
+        let (finding, put) = pass.put_back(path, &tracked.original, Some(snapshot));
+        findings.after.push(finding);
+        match put {
+            Put::Restored => {
+                detached.remove(path);
+                tracked.expected = Identity::of(pass.tree, path);
+            }
+            Put::Moved => {
+                detached.insert(path.clone());
+                tracked.expected = Identity::of(pass.tree, path);
+            }
+            Put::Gone => {
                 findings.gone.insert(path.clone());
                 detached.insert(path.clone());
                 tracked.expected = Identity::Missing;
-                continue;
             }
-            Some(Err(err)) => {
-                let outcome = Outcome::Failed(format!("could not move it: {err}"));
-                findings.after.push(finding(What::Replaced, outcome));
+            // Recorded as undone; the next check tries again.
+            Put::Left => {
                 detached.insert(path.clone());
-                tracked.expected = now;
-                continue;
             }
-        };
-        let restored = match &tracked.original {
-            Identity::Symlink { target } => Some(pass.retry(path, |pass| {
-                let (dir, name) = pass.tree.parent(path)?;
-                dir.symlink(target, &name)
-            })),
-            Identity::Inode { dir: false, .. } if snapshot.saved(path) => {
-                Some(pass.retry(path, |pass| snapshot.restore(pass.tree, path)))
-            }
-            _ => None,
-        };
-        let outcome = match restored {
-            None => Outcome::Moved(moved),
-            Some(Ok(())) => Outcome::Restored(Some(moved)),
-            Some(Err(err)) => Outcome::Failed(format!(
-                "moved to {}, but could not put the earlier version back: {err}",
-                moved.display()
-            )),
-        };
-        if matches!(outcome, Outcome::Restored(_)) {
-            detached.remove(path);
-        } else {
-            detached.insert(path.clone());
         }
-        tracked.expected = Identity::of(pass.tree, path);
-        findings.after.push(finding(What::Replaced, outcome));
     }
 }
 
-/// Something a check left undone, or could not do: its path is tried again
-/// before the next command, and until then is not taken for a known one.
-#[derive(Debug, Clone, Copy)]
+/// Something a check left undone, or could not do: tried again before the
+/// next command.
+#[derive(Debug, Clone)]
 struct Undone {
     what: What,
-    /// A move to quarantine; otherwise a restore.
-    moved: bool,
+    todo: Todo,
     /// Left for want of changes the check could still make, rather than
     /// failed.
     capped: bool,
+    /// Left by an earlier command: failing again, it no longer blocks the
+    /// command, and is only recalled.
+    earlier: bool,
+}
+
+/// What is left to do about an entry.
+#[derive(Debug, Clone)]
+enum Todo {
+    /// Move it to quarantine: it is new, and until then not a known one.
+    Move,
+    /// Move what is there to quarantine, and restore the version the
+    /// snapshot holds.
+    Restore,
+    /// Move what replaced a `.git` entry, gitdir or link to quarantine, and
+    /// put back what it was: a symlink, or the gitfile the snapshot holds.
+    PutBack(Identity),
+}
+
+/// Whether `path`, or a directory above it, is to be moved to quarantine.
+/// A lookup for each directory up, so the cost does not grow with `undone`.
+fn to_move(undone: &BTreeMap<PathBuf, Undone>, path: &Path) -> bool {
+    path.ancestors().any(|above| {
+        #[cfg(test)]
+        LOOKUPS.with(|looks| looks.set(looks.get() + 1));
+        undone
+            .get(above)
+            .is_some_and(|undone| matches!(undone.todo, Todo::Move))
+    })
+}
+
+/// What a move to quarantine came to.
+enum Moved {
+    Stored(PathBuf),
+    NothingThere,
+    /// Recorded as undone; `known` when an earlier command's check failed
+    /// on it already, and nothing new is to be reported.
+    Failed {
+        err: io::Error,
+        known: bool,
+    },
+}
+
+/// What putting back a replaced entry came to.
+enum Put {
+    /// The earlier version is back.
+    Restored,
+    /// What replaced it is in quarantine; nothing (else) is there.
+    Moved,
+    /// Nothing is there, and there is nothing to put back.
+    Gone,
+    /// Left as it is, and recorded as undone.
+    Left,
 }
 
 /// One check: what it may still change, what it leaves undone, and what else
@@ -816,20 +883,41 @@ impl<'a> Pass<'a> {
 
     /// Whether this check may make one more change; if not, `path` is left
     /// undone.
-    fn allow(&mut self, path: &Path, what: What, moved: bool) -> bool {
+    fn allow(&mut self, path: &Path, what: What, todo: &Todo) -> bool {
         if let Some(left) = self.left.checked_sub(1) {
             self.left = left;
             return true;
         }
         let undone = Undone {
             what,
-            moved,
+            todo: todo.clone(),
             capped: true,
+            earlier: false,
         };
         self.undone.insert(path.to_path_buf(), undone);
         false
     }
 
+    /// Records that what was to be done at `path` failed. Whether an earlier
+    /// command's check failed on it already, so that nothing new is to be
+    /// reported.
+    fn failed(&mut self, path: &Path, what: What, todo: &Todo) -> bool {
+        if self
+            .undone
+            .get(path)
+            .is_some_and(|undone| undone.earlier && !undone.capped)
+        {
+            return true;
+        }
+        let undone = Undone {
+            what,
+            todo: todo.clone(),
+            capped: false,
+            earlier: false,
+        };
+        self.undone.insert(path.to_path_buf(), undone);
+        false
+    }
     /// `op` on `path`, and once more if it was refused for want of
     /// permission and the guard could give the owner of a directory on the
     /// way the permissions back.
@@ -925,43 +1013,42 @@ impl<'a> Pass<'a> {
     }
 
     /// Moves `path` (a `what`) to quarantine. `None` when this check may
-    /// make no more changes. What could not be moved is left undone.
-    fn move_out(&mut self, path: &Path, what: What) -> Option<io::Result<PathBuf>> {
-        if !self.allow(path, what, true) {
+    /// make no more changes. What is not done is recorded as `todo`.
+    fn move_out(&mut self, path: &Path, what: What, todo: &Todo) -> Option<Moved> {
+        if !self.allow(path, what, todo) {
             return None;
         }
-        let moved = self.retry(path, |pass| pass.quarantine.take_stored(path));
-        match &moved {
-            Err(err) if !nothing_there(err) => {
-                let undone = Undone {
-                    what,
-                    moved: true,
-                    capped: false,
-                };
-                self.undone.insert(path.to_path_buf(), undone);
-            }
-            _ => {
-                self.undone.remove(path);
-            }
-        }
-        Some(moved.map(|stored| {
-            if let Some(why) = stored.live {
-                self.live.push(Finding {
-                    path: stored.path.clone(),
-                    what: What::Live,
-                    outcome: Outcome::Failed(why),
-                });
-            }
-            stored.path
-        }))
+        Some(
+            match self.retry(path, |pass| pass.quarantine.take_stored(path)) {
+                Ok(stored) => {
+                    self.undone.remove(path);
+                    if let Some(why) = stored.live {
+                        self.live.push(Finding {
+                            path: stored.path.clone(),
+                            what: What::Live,
+                            outcome: Outcome::Failed(why),
+                        });
+                    }
+                    Moved::Stored(stored.path)
+                }
+                Err(err) if nothing_there(&err) => {
+                    self.undone.remove(path);
+                    Moved::NothingThere
+                }
+                Err(err) => {
+                    let known = self.failed(path, what, todo);
+                    Moved::Failed { err, known }
+                }
+            },
+        )
     }
 
     /// Moves `path` to quarantine, if something is there.
     fn take(&mut self, path: &Path, what: What) -> Option<Finding> {
-        let outcome = match self.move_out(path, what)? {
-            Ok(to) => Outcome::Moved(to),
-            Err(err) if nothing_there(&err) => return None,
-            Err(err) => Outcome::Failed(format!("could not move it: {err}")),
+        let outcome = match self.move_out(path, what, &Todo::Move)? {
+            Moved::Stored(to) => Outcome::Moved(to),
+            Moved::NothingThere | Moved::Failed { known: true, .. } => return None,
+            Moved::Failed { err, .. } => Outcome::Failed(format!("could not move it: {err}")),
         };
         Some(Finding {
             path: path.to_path_buf(),
@@ -971,15 +1058,16 @@ impl<'a> Pass<'a> {
     }
 
     /// Restores `path` from `snapshot`; what was there was `moved` to
-    /// quarantine, if anything (which counted as the change).
+    /// quarantine, if anything. `counted` when the change counted already.
     fn restore(
         &mut self,
         snapshot: &Snapshot,
         path: &Path,
         what: What,
         moved: Option<PathBuf>,
+        counted: bool,
     ) -> Option<Finding> {
-        if moved.is_none() && !self.allow(path, what, false) {
+        if !counted && !self.allow(path, what, &Todo::Restore) {
             return None;
         }
         let outcome = match self.retry(path, |pass| snapshot.restore(pass.tree, path)) {
@@ -987,19 +1075,85 @@ impl<'a> Pass<'a> {
                 self.undone.remove(path);
                 Outcome::Restored(moved)
             }
-            Err(err) => match moved {
-                Some(to) => Outcome::Failed(format!(
-                    "moved to {}, but could not restore the earlier version: {err}",
-                    to.display()
-                )),
-                None => Outcome::Failed(format!("could not restore the earlier version: {err}")),
-            },
+            Err(err) => {
+                if self.failed(path, what, &Todo::Restore) {
+                    return None;
+                }
+                match moved {
+                    Some(to) => Outcome::Failed(format!(
+                        "moved to {}, but could not restore the earlier version: {err}",
+                        to.display()
+                    )),
+                    None => {
+                        Outcome::Failed(format!("could not restore the earlier version: {err}"))
+                    }
+                }
+            }
         };
         Some(Finding {
             path: path.to_path_buf(),
             what,
             outcome,
         })
+    }
+
+    /// Moves what replaced the `.git` entry, gitdir or link at `path` to
+    /// quarantine, and puts back what it was (`original`): a symlink, or the
+    /// gitfile `snapshot` holds.
+    fn put_back(
+        &mut self,
+        path: &Path,
+        original: &Identity,
+        snapshot: Option<&Snapshot>,
+    ) -> (Option<Finding>, Put) {
+        let finding = |outcome| {
+            Some(Finding {
+                path: path.to_path_buf(),
+                what: What::Replaced,
+                outcome,
+            })
+        };
+        let todo = Todo::PutBack(original.clone());
+        let moved = match self.move_out(path, What::Replaced, &todo) {
+            None | Some(Moved::Failed { known: true, .. }) => return (None, Put::Left),
+            Some(Moved::Failed { err, .. }) => {
+                let outcome = Outcome::Failed(format!("could not move it: {err}"));
+                return (finding(outcome), Put::Left);
+            }
+            Some(Moved::Stored(to)) => Some(to),
+            Some(Moved::NothingThere) => None,
+        };
+        let put = match (original, snapshot) {
+            (Identity::Symlink { target }, _) => Some(self.retry(path, |pass| {
+                let (dir, name) = pass.tree.parent(path)?;
+                dir.symlink(target, &name)
+            })),
+            (Identity::Inode { dir: false, .. }, Some(snapshot)) if snapshot.saved(path) => {
+                Some(self.retry(path, |pass| snapshot.restore(pass.tree, path)))
+            }
+            _ => None,
+        };
+        match (put, moved) {
+            (None, Some(to)) => (finding(Outcome::Moved(to)), Put::Moved),
+            (None, None) => (None, Put::Gone),
+            (Some(Ok(())), moved) => {
+                self.undone.remove(path);
+                (finding(Outcome::Restored(moved)), Put::Restored)
+            }
+            (Some(Err(err)), moved) => {
+                if self.failed(path, What::Replaced, &todo) {
+                    return (None, Put::Moved);
+                }
+                let why = match moved {
+                    Some(to) => format!(
+                        "moved to {}, but could not put the earlier version back: {err}",
+                        to.display()
+                    ),
+                    None => format!("could not put the earlier version back: {err}"),
+                };
+                (finding(Outcome::Failed(why)), Put::Moved)
+            }
+        }
     }
 
     /// Undoes each difference from `snapshot`, except below the paths `skip`
@@ -1020,13 +1174,15 @@ impl<'a> Pass<'a> {
                     })
                 }
                 Difference::Added => self.take(path, What::Added),
-                Difference::Changed => match self.move_out(path, What::Changed) {
-                    None => None,
-                    Some(Ok(moved)) => self.restore(snapshot, path, What::Changed, Some(moved)),
-                    Some(Err(err)) if nothing_there(&err) => {
-                        self.restore(snapshot, path, What::Changed, None)
+                Difference::Changed => match self.move_out(path, What::Changed, &Todo::Restore) {
+                    None | Some(Moved::Failed { known: true, .. }) => None,
+                    Some(Moved::Stored(moved)) => {
+                        self.restore(snapshot, path, What::Changed, Some(moved), true)
                     }
-                    Some(Err(err)) => Some(Finding {
+                    Some(Moved::NothingThere) => {
+                        self.restore(snapshot, path, What::Changed, None, true)
+                    }
+                    Some(Moved::Failed { err, .. }) => Some(Finding {
                         path: path.to_path_buf(),
                         what: What::Changed,
                         outcome: Outcome::Failed(format!("could not move it: {err}")),
@@ -1036,8 +1192,8 @@ impl<'a> Pass<'a> {
                 // to restore it to; what happened to the directory is
                 // reported.
                 Difference::Missing if tree.parent(path).is_err_and(|err| absent(&err)) => None,
-                Difference::Missing => self.restore(snapshot, path, What::Deleted, None),
-                Difference::Permissions => self.restore(snapshot, path, What::Changed, None),
+                Difference::Missing => self.restore(snapshot, path, What::Deleted, None, false),
+                Difference::Permissions => self.restore(snapshot, path, What::Changed, None, false),
             };
             found.push(finding);
             Next::Go
@@ -1067,9 +1223,12 @@ struct Kept {
     gitdirs: BTreeSet<PathBuf>,
     candidates: BTreeSet<PathBuf>,
     existing: BTreeSet<PathBuf>,
-    /// The protected files and gitfiles before the command (the basic tier
-    /// only).
-    snapshot: Option<Snapshot>,
+    /// The snapshot taken before the command: every protected file in the
+    /// basic tier, protected symlinks and multiply linked files in the full
+    /// tier.
+    snapshot: Snapshot,
+    /// Whether the snapshot holds every protected file (the basic tier).
+    save_all: bool,
     /// Below these, the snapshot is not compared: see [`State::detached`].
     detached: BTreeSet<PathBuf>,
     /// Whether processes a sandboxed command started were running when the
@@ -1077,8 +1236,6 @@ struct Kept {
     survivors: bool,
     /// What the checks left undone: see [`State::undone`].
     undone: BTreeMap<PathBuf, Undone>,
-    /// The most changes one check makes.
-    max_changes: usize,
     /// What the checks since found.
     found: List,
     /// Where the checks between commands move things.
@@ -1086,22 +1243,49 @@ struct Kept {
 }
 
 impl Kept {
-    /// Moves what the checks left undone to quarantine first, then
-    /// protected names planted since the command ended; and if processes it
-    /// left running may have changed things, or a check left restores
-    /// undone, undoes the changes to the protected files and gitfiles.
-    fn check(&mut self, tree: &Tree, quarantine: &mut Quarantine, survivors: bool) {
+    /// Does what the checks left undone first; then moves protected names
+    /// planted since the command ended to quarantine; and, in the basic
+    /// tier if processes the command left running may have changed things,
+    /// or in either tier if restores were left undone, undoes the changes
+    /// to the protected files and gitfiles.
+    fn check(
+        &mut self,
+        tree: &Tree,
+        quarantine: &mut Quarantine,
+        survivors: bool,
+        max_changes: usize,
+    ) {
         self.survivors |= survivors;
-        let mut pass = Pass::new(tree, quarantine, &mut self.undone, self.max_changes);
-        let pending: Vec<(PathBuf, What)> = pass
+        let mut pass = Pass::new(tree, quarantine, &mut self.undone, max_changes);
+        let pending: Vec<(PathBuf, Undone)> = pass
             .undone
             .iter()
-            .filter(|(_, undone)| undone.moved)
-            .map(|(path, undone)| (path.clone(), undone.what))
+            .map(|(path, undone)| (path.clone(), undone.clone()))
             .collect();
-        for (path, what) in pending {
-            let taken = pass.take(&path, what);
-            self.found.push(taken);
+        for (path, undone) in pending {
+            match &undone.todo {
+                Todo::Move => {
+                    let taken = pass.take(&path, undone.what);
+                    self.found.push(taken);
+                }
+                Todo::PutBack(original) => {
+                    let settled = match original {
+                        Identity::Symlink { .. } => Identity::of(tree, &path) == *original,
+                        Identity::Inode { dir: false, .. } => {
+                            self.snapshot.state_of(tree, &path) == Some(None)
+                        }
+                        _ => false,
+                    };
+                    if settled {
+                        pass.undone.remove(&path);
+                        continue;
+                    }
+                    let (finding, _) = pass.put_back(&path, original, Some(&self.snapshot));
+                    self.found.push(finding);
+                }
+                // With the snapshot, below.
+                Todo::Restore => {}
+            }
         }
         let new: Vec<PathBuf> = self
             .candidates
@@ -1113,12 +1297,46 @@ impl Kept {
             let taken = pass.take(&path, What::New);
             self.found.push(taken);
         }
-        let restores_left = pass.undone.values().any(|undone| !undone.moved);
-        if (self.survivors || restores_left)
-            && let Some(snapshot) = &self.snapshot
-        {
+        let restores_left = pass
+            .undone
+            .values()
+            .any(|undone| matches!(undone.todo, Todo::Restore));
+        if (self.survivors && self.save_all) || restores_left {
             let detached = &self.detached;
-            pass.undo(snapshot, |path| below_any(detached, path), &mut self.found);
+            pass.undo(
+                &self.snapshot,
+                |path| below_any(detached, path),
+                &mut self.found,
+            );
+        }
+        // A restore left undone is done once its entry is as recorded; one
+        // nothing can do (no earlier version, or nowhere to put it) is said
+        // once, then dropped.
+        let restores: Vec<(PathBuf, What)> = pass
+            .undone
+            .iter()
+            .filter(|(_, undone)| matches!(undone.todo, Todo::Restore))
+            .map(|(path, undone)| (path.clone(), undone.what))
+            .collect();
+        for (path, what) in restores {
+            let state = self.snapshot.state_of(tree, &path);
+            let stranded = below_any(&self.detached, &path)
+                || state.is_none()
+                || (state == Some(Some(Difference::Missing))
+                    && tree.parent(&path).is_err_and(|err| absent(&err)));
+            if state == Some(None) || stranded {
+                pass.undone.remove(&path);
+            }
+            if stranded {
+                self.found.push(Some(Finding {
+                    path,
+                    what,
+                    outcome: Outcome::Note(
+                        "harness can no longer put the earlier version back, so it leaves it as it is"
+                            .into(),
+                    ),
+                }));
+            }
         }
         pass.report(&mut self.found);
     }

@@ -1000,7 +1000,14 @@ fn unquoted_heredoc_bodies_join_continuation_lines() {
                 "echo \"$(cat <<EOF\nx $\\\n(echo a\ncurl x\n)\nEOF\n)\"",
                 Deny,
             ),
+            // An escaped backslash does not join the lines.
+            ("cat <<EOF\n` # \\\\\ncurl x`\nEOF", Deny),
         ],
+    );
+    // Joined, the backquoted command is ` # curl x`: a comment, which runs nothing.
+    check(
+        &probe_rules(),
+        &[("cat <<EOF\n` # \\\ncurl x`\nEOF", Want::Allow)],
     );
 }
 

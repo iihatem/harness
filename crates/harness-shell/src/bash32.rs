@@ -67,7 +67,30 @@ pub(crate) fn divergence(src: &str) -> Option<&'static str> {
         return Some(COMMENT_CONTINUES);
     }
     let b: Vec<char> = src.chars().collect();
-    Reader { b: &b, depth: 0 }.program().err()
+    let words = word_spans(src);
+    Reader {
+        b: &b,
+        depth: 0,
+        words: words.as_deref(),
+    }
+    .program()
+    .err()
+}
+
+/// The spans, in characters, of the words of `src` as brush-parser's tokenizer reads the
+/// whole program; `None` if it cannot.
+fn word_spans(src: &str) -> Option<Vec<(usize, usize)>> {
+    let options = parser_options().tokenizer_options();
+    let tokens = guarded(|| brush_parser::tokenize_str_with_options(src, &options))?.ok()?;
+    Some(
+        tokens
+            .iter()
+            .filter_map(|t| match t {
+                brush_parser::Token::Word(_, span) => Some((span.start.index, span.end.index)),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// Why bash may end the command substitution whose text the analysis took as `text`
@@ -647,6 +670,9 @@ struct Reader<'a> {
     b: &'a [char],
     /// Command substitutions this text is nested in.
     depth: usize,
+    /// For the program the analysis parsed itself, the spans of its words as brush-parser
+    /// tokenized it there.
+    words: Option<&'a [(usize, usize)]>,
 }
 
 impl Reader<'_> {
@@ -910,7 +936,13 @@ impl Reader<'_> {
             let (start, end) = c.text;
             match c.kind {
                 Kind::Substitution => {
-                    if !brush_reads_one_word(&self.b[c.raw.0..=c.raw.1]) {
+                    // brush-parser is checked on the construct's own text, and in the program
+                    // only for where its word lies. It can still read a construct differently
+                    // in context, as it misses comments in `"$(…)"`: that is a limit of this
+                    // check, which the comparisons below and `substitution_misread` cover for
+                    // the cases known.
+                    if !brush_reads_one_word(&self.b[c.raw.0..=c.raw.1]) || !self.in_one_word(c.raw)
+                    {
                         return Err(Stop::Diverges(ENDS_ELSEWHERE));
                     }
                     match Extract::new(t).delimited(start + 2, 0) {
@@ -928,7 +960,8 @@ impl Reader<'_> {
                     if !nests {
                         continue;
                     }
-                    if !brush_reads_one_word(&self.b[c.raw.0..=c.raw.1]) {
+                    if !brush_reads_one_word(&self.b[c.raw.0..=c.raw.1]) || !self.in_one_word(c.raw)
+                    {
                         return Err(Stop::Diverges(BRACE_ELSEWHERE));
                     }
                     let mut extract = Extract::new(t);
@@ -945,6 +978,18 @@ impl Reader<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Whether the construct from `b[raw.0]` to `b[raw.1]` lies within one word of the
+    /// program as brush-parser tokenized it, when it did.
+    fn in_one_word(&self, raw: (usize, usize)) -> bool {
+        let Some(words) = self.words else {
+            return true;
+        };
+        let k = words.partition_point(|&(_, end)| end <= raw.0);
+        words
+            .get(k)
+            .is_some_and(|&(start, end)| start <= raw.0 && raw.1 < end)
     }
 
     /// Checks the substitutions bash 3.2 found in expanded text `t` (a here-document body,
@@ -1026,6 +1071,7 @@ impl Reader<'_> {
         let nested = Reader {
             b: text,
             depth: self.depth + 1,
+            words: None,
         };
         match nested.walk() {
             Ok(()) | Err(Stop::Eof) => Ok(()),
@@ -1514,6 +1560,22 @@ mod tests {
         ] {
             assert_eq!(divergence(agrees), None, "{agrees:?}");
         }
+        // In the program the analysis parsed, each construct must lie within one of the
+        // words brush-parser read there.
+        let b = chars("echo $(x) y");
+        let read = |words: &[(usize, usize)]| {
+            Reader {
+                b: &b,
+                depth: 0,
+                words: Some(words),
+            }
+            .program()
+        };
+        assert_eq!(read(&[(0, 4), (5, 9), (10, 11)]), Ok(()));
+        assert_eq!(
+            read(&[(0, 4), (5, 8), (8, 9), (10, 11)]),
+            Err(ENDS_ELSEWHERE)
+        );
         for (differs, why) in [
             ("echo $(cat <<EOF)\nx\nEOF", ENDS_ELSEWHERE),
             ("echo $(true;# ); x\n)", ENDS_ELSEWHERE),

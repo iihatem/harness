@@ -19,25 +19,47 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 /// Matches a bash rule pattern against an argv, rendered as its shell-quoted join.
 /// A pattern ending in ` *` also matches the bare command (`git *` matches `git`).
 pub(crate) fn argv_matches(pattern: &str, argv: &[Tok]) -> bool {
+    units_match(pattern, &units(argv, false))
+}
+
+/// Like [`argv_matches`], ignoring case, for deny and confirm rules: a case-insensitive
+/// file system such as macOS's runs `CURL` as `curl`.
+pub(crate) fn argv_matches_any_case(pattern: &str, argv: &[Tok]) -> bool {
+    units_match(&fold(pattern), &units(argv, true))
+}
+
+/// Lowercases `s` character by character, so that whatever matches as written still
+/// matches once folded.
+fn fold(s: &str) -> String {
+    s.chars().flat_map(char::to_lowercase).collect()
+}
+
+fn units(argv: &[Tok], lowercase: bool) -> Vec<Unit> {
     let mut units = Vec::new();
     for (i, tok) in argv.iter().enumerate() {
         if i > 0 {
             units.push(Unit::Char(' '));
         }
         match tok {
+            Tok::Lit(s) if lowercase => units.extend(fold(&quote(s)).chars().map(Unit::Char)),
             Tok::Lit(s) => units.extend(quote(s).chars().map(Unit::Char)),
             Tok::Glob { .. } | Tok::Dyn => units.push(Unit::Dyn),
         }
     }
-    wildcard(pattern, &units)
-        || pattern
-            .strip_suffix(" *")
-            .is_some_and(|bare| wildcard(bare, &units))
+    units
 }
 
-/// Whether `pattern` could match `argv` once its run-time parts are known: the argv's literal
-/// words before its first run-time token must agree with the pattern's text before its first `*`
-/// (one is a prefix of the other). Fully literal argvs return `false` (`argv_matches` decides them).
+fn units_match(pattern: &str, units: &[Unit]) -> bool {
+    wildcard(pattern, units)
+        || pattern
+            .strip_suffix(" *")
+            .is_some_and(|bare| wildcard(bare, units))
+}
+
+/// Whether deny or confirm `pattern` could match `argv` once its run-time parts are known,
+/// ignoring case: the argv's literal words before its first run-time token must agree with
+/// the pattern's text before its first `*` (one is a prefix of the other). Fully literal argvs
+/// return `false` ([`argv_matches_any_case`] decides them).
 pub(crate) fn argv_may_match(pattern: &str, argv: &[Tok]) -> bool {
     let mut known = String::new();
     for (i, tok) in argv.iter().enumerate() {
@@ -45,8 +67,9 @@ pub(crate) fn argv_may_match(pattern: &str, argv: &[Tok]) -> bool {
             known.push(' ');
         }
         match tok {
-            Tok::Lit(s) => known.push_str(&quote(s)),
+            Tok::Lit(s) => known.push_str(&fold(&quote(s))),
             Tok::Glob { .. } | Tok::Dyn => {
+                let pattern = fold(pattern);
                 let fixed = pattern.split('*').next().unwrap_or_default();
                 return fixed.starts_with(&known) || known.starts_with(fixed);
             }
@@ -110,6 +133,20 @@ mod tests {
         let dynamic = vec![Tok::Lit("cargo".into()), Tok::Dyn];
         assert!(argv_matches("cargo *", &dynamic));
         assert!(!argv_matches("cargo test*", &dynamic));
+    }
+
+    #[test]
+    fn deny_and_confirm_patterns_ignore_case() {
+        assert!(!argv_matches("curl*", &lits(&["CURL", "x"])));
+        assert!(argv_matches_any_case("curl*", &lits(&["CURL", "x"])));
+        assert!(argv_matches_any_case("Git Push*", &lits(&["git", "PUSH"])));
+        assert!(argv_may_match(
+            "NPM publish*",
+            &[Tok::Lit("Npm".into()), Tok::Dyn]
+        ));
+        // A sigma before `*` folds like any other (non-ASCII words are shown quoted).
+        assert!(argv_matches("'ΑΣ*", &lits(&["ΑΣΔ"])));
+        assert!(argv_matches_any_case("'ΑΣ*", &lits(&["ΑΣΔ"])));
     }
 
     #[test]

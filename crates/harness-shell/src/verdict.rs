@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use crate::argv::{Tok, display, quote};
-use crate::matching::{argv_matches, argv_may_match};
+use crate::argv::{Tok, command_name, display, quote};
+use crate::matching::{argv_matches, argv_matches_any_case, argv_may_match};
 use crate::parse::analyze;
 use crate::paths::Workspace;
 
@@ -42,8 +42,11 @@ pub enum Verdict {
 /// Decides how `command` may run. `workspace` is the project root; the command is
 /// assumed to start in it.
 ///
-/// Order: definite deny ⇒ `Deny`; may-match deny / undecomposable / destructive ⇒ one
-/// `Ask` carrying every reason (destructive flag set when anything destructive was found);
+/// Deny and confirm rules match in any case; allow rules only as written.
+///
+/// Order: definite deny ⇒ `Deny`; may-match deny (including a deny match in possible
+/// here-document text) / undecomposable / destructive ⇒ one `Ask` carrying every reason
+/// (destructive flag set when anything destructive was found);
 /// definite or may-match confirm, sudo-like wrappers, writes outside the workspace ⇒ `Ask`;
 /// all allow-listed ⇒ `Allow`; otherwise `Unlisted`.
 pub fn evaluate(command: &str, rules: &Rules, workspace: &Path) -> Verdict {
@@ -59,6 +62,14 @@ pub fn evaluate(command: &str, rules: &Rules, workspace: &Path) -> Verdict {
     if let Some((form, rule)) = first_possible_match(&a.forms, &rules.deny) {
         reasons.push(format!(
             "`{}` may match deny rule `bash:{rule}` (part of it is only known at run time)",
+            display(form)
+        ));
+        may_deny = true;
+    } else if let Some((form, rule)) = first_match(&a.data_forms, &rules.deny)
+        .or_else(|| first_possible_match(&a.data_forms, &rules.deny))
+    {
+        reasons.push(format!(
+            "`{}` may match deny rule `bash:{rule}` (it may be here-document text)",
             display(form)
         ));
         may_deny = true;
@@ -117,9 +128,10 @@ pub fn evaluate(command: &str, rules: &Rules, workspace: &Path) -> Verdict {
     }
 }
 
+/// The first deny or confirm rule matching a form, ignoring case.
 fn first_match<'a>(forms: &'a [Vec<Tok>], patterns: &'a [String]) -> Option<(&'a [Tok], &'a str)> {
     forms.iter().find_map(|form| {
-        let rule = patterns.iter().find(|p| argv_matches(p, form))?;
+        let rule = patterns.iter().find(|p| argv_matches_any_case(p, form))?;
         Some((form.as_slice(), rule.as_str()))
     })
 }
@@ -176,7 +188,7 @@ pub fn session_prefixes(command: &str) -> Option<Vec<String>> {
 
 fn prefix(argv: &[Tok]) -> Option<String> {
     let name = argv.first()?.lit()?;
-    if !SUBCOMMAND_TOOLS.contains(&name) {
+    if !SUBCOMMAND_TOOLS.contains(&command_name(name).as_str()) {
         return Some(quote(name).into_owned());
     }
     match argv.get(1) {

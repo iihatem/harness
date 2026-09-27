@@ -6,7 +6,7 @@ use brush_parser::ast::{
     IoFileRedirectKind as Kind, IoFileRedirectTarget as Target, IoRedirect, SeparatorOperator,
 };
 
-use crate::argv::{self, Hidden, MAX_DEPTH, Scan, Tok, basename};
+use crate::argv::{self, Hidden, MAX_DEPTH, Scan, Tok, basename, command_name};
 use crate::destructive;
 use crate::fallback;
 use crate::git;
@@ -47,8 +47,8 @@ struct Operands<'a> {
     /// `NAME=value` operands the shell expands as assignments, by argv position (only
     /// for the argv as written, not once a wrapper is unwrapped).
     assignments: Vec<(usize, Operand<'a>)>,
-    /// Literal text, in a word after the command name, that bash may evaluate later.
-    hidden: Option<Hidden>,
+    /// Literal text, in the words after the command name, that bash may evaluate later.
+    hidden: Hidden,
 }
 
 /// Nesting limit for wrapper commands (`sudo env nice …`).
@@ -65,6 +65,9 @@ pub(crate) struct Analysis {
     /// basename and git-global-option-free variants, and alternative readings of
     /// wrapper options.
     pub forms: Vec<Vec<Tok>>,
+    /// Forms found in text that may be here-document data rather than commands: a deny
+    /// rule matching one of them only asks.
+    pub data_forms: Vec<Vec<Tok>>,
     pub destructive: Vec<String>,
     /// Why auto-allow is impossible although the command is fully understood.
     pub unlisted: Vec<String>,
@@ -79,6 +82,7 @@ pub(crate) fn analyze(src: &str, ws: &Workspace) -> Analysis {
         ws,
         out: Analysis::default(),
         lists: 0,
+        data: 0,
     };
     walker.program(src, &mut Cwd::at(ws.root()), 0);
     walker.out
@@ -102,6 +106,8 @@ struct Walker<'a> {
     out: Analysis,
     /// Command lists currently being walked (across nested programs too).
     lists: usize,
+    /// Rough commands from possible here-document data currently being walked.
+    data: usize,
 }
 
 impl Walker<'_> {
@@ -129,7 +135,7 @@ impl Walker<'_> {
             self.undecomposable("nested too deeply".into());
             return self.rough_scan(src, depth);
         }
-        if let Some(why) = argv::program_too_nested(src) {
+        if let Some(why) = argv::unsafe_heredoc(src).or_else(|| argv::program_too_nested(src)) {
             self.undecomposable(why.into());
             return self.rough_scan(src, depth);
         }
@@ -150,10 +156,22 @@ impl Walker<'_> {
 
     /// Best-effort deny/destructive scan of text the parser could not handle.
     fn rough_scan(&mut self, src: &str, depth: usize) {
-        for words in fallback::rough_commands(src) {
-            let argv = words.into_iter().map(Tok::Lit).collect();
+        self.rough(fallback::rough_commands(src), depth);
+    }
+
+    fn rough(&mut self, commands: Vec<fallback::Rough>, depth: usize) {
+        for command in commands {
+            self.data += usize::from(command.data);
             let operands = Operands::default();
-            self.exec(argv, &operands, &mut Cwd::unknown(), depth + 1, 0, false);
+            self.exec(
+                command.words,
+                &operands,
+                &mut Cwd::unknown(),
+                depth + 1,
+                0,
+                false,
+            );
+            self.data -= usize::from(command.data);
         }
     }
 
@@ -369,7 +387,7 @@ impl Walker<'_> {
                 operands.assignments.push((argv.len(), operand));
             }
             let hidden = self.item(item, &mut argv, cwd, depth);
-            operands.hidden = operands.hidden.or(hidden);
+            operands.hidden = operands.hidden.union(hidden);
         }
         if argv.is_empty() {
             if assigns {
@@ -388,13 +406,7 @@ impl Walker<'_> {
     }
 
     /// Adds an argv word (if `item` is one) and returns its hidden literal text.
-    fn item(
-        &mut self,
-        item: &Item,
-        argv: &mut Vec<Tok>,
-        cwd: &Cwd,
-        depth: usize,
-    ) -> Option<Hidden> {
+    fn item(&mut self, item: &Item, argv: &mut Vec<Tok>, cwd: &Cwd, depth: usize) -> Hidden {
         match item {
             // An assignment-looking argument (`export A=1`) is an ordinary word here.
             Item::Word(w) | Item::AssignmentWord(_, w) => {
@@ -409,7 +421,7 @@ impl Walker<'_> {
                 argv.push(Tok::Dyn);
             }
         }
-        None
+        Hidden::default()
     }
 
     fn assignment(&mut self, assignment: &ast::Assignment, cwd: &Cwd, depth: usize) {
@@ -438,9 +450,9 @@ impl Walker<'_> {
     }
 
     /// Like [`Self::word`], also returning the word's hidden literal text.
-    fn scan_word(&mut self, raw: &str, cwd: &Cwd, depth: usize) -> (Tok, Option<Hidden>) {
+    fn scan_word(&mut self, raw: &str, cwd: &Cwd, depth: usize) -> (Tok, Hidden) {
         if self.too_nested(raw, false, depth) {
-            return (Tok::Dyn, None);
+            return (Tok::Dyn, Hidden::default());
         }
         let mut scan = Scan::default();
         let tok = argv::word_to_tok(raw, &mut scan).unwrap_or_else(|why| {
@@ -459,7 +471,11 @@ impl Walker<'_> {
             return false;
         };
         self.undecomposable(why.into());
-        self.rough_scan(text, depth);
+        if heredoc {
+            self.rough(fallback::rough_heredoc(text), depth);
+        } else {
+            self.rough_scan(text, depth);
+        }
         true
     }
 
@@ -623,30 +639,32 @@ impl Walker<'_> {
         }
     }
 
-    /// Records the command that actually runs once all wrappers are unwrapped.
+    /// Records the command that actually runs once all wrappers are unwrapped. Its name is
+    /// matched in any case (a case-insensitive file system finds `READ` as `/usr/bin/read`,
+    /// which runs the builtin), except for directory changes: only the builtin `cd`
+    /// changes the shell's directory.
     fn run(&mut self, argv: Vec<Tok>, operands: &Operands, cwd: &mut Cwd, same_shell: bool) {
         match &argv[0] {
+            Tok::Lit(name) if !name.is_ascii() => self.undecomposable(
+                "the command name has non-ASCII characters, which the file system may match to another name"
+                    .into(),
+            ),
             Tok::Lit(name) if name.contains('/') => self.unlisted(format!("runs `{name}` by path")),
             Tok::Lit(_) => {}
             _ => self.undecomposable("the command name is only known at run time".into()),
         }
-        let name = argv[0].lit().map(basename).unwrap_or_default();
+        let word = argv[0].lit().map(basename).unwrap_or_default();
+        let name = command_name(word);
+        let name = name.as_str();
         if name == "git" && git::parse(&argv).overrides_config {
             self.undecomposable(
                 "git `-c`/`--config-env`/`--exec-path` can run arbitrary programs".into(),
             );
         }
-        if let Some(hidden) = operands.hidden
-            && evaluates_operands(name, &argv)
+        if evaluates_operands(name, &argv)
+            && let Some(why) = hidden_reason(name, operands.hidden)
         {
-            self.undecomposable(match hidden {
-                Hidden::Substitution => format!(
-                    "`{name}` operand contains quoted command-substitution text that bash may evaluate"
-                ),
-                Hidden::Subscript => format!(
-                    "`{name}` operand contains a quoted `[` or `]`, which bash may evaluate as a subscript"
-                ),
-            });
+            self.undecomposable(why);
         }
         if DECLARATION_BUILTINS.contains(&name) {
             self.declaration_operands(name, &argv, &operands.assignments);
@@ -655,7 +673,7 @@ impl Walker<'_> {
             self.alias_operands(&argv);
         }
         if same_shell {
-            match name {
+            match word {
                 "cd" => cwd.cd(cd_target(&argv[1..])),
                 "pushd" | "popd" => cwd.cd(None),
                 _ => {}
@@ -721,17 +739,44 @@ impl Walker<'_> {
         if let Some(why) = destructive::check(argv, cwd, self.ws) {
             push_unique(&mut self.out.destructive, why);
         }
-        self.out.forms.push(argv.to_vec());
+        let forms = if self.data > 0 {
+            &mut self.out.data_forms
+        } else {
+            &mut self.out.forms
+        };
+        forms.push(argv.to_vec());
         if let Some(Tok::Lit(name)) = argv.first()
             && name.contains('/')
         {
             let mut form = argv.to_vec();
             form[0] = Tok::Lit(basename(name).to_string());
-            self.out.forms.push(form);
+            forms.push(form);
         }
         if let Some(form) = git::without_globals(argv) {
-            self.out.forms.push(form);
+            forms.push(form);
         }
+    }
+}
+
+/// Why literal text in the operands of the evaluating builtin `name` makes it
+/// undecomposable, if it does. In a declaration builtin's values (after the first `=`)
+/// only substitution markers count: a bracket there is plain text (`[::1]`, `^[a-z]+$`).
+fn hidden_reason(name: &str, hidden: Hidden) -> Option<String> {
+    let declaration = DECLARATION_BUILTINS.contains(&name);
+    if hidden.substitution {
+        Some(format!(
+            "`{name}` operand contains quoted command-substitution text that bash may evaluate"
+        ))
+    } else if hidden.undecodable {
+        Some(format!(
+            "`{name}` operand contains `$'…'` text that cannot be decoded, which bash may evaluate"
+        ))
+    } else if hidden.name_bracket || (hidden.value_bracket && !declaration) {
+        Some(format!(
+            "`{name}` operand contains a quoted `[` or `]`, which bash may evaluate as a subscript"
+        ))
+    } else {
+        None
     }
 }
 

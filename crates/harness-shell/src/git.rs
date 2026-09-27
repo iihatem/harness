@@ -1,13 +1,14 @@
 //! git argument parsing: global options, and the destructive subcommands
-//! (`push`, `reset`, `clean`, `checkout`, `restore`).
+//! (`push`, `reset`, `clean`, `checkout`, `restore`, `switch`).
 
-use crate::argv::{Tok, basename};
+use crate::argv::{Tok, command_name};
 
 /// Parsed git global options (`git [global options] <subcommand> …`).
 pub(crate) struct GitCall {
     /// Index in argv of the subcommand token.
     pub sub: Option<usize>,
-    /// `-c`, `--config-env` or `--exec-path` was given: config can run arbitrary programs.
+    /// `--config-env`, `--exec-path`, or a `-c` setting that is not [`inert_setting`] was
+    /// given: config can run arbitrary programs.
     pub overrides_config: bool,
 }
 
@@ -25,7 +26,12 @@ pub(crate) fn parse(argv: &[Tok]) -> GitCall {
         };
         match s.as_str() {
             "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--attr-source" => i += 2,
-            "-c" | "--config-env" => {
+            "-c" => {
+                let setting = argv.get(i + 1).and_then(Tok::lit);
+                call.overrides_config |= !setting.is_some_and(inert_setting);
+                i += 2;
+            }
+            "--config-env" => {
                 call.overrides_config = true;
                 i += 2;
             }
@@ -44,10 +50,29 @@ pub(crate) fn parse(argv: &[Tok]) -> GitCall {
     call
 }
 
+/// Whether `git -c <setting>` sets only a value git never runs as a program: the
+/// identity, the initial branch name, colours, advice, path quoting, or signing turned
+/// off. Sections and keys match in any case, as git's do.
+fn inert_setting(setting: &str) -> bool {
+    let (key, value) = match setting.split_once('=') {
+        Some((key, value)) => (key, Some(value)),
+        None => (setting, None),
+    };
+    let key = key.to_ascii_lowercase();
+    match key.as_str() {
+        "user.name" | "user.email" | "init.defaultbranch" | "core.quotepath" => true,
+        "commit.gpgsign" | "tag.gpgsign" => value.is_some_and(|v| v.eq_ignore_ascii_case("false")),
+        _ => ["color.", "advice."].iter().any(|section| {
+            key.strip_prefix(section)
+                .is_some_and(|rest| !rest.is_empty())
+        }),
+    }
+}
+
 /// `git <global options> sub args…` → `git sub args…`, so deny rules like
 /// `git push*` see through `git -C dir push`.
 pub(crate) fn without_globals(argv: &[Tok]) -> Option<Vec<Tok>> {
-    if argv.first()?.lit().map(basename) != Some("git") {
+    if argv.first()?.lit().map(command_name)? != "git" {
         return None;
     }
     let sub = parse(argv).sub.filter(|&s| s > 1)?;
@@ -68,6 +93,7 @@ pub(crate) fn destructive(argv: &[Tok]) -> Option<String> {
         "clean" => (&CLEAN, clean),
         "checkout" => (&CHECKOUT, checkout),
         "restore" => (&RESTORE, restore),
+        "switch" => (&SWITCH, switch),
         _ => return None,
     };
     let args = GitArgs::scan(&argv[sub + 1..], spec);
@@ -116,6 +142,11 @@ fn checkout(a: &GitArgs) -> Option<&'static str> {
             _ => true,
         });
     (forced || pathspec).then_some("overwrites local changes")
+}
+
+fn switch(a: &GitArgs) -> Option<&'static str> {
+    let discards = a.short('f') || a.maybe("force") || a.maybe("discard-changes");
+    discards.then_some("discards local changes")
 }
 
 fn restore(a: &GitArgs) -> Option<&'static str> {
@@ -170,6 +201,13 @@ const RESTORE: Spec = Spec {
            recurse-submodules no-recurse-submodules pathspec-from-file pathspec-file-nul",
     long_arg: "source pathspec-from-file",
     short_arg: "s",
+};
+
+const SWITCH: Spec = Spec {
+    long: "create force-create guess discard-changes quiet recurse-submodules progress merge \
+           conflict detach track force orphan overwrite-ignore ignore-other-worktrees",
+    long_arg: "create force-create conflict orphan",
+    short_arg: "cC",
 };
 
 /// A subcommand's arguments split parse-options style (options may follow operands).
@@ -307,6 +345,10 @@ mod tests {
             "git restore a.rs",
             "git restore --s a.rs",
             "git restore -SW a.rs",
+            "git switch -f main",
+            "git switch --discard main",
+            "git switch -c x --for",
+            "git switch -Cnew -f",
         ] {
             assert!(destructive_cmd(cmd), "{cmd}");
         }
@@ -325,6 +367,10 @@ mod tests {
             "git checkout main",
             "git restore --staged a.rs",
             "git restore --st a.rs",
+            "git switch main",
+            "git switch -c -f",
+            "git switch --conflict diff3 -m main",
+            "git switch --no-force main",
             "git status",
         ] {
             assert!(!destructive_cmd(cmd), "{cmd}");
@@ -341,5 +387,35 @@ mod tests {
         assert_eq!(call.sub, Some(6));
         assert!(call.overrides_config);
         assert_eq!(without_globals(&argv).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn inert_settings() {
+        for setting in [
+            "user.name=x",
+            "USER.Email=a@b",
+            "init.defaultBranch=main",
+            "color.ui",
+            "color.diff.meta=blue",
+            "Advice.detachedHead=false",
+            "core.quotePath=off",
+            "commit.gpgsign=false",
+            "tag.gpgSign=FALSE",
+        ] {
+            assert!(inert_setting(setting), "{setting}");
+        }
+        for setting in [
+            "core.pager=less",
+            "commit.gpgsign",
+            "commit.gpgsign=no",
+            "color",
+            "color.=x",
+            "colors.ui=1",
+            "user.namex=y",
+            "user.name.x=y",
+            "alias.st=!sh",
+        ] {
+            assert!(!inert_setting(setting), "{setting}");
+        }
     }
 }

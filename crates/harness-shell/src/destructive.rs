@@ -3,13 +3,13 @@
 //! [`crate::git`]). An argument only known at run time that could change the
 //! outcome counts as destructive.
 
-use crate::argv::{Tok, basename, display};
+use crate::argv::{Tok, command_name, display};
 use crate::git;
 use crate::paths::{Cwd, Workspace};
 
 /// Returns why `argv` is destructive, or `None`.
 pub(crate) fn check(argv: &[Tok], cwd: &Cwd, ws: &Workspace) -> Option<String> {
-    let why = match basename(argv.first()?.lit()?) {
+    let why = match command_name(argv.first()?.lit()?).as_str() {
         "rm" => rm(&argv[1..], cwd, ws)?,
         "git" => git::destructive(argv)?,
         _ => return None,

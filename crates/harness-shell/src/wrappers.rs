@@ -4,7 +4,7 @@
 //! (`sudo --flag word cmd`), that option might have taken the word as its value, so
 //! the argv one word further on is also scanned for deny/destructive matches.
 
-use crate::argv::{Tok, basename};
+use crate::argv::{Tok, basename, command_name};
 
 /// Environment variables whose value makes common tools run another program.
 pub(crate) fn runs_programs(var: &str) -> bool {
@@ -60,10 +60,26 @@ pub(crate) struct Unwrapped {
 }
 
 /// Returns the wrapper's effect, or `None` if `argv` is not a wrapper invocation
-/// (it is then the command itself).
+/// (it is then the command itself). The name is matched in any case, as a case-insensitive
+/// file system finds `SUDO` as `sudo`.
 pub(crate) fn unwrap(argv: &[Tok]) -> Option<Unwrapped> {
-    let name = basename(argv.first()?.lit()?);
-    let args = &argv[1..];
+    let word = basename(argv.first()?.lit()?);
+    let name = command_name(word);
+    let u = unwrap_named(&name, &argv[1..])?;
+    if word == name {
+        return Some(u);
+    }
+    // Spelled another way, the name is never a shell builtin but a program found on the
+    // PATH (`/usr/bin/command` runs in a child process), and allow rules do not match it.
+    let why = format!("`{word}` is written in a different case from `{name}`");
+    Some(Unwrapped {
+        same_shell: false,
+        unlisted: u.unlisted.or(Some(why)),
+        ..u
+    })
+}
+
+fn unwrap_named(name: &str, args: &[Tok]) -> Option<Unwrapped> {
     let skip = |short_arg, long_arg| scan_options(args, short_arg, long_arg).0;
     match name {
         "command" => command(args),

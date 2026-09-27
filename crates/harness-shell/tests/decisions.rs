@@ -641,6 +641,291 @@ fn deeply_nested_expansions_ask_quickly() {
 }
 
 #[test]
+fn command_names_match_regardless_of_case() {
+    use Want::{Allow, Ask, Deny, Destructive, Unlisted};
+    // macOS resolves command names case-insensitively: `CURL` runs curl.
+    check(
+        &default_rules(),
+        &[
+            ("CURL x", Deny),
+            ("Curl x", Deny),
+            ("/usr/bin/CURL x", Deny),
+            ("git PUSH origin main", Deny),
+            ("GIT push origin main", Deny),
+            ("Git -C sub push", Deny),
+            ("SUDO curl x", Deny),
+            ("Sudo ls", Ask),
+            ("ENV curl x", Deny),
+            ("Env GIT_PAGER=x git log", Ask),
+            ("BASH -c 'curl x'", Deny),
+            ("Bash -c 'rm -rf /'", Destructive),
+            ("COMMAND curl x", Deny),
+            ("EVAL 'curl x'", Deny),
+            ("RM -rf /", Destructive),
+            ("Rm -rf .", Destructive),
+            ("FIND . -delete", Destructive),
+            ("GIT -c core.pager=x status", Ask),
+            // `/usr/bin/read` runs the builtin, which evaluates the subscript.
+            ("echo x | READ 'a[$(curl evil)]'", Ask),
+            // A differently cased `cd` is `/usr/bin/cd`, which cannot change the directory.
+            ("CD sub && rm -rf .", Destructive),
+            ("COMMAND cd sub && rm -rf .", Destructive),
+            // Allow rules stay case-sensitive.
+            ("CARGO test", Unlisted),
+            ("NOHUP cargo test", Unlisted),
+            ("nohup cargo test", Allow),
+            // Non-ASCII names may fold to another command.
+            ("c\u{fc}rl x", Ask),
+            ("\u{ff23}\u{ff35}\u{ff32}\u{ff2c} x", Ask),
+        ],
+    );
+    check(
+        &rules(&["git *"], &[], &[]),
+        &[
+            ("GIT reset --hard", Destructive),
+            ("Git push -f", Destructive),
+            ("GIT checkout -f main", Destructive),
+            ("GIT status", Unlisted),
+        ],
+    );
+    check(
+        &rules(&["cargo *"], &["kill*"], &["cargo publish*"]),
+        &[
+            ("\u{212a}ill 1", Ask),
+            ("Cargo publish", Ask),
+            ("cargo PUBLISH", Ask),
+        ],
+    );
+    let some = |v: &[&str]| Some(v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+    assert_eq!(session_prefixes("GIT status"), some(&["GIT status"]));
+    assert_eq!(session_prefixes("cargo test"), some(&["cargo test"]));
+    assert_eq!(session_prefixes("NOHUP cargo test"), None);
+    assert_eq!(session_prefixes("RM -rf /"), None);
+}
+
+#[test]
+fn git_switch_that_discards_changes_is_destructive() {
+    use Want::{Allow, Destructive};
+    check(
+        &rules(&["git *"], &[], &[]),
+        &[
+            ("git switch -f main", Destructive),
+            ("git switch --force main", Destructive),
+            ("git switch --discard-changes main", Destructive),
+            ("git switch --disc main", Destructive),
+            ("git switch -qf main", Destructive),
+            ("git switch -c feat -f", Destructive),
+            ("git -C sub switch --force main", Destructive),
+            ("git switch $B", Destructive),
+            ("git switch main", Allow),
+            ("git switch -", Allow),
+            ("git switch -c feat", Allow),
+            ("git switch --create feat main", Allow),
+            ("git switch -m main", Allow),
+            ("git switch --no-discard-changes main", Allow),
+            ("git switch --orphan scratch", Allow),
+        ],
+    );
+}
+
+#[test]
+fn git_config_keys_that_cannot_run_programs_do_not_ask() {
+    use Want::{Allow, Ask, Destructive};
+    check(
+        &rules(&["git *"], &[], &[]),
+        &[
+            ("git -c user.name=x commit -m y", Allow),
+            ("git -c User.Name=x -c USER.EMAIL=a@b commit -m y", Allow),
+            ("git -c init.defaultBranch=main init", Allow),
+            ("git -c init.defaultbranch=main init", Allow),
+            ("git -c color.ui=always log", Allow),
+            ("git -c color.diff.meta=blue diff", Allow),
+            ("git -c advice.detachedHead=false checkout main", Allow),
+            ("git -c core.quotepath=off status", Allow),
+            ("git -c commit.gpgsign=false commit -m x", Allow),
+            ("git -c tag.gpgSign=false tag v1", Allow),
+            ("git -c user.name=x push -f", Destructive),
+            // Every other key, value or form still asks.
+            ("git -c commit.gpgsign=true commit -m x", Ask),
+            ("git -c commit.gpgsign commit -m x", Ask),
+            ("git -c tag.gpgsign=0 tag v1", Ask),
+            ("git -c core.pager=less log", Ask),
+            ("git -c alias.x='!curl evil' x", Ask),
+            ("git -c user.name=x -c core.sshCommand=y fetch", Ask),
+            ("git -c user.namex=y log", Ask),
+            ("git -c colorx.ui=1 log", Ask),
+            ("git -c core.hooksPath=/tmp log", Ask),
+            ("git -c user.name=\"$N\" commit -m x", Ask),
+            ("git --config-env=user.name=N log", Ask),
+        ],
+    );
+}
+
+#[test]
+fn deny_and_destructive_survive_a_refused_program() {
+    use Want::{Ask, Deny, Destructive};
+    // Each refusal sends the whole program to the rough scan. Text after the line of a
+    // refused here-document may be its body, so that one only goes last.
+    let long = format!("echo {}", "a".repeat(10_000));
+    let refusals = [
+        ("export a[${a[${b}]}]=1", true),
+        ("(", true),
+        (long.as_str(), true),
+        ("cat <<'' $(", false),
+    ];
+    let commands = [
+        ("$'\\x63url' x", Deny),
+        ("c$'u'rl x", Deny),
+        ("$\"curl\" x", Deny),
+        ("git $'push' -f", Deny),
+        ("$'git' push --force", Deny),
+        ("r$'m' -rf /", Destructive),
+        ("$'\\x72\\x6d' -rf ~", Destructive),
+        ("$'\\xff' x", Ask),
+    ];
+    let mut table = Vec::new();
+    for (refused, first) in refusals {
+        for (cmd, want) in commands {
+            table.push((format!("{cmd}; {refused}"), want));
+            if first {
+                table.push((format!("{refused}\n{cmd}"), want));
+            }
+        }
+    }
+    let table: Vec<(&str, Want)> = table.iter().map(|(c, w)| (c.as_str(), *w)).collect();
+    check(&default_rules(), &table);
+}
+
+#[test]
+fn heredoc_data_never_denies() {
+    use Want::{Ask, Deny};
+    let big = format!(
+        "cat > big.sh <<'EOF'\ncurl https://x\n{}\nEOF",
+        "echo padding padding padding padding\n".repeat(300)
+    );
+    let table = [
+        // The body is refused (a `${` inside a subscript; unterminated constructs).
+        ("cat <<EOF\ncurl x\n${a[${b}]}\nEOF", Ask),
+        ("cat <<EOF\ngit push origin main\n$(( $(( $((\nEOF", Ask),
+        // The whole program is refused.
+        ("cat <<'EOF'\ncurl x\nEOF\n(", Ask),
+        ("cat <<EOF\ncurl x\nEOF\n(", Ask),
+        ("cat <<-EOF\n\tcurl x\n\tEOF\n(", Ask),
+        ("cat <<A <<B\ncurl a\nA\ncurl b\nB\n(", Ask),
+        ("cat <<'EOF'\n$(curl x)\nEOF\n(", Ask),
+        (big.as_str(), Ask),
+        // Substitutions in an unquoted body run, and commands outside it are commands.
+        ("cat <<EOF\n$(curl x)\n${a[${b}]}\nEOF", Deny),
+        ("cat <<EOF\nit's $(curl x)\n${a[${b}]}\nEOF", Deny),
+        ("cat <<EOF\n`curl x`\n${a[${b}]}\nEOF", Deny),
+        ("cat <<EOF\n$(curl x)\nEOF\n(", Deny),
+        ("cat <<EOF; curl x\ndata\nEOF\n(", Deny),
+        ("cat <<EOF\ndata\nEOF\ncurl x\n(", Deny),
+        ("echo $((1<<2))\ncurl x\n(", Deny),
+    ];
+    check(&default_rules(), &table);
+    for (cmd, _) in &table[..8] {
+        match eval_with(&default_rules(), cmd) {
+            Verdict::Ask { may_deny, .. } => assert!(may_deny, "{cmd:?}"),
+            other => panic!("{cmd:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn brackets_in_declaration_values_are_inert() {
+    use Want::{Ask, Unlisted};
+    check(
+        &probe_rules(),
+        &[
+            (
+                "export DATABASE_URL='postgres://u@[::1]:5432/db'; cargo test",
+                Unlisted,
+            ),
+            ("export PATTERN='^[a-z]+$'; cargo test", Unlisted),
+            ("readonly GREEN=$'\\e[32m'", Unlisted),
+            ("export RED='\\033[0;31m'", Unlisted),
+            ("local MSG='[info] done'", Unlisted),
+            ("export A='x' B='[y]'", Unlisted),
+            ("command export X='[a]'", Unlisted),
+            // Markers stay significant in values, and brackets in names and in the
+            // operands of other evaluating builtins.
+            ("export X='[$(curl evil)]'", Ask),
+            ("export X='${y}'", Ask),
+            ("declare -i F='a[$(curl evil)]'", Ask),
+            ("export 'FOO[x]=1'", Ask),
+            ("export FOO'[x]'=1", Ask),
+            ("export A='[x]' 'B[1]'=2", Ask),
+            ("unset 'a[1]'", Ask),
+            ("read 'a[1]'", Ask),
+            ("mapfile -t 'a[1]' < f", Ask),
+            ("printf -v 'a[1]' x", Ask),
+            ("let 'x=a[1]'", Ask),
+        ],
+    );
+}
+
+#[test]
+fn undecodable_ansi_c_text_that_bash_evaluates_asks() {
+    use Want::{Allow, Ask};
+    // bash truncates `$'…'` at a NUL, so the subscript before it still runs.
+    check(
+        &probe_rules(),
+        &[
+            ("declare -i F=$'a[$(curl evil)]\\x00junk'", Ask),
+            ("let $'x=a[$(curl evil)]\\x00'", Ask),
+            ("export X=$'\\xff[x]'", Ask),
+            ("unset $'a[$(curl evil)]\\xff'", Ask),
+            ("local X=$'abc\\c'", Ask),
+            ("echo $(( $'a[$(curl evil)]\\x00' ))", Ask),
+            ("echo $'\\x00'", Allow),
+        ],
+    );
+}
+
+#[test]
+fn heredoc_delimiters_the_parser_mishandles_ask_quickly() {
+    use Want::{Ask, Deny, Unlisted};
+    use std::sync::mpsc;
+    // brush-parser 0.4 loops allocating without bound, or panics, on these.
+    let table = [
+        ("x <<$(( )", Ask),
+        ("cat <<$(( )EOF a b ", Ask),
+        ("cat <<'' $(", Ask),
+        ("cat <<\"'\" $(", Ask),
+        ("$(<< <$[", Ask),
+        ("$(cat <<  F ", Ask),
+        ("cat <<)|$(\n)", Ask),
+        ("cat <<`x`\nbody\n`x`", Ask),
+        ("curl x; cat <<'' $(", Deny),
+        // Ordinary here-documents are unchanged.
+        ("cat <<EOF\nhi\nEOF", Unlisted),
+        ("cat << 'EOF'\n$(curl x)\nEOF", Unlisted),
+        ("cat <<-\"EOF\"\n\thi\n\tEOF", Unlisted),
+        ("echo $(cat <<EOF\nhi\nEOF\n)", Unlisted),
+    ];
+    for (cmd, want) in table {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let got = eval_with(&rules(&[], &["curl*"], &[]), cmd);
+            let _ = tx.send((got, start.elapsed()));
+        });
+        let (got, took) = match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("{cmd:?}: evaluate panicked"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The parser may still be allocating; stop before it exhausts memory.
+                eprintln!("{cmd:?}: evaluate did not return within 5 s");
+                std::process::abort();
+            }
+        };
+        assert_eq!(kind(&got), want, "{cmd:?}: {got:?}");
+        assert!(took < Duration::from_secs(1), "{cmd:?}: took {took:?}");
+    }
+}
+
+#[test]
 fn reasons_name_the_rule() {
     match eval_with(&default_rules(), "cargo test && /usr/bin/curl x") {
         Verdict::Deny { reason } => assert!(reason.contains("bash:curl*"), "{reason}"),

@@ -47,18 +47,33 @@ pub(crate) struct Scan {
     /// Why the text cannot be fully analyzed, although scanning went on.
     pub opaque: Vec<String>,
     /// Text of the word that bash reads literally but may evaluate later.
-    pub hidden: Option<Hidden>,
+    pub hidden: Hidden,
 }
 
 /// Literal text in a word (quoted, escaped, or otherwise left unexpanded when bash
 /// reads the word) that builtins such as `let`, `declare` or `unset` evaluate again as
 /// arithmetic, a subscript or a variable name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Hidden {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Hidden {
     /// A substitution marker (`$(`, `${`, `$[` or a backtick).
-    Substitution,
-    /// A quoted or escaped `[` or `]`.
-    Subscript,
+    pub substitution: bool,
+    /// A `$'…'` string that cannot be decoded, so it may hide either kind of text.
+    pub undecodable: bool,
+    /// A quoted or escaped `[` or `]` before the word's first `=`: in a variable name.
+    pub name_bracket: bool,
+    /// A quoted or escaped `[` or `]` after the word's first `=`: in a value.
+    pub value_bracket: bool,
+}
+
+impl Hidden {
+    pub(crate) fn union(self, other: Hidden) -> Hidden {
+        Hidden {
+            substitution: self.substitution || other.substitution,
+            undecodable: self.undecodable || other.undecodable,
+            name_bracket: self.name_bracket || other.name_bracket,
+            value_bracket: self.value_bracket || other.value_bracket,
+        }
+    }
 }
 
 /// Converts a raw shell word into a token, recording in `scan` the source of every
@@ -108,8 +123,9 @@ fn arith_scan(text: &str, scan: &mut Scan, depth: usize) -> Result<(), String> {
         None => return Ok(()),
     }
     // A marker left in the resolved text was quoted or escaped, so brush did not expose
-    // it as a live substitution, but the arithmetic evaluation still runs it.
-    if subst_marker(&b.text) {
+    // it as a live substitution, but the arithmetic evaluation still runs it. Text that
+    // cannot be decoded may hide one.
+    if subst_marker(&b.text) || b.undecodable {
         return Err("arithmetic text may run a command substitution".into());
     }
     Ok(())
@@ -124,8 +140,8 @@ fn arith_marker(text: &str) -> Result<(), String> {
     let hidden = match parse(text, false)? {
         Some(pieces) => {
             let mut literal = String::new();
-            literal_text(&pieces, &mut literal);
-            subst_marker(&literal)
+            let decoded = literal_text(&pieces, &mut literal);
+            subst_marker(&literal) || !decoded
         }
         None => subst_marker(text),
     };
@@ -135,18 +151,26 @@ fn arith_marker(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The text of `pieces` after quote removal, without the expansions.
-fn literal_text(pieces: &[WordPieceWithSource], out: &mut String) {
+/// The text of `pieces` after quote removal, without the expansions. `false` if a
+/// `$'…'` string could not be decoded (its text is missing).
+fn literal_text(pieces: &[WordPieceWithSource], out: &mut String) -> bool {
+    let mut decoded = true;
     for p in pieces {
         match &p.piece {
             WordPiece::Text(t) | WordPiece::SingleQuotedText(t) => out.push_str(t),
-            WordPiece::AnsiCQuotedText(t) => out.push_str(&decode_ansi_c(t).unwrap_or_default()),
+            WordPiece::AnsiCQuotedText(t) => match decode_ansi_c(t) {
+                Some(s) => out.push_str(&s),
+                None => decoded = false,
+            },
             WordPiece::DoubleQuotedSequence(inner)
-            | WordPiece::GettextDoubleQuotedSequence(inner) => literal_text(inner, out),
+            | WordPiece::GettextDoubleQuotedSequence(inner) => {
+                decoded &= literal_text(inner, out);
+            }
             WordPiece::EscapeSequence(e) => out.push_str(e.strip_prefix('\\').unwrap_or(e)),
             _ => {}
         }
     }
+    decoded
 }
 
 /// Collects command substitutions nested in expansion text such as `X:-$(cmd)` or an
@@ -322,6 +346,96 @@ pub(crate) fn program_too_nested(src: &str) -> Option<&'static str> {
     })
 }
 
+/// Here-document delimiter words are scanned this far at most.
+const MAX_DELIMITER: usize = 1024;
+
+/// Why brush-parser should not tokenize `src`, if it should not: a here-document operator
+/// whose delimiter is missing, empty once every quote character is removed, or holds a
+/// substitution, bracket, brace or parenthesis. Its tokenizer drops every quote character
+/// from a delimiter, and inside a substitution can take a blank as one; with an empty
+/// delimiter and a construct left open it loops, allocating without bound, and with a
+/// delimiter that ends a construct it panics (`x <<$(( )`, `cat <<'' $(`, `cat <<)|$(`).
+pub(crate) fn unsafe_heredoc(src: &str) -> Option<&'static str> {
+    let b = src.as_bytes();
+    let mut i = 0;
+    while let Some(at) = src[i..].find("<<") {
+        let mut j = i + at + 2;
+        if b.get(j) == Some(&b'<') {
+            // A here-string (`<<<`).
+            i = j + 1;
+            continue;
+        }
+        if b.get(j) == Some(&b'-') {
+            j += 1;
+        }
+        let mut blanks = 0;
+        loop {
+            if matches!(b.get(j), Some(b' ' | b'\t')) {
+                j += 1;
+            } else if b.get(j..j + 2) == Some(b"\\\n") {
+                j += 2;
+            } else {
+                break;
+            }
+            blanks += 1;
+        }
+        if blanks > 1 || unsafe_delimiter(&b[j..]) {
+            return Some("a here-document delimiter is empty or contains expansion syntax");
+        }
+        i = j;
+    }
+    None
+}
+
+/// Whether the here-document delimiter word at the start of `b` is missing, has no
+/// visible character besides quotes, or has a backtick, `$(`, `$[`, `${`, or a quoted,
+/// escaped or unquoted bracket or brace (or a quoted or escaped parenthesis). A word
+/// longer than [`MAX_DELIMITER`] counts as unsafe.
+fn unsafe_delimiter(b: &[u8]) -> bool {
+    let visible = |c: u8| !c.is_ascii_whitespace() && !c.is_ascii_control();
+    let mut quote: Option<u8> = None;
+    let mut text = false;
+    let mut k = 0;
+    while let Some(&c) = b.get(k) {
+        k += 1;
+        if k > MAX_DELIMITER {
+            return true;
+        }
+        if c == b'`' || (c == b'$' && matches!(b.get(k), Some(b'(' | b'[' | b'{'))) {
+            return true;
+        }
+        match c {
+            b'\\' if quote != Some(b'\'') => {
+                match b.get(k) {
+                    Some(b'\n') if quote.is_none() => {}
+                    Some(b'(' | b')' | b'[' | b']' | b'{' | b'}') => return true,
+                    Some(&e) => text |= visible(e),
+                    None => {}
+                }
+                k += 1;
+            }
+            b'\'' | b'"' if quote.is_none() => {
+                // `$'…'` ends at a `'` too, but a backslash escapes it.
+                let ansi_c = c == b'\'' && k >= 2 && b[k - 2] == b'$';
+                quote = Some(if ansi_c { b'$' } else { c });
+            }
+            b'\'' if matches!(quote, Some(b'\'' | b'$')) => quote = None,
+            b'"' if quote == Some(b'"') => quote = None,
+            b'\'' | b'"' => {}
+            // A comment: the delimiter is missing.
+            b'#' if k == 1 => return true,
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')'
+                if quote.is_none() =>
+            {
+                break;
+            }
+            b'(' | b')' | b'[' | b']' | b'{' | b'}' => return true,
+            _ => text |= visible(c),
+        }
+    }
+    !text
+}
+
 /// Length of the shell variable name starting at `b[from]` (0 if there is none).
 fn name_len(b: &[u8], from: usize) -> usize {
     match b.get(from) {
@@ -341,8 +455,11 @@ struct Builder {
     dynamic: bool,
     /// Byte offset in `text` of the first unquoted glob character.
     glob_at: Option<usize>,
-    /// A `[` or `]` was single-quoted, `$'…'`-quoted or escaped.
-    inert_bracket: bool,
+    /// Byte offsets in `text` of the first and last `[` or `]` that was single-quoted,
+    /// `$'…'`-quoted or escaped.
+    inert_brackets: Option<(usize, usize)>,
+    /// A `$'…'` string could not be decoded.
+    undecodable: bool,
 }
 
 impl Builder {
@@ -363,7 +480,10 @@ impl Builder {
                 WordPiece::SingleQuotedText(t) => self.push_inert(t),
                 WordPiece::AnsiCQuotedText(t) => match decode_ansi_c(t) {
                     Some(s) => self.push_inert(&s),
-                    None => self.dynamic = true,
+                    None => {
+                        self.dynamic = true;
+                        self.undecodable = true;
+                    }
                 },
                 WordPiece::DoubleQuotedSequence(inner)
                 | WordPiece::GettextDoubleQuotedSequence(inner) => {
@@ -413,19 +533,28 @@ impl Builder {
     }
 
     fn push_inert(&mut self, t: &str) {
-        self.inert_bracket |= t.contains(['[', ']']);
+        for (i, _) in t.match_indices(['[', ']']) {
+            let at = self.text.len() + i;
+            let (first, _) = self.inert_brackets.unwrap_or((at, at));
+            self.inert_brackets = Some((first, at));
+        }
         self.text.push_str(t);
     }
 
     /// Literal text bash may evaluate later: a substitution marker anywhere in the
-    /// word's literal text, or a quoted or escaped bracket.
-    fn hidden(&self) -> Option<Hidden> {
-        if subst_marker(&self.text) {
-            Some(Hidden::Substitution)
-        } else if self.inert_bracket {
-            Some(Hidden::Subscript)
-        } else {
-            None
+    /// word's literal text, undecodable `$'…'` text, or a quoted or escaped bracket.
+    fn hidden(&self) -> Hidden {
+        let eq = self.text.find('=');
+        let (name_bracket, value_bracket) = match (self.inert_brackets, eq) {
+            (None, _) => (false, false),
+            (Some(_), None) => (true, false),
+            (Some((first, last)), Some(eq)) => (first < eq, last > eq),
+        };
+        Hidden {
+            substitution: subst_marker(&self.text),
+            undecodable: self.undecodable,
+            name_bracket,
+            value_bracket,
         }
     }
 
@@ -478,7 +607,7 @@ fn has_brace_expansion(unquoted: &str) -> bool {
 
 /// Decodes the body of a bash `$'…'` string. `None` if the result cannot be known
 /// statically (NUL truncation, invalid code point, non-UTF-8 bytes).
-fn decode_ansi_c(s: &str) -> Option<String> {
+pub(crate) fn decode_ansi_c(s: &str) -> Option<String> {
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     let mut buf = [0u8; 4];
@@ -583,6 +712,12 @@ pub(crate) fn display(argv: &[Tok]) -> String {
 /// Last path component of a command name (`/usr/bin/git` → `git`).
 pub(crate) fn basename(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
+}
+
+/// The program a command word names, as a case-insensitive file system such as macOS's
+/// finds it: its basename, ASCII-lowercased (`/usr/bin/Git` → `git`).
+pub(crate) fn command_name(word: &str) -> String {
+    basename(word).to_ascii_lowercase()
 }
 
 #[cfg(test)]

@@ -78,8 +78,12 @@ pub(crate) fn divergence(src: &str) -> Option<&'static str> {
 }
 
 /// The spans, in characters, of the words of `src` as brush-parser's tokenizer reads the
-/// whole program; `None` if it cannot.
+/// whole program; `None` if it cannot, or must not be given the text (see
+/// [`unsafe_heredoc`]).
 fn word_spans(src: &str) -> Option<Vec<(usize, usize)>> {
+    if unsafe_heredoc(src).is_some() {
+        return None;
+    }
     let options = parser_options().tokenizer_options();
     let tokens = guarded(|| brush_parser::tokenize_str_with_options(src, &options))?.ok()?;
     Some(
@@ -1576,6 +1580,8 @@ mod tests {
             read(&[(0, 4), (5, 8), (8, 9), (10, 11)]),
             Err(ENDS_ELSEWHERE)
         );
+        // Text brush-parser must not be given is not tokenized for that check either.
+        assert_eq!(word_spans("cat <<''\n\n"), None);
         for (differs, why) in [
             ("echo $(cat <<EOF)\nx\nEOF", ENDS_ELSEWHERE),
             ("echo $(true;# ); x\n)", ENDS_ELSEWHERE),

@@ -1750,7 +1750,19 @@ async fn expect_planted_hook_not_run(
     prepare: impl Fn(&Path),
     plant: impl Fn(&Payload) -> String,
 ) {
-    let (_ctl_dir, ctl) = gitdirs_workspace();
+    expect_planted_hook_not_run_in(c, label, gitdirs_workspace, worktree, prepare, plant).await;
+}
+
+/// [`expect_planted_hook_not_run`] in workspaces made by `workspace`.
+async fn expect_planted_hook_not_run_in(
+    c: &mut Checks,
+    label: &str,
+    workspace: impl Fn() -> (tempfile::TempDir, PathBuf),
+    worktree: &str,
+    prepare: impl Fn(&Path),
+    plant: impl Fn(&Payload) -> String,
+) {
+    let (_ctl_dir, ctl) = workspace();
     prepare(&ctl);
     let payload = Payload::new();
     let script = plant(&payload);
@@ -1771,7 +1783,7 @@ async fn expect_planted_hook_not_run(
          in {worktree} run the planted hook, so the sandboxed check would prove nothing: {status}"
     );
 
-    let (_ws_dir, ws) = gitdirs_workspace();
+    let (_ws_dir, ws) = workspace();
     prepare(&ws);
     let payload = Payload::new();
     let script = plant(&payload);
@@ -2116,6 +2128,322 @@ async fn t16_gitweb_and_pid_cannot_be_planted_in_any_gitdir() {
     } else {
         eprintln!("[seatbelt.rs] t16: this git has no `instaweb`; skipping the end-to-end checks");
     }
+
+    c.finish();
+}
+
+// ---------------------------------------------------------------------------
+// T17. a `.git` symlink or gitfile that leads to a gitdir in the workspace
+// ---------------------------------------------------------------------------
+//
+// Git follows a `.git` symlink, and reads a `.git` file's `gitdir: <path>`
+// (relative to the dir that holds `.git`). The gitdir it reaches has no
+// `.git` in its path, so the profile has to find it and protect it like
+// `.git` itself: its config, hooks, commondir, config.worktree, gitweb/ and
+// pid, and every entry on the way to it, so it cannot be moved out, edited
+// and moved back, or swapped for another.
+
+/// How a workspace's `.git` leads to its gitdir. See [`linked_git_workspace`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LinkedGit {
+    /// `.git -> gitstuff`.
+    Symlink,
+    /// `.git -> link/gitstuff` and `link -> real`.
+    SymlinkChain,
+    /// A `.git` file saying `gitdir: meta/repo`.
+    Gitfile,
+    /// `.git -> meta/gitfile`, which says `gitdir: repo` (relative to the
+    /// workspace, where `.git` is).
+    SymlinkedGitfile,
+}
+
+impl LinkedGit {
+    const ALL: [LinkedGit; 4] = [
+        LinkedGit::Symlink,
+        LinkedGit::SymlinkChain,
+        LinkedGit::Gitfile,
+        LinkedGit::SymlinkedGitfile,
+    ];
+
+    /// The gitdir git uses, relative to the workspace, as it is on disk.
+    fn gitdir(self) -> &'static str {
+        match self {
+            LinkedGit::Symlink => "gitstuff",
+            LinkedGit::SymlinkChain => "real/gitstuff",
+            LinkedGit::Gitfile => "meta/repo",
+            LinkedGit::SymlinkedGitfile => "repo",
+        }
+    }
+}
+
+/// A fresh temp workspace holding a repo whose `.git` is `kind`, set up
+/// outside the sandbox. Checks that git finds the repo through it.
+fn linked_git_workspace(kind: LinkedGit) -> (tempfile::TempDir, PathBuf) {
+    use std::os::unix::fs::symlink;
+
+    let (dir, ws) = canonical_tempdir();
+    git_repo(&ws);
+    let gitdir = ws.join(kind.gitdir());
+    std::fs::create_dir_all(gitdir.parent().unwrap()).unwrap();
+    std::fs::rename(ws.join(".git"), &gitdir).unwrap();
+    match kind {
+        LinkedGit::Symlink => symlink("gitstuff", ws.join(".git")).unwrap(),
+        LinkedGit::SymlinkChain => {
+            symlink("real", ws.join("link")).unwrap();
+            symlink("link/gitstuff", ws.join(".git")).unwrap();
+        }
+        LinkedGit::Gitfile => std::fs::write(ws.join(".git"), "gitdir: meta/repo\n").unwrap(),
+        LinkedGit::SymlinkedGitfile => {
+            std::fs::create_dir(ws.join("meta")).unwrap();
+            std::fs::write(ws.join("meta/gitfile"), "gitdir: repo\n").unwrap();
+            symlink("meta/gitfile", ws.join(".git")).unwrap();
+        }
+    }
+    let out = host_git(&ws)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .expect("run git rev-parse");
+    let found = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    assert_eq!(
+        found.canonicalize().ok(),
+        Some(gitdir.canonicalize().unwrap()),
+        "{kind:?}: git does not use {gitdir:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (dir, ws)
+}
+
+/// A fresh temp workspace whose `.git` file says `gitdir: meta/wt`, a gitdir
+/// whose `commondir` names `meta/main`, where git then takes config, hooks,
+/// objects and refs from (the layout of a linked worktree's gitdir).
+fn commondir_git_workspace() -> (tempfile::TempDir, PathBuf) {
+    let (dir, ws) = canonical_tempdir();
+    git_repo(&ws);
+    std::fs::create_dir_all(ws.join("meta/wt")).unwrap();
+    std::fs::rename(ws.join(".git"), ws.join("meta/main")).unwrap();
+    std::fs::copy(ws.join("meta/main/HEAD"), ws.join("meta/wt/HEAD")).unwrap();
+    std::fs::write(ws.join("meta/wt/commondir"), "../main\n").unwrap();
+    std::fs::write(ws.join(".git"), "gitdir: meta/wt\n").unwrap();
+    let out = host_git(&ws)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .expect("run git rev-parse");
+    let found = ws.join(String::from_utf8_lossy(&out.stdout).trim());
+    assert_eq!(
+        found.canonicalize().ok(),
+        Some(ws.join("meta/main")),
+        "git does not take its common dir from meta/main: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (dir, ws)
+}
+
+#[tokio::test]
+async fn t17_a_symlinked_or_gitfile_git_gets_the_same_protections() {
+    if skip_if_nested("t17_a_symlinked_or_gitfile_git_gets_the_same_protections") {
+        return;
+    }
+    let mut c = Checks::default();
+
+    for kind in LinkedGit::ALL {
+        let (_d, ws) = linked_git_workspace(kind);
+        let g = kind.gitdir();
+
+        for file in [
+            "config",
+            "config.worktree",
+            "commondir",
+            "hooks/pre-commit",
+            "pid",
+        ] {
+            expect_gitdir_file_protected(&mut c, &ws, &format!("{g}/{file}")).await;
+        }
+        if matches!(kind, LinkedGit::Symlink | LinkedGit::SymlinkChain) {
+            // The same file, reached through the `.git` symlink.
+            expect_gitdir_file_protected(&mut c, &ws, ".git/config").await;
+        }
+        // Gitdirs of submodules and linked worktrees inside it.
+        for dir in [format!("{g}/modules/m"), format!("{g}/worktrees/w")] {
+            std::fs::create_dir_all(ws.join(&dir)).unwrap();
+            for file in ["config", "commondir"] {
+                let rel = format!("{dir}/{file}");
+                let path = ws.join(&rel);
+                expect_denied(
+                    &mut c,
+                    &ws,
+                    &format!("{kind:?}: {rel} (absent): create"),
+                    &format!("echo planted > '{rel}'"),
+                    || !path.exists(),
+                )
+                .await;
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+
+        // Every entry on the way to the gitdir stays where it is.
+        let head = ws.join(g).join("HEAD");
+        expect_denied(
+            &mut c,
+            &ws,
+            &format!("{kind:?}: rename the gitdir"),
+            &format!("mv '{g}' moved"),
+            || head.is_file(),
+        )
+        .await;
+        match kind {
+            LinkedGit::Symlink => {}
+            LinkedGit::SymlinkChain => {
+                let link = ws.join("link");
+                expect_denied(
+                    &mut c,
+                    &ws,
+                    "SymlinkChain: repoint `link`",
+                    "mkdir -p evil && rm link && ln -s evil link",
+                    || std::fs::read_link(&link).is_ok_and(|t| t == Path::new("real")),
+                )
+                .await;
+                expect_denied(
+                    &mut c,
+                    &ws,
+                    "SymlinkChain: rename `real`",
+                    "mv real real2",
+                    || head.is_file(),
+                )
+                .await;
+            }
+            LinkedGit::Gitfile => {
+                expect_denied(
+                    &mut c,
+                    &ws,
+                    "Gitfile: rename `meta`",
+                    "mv meta meta2",
+                    || head.is_file(),
+                )
+                .await;
+            }
+            LinkedGit::SymlinkedGitfile => {
+                let gitfile = ws.join("meta/gitfile");
+                expect_denied(
+                    &mut c,
+                    &ws,
+                    "SymlinkedGitfile: rewrite the gitfile",
+                    "echo 'gitdir: elsewhere' > meta/gitfile",
+                    || read(&gitfile) == b"gitdir: repo\n",
+                )
+                .await;
+                expect_denied(
+                    &mut c,
+                    &ws,
+                    "SymlinkedGitfile: rename `meta`",
+                    "mv meta meta2",
+                    || read(&gitfile) == b"gitdir: repo\n",
+                )
+                .await;
+            }
+        }
+
+        // Everyday git still works (in a fresh workspace, so it does not
+        // depend on the checks above).
+        let (_d, ws) = linked_git_workspace(kind);
+        const GIT: &str = "git -c user.email=t@t -c user.name=t";
+        for (label, step) in [
+            (
+                "commit",
+                format!("echo x > f && {GIT} add f && {GIT} commit -q -m one"),
+            ),
+            ("switch -c", format!("{GIT} switch -q -c two")),
+            ("checkout -", format!("{GIT} checkout -q -")),
+            ("stash", format!("echo y > f && {GIT} stash -q")),
+            ("status", format!("{GIT} status --short")),
+        ] {
+            expect_allowed(&mut c, &ws, &format!("{kind:?}: {label}"), &step).await;
+        }
+    }
+
+    // End to end: a planted config never reaches the user's `git status`.
+    for kind in LinkedGit::ALL {
+        let g = kind.gitdir();
+        let make = || linked_git_workspace(kind);
+        expect_planted_hook_not_run_in(
+            &mut c,
+            &format!("{kind:?}: {g}/config"),
+            make,
+            ".",
+            |_| {},
+            |p| format!("cat '{}' > '{g}/config'", p.config.display()),
+        )
+        .await;
+        expect_planted_hook_not_run_in(
+            &mut c,
+            &format!("{kind:?}: move {g} out, edit its config, move it back"),
+            make,
+            ".",
+            |_| {},
+            |p| {
+                let away = p.common.with_file_name("away");
+                format!(
+                    "mv '{g}' '{away}' && cat '{config}' > '{away}/config' && mv '{away}' '{g}'",
+                    away = away.display(),
+                    config = p.config.display()
+                )
+            },
+        )
+        .await;
+    }
+    expect_planted_hook_not_run_in(
+        &mut c,
+        "SymlinkChain: repoint `link` at a copy with a planted config",
+        || linked_git_workspace(LinkedGit::SymlinkChain),
+        ".",
+        |_| {},
+        |p| {
+            format!(
+                "mkdir evil && cp -R real/gitstuff evil/ && cat '{}' > evil/gitstuff/config \
+                 && rm link && ln -s evil link",
+                p.config.display()
+            )
+        },
+    )
+    .await;
+    expect_planted_hook_not_run_in(
+        &mut c,
+        "SymlinkedGitfile: point the gitfile at a copy with a planted config",
+        || linked_git_workspace(LinkedGit::SymlinkedGitfile),
+        ".",
+        |_| {},
+        |p| {
+            format!(
+                "cp -R repo evil && cat '{}' > evil/config && echo 'gitdir: evil' > meta/gitfile",
+                p.config.display()
+            )
+        },
+    )
+    .await;
+
+    // The gitdir's `commondir` names another gitdir in the workspace, and git
+    // loads config and hooks from that one.
+    let (_d, ws) = commondir_git_workspace();
+    for rel in ["meta/main/config", "meta/main/hooks/pre-commit"] {
+        expect_gitdir_file_protected(&mut c, &ws, rel).await;
+    }
+    let head = ws.join("meta/main/HEAD");
+    expect_denied(
+        &mut c,
+        &ws,
+        "commondir: rename the common dir",
+        "mv meta/main meta/main2",
+        || head.is_file(),
+    )
+    .await;
+    expect_planted_hook_not_run_in(
+        &mut c,
+        "commondir: meta/main/config",
+        commondir_git_workspace,
+        ".",
+        |_| {},
+        |p| format!("cat '{}' > meta/main/config", p.config.display()),
+    )
+    .await;
 
     c.finish();
 }

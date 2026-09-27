@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::gitdir::{LinkedGitdirs, linked_gitdirs};
 use crate::policy::{FsAccess, SandboxPolicy};
 use crate::roots::{home_dir, safe_root};
 
@@ -85,6 +86,9 @@ struct CanonPaths {
     tmpdir: Option<PathBuf>,
     user_cache_dir: Option<PathBuf>,
     extra_writable: Vec<PathBuf>,
+    /// The gitdirs inside the workspace that a symlinked or gitfile `.git`
+    /// leads to, found afresh for every command.
+    linked: LinkedGitdirs,
 }
 
 impl CanonPaths {
@@ -109,12 +113,14 @@ impl CanonPaths {
             .iter()
             .filter_map(|p| std::fs::canonicalize(p).ok())
             .collect();
+        let linked = linked_gitdirs(&workspace);
 
         Ok(Self {
             workspace,
             tmpdir,
             user_cache_dir,
             extra_writable,
+            linked,
         })
     }
 }
@@ -205,6 +211,12 @@ fn path_param(path: &Path) -> io::Result<String> {
     })
 }
 
+/// After a gitdir's path, the protected files in it and in the gitdirs of
+/// its submodules (`modules/…`) and linked worktrees (`worktrees/<id>`), as
+/// SBPL string literals for `string-append`. See [`write_section`].
+const GITDIR_FILES: &str = r#""(/modules/.+|/worktrees/[^/]+)?"
+                        "/(config|config\\.worktree|commondir|hooks(/.*)?|gitweb(/.*)?|pid)$""#;
+
 /// The write-access section appended for [`FsAccess::WorkspaceWrite`]:
 /// writable roots, a guard against writing through hard links, and
 /// protections for workspace metadata that must stay intact even though the
@@ -212,7 +224,9 @@ fn path_param(path: &Path) -> io::Result<String> {
 ///
 /// `root_keys` are the params of the optional writable roots (TMPDIR,
 /// USER_CACHE_DIR, EXTRA_n) that were found; the workspace, `/private/tmp`
-/// and `/private/var/tmp` are always writable.
+/// and `/private/var/tmp` are always writable. `gitdir_keys` and
+/// `entry_keys` are the params of a symlinked or gitfile `.git`'s gitdirs
+/// and of the entries on the way to them (see [`LinkedGitdirs`]).
 ///
 /// Name matching: on a case-insensitive APFS volume, Seatbelt applied these
 /// `literal`/`regex` rules case-insensitively and with the volume's Unicode
@@ -220,12 +234,22 @@ fn path_param(path: &Path) -> io::Result<String> {
 /// denied, including names that did not exist yet), so the rules are written
 /// in lowercase. On a case-sensitive volume those variants are different
 /// names, which git ignores.
-fn write_section(root_keys: &[String]) -> String {
+fn write_section(root_keys: &[String], gitdir_keys: &[String], entry_keys: &[String]) -> String {
     let mut roots = String::from(r#"(subpath (param "WORKSPACE"))"#);
     for key in root_keys {
         roots.push_str(&format!("\n    (subpath (param \"{key}\"))"));
     }
     roots.push_str("\n    (subpath \"/private/tmp\")\n    (subpath \"/private/var/tmp\")");
+
+    let mut linked = String::new();
+    for key in gitdir_keys {
+        linked.push_str(&format!(
+            "\n  (regex (string-append \"^\" (regex-quote (param \"{key}\"))\n                        {GITDIR_FILES}))"
+        ));
+    }
+    for key in entry_keys {
+        linked.push_str(&format!("\n  (literal (param \"{key}\"))"));
+    }
 
     format!(
         r#"
@@ -272,14 +296,23 @@ fn write_section(root_keys: &[String]) -> String {
 ; `git worktree add` (creates `commondir`), `git worktree remove/prune`
 ; (delete it), `git config --worktree` or `git sparse-checkout` once
 ; worktreeConfig is set (write `config.worktree`), and `git instaweb`.
-; These are path rules: moving a parent dir (a nested repo, `.git/modules/*`,
-; `.git/worktrees/<id>`) out to a writable root, editing it there and moving
-; it back is not covered. The top-level `.git` cannot be moved.
+;
+; A `.git` symlink or gitfile (`gitdir: <path>`) can lead to a gitdir with no
+; `.git` in its path (Seatbelt matches resolved paths). When that gitdir, or
+; the one its `commondir` names, is inside the workspace, the same files in
+; it are protected, and so is every entry on the way there (each symlink and
+; directory, the gitfile, and the gitdir itself), so none of them can be
+; moved out and back, repointed or swapped. They are looked up again for
+; every command (see gitdir.rs); one outside the workspace is not covered.
+;
+; These are path rules: moving a parent dir of any other gitdir (a nested
+; repo, `.git/modules/*`, `.git/worktrees/<id>`) out to a writable root,
+; editing it there and moving it back is not covered. The top-level `.git`
+; cannot be moved.
 (deny file-write* (with message (param "LOG_TAG"))
   (regex (string-append "^" (regex-quote (param "WORKSPACE")) "(/.*)?/\\.git$"))
-  (regex (string-append "^" (regex-quote (param "WORKSPACE"))
-                        "(/.*)?/\\.git(/modules/.+|/worktrees/[^/]+)?"
-                        "/(config|config\\.worktree|commondir|hooks(/.*)?|gitweb(/.*)?|pid)$"))
+  (regex (string-append "^" (regex-quote (param "WORKSPACE")) "(/.*)?/\\.git"
+                        {GITDIR_FILES})){linked}
   (subpath (string-append (param "WORKSPACE") "/.harness"))
   (literal (string-append (param "WORKSPACE") "/HEAD")))
 (deny file-write-unlink (with message (param "LOG_TAG"))
@@ -320,7 +353,20 @@ pub(crate) fn build_profile(
             root_keys.push(key);
         }
 
-        profile.push_str(&write_section(&root_keys));
+        let mut gitdir_keys = Vec::new();
+        for (i, gitdir) in canon.linked.gitdirs.iter().enumerate() {
+            let key = format!("GITDIR_{i}");
+            params.push((key.clone(), path_param(gitdir)?));
+            gitdir_keys.push(key);
+        }
+        let mut entry_keys = Vec::new();
+        for (i, entry) in canon.linked.entries.iter().enumerate() {
+            let key = format!("GITDIR_ENTRY_{i}");
+            params.push((key.clone(), path_param(entry)?));
+            entry_keys.push(key);
+        }
+
+        profile.push_str(&write_section(&root_keys, &gitdir_keys, &entry_keys));
     }
 
     if policy.allow_localhost {
@@ -413,11 +459,59 @@ mod tests {
     }
 
     #[test]
+    fn a_symlinked_git_adds_its_gitdir_and_the_entries_on_the_way() {
+        let (_d, ws) = canon_tempdir();
+        std::fs::create_dir_all(ws.join("real/gitstuff")).unwrap();
+        std::os::unix::fs::symlink("real", ws.join("link")).unwrap();
+        std::os::unix::fs::symlink("link/gitstuff", ws.join(".git")).unwrap();
+        let policy = SandboxPolicy {
+            access: FsAccess::WorkspaceWrite,
+            workspace: ws.clone(),
+            extra_writable: Vec::new(),
+            allow_localhost: false,
+        };
+        let (profile, params) = build_profile(&policy, "sh").unwrap();
+        let param = |key: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| PathBuf::from(v))
+        };
+        assert_eq!(param("GITDIR_0"), Some(ws.join("real/gitstuff")));
+        assert_eq!(param("GITDIR_1"), None);
+        let entries: Vec<PathBuf> = (0..)
+            .map_while(|i| param(&format!("GITDIR_ENTRY_{i}")))
+            .collect();
+        assert_eq!(
+            entries,
+            ["link", "real", "real/gitstuff"].map(|e| ws.join(e))
+        );
+        assert!(
+            profile.contains("(regex-quote (param \"GITDIR_0\"))"),
+            "{profile}"
+        );
+        for i in 0..entries.len() {
+            let rule = format!("(literal (param \"GITDIR_ENTRY_{i}\"))");
+            assert!(profile.contains(&rule), "{rule} missing:\n{profile}");
+        }
+
+        // Read-only mode writes nothing, so it needs none of this.
+        let read_only = SandboxPolicy {
+            access: FsAccess::ReadOnly,
+            ..policy
+        };
+        let (profile, params) = build_profile(&read_only, "sh").unwrap();
+        assert!(!profile.contains("GITDIR"), "{profile}");
+        assert!(params.iter().all(|(k, _)| !k.starts_with("GITDIR")));
+    }
+
+    #[test]
     fn optional_roots_are_left_out_of_the_profile() {
-        let section = write_section(&[]);
+        let section = write_section(&[], &[], &[]);
         assert!(!section.contains("TMPDIR"), "{section}");
         assert!(!section.contains("USER_CACHE_DIR"), "{section}");
-        let section = write_section(&["TMPDIR".into(), "EXTRA_0".into()]);
+        assert!(!section.contains("GITDIR"), "{section}");
+        let section = write_section(&["TMPDIR".into(), "EXTRA_0".into()], &[], &[]);
         assert!(
             section.contains("(subpath (param \"TMPDIR\"))"),
             "{section}"

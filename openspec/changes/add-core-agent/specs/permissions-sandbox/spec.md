@@ -135,7 +135,7 @@ In workspace-write sandboxes the system SHALL protect `.git/config`, `.git/hooks
 
 On macOS, and on Linux when unprivileged user namespaces are available (the full tier), writes to these paths MUST fail. On Linux, names that do not exist yet MUST be caught by a guard that moves them to a quarantine directory, never deleting them, and reports it in the tool result.
 
-When user namespaces are unavailable (the basic tier), the system MUST warn at startup and point to `harness sandbox doctor`, and the guard MUST also restore changed protected files after each command. With `sandbox.linux_git_protection = "required"`, the basic tier MUST require approval for every shell command.
+When user namespaces are unavailable (the basic tier), the system MUST warn at startup and point to `harness sandbox doctor`, and the guard MUST also restore changed protected files after each command. With `sandbox.linux_git_protection = "required"`, the basic tier MUST require approval for every shell command in `ask` and `auto`.
 
 #### Scenario: Planting a hook
 - **WHEN** a sandboxed command runs `echo x > .git/hooks/pre-commit` in `auto` mode on macOS, or on Linux in the full tier

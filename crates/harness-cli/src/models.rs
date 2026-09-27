@@ -36,7 +36,7 @@ pub async fn run() -> u8 {
         );
     }
     for model in found {
-        println!("{}", model.id());
+        println!("{}", terminal_safe(&model.id()));
     }
     0
 }

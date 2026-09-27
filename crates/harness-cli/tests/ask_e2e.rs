@@ -639,6 +639,29 @@ async fn invalid_config_with_an_escape_byte_is_escaped_on_stderr() {
     assert!(stderr.contains("\\u{1b}"), "{stderr}");
 }
 
+// Review Focus: `registry::resolve`'s errors (BadId/UnknownProvider) embed the raw model id or
+// provider name verbatim, and that text can come straight from the config's `model = "…"`. It
+// must reach stderr escaped, exactly like the config-parse-error case above.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_id_with_an_escape_byte_is_escaped_on_stderr() {
+    let server = MockServer::start().await;
+    // TOML basic strings disallow a literal control byte; `\u001b` is the escape sequence that
+    // decodes to a real ESC character in the resulting config string.
+    let env = Env::new(&server.uri(), "model = \"unknownprov\\u001b/x\"");
+    let output =
+        tokio::task::spawn_blocking(move || env.cmd().args(["ask", "hi"]).output().unwrap())
+            .await
+            .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("unknown provider"), "{stderr}");
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "raw ESC byte on stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("\\u{1b}"), "{stderr}");
+}
+
 #[test]
 fn no_subcommand_explains_that_interactive_mode_is_not_ready() {
     Command::new(BIN)

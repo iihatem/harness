@@ -46,7 +46,7 @@ pub async fn run(
         } else {
             eprintln!("Available models:");
             for model in &found {
-                eprintln!("  {}", model.id());
+                eprintln!("  {}", terminal_safe(&model.id()));
             }
         }
         eprintln!(
@@ -58,7 +58,7 @@ pub async fn run(
     let resolved = match registry::resolve(&model_id, &setup.config.providers, setup::env) {
         Ok(resolved) => resolved,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", terminal_safe(&e.to_string()));
             return 2;
         }
     };

@@ -618,6 +618,27 @@ async fn control_characters_reach_the_terminal_only_escaped() {
     );
 }
 
+// Review Focus: a config parse error echoes a snippet of the offending source line. If that line
+// contains a raw control byte (e.g. pasted from a terminal capture), it must reach stderr escaped,
+// not raw — the same guarantee `terminal_safe` already gives rule text and model output.
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_config_with_an_escape_byte_is_escaped_on_stderr() {
+    let server = MockServer::start().await;
+    let env = Env::new(&server.uri(), "mdo\u{1b}e = \"auto\"");
+    let output =
+        tokio::task::spawn_blocking(move || env.cmd().args(["ask", "hi"]).output().unwrap())
+            .await
+            .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("config.toml"), "{stderr}");
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "raw ESC byte on stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("\\u{1b}"), "{stderr}");
+}
+
 #[test]
 fn no_subcommand_explains_that_interactive_mode_is_not_ready() {
     Command::new(BIN)

@@ -32,7 +32,7 @@ pub async fn run(
     let setup = match setup::load() {
         Ok(setup) => setup,
         Err(message) => {
-            eprintln!("error: {message}");
+            eprintln!("error: {}", terminal_safe(&message));
             return 2;
         }
     };

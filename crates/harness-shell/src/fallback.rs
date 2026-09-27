@@ -50,6 +50,18 @@ pub(crate) fn rough_heredoc(body: &str) -> Vec<Rough> {
     split(body, Text::Body { live: true }, 1)
 }
 
+/// Whether `src` has a `<<` in `${…}` or `$[…]`, outside single quotes. To bash it is
+/// text, but brush-parser takes one in `${…}` for a here-document operator and the lines
+/// after it for the body.
+pub(crate) fn heredoc_in_expansion(src: &str) -> bool {
+    if !src.contains("<<") || !(src.contains("${") || src.contains("$[")) {
+        return false;
+    }
+    let mut split = Splitter::new(src.chars().collect(), 0, Text::Program, 0);
+    split.run();
+    split.expansion_heredoc
+}
+
 /// Rough nesting depth of brackets and compound-command keywords, quotes ignored.
 /// Checked before parsing: the parser recurses once per level, so deeply nested
 /// input could otherwise exhaust the stack.
@@ -292,6 +304,8 @@ struct Splitter {
     legacy: bool,
     done: bool,
     shared: Shared,
+    /// A `<<` was found in `${…}` or `$[…]` (see [`heredoc_in_expansion`]).
+    expansion_heredoc: bool,
     /// The first newline at or after some position at or before [`Splitter::at`].
     newline: Option<usize>,
     /// Here-document bodies this text is nested in.
@@ -337,6 +351,7 @@ impl Splitter {
             legacy: false,
             done: false,
             shared: Shared::default(),
+            expansion_heredoc: false,
             newline: None,
             depth,
             stack: Vec::new(),
@@ -396,6 +411,9 @@ impl Splitter {
             }
             if !self.legacy {
                 self.expansion(c);
+                if c == '<' && self.peek() == Some('<') && !self.braces.is_empty() {
+                    self.expansion_heredoc = true;
+                }
             }
         }
         match self.quote {

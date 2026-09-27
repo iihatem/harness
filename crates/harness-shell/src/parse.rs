@@ -147,6 +147,12 @@ impl Walker<'_> {
             self.undecomposable(why.into());
             return self.rough_scan(src, depth);
         }
+        if fallback::heredoc_in_expansion(src) {
+            self.undecomposable(
+                "the parser would take a `<<` in `${…}` or `$[…]` for a here-document".into(),
+            );
+            return self.rough_scan(src, depth);
+        }
         let panics = argv::parser_panics();
         let mut parser =
             brush_parser::Parser::new(std::io::Cursor::new(src), &argv::parser_options());

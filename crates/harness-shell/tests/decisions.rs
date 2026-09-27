@@ -981,6 +981,26 @@ fn a_lost_here_document_does_not_hide_later_commands() {
 }
 
 #[test]
+fn heredoc_operators_in_expansions_are_not_trusted() {
+    use Want::{Ask, Deny};
+    // brush-parser takes a `<<` in `${…}` for a here-document, so it reads `curl x` as
+    // body text; to bash the `<<` is text and `curl x` runs.
+    let programs = [
+        "echo ${x:-a <<EOF b}\ncurl x\nEOF",
+        "echo ${x:=a <<EOF b}\ncurl x\nEOF",
+        "echo ${x//a/<<EOF b}\ncurl x\nEOF",
+        "echo \"${x:-a <<EOF b}\"\ncurl x\nEOF",
+        "echo $(echo ${x:-a <<EOF b})\ncurl x\nEOF",
+        "echo ${<<EOF\n}\nEOF\ncurl x",
+        "x\r#${<<EOF\n}\nEOF\ncurl x",
+    ];
+    let denied: Vec<(&str, Want)> = programs.iter().map(|p| (*p, Deny)).collect();
+    check(&default_rules(), &denied);
+    let asked: Vec<(&str, Want)> = programs.iter().map(|p| (*p, Ask)).collect();
+    check(&rules(&["echo*"], &[], &[]), &asked);
+}
+
+#[test]
 fn parser_panics_ask_and_are_scanned() {
     use Want::{Ask, Deny};
     // brush-parser 0.4 panics on these (`tokenizer.rs:674` and `:1018`).

@@ -14,7 +14,7 @@ const MAX_LISTED: usize = 10;
 /// How many lines one section of the report lists; the rest are counted.
 const MAX_LINES: usize = 50;
 
-const BEFORE: &str = "[before this command ran, harness found protected git metadata created or changed after the previous command ended, probably by a process it left running:";
+pub(super) const BEFORE: &str = "[before this command ran, harness found protected git metadata created or changed after the previous command ended, probably by a process it left running:";
 
 const AFTER: &str = "[the sandbox undid changes this command made to protected git metadata (hooks, config, commondir, repositories, .harness/, a top-level HEAD), which git outside the sandbox would otherwise use:";
 
@@ -64,6 +64,9 @@ pub(super) enum What {
     /// A directory whose owner lost read, write or search permission, which
     /// kept the guard from undoing a change.
     Locked,
+    /// Something stored in quarantine that git may still take for a
+    /// repository.
+    Live,
 }
 
 impl What {
@@ -78,6 +81,7 @@ impl What {
             What::Added => "new in a protected directory",
             What::Unreachable => "could not be checked",
             What::Locked => "its owner lost read, write or search permission",
+            What::Live => "stored in quarantine, but not fully neutralized",
         }
     }
 }
@@ -153,11 +157,11 @@ pub(super) struct Findings {
     /// The scan before the command was incomplete, and the session has not
     /// said so yet.
     pub(super) incomplete: bool,
-    /// Changes left as they were before the command ran, past what one check
-    /// undoes.
-    pub(super) left_before: usize,
-    /// The same, for the command's own changes.
-    pub(super) left_after: usize,
+    /// What the checks left as it is, past the most changes one check
+    /// makes: moved or restored before the next command.
+    pub(super) undone: Vec<(PathBuf, What)>,
+    /// The most changes one check makes.
+    pub(super) max_changes: usize,
 }
 
 impl Findings {
@@ -167,8 +171,7 @@ impl Findings {
     pub(super) fn blocked(&self) -> bool {
         !self.after.is_empty()
             || self.uncheckable
-            || self.left_before > 0
-            || self.left_after > 0
+            || !self.undone.is_empty()
             || self.before.items.iter().any(Finding::failed)
     }
 
@@ -180,10 +183,7 @@ impl Findings {
             Err(_) => path.display().to_string(),
         };
         let mut message = String::new();
-        for (header, findings, left) in [
-            (BEFORE, &self.before, self.left_before),
-            (AFTER, &self.after, self.left_after),
-        ] {
+        for (header, findings) in [(BEFORE, &self.before), (AFTER, &self.after)] {
             if !findings.is_empty() {
                 let lines = findings.items.iter().map(|finding| {
                     format!(
@@ -195,13 +195,17 @@ impl Findings {
                 });
                 section(&mut message, header, lines, findings.items.len(), MAX_LINES);
             }
-            if left > 0 {
-                let _ = writeln!(
-                    message,
-                    "[harness found more than {} changes in one check; {left} more were left as they are, and the command counts as blocked.]",
-                    super::MAX_CHANGES
-                );
-            }
+        }
+        if !self.undone.is_empty() {
+            let header = format!(
+                "[harness stops at {} changes in one check, and left these as they are; it goes on with them before the next command, and the command counts as blocked:",
+                self.max_changes
+            );
+            let lines = self
+                .undone
+                .iter()
+                .map(|(path, what)| format!("{}: {}", rel(path), what.describe()));
+            section(&mut message, &header, lines, self.undone.len(), MAX_LINES);
         }
         if self.uncheckable {
             message.push_str(UNCHECKABLE);
@@ -330,14 +334,18 @@ mod tests {
     }
 
     #[test]
-    fn changes_left_undone_block_the_command() {
+    fn what_was_left_undone_is_named_and_blocks_the_command() {
         let findings = Findings {
-            left_after: 3,
+            undone: vec![(PathBuf::from("/ws/zz/.git"), What::Repository)],
+            max_changes: 3,
             ..Findings::default()
         };
         let report = findings.report(Path::new("/ws")).unwrap();
         assert!(report.blocked);
-        assert!(report.message.contains("; 3 more were left as they are"));
+        assert_eq!(
+            report.message,
+            "[harness stops at 3 changes in one check, and left these as they are; it goes on with them before the next command, and the command counts as blocked:\n- zz/.git: a new repository]\n"
+        );
     }
 
     #[test]

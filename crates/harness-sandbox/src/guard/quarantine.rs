@@ -105,12 +105,18 @@ impl Quarantine {
     /// (`<name>.harness-quarantine-<n>`) so git no longer uses it, and that
     /// path is returned. `NotFound` means nothing is there; any other error
     /// means it was not handled (a symlink on the way, say).
-    pub(crate) fn take(&mut self, path: &Path) -> io::Result<PathBuf> {
+    pub(crate) fn take_stored(&mut self, path: &Path) -> io::Result<Stored> {
         self.take_with(
             path,
             |from, name, to, to_name| from.rename_new(name, to, to_name),
             || {},
         )
+    }
+
+    /// Where [`take_stored`](Self::take_stored) moved `path`.
+    #[cfg(test)]
+    pub(crate) fn take(&mut self, path: &Path) -> io::Result<PathBuf> {
+        self.take_stored(path).map(|stored| stored.path)
     }
 
     /// [`take`](Self::take), with `rename` moving an entry into quarantine
@@ -121,23 +127,34 @@ impl Quarantine {
         path: &Path,
         rename: impl Fn(&Dir, &OsStr, &Dir, &OsStr) -> io::Result<()>,
         after_copy: impl FnOnce(),
-    ) -> io::Result<PathBuf> {
+    ) -> io::Result<Stored> {
         #[cfg(test)]
         if self.stuck.contains(path) {
             return Err(io::Error::other("stuck, for a test"));
         }
-        let (parent, name) = self.parent(path)?;
-        let found = parent.stat(&name)?;
+        let (parent, name, reused) = self.parent(path)?;
+        let (parent, name, found) = match parent.stat(&name) {
+            Ok(found) => (parent, name, found),
+            // The directory it was taken from last may have been replaced
+            // since: walk to it afresh.
+            Err(err) if reused && err.kind() == io::ErrorKind::NotFound => {
+                self.source = None;
+                let (parent, name, _) = self.parent(path)?;
+                let found = parent.stat(&name)?;
+                (parent, name, found)
+            }
+            Err(err) => return Err(err),
+        };
         let Ok((dest_dir, dest_name, dest)) = self.destination(path) else {
-            return rename_in_place(&parent, &name, path);
+            return in_place(&parent, &name, path);
         };
         match rename(&parent, &name, &dest_dir, &dest_name) {
-            Ok(()) => {
-                if found.kind == Kind::Dir {
-                    neutralize(&dest_dir, &dest_name);
-                }
-                Ok(dest)
-            }
+            Ok(()) => Ok(Stored {
+                path: dest,
+                live: (found.kind == Kind::Dir)
+                    .then(|| neutralize(&dest_dir, &dest_name).err())
+                    .flatten(),
+            }),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Err(err),
             Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
                 let copy = Copy {
@@ -148,22 +165,23 @@ impl Quarantine {
                 };
                 copy.move_across(&dest, path, after_copy)
             }
-            Err(_) => rename_in_place(&parent, &name, path),
+            Err(_) => in_place(&parent, &name, path),
         }
     }
 
-    /// The workspace directory `path` is in, and its name there.
-    fn parent(&mut self, path: &Path) -> io::Result<(Dir, OsString)> {
+    /// The workspace directory `path` is in, its name there, and whether
+    /// the directory is the one the last entry was taken from.
+    fn parent(&mut self, path: &Path) -> io::Result<(Dir, OsString, bool)> {
         let above = path.parent().unwrap_or(path);
         if let Some((dir_path, dir)) = &self.source
             && dir_path == above
             && let Some(name) = path.file_name()
         {
-            return Ok((dir.try_clone()?, name.to_os_string()));
+            return Ok((dir.try_clone()?, name.to_os_string(), true));
         }
         let (dir, name) = self.tree.parent(path)?;
         self.source = Some((above.to_path_buf(), dir.try_clone()?));
-        Ok((dir, name))
+        Ok((dir, name, false))
     }
 
     /// A free name in the quarantine directory for `path`, and the
@@ -268,6 +286,14 @@ impl Quarantine {
     }
 }
 
+/// Where an entry was moved, and, when git could still take something in it
+/// for a repository, why.
+#[derive(Debug)]
+pub(crate) struct Stored {
+    pub(crate) path: PathBuf,
+    pub(crate) live: Option<String>,
+}
+
 /// An entry to move across filesystems: `name` in `from`, to `to_name` in
 /// `to`.
 struct Copy<'a> {
@@ -286,7 +312,7 @@ impl Copy<'_> {
         dest: &Path,
         path: &Path,
         after_copy: impl FnOnce(),
-    ) -> io::Result<PathBuf> {
+    ) -> io::Result<Stored> {
         let mut budget = Budget {
             entries: MAX_COPY_ENTRIES,
             bytes: MAX_COPY_BYTES,
@@ -296,15 +322,22 @@ impl Copy<'_> {
             Err(_) => {
                 // The partial copy is harness's own.
                 let _ = remove_copy(self.to, self.to_name, 0);
-                return rename_in_place(self.from, self.name, path);
+                return in_place(self.from, self.name, path);
             }
         };
         after_copy();
+        // The copy stored every `.git` and `HEAD` as it copied.
         let Err(err) = remove_copied(self.from, self.name, &copied) else {
-            return Ok(dest.to_path_buf());
+            return Ok(Stored {
+                path: dest.to_path_buf(),
+                live: None,
+            });
         };
-        let left = match rename_in_place(self.from, self.name, path) {
-            Ok(renamed) => format!("what is left of it was renamed to {}", renamed.display()),
+        let left = match in_place(self.from, self.name, path) {
+            Ok(renamed) => format!(
+                "what is left of it was renamed to {}",
+                renamed.path.display()
+            ),
             Err(why) => format!("what is left of it is still there ({why})"),
         };
         Err(io::Error::other(format!(
@@ -455,63 +488,111 @@ fn remove_copy(dir: &Dir, name: &OsStr, depth: usize) -> io::Result<()> {
 fn stored(name: &OsStr) -> &OsStr {
     if name == ".git" {
         OsStr::new("dot-git")
+    } else if name == "HEAD" {
+        OsStr::new(STORED_HEAD)
     } else {
         name
     }
 }
 
-/// Renames every `.git` below the directory `name` in `dir`, just moved into
-/// quarantine, to `dot-git`: no git run in the quarantine may take it for a
-/// repository. Stops after [`MAX_COPY_ENTRIES`] entries or
-/// [`MAX_COPY_DEPTH`] levels.
-fn neutralize(dir: &Dir, name: &OsStr) {
-    if let Ok(inner) = dir.open_dir(name) {
-        let mut left = MAX_COPY_ENTRIES;
-        neutralize_below(&inner, 0, &mut left);
-    }
+/// How a `HEAD` is stored: git takes a directory for a repository only
+/// with a valid `HEAD` in it.
+const STORED_HEAD: &str = "HEAD.quarantined";
+
+/// Renames every `.git` below the directory `name` in `dir` to `dot-git`,
+/// and every `HEAD` to `HEAD.quarantined`, so that git takes nothing in it
+/// for a repository. Stops after [`MAX_COPY_ENTRIES`] entries or
+/// [`MAX_COPY_DEPTH`] levels. Why it could not make sure, if it could not.
+fn neutralize(dir: &Dir, name: &OsStr) -> Result<(), String> {
+    let inner = dir
+        .open_dir(name)
+        .map_err(|err| format!("harness could not look inside it ({err})"))?;
+    let mut left = MAX_COPY_ENTRIES;
+    let mut failure = None;
+    neutralize_below(&inner, 0, &mut left, &mut failure);
+    failure.map_or(Ok(()), Err)
 }
 
-fn neutralize_below(dir: &Dir, depth: usize, left: &mut usize) {
+fn neutralize_below(dir: &Dir, depth: usize, left: &mut usize, failure: &mut Option<String>) {
+    let too_large =
+        "it is too deep or too large for harness to make sure no repository inside it still works";
     if depth > MAX_COPY_DEPTH {
+        failure.get_or_insert_with(|| too_large.to_string());
         return;
     }
-    let Ok(names) = dir.entries() else {
-        return;
+    let names = match dir.entries() {
+        Ok(names) => names,
+        Err(err) => {
+            failure
+                .get_or_insert_with(|| format!("harness could not look inside all of it ({err})"));
+            return;
+        }
     };
     for mut name in names {
         let Some(fewer) = left.checked_sub(1) else {
+            failure.get_or_insert_with(|| too_large.to_string());
             return;
         };
         *left = fewer;
-        if name == ".git" {
-            match rename_to_dot_git(dir, &name) {
+        let renamed_to = if name == ".git" {
+            Some("dot-git")
+        } else if name == "HEAD" {
+            Some(STORED_HEAD)
+        } else {
+            None
+        };
+        if let Some(to) = renamed_to {
+            match rename_free(dir, &name, to) {
                 Ok(renamed) => name = renamed,
-                Err(_) => continue,
+                Err(err) => {
+                    failure.get_or_insert_with(|| {
+                        format!(
+                            "a {} inside it could not be renamed ({err}), so a repository inside it may still work",
+                            name.display()
+                        )
+                    });
+                    continue;
+                }
             }
         }
         if dir.stat(&name).is_ok_and(|stat| stat.kind == Kind::Dir)
             && let Ok(inner) = dir.open_dir(&name)
         {
-            neutralize_below(&inner, depth + 1, left);
+            neutralize_below(&inner, depth + 1, left, failure);
         }
     }
 }
 
-/// Renames `name` in `dir` to `dot-git`, or `dot-git.<n>` when that is
-/// taken.
-fn rename_to_dot_git(dir: &Dir, name: &OsStr) -> io::Result<OsString> {
+/// Renames `name` in `dir` to `to`, or `<to>.<n>` when that is taken.
+fn rename_free(dir: &Dir, name: &OsStr, to: &str) -> io::Result<OsString> {
     for n in 0..100 {
-        let mut to = OsString::from("dot-git");
+        let mut free = OsString::from(to);
         if n > 0 {
-            to.push(format!(".{n}"));
+            free.push(format!(".{n}"));
         }
-        match dir.rename_new(name, dir, &to) {
-            Ok(()) => return Ok(to),
+        match dir.rename_new(name, dir, &free) {
+            Ok(()) => return Ok(free),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(err),
         }
     }
     Err(io::Error::other("no free name for it"))
+}
+
+/// [`rename_in_place`], neutralized as a directory in quarantine is, since
+/// git could be run in it all the same.
+fn in_place(parent: &Dir, name: &OsStr, path: &Path) -> io::Result<Stored> {
+    let renamed = rename_in_place(parent, name, path)?;
+    let live = match renamed.file_name() {
+        Some(new_name) if parent.stat(new_name).is_ok_and(|s| s.kind == Kind::Dir) => {
+            neutralize(parent, new_name).err()
+        }
+        _ => None,
+    };
+    Ok(Stored {
+        path: renamed,
+        live,
+    })
 }
 
 /// Renames `name` in `parent`, at `path`, to `<name>.harness-quarantine-<n>`
@@ -626,7 +707,8 @@ mod tests {
         let first = q.take(&ws.join("HEAD")).unwrap();
         std::fs::write(ws.join("HEAD"), "two").unwrap();
         let second = q.take(&ws.join("HEAD")).unwrap();
-        assert_eq!(second, first.with_file_name("HEAD.1"));
+        assert!(first.ends_with("HEAD.quarantined"), "{first:?}");
+        assert_eq!(second, first.with_file_name("HEAD.quarantined.1"));
         assert_eq!(read(&first), "one");
         assert_eq!(read(&second), "two");
     }
@@ -653,7 +735,10 @@ mod tests {
         .unwrap();
         symlink("hooks/x", ws.join("sub/.git/link")).unwrap();
         let mut q = Quarantine::new(&root, &ws);
-        let dest = q.take_with(&ws.join("sub/.git"), across, || {}).unwrap();
+        let dest = q
+            .take_with(&ws.join("sub/.git"), across, || {})
+            .unwrap()
+            .path;
         assert!(dest.starts_with(&root));
         assert_eq!(read(&dest.join("hooks/x")), "hook");
         let mode = std::fs::metadata(dest.join("hooks/x"))
@@ -683,7 +768,7 @@ mod tests {
             let mut q = Quarantine::new(&root, &ws);
             (q.take_with(&ws.join(".git/commondir"), across, || {}), ws)
         });
-        let dest = moved.unwrap();
+        let dest = moved.unwrap().path;
         assert_eq!(dest, ws.join(".git/commondir.harness-quarantine-1"));
         assert!(exists(&dest));
         assert!(!exists(&ws.join(".git/commondir")));
@@ -736,10 +821,77 @@ mod tests {
         let hook = q.take(&ws.join(".git/hooks/x")).unwrap();
         assert!(hook.ends_with("dot-git/hooks/x"), "{hook:?}");
         // Across filesystems as well.
-        let copied = q.take_with(&ws.join("two/.git"), across, || {}).unwrap();
+        let copied = q
+            .take_with(&ws.join("two/.git"), across, || {})
+            .unwrap()
+            .path;
         assert!(copied.ends_with("two/dot-git"), "{copied:?}");
         assert!(copied.join("inner/dot-git").is_dir());
         assert!(!exists(&copied.join("inner/.git")));
+    }
+
+    #[test]
+    fn a_stored_repository_has_no_head_at_any_depth() {
+        let (_d, ws, root) = dirs();
+        for dir in [
+            "sub/.git",
+            "sub/.git/inner/.git",
+            "sub/.git/modules/m",
+            "two/.git",
+        ] {
+            std::fs::create_dir_all(ws.join(dir).join("refs")).unwrap();
+            std::fs::write(ws.join(dir).join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        }
+        let mut q = Quarantine::new(&root, &ws);
+        let stored = q.take_stored(&ws.join("sub/.git")).unwrap();
+        assert_eq!(stored.live, None);
+        for dir in ["", "inner/dot-git", "modules/m"] {
+            let dir = stored.path.join(dir);
+            assert!(!exists(&dir.join("HEAD")), "{dir:?}");
+            assert_eq!(
+                read(&dir.join("HEAD.quarantined")),
+                "ref: refs/heads/main\n"
+            );
+        }
+        // Across filesystems as well.
+        let copied = q.take_with(&ws.join("two/.git"), across, || {}).unwrap();
+        assert!(!exists(&copied.path.join("HEAD")));
+        assert_eq!(
+            read(&copied.path.join("HEAD.quarantined")),
+            "ref: refs/heads/main\n"
+        );
+    }
+
+    #[test]
+    fn what_is_too_deep_to_neutralize_is_reported() {
+        let (_d, ws, root) = dirs();
+        let mut deep = ws.join("sub/.git");
+        for _ in 0..40 {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(deep.join(".git")).unwrap();
+        let stored = Quarantine::new(&root, &ws)
+            .take_stored(&ws.join("sub/.git"))
+            .unwrap();
+        let live = stored.live.expect("not fully neutralized");
+        assert!(live.contains("too deep or too large"), "{live}");
+    }
+
+    #[test]
+    fn an_entry_behind_a_directory_replaced_since_the_last_move_is_still_found() {
+        let (_d, ws, root) = dirs();
+        let hooks = ws.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("a"), "a").unwrap();
+        let mut q = Quarantine::new(&root, &ws);
+        q.take(&hooks.join("a")).unwrap();
+        // The directory it was taken from is replaced by another.
+        std::fs::rename(&hooks, ws.join(".git/hooks-old")).unwrap();
+        std::fs::create_dir(&hooks).unwrap();
+        std::fs::write(hooks.join("b"), "b").unwrap();
+        let moved = q.take(&hooks.join("b")).unwrap();
+        assert_eq!(read(&moved), "b");
+        assert!(!exists(&hooks.join("b")));
     }
 
     #[test]
@@ -751,7 +903,7 @@ mod tests {
             std::fs::write(ws.join("HEAD"), format!("{i}")).unwrap();
             last = q.take(&ws.join("HEAD")).unwrap();
         }
-        assert_eq!(last.file_name().unwrap(), "HEAD.199");
+        assert_eq!(last.file_name().unwrap(), "HEAD.quarantined.199");
         assert_eq!(read(&last), "199");
         assert!(q.probes() <= 200, "{} names tried", q.probes());
     }

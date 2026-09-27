@@ -54,16 +54,15 @@ fn gone(path: &Path) -> bool {
 }
 
 /// The one entry the quarantine holds for `rel` (relative to the workspace),
-/// where every `.git` in the path is stored as `dot-git`.
+/// where every `.git` in the path is stored as `dot-git` and every `HEAD` as
+/// `HEAD.quarantined`.
 fn quarantined(env: &Env, rel: &str) -> PathBuf {
     let stored: PathBuf = Path::new(rel)
         .iter()
-        .map(|name| {
-            if name == ".git" {
-                OsStr::new("dot-git")
-            } else {
-                name
-            }
+        .map(|name| match name.to_str() {
+            Some(".git") => OsStr::new("dot-git"),
+            Some("HEAD") => OsStr::new("HEAD.quarantined"),
+            _ => name,
         })
         .collect();
     let mut found: Vec<PathBuf> = std::fs::read_dir(&env.quarantine)
@@ -704,6 +703,55 @@ fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
+/// `git args…` in `dir`, with no configuration but the repository's.
+fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .unwrap()
+}
+
+/// Whether git, run in `dir`, finds a repository there or above it, up to
+/// the temp directory of `env` (and not beyond).
+fn a_repository_for_git(env: &Env, dir: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(dir)
+        .env("GIT_CEILING_DIRECTORIES", env.ws.parent().unwrap())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// The path the report says `rel` was moved to.
+fn moved_to(message: &str, rel: &str) -> PathBuf {
+    let line = message
+        .lines()
+        .find(|line| line.starts_with(&format!("- {rel}: ")))
+        .unwrap_or_else(|| panic!("no line for {rel}: {message}"));
+    let (_, to) = line.rsplit_once("moved to ").unwrap();
+    PathBuf::from(to.trim_end_matches(']'))
+}
+
+/// Makes `dir` a gitdir as git sees one, with a pager in its config.
+fn gitdir(dir: &Path) {
+    std::fs::create_dir_all(dir.join("objects")).unwrap();
+    std::fs::create_dir_all(dir.join("refs")).unwrap();
+    std::fs::create_dir_all(dir.join("hooks")).unwrap();
+    std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(dir.join("config"), "[core]\n\tpager = evil\n").unwrap();
+}
+
 #[test]
 fn a_quarantined_repository_is_not_a_live_repository() {
     let env = env();
@@ -713,9 +761,16 @@ fn a_quarantined_repository_is_not_a_live_repository() {
     std::fs::write(env.ws.join("gf/.git"), "gitdir: ../.git/modules/m\n").unwrap();
     let guard = env.session.begin(&env.ws, true, |_| {});
     // A planted repository, with another one inside it.
-    std::fs::create_dir_all(env.ws.join("sub/.git/hooks")).unwrap();
-    std::fs::write(env.ws.join("sub/.git/config"), "[core]\n\tpager = evil\n").unwrap();
-    std::fs::create_dir_all(env.ws.join("sub/.git/inner/.git")).unwrap();
+    std::fs::create_dir_all(env.ws.join("sub")).unwrap();
+    assert!(git(&env.ws.join("sub"), &["init", "-q"]).status.success());
+    assert!(
+        git(&env.ws.join("sub"), &["config", "core.pager", "evil"])
+            .status
+            .success()
+    );
+    gitdir(&env.ws.join("sub/.git/inner/.git"));
+    assert!(a_repository_for_git(&env, &env.ws.join("sub/.git")));
+    assert!(a_repository_for_git(&env, &env.ws.join("sub/.git/inner")));
     // A replaced top-level `.git`, and a replaced gitfile.
     std::fs::rename(env.ws.join(".git"), env.ws.join("moved")).unwrap();
     std::fs::create_dir_all(env.ws.join(".git/hooks")).unwrap();
@@ -727,23 +782,44 @@ fn a_quarantined_repository_is_not_a_live_repository() {
     walk(&env.quarantine, &mut stored);
     let live: Vec<_> = stored
         .iter()
-        .filter(|path| path.file_name() == Some(OsStr::new(".git")))
+        .filter(|path| {
+            let name = path.file_name().unwrap();
+            name == ".git" || name == "HEAD"
+        })
         .collect();
     assert!(live.is_empty(), "{live:?}");
     let repository = quarantined(&env, "sub/.git");
     assert!(repository.ends_with("sub/dot-git"));
-    assert_eq!(read(&repository.join("config")), "[core]\n\tpager = evil\n");
-    assert!(repository.join("inner/dot-git").is_dir());
+    assert_eq!(moved_to(&report.message, "sub/.git"), repository);
+    // Kept for inspection, but git takes none of it for a repository.
+    assert!(read(&repository.join("config")).contains("pager = evil"));
+    for dir in [
+        repository.clone(),
+        repository.join("hooks"),
+        repository.join("inner"),
+        repository.join("inner/dot-git"),
+    ] {
+        assert!(!a_repository_for_git(&env, &dir), "{dir:?}");
+    }
     assert!(quarantined(&env, ".git").join("hooks").is_dir());
     assert_eq!(read(&quarantined(&env, "gf/.git")), "gitdir: /tmp/evil\n");
-    assert!(
-        report.message.contains(&format!(
-            "\n- sub/.git: a new repository; moved to {}",
-            repository.display()
-        )),
-        "{}",
-        report.message
-    );
+}
+
+#[test]
+fn a_quarantined_submodule_gitdir_is_not_a_live_repository() {
+    let env = env();
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    let planted = env.ws.join(".git/modules/m");
+    gitdir(&planted);
+    assert!(a_repository_for_git(&env, &planted));
+    let report = guard.finish().expect("a report");
+    let stored = moved_to(&report.message, ".git/modules/m");
+    assert!(stored.ends_with("dot-git/modules/m"), "{stored:?}");
+    assert!(read(&stored.join("config")).contains("pager = evil"));
+    assert!(read(&stored.join("HEAD.quarantined")).starts_with("ref: "));
+    for dir in [stored.clone(), stored.join("hooks")] {
+        assert!(!a_repository_for_git(&env, &dir), "{dir:?}");
+    }
 }
 
 #[test]

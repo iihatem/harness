@@ -250,17 +250,25 @@ fn twenty_thousand_planted_hooks_take_bounded_work_and_a_bounded_report() {
     assert!(
         report
             .message
-            .contains("more than 10000 changes in one check; 10000 more were left as they are"),
+            .contains("[harness stops at 10000 changes in one check, and left these as they are"),
         "{}",
         report.message
     );
-    // 50 lines, then a count.
     assert!(
-        report.message.contains("\n- and 9950 more]"),
+        report
+            .message
+            .contains("\n- .git/hooks/h10000: new in a protected directory"),
         "{}",
         report.message
     );
-    assert!(report.message.lines().count() < 70, "{}", report.message);
+    // 50 lines, then a count, in each section.
+    assert_eq!(
+        report.message.matches("\n- and 9950 more]").count(),
+        2,
+        "{}",
+        report.message
+    );
+    assert!(report.message.lines().count() < 120, "{}", report.message);
     assert!(
         report.message.len() < 20_000,
         "{} bytes",
@@ -304,4 +312,145 @@ fn the_same_name_planted_again_and_again_is_not_searched_for_a_free_name() {
         "{}",
         report.message
     );
+}
+
+/// Sets the most changes one check makes.
+fn cap(env: &Env, max: usize) {
+    lock(&env.session.hooks).max_changes = Some(max);
+}
+
+#[test]
+fn a_repository_past_the_cap_is_named_and_moved_before_the_next_command() {
+    let env = env();
+    cap(&env, 3);
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    for decoy in ["a1", "a2", "a3"] {
+        std::fs::create_dir_all(env.ws.join(decoy).join(".git")).unwrap();
+    }
+    std::fs::create_dir_all(env.ws.join("zz/.git/hooks")).unwrap();
+    std::fs::write(env.ws.join("zz/.git/config"), EVIL).unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(report.blocked);
+    assert!(
+        report.message.contains(
+            "[harness stops at 3 changes in one check, and left these as they are; it goes on with them before the next command, and the command counts as blocked:\n- zz/.git: a new repository]"
+        ),
+        "{}",
+        report.message
+    );
+    assert!(env.ws.join("zz/.git").exists());
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report.message.starts_with(&format!(
+            "{}\n- zz/.git: a new repository; moved to ",
+            report::BEFORE
+        )),
+        "{}",
+        report.message
+    );
+    assert!(!env.ws.join("zz/.git").exists());
+}
+
+#[test]
+fn a_nested_gitdir_past_the_cap_is_moved_before_the_next_command() {
+    let env = env();
+    cap(&env, 3);
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    let worktrees = env.ws.join(".git/worktrees");
+    for name in ["a1", "a2", "a3", "zz"] {
+        std::fs::create_dir_all(worktrees.join(name)).unwrap();
+        std::fs::write(worktrees.join(name).join("config.worktree"), EVIL).unwrap();
+    }
+    let report = guard.finish().expect("a report");
+    // The gitdirs are found in directory order: one of them is left.
+    let left: Vec<String> = std::fs::read_dir(&worktrees)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(left.len(), 1, "{left:?}");
+    let rel = format!(".git/worktrees/{}", left[0]);
+    assert!(
+        report
+            .message
+            .contains(&format!("\n- {rel}: a new worktree or submodule gitdir]")),
+        "{}",
+        report.message
+    );
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(
+        report.message.contains(&format!(
+            "\n- {rel}: a new worktree or submodule gitdir; moved to "
+        )),
+        "{}",
+        report.message
+    );
+    assert_eq!(std::fs::read_dir(&worktrees).unwrap().count(), 0);
+}
+
+#[test]
+fn what_is_left_undone_between_commands_is_moved_while_survivors_live() {
+    let env = env();
+    cap(&env, 3);
+    env.session.set_survivor_probe(Arc::new(|| true));
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    for name in ["a1", "a2", "a3", "zz"] {
+        std::fs::create_dir_all(env.ws.join(name).join(".git")).unwrap();
+    }
+    assert!(guard.finish().expect("a report").blocked);
+    let left = env.ws.join("zz/.git");
+    assert!(left.exists(), "the fourth is past the cap");
+    env.session
+        .between_commands(&env.ws)
+        .expect("survivors")
+        .check();
+    assert!(!left.exists());
+}
+
+#[test]
+fn what_is_left_undone_stays_unknown_until_it_is_moved() {
+    // The move before the next command fails too: its scan finds the
+    // repository, which must still count as new.
+    let env = env();
+    cap(&env, 1);
+    let planted = env.ws.join("zz/.git");
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    std::fs::create_dir_all(env.ws.join("a1/.git")).unwrap();
+    std::fs::create_dir_all(&planted).unwrap();
+    assert!(guard.finish().expect("a report").blocked);
+    lock(&env.session.hooks).max_changes = None;
+    lock(&env.session.hooks).stuck.insert(planted.clone());
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    assert!(!guard.index().dot_gits.contains(&planted));
+    let report = guard.finish().expect("a report");
+    assert!(report.blocked, "{}", report.message);
+    assert!(
+        report
+            .message
+            .contains("\n- zz/.git: a new repository; could not move it"),
+        "{}",
+        report.message
+    );
+    lock(&env.session.hooks).stuck.clear();
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(
+        report
+            .message
+            .contains("\n- zz/.git: a new repository; moved to "),
+        "{}",
+        report.message
+    );
+    assert!(!planted.exists());
 }

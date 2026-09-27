@@ -99,6 +99,8 @@ struct TestHooks {
     after_scan: Option<Box<dyn FnOnce() + Send>>,
     /// Paths whose moves to quarantine fail.
     stuck: BTreeSet<PathBuf>,
+    /// The most changes one check makes, in place of [`MAX_CHANGES`].
+    max_changes: Option<usize>,
 }
 
 /// What a session keeps for one workspace.
@@ -191,6 +193,15 @@ impl GuardSession {
         index
     }
 
+    /// The most changes one check makes.
+    fn max_changes(&self) -> usize {
+        #[cfg(test)]
+        if let Some(max) = lock(&self.hooks).max_changes {
+            return max;
+        }
+        MAX_CHANGES
+    }
+
     fn quarantine(&self, workspace: &Path) -> Quarantine {
         let quarantine = Quarantine::new(&self.quarantine_root, workspace);
         #[cfg(test)]
@@ -219,23 +230,35 @@ impl GuardSession {
         let tree = Tree::new(workspace);
         let mut quarantine = self.quarantine(workspace);
         let mut findings = Findings::default();
+        let mut undone = BTreeMap::new();
         if let Some(mut kept) = self.take_kept(workspace) {
             let survivors = self.survivors();
             kept.check(&tree, &mut quarantine, survivors);
             findings.before = kept.found;
-            findings.left_before = kept.left_over;
+            undone = kept.undone;
         }
+        // What is still to be moved is new, whatever the scan finds: a
+        // repository or gitdir left undone is not taken for a known one.
+        let unknown = |path: &Path| {
+            undone
+                .iter()
+                .any(|(left, undone): (&PathBuf, &Undone)| undone.moved && path.starts_with(left))
+        };
 
-        let index = self.scan(workspace, &rules);
+        let mut index = self.scan(workspace, &rules);
+        index.dot_gits.retain(|path| !unknown(path));
+        index.gitdirs.retain(|path| !unknown(path));
+        index.links.retain(|path| !unknown(path));
         placeholders(&index);
         // What an incomplete scan did not reach is still known: the
         // linked-worktree and submodule gitdirs in each gitdir it found.
-        let nested = nested_in(&index.gitdirs);
+        let mut nested = nested_in(&index.gitdirs);
+        nested.retain(|path| !unknown(path));
         let gitdirs: BTreeSet<PathBuf> = index.gitdirs.union(&nested).cloned().collect();
         let candidates = candidates(workspace, &gitdirs);
         let existing: BTreeSet<PathBuf> = candidates
             .iter()
-            .filter(|path| may_exist(&tree, path))
+            .filter(|path| !unknown(path) && may_exist(&tree, path))
             .cloned()
             .collect();
         let identities = index
@@ -245,7 +268,8 @@ impl GuardSession {
             .chain(&index.links)
             .map(|path| (path.clone(), Tracked::new(Identity::of(&tree, path))))
             .collect();
-        let top_existed = may_exist(&tree, &workspace.join(".git"));
+        let top = workspace.join(".git");
+        let top_existed = !unknown(&top) && may_exist(&tree, &top);
         // A gitfile names the gitdir git uses, so it is saved like the
         // protected files.
         let roots: Vec<PathBuf> = existing
@@ -253,7 +277,8 @@ impl GuardSession {
             .cloned()
             .chain(gitfiles(&tree, &index.dot_gits))
             .collect();
-        let snapshot = Snapshot::take(&tree, &roots, save_all);
+        // Entries still to be moved are left out, so they count as new.
+        let snapshot = Snapshot::take(&tree, &roots, save_all, unknown);
         findings.incomplete = index.incomplete && self.first_report_of_incomplete(workspace);
         GitGuard {
             session: Arc::clone(self),
@@ -272,6 +297,8 @@ impl GuardSession {
                 snapshot,
                 quarantine,
                 findings,
+                undone,
+                max_changes: self.max_changes(),
                 finished: false,
             })),
         }
@@ -402,17 +429,25 @@ impl GitGuard {
                 tree,
                 quarantine,
                 findings,
+                undone,
+                max_changes,
                 ..
             } = &mut *state;
-            let mut pass = Pass::new(tree, quarantine);
+            let mut pass = Pass::new(tree, quarantine, undone, *max_changes);
             for dot_git in new {
                 let taken = pass.take(&dot_git, What::Repository);
                 findings.after.push(taken);
             }
-            findings.left_after += pass.refused;
-            pass.report_unlocked(&mut findings.after);
+            pass.report(&mut findings.after);
             findings.uncheckable = now.incomplete;
         }
+        state.findings.max_changes = state.max_changes;
+        state.findings.undone = state
+            .undone
+            .iter()
+            .filter(|(_, undone)| undone.capped)
+            .map(|(path, undone)| (path.clone(), undone.what))
+            .collect();
         state.finished = true;
         state.quarantine.close();
         let kept = state.keep(self.session.survivors());
@@ -536,6 +571,11 @@ struct State {
     snapshot: Snapshot,
     quarantine: Quarantine,
     findings: Findings,
+    /// What the checks left undone, or could not do: tried again before the
+    /// next command.
+    undone: BTreeMap<PathBuf, Undone>,
+    /// The most changes one check makes.
+    max_changes: usize,
     /// The guard has finished: its checks do nothing.
     finished: bool,
 }
@@ -559,9 +599,11 @@ impl State {
             snapshot,
             quarantine,
             findings,
+            undone,
+            max_changes,
             ..
         } = self;
-        let mut pass = Pass::new(tree, quarantine);
+        let mut pass = Pass::new(tree, quarantine, undone, *max_changes);
         check_identities(&mut pass, identities, snapshot, detached, findings);
         let new: Vec<PathBuf> = candidates
             .difference(existing)
@@ -597,8 +639,7 @@ impl State {
             |path| below_any(detached, path),
             &mut findings.after,
         );
-        findings.left_after = pass.refused;
-        pass.report_unlocked(&mut findings.after);
+        pass.report(&mut findings.after);
     }
 
     /// What the checks until the next command compare against: the state
@@ -635,9 +676,9 @@ impl State {
             snapshot,
             detached: self.detached.clone(),
             survivors,
-            unfinished: self.findings.left_after > 0,
+            undone: self.undone.clone(),
+            max_changes: self.max_changes,
             found: List::default(),
-            left_over: 0,
             quarantine: None,
         }
     }
@@ -681,7 +722,7 @@ fn check_identities(
             }
             Identity::Symlink { .. } | Identity::Inode { .. } => {}
         }
-        let moved = match pass.move_out(path) {
+        let moved = match pass.move_out(path, What::Replaced) {
             None => continue,
             Some(Ok(moved)) => moved,
             Some(Err(err)) if nothing_there(&err) => {
@@ -726,42 +767,67 @@ fn check_identities(
     }
 }
 
-/// One check: what it may still change, and the directories whose owner
-/// permissions it gave back on the way.
+/// Something a check left undone, or could not do: its path is tried again
+/// before the next command, and until then is not taken for a known one.
+#[derive(Debug, Clone, Copy)]
+struct Undone {
+    what: What,
+    /// A move to quarantine; otherwise a restore.
+    moved: bool,
+    /// Left for want of changes the check could still make, rather than
+    /// failed.
+    capped: bool,
+}
+
+/// One check: what it may still change, what it leaves undone, and what else
+/// it has to report.
 struct Pass<'a> {
     tree: &'a Tree,
     quarantine: &'a mut Quarantine,
+    /// What the checks left undone: this one adds to it, and takes off what
+    /// it does.
+    undone: &'a mut BTreeMap<PathBuf, Undone>,
     /// Changes this check may still make.
     left: usize,
-    /// Changes it did not make, past [`MAX_CHANGES`].
-    refused: usize,
+    /// Directories whose owner permissions it gave back.
     unlocked: BTreeSet<PathBuf>,
+    /// Entries it stored in quarantine that git may still take for a
+    /// repository.
+    live: Vec<Finding>,
 }
 
 impl<'a> Pass<'a> {
-    fn new(tree: &'a Tree, quarantine: &'a mut Quarantine) -> Pass<'a> {
+    fn new(
+        tree: &'a Tree,
+        quarantine: &'a mut Quarantine,
+        undone: &'a mut BTreeMap<PathBuf, Undone>,
+        max_changes: usize,
+    ) -> Pass<'a> {
         quarantine.forget_sources();
         Pass {
             tree,
             quarantine,
-            left: MAX_CHANGES,
-            refused: 0,
+            undone,
+            left: max_changes,
             unlocked: BTreeSet::new(),
+            live: Vec::new(),
         }
     }
 
-    /// Whether this check may make one more change.
-    fn allow(&mut self) -> bool {
-        match self.left.checked_sub(1) {
-            Some(left) => {
-                self.left = left;
-                true
-            }
-            None => {
-                self.refused += 1;
-                false
-            }
+    /// Whether this check may make one more change; if not, `path` is left
+    /// undone.
+    fn allow(&mut self, path: &Path, what: What, moved: bool) -> bool {
+        if let Some(left) = self.left.checked_sub(1) {
+            self.left = left;
+            return true;
         }
+        let undone = Undone {
+            what,
+            moved,
+            capped: true,
+        };
+        self.undone.insert(path.to_path_buf(), undone);
+        false
     }
 
     /// `op` on `path`, and once more if it was refused for want of
@@ -858,18 +924,41 @@ impl<'a> Pass<'a> {
         Outcome::Failed(why)
     }
 
-    /// Moves `path` to quarantine. `None` when this check may make no more
-    /// changes.
-    fn move_out(&mut self, path: &Path) -> Option<io::Result<PathBuf>> {
-        if !self.allow() {
+    /// Moves `path` (a `what`) to quarantine. `None` when this check may
+    /// make no more changes. What could not be moved is left undone.
+    fn move_out(&mut self, path: &Path, what: What) -> Option<io::Result<PathBuf>> {
+        if !self.allow(path, what, true) {
             return None;
         }
-        Some(self.retry(path, |pass| pass.quarantine.take(path)))
+        let moved = self.retry(path, |pass| pass.quarantine.take_stored(path));
+        match &moved {
+            Err(err) if !nothing_there(err) => {
+                let undone = Undone {
+                    what,
+                    moved: true,
+                    capped: false,
+                };
+                self.undone.insert(path.to_path_buf(), undone);
+            }
+            _ => {
+                self.undone.remove(path);
+            }
+        }
+        Some(moved.map(|stored| {
+            if let Some(why) = stored.live {
+                self.live.push(Finding {
+                    path: stored.path.clone(),
+                    what: What::Live,
+                    outcome: Outcome::Failed(why),
+                });
+            }
+            stored.path
+        }))
     }
 
     /// Moves `path` to quarantine, if something is there.
     fn take(&mut self, path: &Path, what: What) -> Option<Finding> {
-        let outcome = match self.move_out(path)? {
+        let outcome = match self.move_out(path, what)? {
             Ok(to) => Outcome::Moved(to),
             Err(err) if nothing_there(&err) => return None,
             Err(err) => Outcome::Failed(format!("could not move it: {err}")),
@@ -890,11 +979,14 @@ impl<'a> Pass<'a> {
         what: What,
         moved: Option<PathBuf>,
     ) -> Option<Finding> {
-        if moved.is_none() && !self.allow() {
+        if moved.is_none() && !self.allow(path, what, false) {
             return None;
         }
         let outcome = match self.retry(path, |pass| snapshot.restore(pass.tree, path)) {
-            Ok(()) => Outcome::Restored(moved),
+            Ok(()) => {
+                self.undone.remove(path);
+                Outcome::Restored(moved)
+            }
             Err(err) => match moved {
                 Some(to) => Outcome::Failed(format!(
                     "moved to {}, but could not restore the earlier version: {err}",
@@ -928,7 +1020,7 @@ impl<'a> Pass<'a> {
                     })
                 }
                 Difference::Added => self.take(path, What::Added),
-                Difference::Changed => match self.move_out(path) {
+                Difference::Changed => match self.move_out(path, What::Changed) {
                     None => None,
                     Some(Ok(moved)) => self.restore(snapshot, path, What::Changed, Some(moved)),
                     Some(Err(err)) if nothing_there(&err) => {
@@ -952,14 +1044,18 @@ impl<'a> Pass<'a> {
         });
     }
 
-    /// Reports the directories whose owner permissions this check gave back.
-    fn report_unlocked(&mut self, found: &mut List) {
+    /// Reports the directories whose owner permissions this check gave
+    /// back, and what it stored that git may still take for a repository.
+    fn report(&mut self, found: &mut List) {
         for dir in std::mem::take(&mut self.unlocked) {
             found.push(Some(Finding {
                 path: dir,
                 what: What::Locked,
                 outcome: Outcome::Unlocked,
             }));
+        }
+        for live in std::mem::take(&mut self.live) {
+            found.push(Some(live));
         }
     }
 }
@@ -979,25 +1075,34 @@ struct Kept {
     /// Whether processes a sandboxed command started were running when the
     /// guard finished, or at any check since.
     survivors: bool,
-    /// Whether the last check stopped at [`MAX_CHANGES`] with changes left:
-    /// the next one goes on with them.
-    unfinished: bool,
+    /// What the checks left undone: see [`State::undone`].
+    undone: BTreeMap<PathBuf, Undone>,
+    /// The most changes one check makes.
+    max_changes: usize,
     /// What the checks since found.
     found: List,
-    /// Changes the last check did not make, past [`MAX_CHANGES`].
-    left_over: usize,
     /// Where the checks between commands move things.
     quarantine: Option<Quarantine>,
 }
 
 impl Kept {
-    /// Moves protected names planted since the command ended to quarantine,
-    /// and if processes it left running may have changed things, or the
-    /// command's guard stopped with changes left, undoes the changes to the
-    /// protected files and gitfiles.
+    /// Moves what the checks left undone to quarantine first, then
+    /// protected names planted since the command ended; and if processes it
+    /// left running may have changed things, or a check left restores
+    /// undone, undoes the changes to the protected files and gitfiles.
     fn check(&mut self, tree: &Tree, quarantine: &mut Quarantine, survivors: bool) {
         self.survivors |= survivors;
-        let mut pass = Pass::new(tree, quarantine);
+        let mut pass = Pass::new(tree, quarantine, &mut self.undone, self.max_changes);
+        let pending: Vec<(PathBuf, What)> = pass
+            .undone
+            .iter()
+            .filter(|(_, undone)| undone.moved)
+            .map(|(path, undone)| (path.clone(), undone.what))
+            .collect();
+        for (path, what) in pending {
+            let taken = pass.take(&path, what);
+            self.found.push(taken);
+        }
         let new: Vec<PathBuf> = self
             .candidates
             .difference(&self.existing)
@@ -1008,15 +1113,14 @@ impl Kept {
             let taken = pass.take(&path, What::New);
             self.found.push(taken);
         }
-        if (self.survivors || self.unfinished)
+        let restores_left = pass.undone.values().any(|undone| !undone.moved);
+        if (self.survivors || restores_left)
             && let Some(snapshot) = &self.snapshot
         {
             let detached = &self.detached;
             pass.undo(snapshot, |path| below_any(detached, path), &mut self.found);
-            self.unfinished = pass.refused > 0;
         }
-        self.left_over = pass.refused;
-        pass.report_unlocked(&mut self.found);
+        pass.report(&mut self.found);
     }
 }
 

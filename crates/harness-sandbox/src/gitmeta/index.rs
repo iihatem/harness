@@ -59,6 +59,10 @@ const MAX_LOOKUPS: usize = 4096;
 /// The longest path a symlink resolution may reach: `PATH_MAX` on Linux.
 const MAX_RESOLVED_PATH: usize = 4096;
 
+/// Bytes of paths one [`discover`] records in [`GitIndex::links`]. Past it,
+/// no more are recorded and the index is incomplete.
+const MAX_LINKS_BYTES: usize = 16 << 20;
+
 /// How many directories below `modules/` are searched for submodule gitdirs
 /// (a submodule's name can contain `/`).
 const MAX_MODULE_DEPTH: usize = 64;
@@ -114,7 +118,7 @@ pub struct GitIndex {
     pub gitdirs: BTreeSet<PathBuf>,
     /// Entries inside the workspace on the way from a gitfile or symlinked
     /// `.git` to its gitdirs, and from a gitdir to the one its `commondir`
-    /// names: each symlink, directory and gitfile.
+    /// names: each symlink, directory and gitfile. At most 16 MiB of paths.
     pub links: BTreeSet<PathBuf>,
     /// Whether the walk may have missed something, so the sets above are not
     /// the whole workspace: a directory could not be read; a gitfile or
@@ -123,7 +127,8 @@ pub struct GitIndex {
     /// went deeper than 64 directories; the walk ran out of its budget of
     /// 200,000 directory entries and lookups; it ran past 5 seconds (it
     /// stops at the next look at the clock, so it can overrun by one step's
-    /// work); or the [`IgnoreRules`] it was given are incomplete.
+    /// work); `links` reached 16 MiB of paths, and no more were recorded; or
+    /// the [`IgnoreRules`] it was given are incomplete.
     pub incomplete: bool,
 }
 
@@ -275,7 +280,8 @@ pub(crate) fn discover_with_budget(
         let common = noting(common, &mut walk.incomplete);
         // As for a gitfile: the entries on the way, but not the gitdir it
         // starts from or the directories above that.
-        index.links.extend(
+        walk.record_links(
+            &mut index.links,
             visited
                 .into_iter()
                 .filter(|entry| !gitdir.starts_with(entry) && within(entry, workspace)),
@@ -292,19 +298,43 @@ pub(crate) fn discover_with_budget(
 }
 
 /// What one walk may spend.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Budget {
-    /// Directory entries read.
+    /// Directory entries read and `readlink` lookups made.
     pub(crate) entries: usize,
-    /// Time since the walk started.
-    pub(crate) time: Duration,
+    /// What says the walk's time is up.
+    pub(crate) clock: Clock,
+    /// Bytes of paths the index's `links` may hold.
+    pub(crate) links_bytes: usize,
 }
 
 impl Budget {
     pub(crate) const DEFAULT: Budget = Budget {
         entries: MAX_ENTRIES,
-        time: MAX_TIME,
+        clock: Clock::Wall(MAX_TIME),
+        links_bytes: MAX_LINKS_BYTES,
     };
+}
+
+/// What says a walk's time is up.
+#[derive(Debug, Clone)]
+pub(crate) enum Clock {
+    /// The wall clock: this long after the walk starts.
+    Wall(Duration),
+    /// For tests: a clock that runs with the walk's work, the budget it has
+    /// spent, so that its time is up once `deadline` of it is spent. It
+    /// counts in `meter` how often it is looked at, and what was spent by
+    /// the last look.
+    #[cfg(test)]
+    Work { deadline: usize, meter: Arc<Meter> },
+}
+
+/// What a [`Clock::Work`] saw.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct Meter {
+    pub(crate) looks: std::sync::atomic::AtomicUsize,
+    pub(crate) spent: std::sync::atomic::AtomicUsize,
 }
 
 /// The gitdirs of `gitdir`'s linked worktrees (every directory in
@@ -468,7 +498,7 @@ impl Visit for Indexing<'_> {
             walk.charge(&allowance);
             walk.incomplete |= linked.unreadable;
             self.index.gitdirs.extend(linked.gitdirs);
-            self.index.links.extend(linked.entries);
+            walk.record_links(&mut self.index.links, linked.entries);
         }
     }
 
@@ -521,12 +551,17 @@ impl IgnoreFile {
 /// One walk's reads: what is left of its budget, and whether it has missed
 /// anything.
 struct Walk {
+    /// The budget's entries, for [`Clock::Work`].
+    #[cfg(test)]
+    entries: usize,
     entries_left: usize,
-    /// `None` when the budget's time is too long to add to now.
+    clock: Clock,
+    /// For [`Clock::Wall`]: `None` when its time is too long to add to now.
     deadline: Option<Instant>,
     steps: u32,
     exhausted: bool,
     ignore_bytes_left: u64,
+    links_bytes_left: usize,
     patterns_left: usize,
     wild_cost_left: usize,
     incomplete: bool,
@@ -534,12 +569,21 @@ struct Walk {
 
 impl Walk {
     fn new(budget: Budget) -> Walk {
+        let deadline = match budget.clock {
+            Clock::Wall(time) => Instant::now().checked_add(time),
+            #[cfg(test)]
+            Clock::Work { .. } => None,
+        };
         Walk {
+            #[cfg(test)]
+            entries: budget.entries,
             entries_left: budget.entries,
-            deadline: Instant::now().checked_add(budget.time),
+            clock: budget.clock,
+            deadline,
             steps: 0,
             exhausted: false,
             ignore_bytes_left: MAX_IGNORE_TOTAL,
+            links_bytes_left: budget.links_bytes,
             patterns_left: MAX_PATTERNS_TOTAL,
             wild_cost_left: MAX_WILD_COST,
             incomplete: false,
@@ -565,7 +609,17 @@ impl Walk {
     }
 
     fn past_deadline(&self) -> bool {
-        self.deadline.is_some_and(|d| Instant::now() >= d)
+        match &self.clock {
+            Clock::Wall(_) => self.deadline.is_some_and(|d| Instant::now() >= d),
+            #[cfg(test)]
+            Clock::Work { deadline, meter } => {
+                use std::sync::atomic::Ordering::Relaxed;
+                let spent = self.entries - self.entries_left;
+                meter.looks.fetch_add(1, Relaxed);
+                meter.spent.store(spent, Relaxed);
+                spent >= *deadline
+            }
+        }
     }
 
     /// Ends the walk with one more look at the clock, so that an overrun
@@ -610,6 +664,29 @@ impl Walk {
     fn stop(&mut self) {
         self.exhausted = true;
         self.incomplete = true;
+    }
+
+    /// Records `found` in `links` while the bytes of the paths recorded stay
+    /// within the budget's `links_bytes`. Past it, none more are, and the
+    /// walk is incomplete.
+    fn record_links(
+        &mut self,
+        links: &mut BTreeSet<PathBuf>,
+        found: impl IntoIterator<Item = PathBuf>,
+    ) {
+        for link in found {
+            if links.contains(&link) {
+                continue;
+            }
+            let bytes = link.as_os_str().len();
+            if bytes > self.links_bytes_left {
+                self.links_bytes_left = 0;
+                self.incomplete = true;
+                return;
+            }
+            self.links_bytes_left -= bytes;
+            links.insert(link);
+        }
     }
 
     /// The entries of the directory `dir`. `None`, and the walk is
@@ -834,25 +911,32 @@ impl Cost {
     }
 }
 
-/// Whether the matcher tests `pattern` in its regex set, rather than looking
-/// it up: any wildcard (`*`, `?`, `[`, or an escape), except in `*.ext`,
-/// which it looks up by extension. A leading `!`, a leading or trailing `/`,
-/// and a leading `**/` are looked up too (measured: `*suffix` and `prefix*`
-/// patterns are not; they cost about 8 KB each to build).
+/// Whether the matcher tests `pattern` in its regex set (or with a regex of
+/// its own), rather than looking it up. globset (`MatchStrategy::new`, for
+/// gitignore globs, whose `*` does not match `/`) looks up only literals
+/// (after a leading `!`, a leading or trailing `/`, or a leading `**/`), and
+/// `*.ext` at any depth: with a leading `**/`, or with no `/` at all, to
+/// which git's matcher adds one. Anything else with a wildcard (`*`, `?`,
+/// `[`, `{`, or an escape) is wild: `/*.ext` and `dir/*.ext` too. (Measured:
+/// `*suffix` and `prefix*` patterns cost about 8 KB each to build.)
 fn is_wild(pattern: &[u8]) -> bool {
-    let is_meta = |b: &u8| matches!(b, b'*' | b'?' | b'[' | b'\\');
+    let is_meta = |b: &u8| matches!(b, b'*' | b'?' | b'[' | b'{' | b'\\');
     let mut pattern = pattern.trim_ascii_end();
     pattern = pattern.strip_prefix(b"!").unwrap_or(pattern);
+    let anchored = pattern.starts_with(b"/");
     pattern = pattern.strip_prefix(b"/").unwrap_or(pattern);
     pattern = pattern.strip_suffix(b"/").unwrap_or(pattern);
-    pattern = pattern.strip_prefix(b"**/").unwrap_or(pattern);
-    if !pattern.iter().any(is_meta) {
+    let (any_depth, rest) = match pattern.strip_prefix(b"**/") {
+        Some(rest) => (true, rest),
+        None => (!anchored && !pattern.contains(&b'/'), pattern),
+    };
+    if !rest.iter().any(is_meta) {
         return false;
     }
-    match pattern.strip_prefix(b"*.") {
-        Some(ext) => ext.is_empty() || ext.iter().any(|b| is_meta(b) || matches!(b, b'/' | b'.')),
-        None => true,
-    }
+    let ext = rest.strip_prefix(b"*.").filter(|_| any_depth);
+    !ext.is_some_and(|ext| {
+        !ext.is_empty() && !ext.iter().any(|b| is_meta(b) || matches!(b, b'/' | b'.'))
+    })
 }
 
 /// The ignore rules for what is directly in one directory: the
@@ -907,6 +991,8 @@ impl Rules {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::super::linked::long_chain;
     use super::*;
 
@@ -975,10 +1061,10 @@ mod tests {
         std::fs::create_dir_all(ws.join(".git")).unwrap();
         std::fs::create_dir_all(ws.join("r/.git")).unwrap();
         let now = Budget {
-            time: Duration::ZERO,
+            clock: Clock::Wall(Duration::ZERO),
             ..Budget::DEFAULT
         };
-        let rules = read_ignore_rules_with_budget(&ws, None, now);
+        let rules = read_ignore_rules_with_budget(&ws, None, now.clone());
         assert!(rules.incomplete(), "{rules:?}");
         let index = discover_with_budget(&ws, None, &IgnoreRules::default(), now);
         assert!(index.incomplete, "{index:?}");
@@ -986,20 +1072,9 @@ mod tests {
     }
 
     /// Wildcard patterns of the kind that made matchers take gigabytes (at
-    /// 3,000 of them, matched against names like [`adversarial_name`]).
+    /// 3,000 of them, matched against names like `a1a8a15...bbc`).
     fn adversarial_patterns(count: usize) -> String {
         (0..count).map(|i| format!("*a{i}*b*c*/\n")).collect()
-    }
-
-    /// A name that keeps many of [`adversarial_patterns`] partly matched.
-    fn adversarial_name(j: usize) -> String {
-        let mut name = String::new();
-        let mut i = j;
-        while name.len() < 200 {
-            name.push_str(&format!("a{i}"));
-            i += 7;
-        }
-        name + "bbc"
     }
 
     /// Writes `text` to `dir/name` and has `walk` read it as an ignore file.
@@ -1062,36 +1137,80 @@ mod tests {
     }
 
     #[test]
-    fn the_clock_is_looked_at_while_directories_are_matched() {
-        // As costly a matcher as one may be, and 2,000 directories that keep
-        // it busy: seconds of matching, with no directory read in between.
-        let (_d, ws) = workspace();
-        std::fs::create_dir(ws.join(".git")).unwrap();
-        std::fs::write(ws.join(".gitignore"), adversarial_patterns(200)).unwrap();
-        for j in 0..2000 {
-            std::fs::create_dir(ws.join(adversarial_name(j))).unwrap();
+    fn the_patterns_the_matcher_tests_in_its_regex_set_are_wild() {
+        // As globset (glob.rs, `MatchStrategy::new`) sorts gitignore globs,
+        // which have `literal_separator` on: only literals, and `*.ext` at
+        // any depth (`**/*.ext`, which git's matcher makes of a pattern with
+        // no `/`), stay out of it.
+        for wild in [
+            "{a,b}",
+            "x{1,2}y/",
+            "/*.log",
+            "!/*.log",
+            "dir/*.log",
+            "**/dir/*.log",
+            "*a*",
+            "a?b",
+            "[Dd]ebug/",
+            "*suffix",
+            "prefix*",
+            "*.tar.gz",
+            "*.",
+            "foo/**",
+            "a/**/b",
+            "**",
+            "*",
+            "\\*.log",
+        ] {
+            assert!(is_wild(wild.as_bytes()), "{wild} is wild");
         }
-        let started = Instant::now();
-        let soon = Budget {
-            time: Duration::from_millis(200),
-            ..Budget::DEFAULT
-        };
-        let rules = read_ignore_rules_with_budget(&ws, None, soon);
-        let took = started.elapsed();
-        assert!(rules.incomplete(), "{rules:?}");
-        assert!(took < Duration::from_millis(1500), "{took:?}");
+        for plain in [
+            "*.log",
+            "!*.log",
+            "*.log  ",
+            "*.d/",
+            "**/*.log",
+            "/**/*.log",
+            "name",
+            "name/",
+            "!name",
+            "/name",
+            "dir/sub",
+            "**/name",
+            "**/foo/bar",
+        ] {
+            assert!(!is_wild(plain.as_bytes()), "{plain} is looked up");
+        }
     }
 
-    /// `run()`, which must finish within 10 seconds, and how long it took.
-    fn timed<T: Send + 'static>(run: impl FnOnce() -> T + Send + 'static) -> (T, Duration) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let started = Instant::now();
-            let value = run();
-            let _ = tx.send((value, started.elapsed()));
-        });
-        rx.recv_timeout(Duration::from_secs(10))
-            .expect("took longer than 10s")
+    /// A clock that runs with the walk's work, its time up once `deadline`
+    /// of the budget is spent, and what it saw.
+    fn work_clock(deadline: usize) -> (Clock, Arc<Meter>) {
+        let meter = Arc::new(Meter::default());
+        let clock = Clock::Work {
+            deadline,
+            meter: Arc::clone(&meter),
+        };
+        (clock, meter)
+    }
+
+    #[test]
+    fn the_clock_is_looked_at_while_directories_are_matched() {
+        // Matching a directory against rules at the wildcard cap takes
+        // milliseconds: with 2,000 in one directory, and no entry read
+        // between them, the clock must be looked at for each.
+        let (_d, ws) = workspace();
+        for j in 0..2000 {
+            std::fs::create_dir(ws.join(format!("d{j}"))).unwrap();
+        }
+        let (clock, meter) = work_clock(usize::MAX);
+        let budget = Budget {
+            clock,
+            ..Budget::DEFAULT
+        };
+        discover_with_budget(&ws, None, &IgnoreRules::default(), budget);
+        let looks = meter.looks.load(Ordering::Relaxed);
+        assert!(looks >= 2000, "{looks} looks");
     }
 
     /// `holders` directories whose `.git` leads through three long symlink
@@ -1112,78 +1231,85 @@ mod tests {
     }
 
     #[test]
-    fn long_symlink_chains_do_not_outlast_the_deadline() {
-        let (_d, ws) = workspace();
-        chained_holders(&ws, 3);
-        let soon = Budget {
-            time: Duration::from_millis(50),
-            ..Budget::DEFAULT
-        };
-        let (index, took) =
-            timed(move || discover_with_budget(&ws, None, &IgnoreRules::default(), soon));
-        assert!(index.incomplete, "{index:?}");
-        assert!(took < Duration::from_secs(2), "{took:?}");
-    }
-
-    #[test]
     fn many_holders_sharing_long_chains_cost_little() {
         let (_d, ws) = workspace();
         chained_holders(&ws, 20);
-        let (index, took) = timed(move || {
-            discover_with_budget(&ws, None, &IgnoreRules::default(), Budget::DEFAULT)
-        });
+        let (clock, meter) = work_clock(usize::MAX);
+        let budget = Budget {
+            clock,
+            ..Budget::DEFAULT
+        };
+        let index = discover_with_budget(&ws, None, &IgnoreRules::default(), budget);
         assert_eq!(index.dot_gits.len(), 20, "{:?}", index.dot_gits);
-        // Each resolution looks at over 10,000 entries: past what one may.
+        // Each resolution would look at over 10,000 entries, and gives up
+        // at `MAX_LOOKUPS`.
         assert!(index.incomplete, "{index:?}");
-        assert!(took < Duration::from_secs(3), "{took:?}");
+        let spent = meter.spent.load(Ordering::Relaxed);
+        assert!(spent <= 20 * MAX_LOOKUPS + 1000, "{spent} spent");
     }
 
     #[test]
     fn the_clock_is_looked_at_before_each_resolution() {
+        // 60 holders whose `.git` goes through long symlink chains. The time
+        // is up during the first resolution (it takes `MAX_LOOKUPS`, far more
+        // than the few hundred entries listed before it).
         let (_d, ws) = workspace();
         chained_holders(&ws, 60);
-        // What one resolution costs here (it gives up at `MAX_LOOKUPS`).
-        let one = (0..3)
-            .map(|_| {
-                let started = Instant::now();
-                let mut allowance = Allowance::new(MAX_LOOKUPS, MAX_RESOLVED_PATH);
-                linked_gitdirs_at(&ws.join("h0"), &ws, &mut allowance);
-                assert!(allowance.ran_out);
-                started.elapsed()
-            })
-            .min()
-            .unwrap();
-        // Each holder is one step: without a look at the clock before each
-        // resolution, the next would come about 14 holders in.
-        let soon = Budget {
-            time: one * 3,
+        let (clock, _) = work_clock(1000);
+        let budget = Budget {
+            clock,
             ..Budget::DEFAULT
         };
-        let (index, took) =
-            timed(move || discover_with_budget(&ws, None, &IgnoreRules::default(), soon));
+        let index = discover_with_budget(&ws, None, &IgnoreRules::default(), budget);
         assert!(index.incomplete, "{index:?}");
-        assert!(took < one * 8, "{took:?} for {one:?} each");
+        // Noticed before the next resolution: at most the holder listed
+        // then is indexed too. (Each holder is one step, so without that
+        // look the walk would go on to the next every-64-steps look.)
+        assert!(index.dot_gits.len() <= 2, "{:?}", index.dot_gits);
     }
 
     #[test]
     fn a_walk_that_ends_past_its_deadline_says_so() {
         let (_d, ws) = workspace();
-        // One resolution of about 2,700 entries, all of it after the last
-        // look at the clock (the gitdir is outside, so nothing follows it).
+        // One resolution of about 2,700 entries, and nothing after it but
+        // the end of the walk (the gitdir is outside, so nothing follows).
         long_chain(&ws, "a", 30, "/nonexistent-harness-gitdir");
         std::fs::create_dir(ws.join("h")).unwrap();
         std::os::unix::fs::symlink("../a0", ws.join("h/.git")).unwrap();
-        let soon = Budget {
-            time: Duration::from_millis(2),
+        // The time is up during that resolution.
+        let (clock, meter) = work_clock(100);
+        let budget = Budget {
+            clock,
             ..Budget::DEFAULT
         };
-        let (index, took) =
-            timed(move || discover_with_budget(&ws, None, &IgnoreRules::default(), soon));
-        assert!(
-            took > Duration::from_millis(2),
-            "too fast to test: {took:?}"
-        );
+        let index = discover_with_budget(&ws, None, &IgnoreRules::default(), budget);
+        assert!(meter.spent.load(Ordering::Relaxed) > 2000);
         assert!(index.incomplete, "{index:?}");
+    }
+
+    #[test]
+    fn links_stop_being_recorded_past_their_cap() {
+        let (_d, ws) = workspace();
+        std::fs::create_dir(ws.join("gd")).unwrap();
+        long_chain(&ws, "a", 3, "gd");
+        std::os::unix::fs::symlink("a0", ws.join(".git")).unwrap();
+        let none = IgnoreRules::default();
+        let bytes = |links: &BTreeSet<PathBuf>| -> usize {
+            links.iter().map(|link| link.as_os_str().len()).sum()
+        };
+        let full = discover_with_budget(&ws, None, &none, Budget::DEFAULT);
+        assert!(!full.incomplete, "{full:?}");
+        let all = bytes(&full.links);
+        assert!(full.links.len() > 200, "{}", full.links.len());
+        let capped = Budget {
+            links_bytes: all / 2,
+            ..Budget::DEFAULT
+        };
+        let index = discover_with_budget(&ws, None, &none, capped);
+        assert!(index.incomplete, "{index:?}");
+        let kept = bytes(&index.links);
+        assert!(kept > 0 && kept <= all / 2, "{kept} of {all}");
+        assert_eq!(index.gitdirs, full.gitdirs);
     }
 
     #[test]

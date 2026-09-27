@@ -542,35 +542,50 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn the_entries_on_the_way_are_deduplicated_in_linear_time() {
-        let (_d, ws) = workspace();
+    /// A workspace whose `.git` goes through three chains of `links` long
+    /// links each (see [`long_chain`]): `.git` to a gitfile naming the second
+    /// chain, to a gitdir whose `commondir` names the third.
+    fn chained(links: usize) -> (tempfile::TempDir, PathBuf) {
+        let (dir, ws) = workspace();
         mkdirs(&ws, "gd");
         mkdirs(&ws, "common");
-        // `.git` -> 38 links -> a gitfile naming 39 links -> a gitdir whose
-        // `commondir` names 39 more: over 10,000 entries on the way.
-        long_chain(&ws, "a", 38, "gitfile");
-        std::fs::write(
-            ws.join("gitfile"),
-            format!("gitdir: {}\n", ws.join("b0").display()),
-        )
-        .unwrap();
-        long_chain(&ws, "b", 39, "gd");
+        long_chain(&ws, "a", links - 1, "gitfile");
+        let gitfile = format!("gitdir: {}\n", ws.join("b0").display());
+        std::fs::write(ws.join("gitfile"), gitfile).unwrap();
+        long_chain(&ws, "b", links, "gd");
         std::fs::write(ws.join("gd/commondir"), "../c0\n").unwrap();
-        long_chain(&ws, "c", 39, "common");
+        long_chain(&ws, "c", links, "common");
         symlink("a0", ws.join(".git")).unwrap();
+        (dir, ws)
+    }
+
+    /// How long [`linked_gitdirs`] takes on `ws` at best, of three tries, on
+    /// a thread that must finish within 10 seconds.
+    fn fastest(ws: &Path) -> Duration {
+        let dir = ws.to_path_buf();
         let (tx, rx) = mpsc::channel();
-        let dir = ws.clone();
         std::thread::spawn(move || {
-            let started = Instant::now();
-            let found = linked_gitdirs(&dir);
-            let _ = tx.send((found, started.elapsed()));
+            let times = (0..3).map(|_| {
+                let started = Instant::now();
+                let found = linked_gitdirs(&dir);
+                assert_eq!(found.gitdirs, vec![dir.join("gd"), dir.join("common")]);
+                started.elapsed()
+            });
+            let _ = tx.send(times.min().unwrap());
         });
-        let (found, took) = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("took longer than 10s");
-        assert_eq!(found.gitdirs, vec![ws.join("gd"), ws.join("common")]);
-        assert!(found.entries.len() > 10_000, "{}", found.entries.len());
-        assert!(took < Duration::from_secs(2), "{took:?}");
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("took longer than 10s")
+    }
+
+    #[test]
+    fn the_entries_on_the_way_are_deduplicated_in_linear_time() {
+        // About 2,600 and 10,500 entries on the way: four times as many take
+        // about four times as long, not sixteen. (A ratio, so it holds on a
+        // machine of any speed.)
+        let (_s, small) = chained(10);
+        let (_l, large) = chained(39);
+        assert!(linked_gitdirs(&large).entries.len() > 10_000);
+        let (small, large) = (fastest(&small), fastest(&large));
+        assert!(large < small * 8, "{large:?} against {small:?}");
     }
 }

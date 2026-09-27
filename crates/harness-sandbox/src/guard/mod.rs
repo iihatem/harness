@@ -635,6 +635,7 @@ impl State {
             snapshot,
             detached: self.detached.clone(),
             survivors,
+            unfinished: self.findings.left_after > 0,
             found: List::default(),
             left_over: 0,
             quarantine: None,
@@ -978,6 +979,9 @@ struct Kept {
     /// Whether processes a sandboxed command started were running when the
     /// guard finished, or at any check since.
     survivors: bool,
+    /// Whether the last check stopped at [`MAX_CHANGES`] with changes left:
+    /// the next one goes on with them.
+    unfinished: bool,
     /// What the checks since found.
     found: List,
     /// Changes the last check did not make, past [`MAX_CHANGES`].
@@ -988,8 +992,9 @@ struct Kept {
 
 impl Kept {
     /// Moves protected names planted since the command ended to quarantine,
-    /// and if processes it left running may have changed things, restores
-    /// the protected files and gitfiles.
+    /// and if processes it left running may have changed things, or the
+    /// command's guard stopped with changes left, undoes the changes to the
+    /// protected files and gitfiles.
     fn check(&mut self, tree: &Tree, quarantine: &mut Quarantine, survivors: bool) {
         self.survivors |= survivors;
         let mut pass = Pass::new(tree, quarantine);
@@ -1003,11 +1008,12 @@ impl Kept {
             let taken = pass.take(&path, What::New);
             self.found.push(taken);
         }
-        if self.survivors
+        if (self.survivors || self.unfinished)
             && let Some(snapshot) = &self.snapshot
         {
             let detached = &self.detached;
             pass.undo(snapshot, |path| below_any(detached, path), &mut self.found);
+            self.unfinished = pass.refused > 0;
         }
         self.left_over = pass.refused;
         pass.report_unlocked(&mut self.found);

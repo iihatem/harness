@@ -269,6 +269,18 @@ fn twenty_thousand_planted_hooks_take_bounded_work_and_a_bounded_report() {
     // A free name in quarantine is found at the first try, not by a search.
     let probes = lock(&state).quarantine.probes();
     assert!(probes <= 10_000, "{probes} names tried for 10,000 moves");
+    // The next command's guard goes on where this one stopped.
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(
+        report.message.starts_with("[before this command ran"),
+        "{}",
+        report.message
+    );
+    assert_eq!(std::fs::read_dir(&hooks).unwrap().count(), 1);
 }
 
 #[test]

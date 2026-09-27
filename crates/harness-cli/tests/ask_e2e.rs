@@ -103,6 +103,31 @@ async fn ask_runs_a_multi_step_task_and_prints_the_final_answer() {
     );
 }
 
+// Review Focus: the model's final answer is model-controlled text, so a prompt-injected ANSI/OSC
+// escape in it must never reach the terminal raw — but an ordinary multi-line answer must still
+// print as multiple lines, not one line full of literal `\n`s.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_final_answer_escapes_ansi_but_keeps_newlines() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(stream(&[text_chunk("\u{1b}[31mred\nline two")]))
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri(), "model = \"mock/test-model\"");
+    let output =
+        tokio::task::spawn_blocking(move || env.cmd().args(["ask", "hi"]).output().unwrap())
+            .await
+            .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "raw ESC byte in stdout: {stdout:?}"
+    );
+    assert!(stdout.contains("\\u{1b}[31m"), "{stdout:?}");
+    assert!(stdout.contains("red\nline two"), "{stdout:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn json_output_is_one_event_per_line_ending_with_turn_finished() {
     let server = MockServer::start().await;

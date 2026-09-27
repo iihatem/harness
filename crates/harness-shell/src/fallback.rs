@@ -194,14 +194,15 @@ struct Shared {
 }
 
 /// Where the lines of a text end, by the text bash may compare with a here-document
-/// delimiter: `(joined, stripped, text)`. A joined line is a line ending in an odd
-/// number of backslashes joined with the lines after it; a stripped one has its leading
-/// tabs removed, as `<<-` does to a whole joined line.
-struct Lines(HashMap<(bool, bool, String), Vec<usize>>);
+/// delimiter, in four variants: `[plain, stripped, joined, joined and stripped]`. A
+/// joined line is a line ending in an odd number of backslashes joined with the lines
+/// after it; a stripped one has its leading tabs removed, as `<<-` does to a whole joined
+/// line.
+struct Lines(HashMap<String, [Vec<usize>; 4]>);
 
 impl Lines {
     fn new(src: &[char]) -> Self {
-        let mut map: HashMap<(bool, bool, String), Vec<usize>> = HashMap::new();
+        let mut map: HashMap<String, [Vec<usize>; 4]> = HashMap::new();
         let mut add = |joined: bool, text: &str, after: usize| {
             for stripped in [false, true] {
                 let text = if stripped {
@@ -209,9 +210,8 @@ impl Lines {
                 } else {
                     text
                 };
-                map.entry((joined, stripped, text.to_owned()))
-                    .or_default()
-                    .push(after);
+                let variant = 2 * usize::from(joined) + usize::from(stripped);
+                map.entry(text.to_owned()).or_default()[variant].push(after);
             }
         };
         let (mut at, mut joined, mut parts) = (0, String::new(), 0);
@@ -243,12 +243,10 @@ impl Lines {
     /// its body from `from`, ends: the start of the line after it.
     fn ends(&self, readings: &[String], strip_tabs: bool, from: usize) -> Vec<usize> {
         let mut ends = Vec::new();
-        for reading in readings {
+        for variants in readings.iter().filter_map(|r| self.0.get(r.as_str())) {
             for joined in [false, true] {
-                let key = (joined, strip_tabs, reading.clone());
-                if let Some(after) = self.0.get(&key)
-                    && let Some(&end) = after.get(after.partition_point(|&p| p <= from))
-                {
+                let after = &variants[2 * usize::from(joined) + usize::from(strip_tabs)];
+                if let Some(&end) = after.get(after.partition_point(|&p| p <= from)) {
                     ends.push(end);
                 }
             }
@@ -294,6 +292,8 @@ struct Splitter {
     legacy: bool,
     done: bool,
     shared: Shared,
+    /// The first newline at or after some position at or before [`Splitter::at`].
+    newline: Option<usize>,
     /// Here-document bodies this text is nested in.
     depth: usize,
     /// Outer contexts of the open substitutions.
@@ -337,6 +337,7 @@ impl Splitter {
             legacy: false,
             done: false,
             shared: Shared::default(),
+            newline: None,
             depth,
             stack: Vec::new(),
             backticks: 0,
@@ -788,13 +789,30 @@ impl Splitter {
         (body, continued)
     }
 
+    /// The start of the line after the current one.
+    fn next_line(&mut self) -> usize {
+        let newline = match self.newline.filter(|&n| n >= self.at) {
+            Some(n) => n,
+            None => self.src[self.at..]
+                .iter()
+                .position(|&c| c == '\n')
+                .map_or(self.src.len(), |p| self.at + p),
+        };
+        self.newline = Some(newline);
+        (newline + 1).min(self.src.len())
+    }
+
     /// Stops trusting where here-documents end (see [`Splitter::lost`]); those pending
     /// only give restart points.
     fn lose_track(&mut self) {
+        // Once lost, every here-document pushed is untracked already.
+        if self.lost.is_some() {
+            return;
+        }
         for doc in &mut self.heredocs {
             doc.delimiter = None;
         }
-        if self.track && self.lost.is_none() {
+        if self.track {
             let line = self.src[..self.at]
                 .iter()
                 .rposition(|&c| c == '\n')
@@ -857,10 +875,7 @@ impl Splitter {
         if !self.legacy && first < self.heredocs.len() {
             let docs = self.heredocs.split_off(first);
             self.lose_track();
-            let next_line = self.src[self.at..]
-                .iter()
-                .position(|&c| c == '\n')
-                .map_or(self.src.len(), |p| self.at + p + 1);
+            let next_line = self.next_line();
             self.untracked(docs.into_iter(), next_line);
         }
         if let Some(f) = self.stack.pop() {
@@ -1125,6 +1140,8 @@ mod tests {
         for src in [
             format!("{}{}", "$(".repeat(40_000), "cat <<X ".repeat(40_000)),
             format!("{}{}", "cat <<X ".repeat(40_000), "$(\n".repeat(40_000)),
+            format!("cat {}\n(", "<<\\A ".repeat(40_000)),
+            "$(cat <<E)".repeat(20_000),
         ] {
             let start = std::time::Instant::now();
             rough_commands(&src);

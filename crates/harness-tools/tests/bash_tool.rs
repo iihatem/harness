@@ -224,13 +224,17 @@ impl GuardLog {
 }
 
 /// Runs `program` (or `/nonexistent/program` with `broken`) directly, with a guard that logs
-/// `finish` and returns `report`.
+/// `finish` and returns `report` (or, with `panics`, a guard whose `finish` panics instead).
+/// `denial` is what `is_denial` returns, so a test can force the exit-code heuristic to mark a
+/// result `sandbox_denied` and check a blocking guard report clears that flag.
 #[derive(Debug)]
 struct GuardedSandbox {
     log: Arc<GuardLog>,
     report: Option<GuardReport>,
     broken: bool,
     fail_prepare: bool,
+    denial: bool,
+    panics: bool,
 }
 
 struct LoggingGuard {
@@ -242,6 +246,15 @@ impl CommandGuard for LoggingGuard {
     fn finish(self: Box<Self>) -> Option<GuardReport> {
         self.log.events.lock().unwrap().push("finished".into());
         self.report
+    }
+}
+
+/// A guard whose `finish` panics, so `bash.rs`'s `spawn_blocking` join fails.
+struct PanickingGuard;
+
+impl CommandGuard for PanickingGuard {
+    fn finish(self: Box<Self>) -> Option<GuardReport> {
+        panic!("the guard exploded");
     }
 }
 
@@ -268,7 +281,7 @@ impl CommandSandbox for GuardedSandbox {
     }
 
     fn is_denial(&self, _exit_code: Option<i32>, _output: &str) -> bool {
-        false
+        self.denial
     }
 
     fn prepare(
@@ -282,12 +295,17 @@ impl CommandSandbox for GuardedSandbox {
             return Err(std::io::Error::other("no way"));
         }
         self.log.events.lock().unwrap().push("prepared".into());
-        Ok(SandboxedCommand {
-            command: self.command(access, workspace, program, args)?,
-            guard: Some(Box::new(LoggingGuard {
+        let guard: Box<dyn CommandGuard> = if self.panics {
+            Box::new(PanickingGuard)
+        } else {
+            Box::new(LoggingGuard {
                 log: self.log.clone(),
                 report: self.report.clone(),
-            })),
+            })
+        };
+        Ok(SandboxedCommand {
+            command: self.command(access, workspace, program, args)?,
+            guard: Some(guard),
         })
     }
 }
@@ -296,6 +314,15 @@ fn guarded(
     report: Option<GuardReport>,
     broken: bool,
 ) -> (tempfile::TempDir, ToolContext, Arc<GuardLog>) {
+    guarded_with(report, broken, false)
+}
+
+/// As `guarded`, but also controls what `is_denial` returns.
+fn guarded_with(
+    report: Option<GuardReport>,
+    broken: bool,
+    denial: bool,
+) -> (tempfile::TempDir, ToolContext, Arc<GuardLog>) {
     let dir = tempfile::tempdir().unwrap();
     let log = Arc::new(GuardLog::default());
     let sandbox = GuardedSandbox {
@@ -303,6 +330,8 @@ fn guarded(
         report,
         broken,
         fail_prepare: false,
+        denial,
+        panics: false,
     };
     let ctx = ToolContext::new(dir.path())
         .with_sandbox(Some(Arc::new(sandbox)), FsAccess::WorkspaceWrite);
@@ -408,6 +437,8 @@ async fn a_sandbox_that_cannot_prepare_runs_nothing() {
         report: None,
         broken: false,
         fail_prepare: true,
+        denial: false,
+        panics: false,
     };
     let ctx = ToolContext::new(dir.path())
         .with_sandbox(Some(Arc::new(sandbox)), FsAccess::WorkspaceWrite);
@@ -417,4 +448,45 @@ async fn a_sandbox_that_cannot_prepare_runs_nothing() {
     assert!(out.is_error);
     assert_eq!(out.content, "failed to prepare the sandbox: no way");
     assert!(!dir.path().join("made.txt").exists());
+}
+
+#[tokio::test]
+async fn a_blocking_guard_report_clears_a_heuristic_sandbox_denial() {
+    // `exit 1` plus `denial: true` makes the exit-code heuristic in `run_command` set
+    // `sandbox_denied`; the blocking guard report must clear it and set `guard_blocked` instead,
+    // since a guard-blocked result is never offered a re-run.
+    let (_dir, ctx, log) = guarded_with(blocking_report(), false, true);
+    let out = BashTool.run(json!({"command": "exit 1"}), &ctx).await;
+    assert_eq!(log.events(), ["prepared", "finished"]);
+    assert!(
+        out.guard_blocked && out.is_error && !out.sandbox_denied,
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn a_panicking_guard_is_reported_blocked_not_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let sandbox = GuardedSandbox {
+        log: Arc::new(GuardLog::default()),
+        report: None,
+        broken: false,
+        fail_prepare: false,
+        denial: false,
+        panics: true,
+    };
+    let ctx = ToolContext::new(dir.path())
+        .with_sandbox(Some(Arc::new(sandbox)), FsAccess::WorkspaceWrite);
+    let out = BashTool.run(json!({"command": "echo hi"}), &ctx).await;
+    assert!(
+        out.is_error && out.guard_blocked && !out.sandbox_denied,
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("could not check git metadata"),
+        "{}",
+        out.content
+    );
 }

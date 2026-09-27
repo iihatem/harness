@@ -128,7 +128,7 @@ async fn finish(guard: Box<dyn CommandGuard>) -> Option<GuardReport> {
     match tokio::task::spawn_blocking(move || guard.finish()).await {
         Ok(report) => report,
         Err(e) => Some(GuardReport {
-            message: format!("[harness could not check git metadata after this command: {e}]"),
+            message: format!("[harness could not check git metadata after this command: {e}]\n"),
             blocked: true,
         }),
     }
@@ -211,12 +211,14 @@ async fn run_command(
         }
         _ = tokio::time::sleep(Duration::from_secs(secs)) => {
             kill_group(pgid);
+            reap(&mut child, pgid).await;
             reader.abort();
             let text = partial_text(&output);
             ToolOutput::error(format!("command timed out after {secs}s and was terminated\n{text}"))
         }
         _ = ctx.cancel.cancelled() => {
             kill_group(pgid);
+            reap(&mut child, pgid).await;
             reader.abort();
             let text = partial_text(&output);
             ToolOutput::error(format!("command interrupted by the user\n{text}"))
@@ -231,6 +233,22 @@ fn kill_group(pgid: Option<i32>) {
             nix::unistd::Pid::from_raw(pgid),
             nix::sys::signal::Signal::SIGKILL,
         );
+    }
+}
+
+/// Waits for the shell itself to be reaped, then polls the process group for up to about 1s,
+/// so no member of it (a background job included) is still mid-syscall when the guard's final
+/// check runs. `kill_group` must already have sent the group SIGKILL.
+async fn reap(child: &mut tokio::process::Child, pgid: Option<i32>) {
+    let _ = child.wait().await;
+    let Some(pgid) = pgid else { return };
+    let pgid = nix::unistd::Pid::from_raw(pgid);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
+    while nix::sys::signal::killpg(pgid, None).is_ok() {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

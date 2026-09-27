@@ -8,17 +8,25 @@
 //! copied: an entry that is new, replaced or written since stops the removal,
 //! and what is left is renamed in place so git no longer uses it.
 //!
-//! The quarantine directory itself is trusted: outside the workspace, and
-//! private to the user.
+//! The quarantine directory is trusted: outside the workspace, private to
+//! the user, and canonical when harness started. It is still reached without
+//! following a symlink, so one swapped in since is not used.
+//!
+//! A repository in quarantine must not be one git would use, so every `.git`
+//! is stored as `dot-git`: in the path an entry is stored at, and below a
+//! directory moved there.
 
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::nofollow::{Dir, Kind, Stat, Tree, stat_file};
+use super::nofollow::{Dir, Kind, Stat, Tree, create_dirs, stat_file};
 
 /// A copy across filesystems stops (and the entry is renamed in place
 /// instead) after this many entries,
@@ -28,6 +36,9 @@ const MAX_COPY_BYTES: u64 = 256 << 20;
 /// or this many directories deep.
 const MAX_COPY_DEPTH: usize = 32;
 
+/// How many directories in the quarantine are kept open.
+const MAX_MADE: usize = 32;
+
 /// One command's quarantine directory, `<root>/<UTC time>-<pid>-<n>`,
 /// created (private to the user) the first time something is moved into it.
 #[derive(Debug)]
@@ -35,6 +46,21 @@ pub(crate) struct Quarantine {
     root: PathBuf,
     tree: Tree,
     dir: Option<(PathBuf, Dir)>,
+    /// For each path an entry was stored at, the suffix to try next, so a
+    /// name taken again and again is not searched for a free one.
+    next: HashMap<PathBuf, u64>,
+    /// Directories made in this command's directory, by their path in it.
+    made: HashMap<PathBuf, Dir>,
+    /// The workspace directory the last entry was taken from, until
+    /// [`forget_sources`](Self::forget_sources): entries taken one after the
+    /// other from one directory are reached without walking to it each time.
+    source: Option<(PathBuf, Dir)>,
+    /// Names tried in the quarantine.
+    #[cfg(test)]
+    probes: usize,
+    /// Paths whose moves fail, for tests.
+    #[cfg(test)]
+    pub(crate) stuck: BTreeSet<PathBuf>,
 }
 
 impl Quarantine {
@@ -43,7 +69,33 @@ impl Quarantine {
             root: root.to_path_buf(),
             tree: Tree::new(workspace),
             dir: None,
+            next: HashMap::new(),
+            made: HashMap::new(),
+            source: None,
+            #[cfg(test)]
+            probes: 0,
+            #[cfg(test)]
+            stuck: BTreeSet::new(),
         }
+    }
+
+    /// Forgets the workspace directory it last took an entry from: a check
+    /// begins, and walks to each directory afresh.
+    pub(crate) fn forget_sources(&mut self) {
+        self.source = None;
+    }
+
+    /// Closes every directory it holds open: nothing more will be moved.
+    pub(crate) fn close(&mut self) {
+        self.source = None;
+        self.made.clear();
+        self.dir = None;
+    }
+
+    /// How many names were tried in the quarantine.
+    #[cfg(test)]
+    pub(crate) fn probes(&self) -> usize {
+        self.probes
     }
 
     /// Moves `path`, which is below the workspace, into the quarantine
@@ -70,13 +122,22 @@ impl Quarantine {
         rename: impl Fn(&Dir, &OsStr, &Dir, &OsStr) -> io::Result<()>,
         after_copy: impl FnOnce(),
     ) -> io::Result<PathBuf> {
-        let (parent, name) = self.tree.parent(path)?;
-        parent.stat(&name)?;
+        #[cfg(test)]
+        if self.stuck.contains(path) {
+            return Err(io::Error::other("stuck, for a test"));
+        }
+        let (parent, name) = self.parent(path)?;
+        let found = parent.stat(&name)?;
         let Ok((dest_dir, dest_name, dest)) = self.destination(path) else {
             return rename_in_place(&parent, &name, path);
         };
         match rename(&parent, &name, &dest_dir, &dest_name) {
-            Ok(()) => Ok(dest),
+            Ok(()) => {
+                if found.kind == Kind::Dir {
+                    neutralize(&dest_dir, &dest_name);
+                }
+                Ok(dest)
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Err(err),
             Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
                 let copy = Copy {
@@ -91,17 +152,70 @@ impl Quarantine {
         }
     }
 
+    /// The workspace directory `path` is in, and its name there.
+    fn parent(&mut self, path: &Path) -> io::Result<(Dir, OsString)> {
+        let above = path.parent().unwrap_or(path);
+        if let Some((dir_path, dir)) = &self.source
+            && dir_path == above
+            && let Some(name) = path.file_name()
+        {
+            return Ok((dir.try_clone()?, name.to_os_string()));
+        }
+        let (dir, name) = self.tree.parent(path)?;
+        self.source = Some((above.to_path_buf(), dir.try_clone()?));
+        Ok((dir, name))
+    }
+
     /// A free name in the quarantine directory for `path`, and the
-    /// directory to create it in, with its parents created.
+    /// directory to create it in, with its parents created: at `path`
+    /// relative to the workspace, with every `.git` stored as `dot-git`, and
+    /// a numbered name (`HEAD.1`) when that is taken.
     fn destination(&mut self, path: &Path) -> io::Result<(Dir, OsString, PathBuf)> {
         let rel = path
             .strip_prefix(self.tree.root())
             .map_err(|_| io::Error::other("outside the workspace"))?;
-        let name = rel
-            .file_name()
-            .ok_or_else(|| io::Error::other("nothing to quarantine"))?;
+        let name = stored(
+            rel.file_name()
+                .ok_or_else(|| io::Error::other("nothing to quarantine"))?,
+        );
+        let within: PathBuf = rel
+            .parent()
+            .into_iter()
+            .flat_map(Path::iter)
+            .map(stored)
+            .collect();
+        let (dest, dir) = self.made_dir(&within)?;
+        let key = dest.join(name);
+        let first = self.next.get(&key).copied().unwrap_or(0);
+        for n in first..first + 10_000 {
+            let mut free = name.to_os_string();
+            if n > 0 {
+                free.push(format!(".{n}"));
+            }
+            #[cfg(test)]
+            {
+                self.probes += 1;
+            }
+            match dir.stat(&free) {
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    self.next.insert(key, n + 1);
+                    return Ok((dir, free.clone(), dest.join(free)));
+                }
+                Err(err) => return Err(err),
+                Ok(_) => {}
+            }
+        }
+        Err(io::Error::other("no free name in the quarantine"))
+    }
+
+    /// The directory `within` this command's directory, made with its
+    /// parents the first time, and its path.
+    fn made_dir(&mut self, within: &Path) -> io::Result<(PathBuf, Dir)> {
         let (mut dest, mut dir) = self.command_dir()?;
-        for component in rel.parent().into_iter().flat_map(Path::iter) {
+        if let Some(made) = self.made.get(within) {
+            return Ok((dest.join(within), made.try_clone()?));
+        }
+        for component in within {
             match dir.mkdir(component, 0o700) {
                 Ok(()) => dir.open_dir(component)?.set_mode(0o700)?,
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
@@ -110,20 +224,11 @@ impl Quarantine {
             dir = dir.open_dir(component)?;
             dest.push(component);
         }
-        let mut free = name.to_os_string();
-        for n in 1..10_000 {
-            match dir.stat(&free) {
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    return Ok((dir, free.clone(), dest.join(free)));
-                }
-                Err(err) => return Err(err),
-                Ok(_) => {
-                    free = name.to_os_string();
-                    free.push(format!(".{n}"));
-                }
-            }
+        if self.made.len() >= MAX_MADE {
+            self.made.clear();
         }
-        Err(io::Error::other("no free name in the quarantine"))
+        self.made.insert(within.to_path_buf(), dir.try_clone()?);
+        Ok((dest, dir))
     }
 
     /// This command's directory, created the first time.
@@ -132,11 +237,7 @@ impl Quarantine {
             return Ok((path.clone(), dir.try_clone()?));
         }
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.root)?;
-        let root = Dir::open(&self.root)?;
+        let root = create_dirs(&self.root, 0o700)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -291,7 +392,7 @@ fn copy(
             names.sort();
             let mut children = Vec::with_capacity(names.len());
             for child in names {
-                let copied = copy(&dir, &child, &into, &child, budget, depth + 1)?;
+                let copied = copy(&dir, &child, &into, stored(&child), budget, depth + 1)?;
                 children.push((child, copied));
             }
             into.set_mode((opened.mode & 0o777) | 0o700)?;
@@ -348,6 +449,69 @@ fn remove_copy(dir: &Dir, name: &OsStr, depth: usize) -> io::Result<()> {
         remove_copy(&inner, &child, depth + 1)?;
     }
     dir.remove(name, true)
+}
+
+/// How `name` is stored in quarantine: `.git` as `dot-git`.
+fn stored(name: &OsStr) -> &OsStr {
+    if name == ".git" {
+        OsStr::new("dot-git")
+    } else {
+        name
+    }
+}
+
+/// Renames every `.git` below the directory `name` in `dir`, just moved into
+/// quarantine, to `dot-git`: no git run in the quarantine may take it for a
+/// repository. Stops after [`MAX_COPY_ENTRIES`] entries or
+/// [`MAX_COPY_DEPTH`] levels.
+fn neutralize(dir: &Dir, name: &OsStr) {
+    if let Ok(inner) = dir.open_dir(name) {
+        let mut left = MAX_COPY_ENTRIES;
+        neutralize_below(&inner, 0, &mut left);
+    }
+}
+
+fn neutralize_below(dir: &Dir, depth: usize, left: &mut usize) {
+    if depth > MAX_COPY_DEPTH {
+        return;
+    }
+    let Ok(names) = dir.entries() else {
+        return;
+    };
+    for mut name in names {
+        let Some(fewer) = left.checked_sub(1) else {
+            return;
+        };
+        *left = fewer;
+        if name == ".git" {
+            match rename_to_dot_git(dir, &name) {
+                Ok(renamed) => name = renamed,
+                Err(_) => continue,
+            }
+        }
+        if dir.stat(&name).is_ok_and(|stat| stat.kind == Kind::Dir)
+            && let Ok(inner) = dir.open_dir(&name)
+        {
+            neutralize_below(&inner, depth + 1, left);
+        }
+    }
+}
+
+/// Renames `name` in `dir` to `dot-git`, or `dot-git.<n>` when that is
+/// taken.
+fn rename_to_dot_git(dir: &Dir, name: &OsStr) -> io::Result<OsString> {
+    for n in 0..100 {
+        let mut to = OsString::from("dot-git");
+        if n > 0 {
+            to.push(format!(".{n}"));
+        }
+        match dir.rename_new(name, dir, &to) {
+            Ok(()) => return Ok(to),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::other("no free name for it"))
 }
 
 /// Renames `name` in `parent`, at `path`, to `<name>.harness-quarantine-<n>`
@@ -438,7 +602,7 @@ mod tests {
         std::fs::write(ws.join(".git/hooks/pre-commit"), "echo hi\n").unwrap();
         let mut q = Quarantine::new(&root, &ws);
         let dest = q.take(&ws.join(".git/hooks/pre-commit")).unwrap();
-        assert!(dest.ends_with(".git/hooks/pre-commit"), "{dest:?}");
+        assert!(dest.ends_with("dot-git/hooks/pre-commit"), "{dest:?}");
         assert_eq!(read(&dest), "echo hi\n");
         assert!(!ws.join(".git/hooks/pre-commit").exists());
         let command_dir = std::fs::read_dir(&root)
@@ -448,7 +612,7 @@ mod tests {
             .unwrap()
             .path();
         assert!(dest.starts_with(&command_dir));
-        for dir in [&command_dir, &command_dir.join(".git/hooks")] {
+        for dir in [&command_dir, &command_dir.join("dot-git/hooks")] {
             let mode = std::fs::metadata(dir).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700, "{dir:?}");
         }
@@ -556,6 +720,57 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_is_stored_as_dot_git_at_any_depth() {
+        let (_d, ws, root) = dirs();
+        std::fs::create_dir_all(ws.join("sub/.git/hooks")).unwrap();
+        std::fs::create_dir_all(ws.join("sub/.git/inner/.git")).unwrap();
+        std::fs::write(ws.join("sub/.git/inner/.git/config"), "inner").unwrap();
+        std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+        std::fs::write(ws.join(".git/hooks/x"), "hook").unwrap();
+        std::fs::create_dir_all(ws.join("two/.git/inner/.git")).unwrap();
+        let mut q = Quarantine::new(&root, &ws);
+        let dest = q.take(&ws.join("sub/.git")).unwrap();
+        assert!(dest.ends_with("sub/dot-git"), "{dest:?}");
+        assert_eq!(read(&dest.join("inner/dot-git/config")), "inner");
+        assert!(!exists(&dest.join("inner/.git")));
+        let hook = q.take(&ws.join(".git/hooks/x")).unwrap();
+        assert!(hook.ends_with("dot-git/hooks/x"), "{hook:?}");
+        // Across filesystems as well.
+        let copied = q.take_with(&ws.join("two/.git"), across, || {}).unwrap();
+        assert!(copied.ends_with("two/dot-git"), "{copied:?}");
+        assert!(copied.join("inner/dot-git").is_dir());
+        assert!(!exists(&copied.join("inner/.git")));
+    }
+
+    #[test]
+    fn a_free_name_is_found_without_searching() {
+        let (_d, ws, root) = dirs();
+        let mut q = Quarantine::new(&root, &ws);
+        let mut last = PathBuf::new();
+        for i in 0..200 {
+            std::fs::write(ws.join("HEAD"), format!("{i}")).unwrap();
+            last = q.take(&ws.join("HEAD")).unwrap();
+        }
+        assert_eq!(last.file_name().unwrap(), "HEAD.199");
+        assert_eq!(read(&last), "199");
+        assert!(q.probes() <= 200, "{} names tried", q.probes());
+    }
+
+    #[test]
+    fn a_quarantine_root_reached_through_a_symlink_is_not_used() {
+        // The root was canonical when the session started; then something
+        // swapped it for a symlink.
+        let (_d, ws, root) = dirs();
+        let outside = ws.parent().unwrap().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, &root).unwrap();
+        std::fs::write(ws.join("HEAD"), "ref: x\n").unwrap();
+        let moved = Quarantine::new(&root, &ws).take(&ws.join("HEAD")).unwrap();
+        assert_eq!(moved, ws.join("HEAD.harness-quarantine-0"));
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
     fn across_filesystems_nothing_that_was_not_copied_is_removed() {
         let (_d, ws, root) = dirs();
         let outside = ws.parent().unwrap().join("outside");
@@ -599,7 +814,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .path()
-            .join("sub/.git");
+            .join("sub/dot-git");
         assert_eq!(read(&copy.join("config")), "copied");
         assert_eq!(read(&copy.join("objects/o")), "object");
         assert_eq!(read(&copy.join("hooks/x")), "hook");

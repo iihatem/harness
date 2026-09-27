@@ -278,10 +278,26 @@ impl Dir {
     pub(crate) fn rename_new(&self, name: &OsStr, to: &Dir, to_name: &OsStr) -> io::Result<()> {
         let from = plain_name(name)?;
         let dest = plain_name(to_name)?;
-        if let Some(renamed) = rename_exclusive(self.raw(), &from, to.raw(), &dest) {
-            return renamed;
+        match rename_exclusive(self.raw(), &from, to.raw(), &dest) {
+            Some(renamed) => renamed,
+            None => self.rename_looking_first(name, to, to_name),
         }
-        // No exclusive rename on this filesystem: look, then rename.
+    }
+
+    /// [`rename_new`](Self::rename_new) where the system or filesystem has
+    /// no exclusive rename: looks, then renames. Something put at `to_name`
+    /// between the two would be replaced. For a file or symlink that window
+    /// is accepted; a directory could replace an empty directory, so it is
+    /// refused.
+    fn rename_looking_first(&self, name: &OsStr, to: &Dir, to_name: &OsStr) -> io::Result<()> {
+        let from = plain_name(name)?;
+        let dest = plain_name(to_name)?;
+        if self.stat(name)?.kind == Kind::Dir {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this filesystem cannot rename a directory without the risk of replacing one",
+            ));
+        }
         match to.stat(to_name) {
             Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -362,6 +378,65 @@ impl Drop for Stream {
     fn drop(&mut self) {
         // SAFETY: the stream is open, and closed only here.
         unsafe { libc::closedir(self.0) };
+    }
+}
+
+/// Opens the directory at the absolute `path`, which was canonical when
+/// harness started, creating it and its missing parents with `mode`. No
+/// symlink is followed in any component: one swapped in since makes it fail.
+pub(crate) fn create_dirs(path: &Path, mode: u32) -> io::Result<Dir> {
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(invalid("not an absolute path"));
+    }
+    let names: Vec<&OsStr> = components
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name),
+            _ => Err(invalid("not a path of plain names")),
+        })
+        .collect::<io::Result<_>>()?;
+    let mut dir = Dir::open(Path::new("/"))?;
+    for (i, name) in names.iter().enumerate() {
+        let last = i + 1 == names.len();
+        let next = if last {
+            dir.open_dir(name)
+        } else {
+            dir.pass_through(name)
+        };
+        dir = match next {
+            Ok(next) => next,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let created = match dir.mkdir(name, mode) {
+                    Ok(()) => true,
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => false,
+                    Err(err) => return Err(err),
+                };
+                let made = dir.open_dir(name)?;
+                if created {
+                    made.set_mode(mode)?;
+                }
+                made
+            }
+            Err(err) => return Err(err),
+        };
+    }
+    Ok(dir)
+}
+
+impl Dir {
+    /// The directory `name` in this one, when it is not a symlink, opened
+    /// only to reach what is below it: on Linux with `O_PATH`, which needs
+    /// no read permission on it.
+    fn pass_through(&self, name: &OsStr) -> io::Result<Dir> {
+        #[cfg(target_os = "linux")]
+        {
+            let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            Ok(Dir {
+                fd: self.open_at(name, flags, 0)?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.open_dir(name)
     }
 }
 
@@ -814,6 +889,45 @@ mod tests {
         );
         let err = c.rename_new(os("file"), &a, os("again")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn without_an_exclusive_rename_a_directory_is_not_renamed() {
+        // As on a filesystem that cannot rename without replacing: a
+        // directory could replace an empty one, so it is refused.
+        let (_d, base) = tree();
+        let a = Tree::new(&base).dir(&base.join("a")).unwrap();
+        let err = a.rename_looking_first(os("b"), &a, os("b2")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+        assert!(base.join("a/b").is_dir());
+        std::fs::write(base.join("a/file"), "x").unwrap();
+        std::fs::write(base.join("a/other"), "y").unwrap();
+        let err = a
+            .rename_looking_first(os("file"), &a, os("other"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        a.rename_looking_first(os("file"), &a, os("moved")).unwrap();
+        assert_eq!(std::fs::read_to_string(base.join("a/moved")).unwrap(), "x");
+        assert_eq!(std::fs::read_to_string(base.join("a/other")).unwrap(), "y");
+    }
+
+    #[test]
+    fn directories_are_made_down_a_trusted_path_without_following_symlinks() {
+        let (_d, base) = tree();
+        let made = create_dirs(&base.join("new/one"), 0o700).unwrap();
+        assert_eq!(made.stat_self().unwrap().kind, Kind::Dir);
+        let mode = std::fs::metadata(base.join("new/one"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(
+            create_dirs(&base.join("a/b"), 0o700).is_ok(),
+            "already there"
+        );
+        let err = create_dirs(&base.join("link/made"), 0o700).unwrap_err();
+        assert!(absent(&err), "{err}");
+        assert!(!base.join("a/made").exists());
     }
 
     #[test]

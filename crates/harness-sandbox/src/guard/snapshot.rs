@@ -90,6 +90,14 @@ pub(crate) enum Difference {
     Added,
 }
 
+/// What a [`Snapshot::walk`] does after it has handed an entry on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Next {
+    Go,
+    /// Look at the entry again: it was unreachable, and may not be now.
+    Again,
+}
+
 /// The recorded entries, parents before children.
 #[derive(Debug, Default)]
 pub(crate) struct Snapshot {
@@ -243,22 +251,33 @@ impl Snapshot {
     /// looked at when its turn comes, after `act` has undone what came
     /// before it: a directory whose permissions `act` put back is looked
     /// into.
+    ///
+    /// For an entry it cannot reach, `act` may make it reachable (give a
+    /// directory above it its permissions back) and answer [`Next::Again`]:
+    /// the entry is then looked at once more.
     pub(crate) fn walk(
         &self,
         tree: &Tree,
         skip: impl Fn(&Path) -> bool,
-        mut act: impl FnMut(&Path, Difference),
+        mut act: impl FnMut(&Path, Difference) -> Next,
     ) {
         let mut unreachable: Vec<&Path> = Vec::new();
         for (path, node) in &self.nodes {
             if skip(path) || unreachable.iter().any(|above| path.starts_with(above)) {
                 continue;
             }
-            if let Some(difference) = difference(tree, path, node) {
-                if difference == Difference::Unreachable {
-                    unreachable.push(path);
+            let mut found = difference(tree, path, node);
+            if let Some(first) = found
+                && act(path, first) == Next::Again
+            {
+                found = difference(tree, path, node);
+                if let Some(second) = found {
+                    act(path, second);
                 }
-                act(path, difference);
+            }
+            if found == Some(Difference::Unreachable) {
+                unreachable.push(path);
+                continue;
             }
             if let Node::Dir { whole: true, .. } = node {
                 for added in self.added(tree, path) {
@@ -279,6 +298,7 @@ impl Snapshot {
             |_| false,
             |path, difference| {
                 found.push((path.to_path_buf(), difference));
+                Next::Go
             },
         );
         found
@@ -696,6 +716,7 @@ mod tests {
                 if difference == Difference::Permissions {
                     snapshot.restore(&tree, path).unwrap();
                 }
+                Next::Go
             },
         );
         assert_eq!(
@@ -712,11 +733,41 @@ mod tests {
                 |path| path.starts_with(&hooks),
                 |path, d| {
                     found.push((path.to_path_buf(), d));
+                    Next::Go
                 },
             );
             found
         };
         assert!(skipped.is_empty(), "{skipped:?}");
+    }
+
+    #[test]
+    fn an_entry_made_reachable_again_is_looked_at_again() {
+        let (_d, tree, git) = gitdir();
+        let snapshot = Snapshot::take(&tree, &roots(&git), true);
+        std::fs::write(git.join("hooks/post-checkout"), "evil\n").unwrap();
+        std::fs::set_permissions(&git, PermissionsExt::from_mode(0o000)).unwrap();
+        let mut found = Vec::new();
+        snapshot.walk(
+            &tree,
+            |_| false,
+            |path, difference| {
+                found.push((path.to_path_buf(), difference));
+                if difference == Difference::Unreachable {
+                    std::fs::set_permissions(&git, PermissionsExt::from_mode(0o755)).unwrap();
+                    return Next::Again;
+                }
+                Next::Go
+            },
+        );
+        std::fs::set_permissions(&git, PermissionsExt::from_mode(0o755)).unwrap();
+        // SAFETY: no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let mut expected = vec![(git.join("hooks/post-checkout"), Difference::Added)];
+        if !root {
+            expected.insert(0, (git.join("config"), Difference::Unreachable));
+        }
+        assert_eq!(found, expected);
     }
 
     #[test]

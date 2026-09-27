@@ -10,41 +10,59 @@
 //!   ended (a process that command left running may have planted them), and
 //!   in the basic tier, when such processes were running, restores the
 //!   protected files they changed ([`GuardSession::set_survivor_probe`]);
-//! - indexes the workspace ([`discover`], with the ignore rules read once per
-//!   session: [`GuardSession::prime`]) and records which protected names
-//!   exist, and in the basic tier saves the protected files;
+//! - indexes the workspace ([`discover`](crate::gitmeta::discover), with the
+//!   ignore rules read once per session: [`GuardSession::prime`]) and records
+//!   which protected names exist, and in the basic tier saves the protected
+//!   files;
 //! - while it runs (a watcher calls [`WatchHandle::check`]) and after it
 //!   ends, moves to quarantine every new protected name, new gitdir and
 //!   replaced `.git`, and restores changed protected files;
 //! - after it ends, also walks the workspace for new `.git` entries.
 //!
+//! What the next command's checks compare against is what the guard restores
+//! to, the state before the command, never what is on disk after it: a
+//! process the command left running may write while the guard finishes.
+//!
 //! Nothing is ever deleted: it is moved to `<quarantine root>/<time>-<pid>-<n>/`
-//! at its path relative to the workspace. Nothing in the workspace is reached
-//! through a symlink either ([`nofollow`]): a command, or a process it left
-//! running, can swap a directory for one at any moment.
+//! at its path relative to the workspace, with every `.git` stored as
+//! `dot-git`. Nothing in the workspace is reached through a symlink either
+//! ([`nofollow`]): a command, or a process it left running, can swap a
+//! directory for one at any moment. When a directory's owner lost the
+//! permissions the guard needs, the guard gives them back and says so.
 
 mod nofollow;
 mod quarantine;
 mod report;
 mod snapshot;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use harness_core::tool::GuardReport;
 
 use crate::gitmeta::{
-    GITDIR_PROTECTED, GitIndex, IgnoreRules, WORKSPACE_PROTECTED, discover, nested_gitdirs,
-    read_ignore_rules,
+    Budget, GITDIR_PROTECTED, GitIndex, IgnoreRules, WORKSPACE_PROTECTED, discover_with_budget,
+    nested_gitdirs, read_ignore_rules,
 };
-use nofollow::{Kind, Tree, absent};
+use nofollow::{Dir, Kind, Stat, Tree, absent};
 use quarantine::Quarantine;
-use report::{Finding, Findings, Outcome, What, push};
-use snapshot::{Difference, Snapshot};
+use report::{Finding, Findings, List, Outcome, What};
+use snapshot::{Difference, Next, Snapshot};
+
+/// How many changes one check undoes (moves, restores). It stops there, and
+/// reports how many more there were: the check holds the guard's lock.
+const MAX_CHANGES: usize = 10_000;
+
+/// How many linked-worktree and submodule gitdirs the guard records beyond
+/// the ones the scan found.
+const MAX_NESTED: usize = 10_000;
 
 /// Says whether processes that sandboxed commands started are still running
 /// after those commands ended. The Linux sandbox sets one; the default says
@@ -58,6 +76,8 @@ pub struct GuardSession {
     quarantine_root: PathBuf,
     probe: Mutex<SurvivorProbe>,
     workspaces: Mutex<BTreeMap<PathBuf, Workspace>>,
+    #[cfg(test)]
+    hooks: Mutex<TestHooks>,
 }
 
 impl fmt::Debug for GuardSession {
@@ -67,6 +87,18 @@ impl fmt::Debug for GuardSession {
             .field("workspaces", &self.workspaces)
             .finish_non_exhaustive()
     }
+}
+
+/// What tests change about a session.
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks {
+    /// The budget of every scan, in place of the default one.
+    budget: Option<Budget>,
+    /// Runs once, right after the next scan of a workspace.
+    after_scan: Option<Box<dyn FnOnce() + Send>>,
+    /// Paths whose moves to quarantine fail.
+    stuck: BTreeSet<PathBuf>,
 }
 
 /// What a session keeps for one workspace.
@@ -85,13 +117,17 @@ struct Workspace {
 }
 
 impl GuardSession {
-    /// A session whose quarantined entries go below `quarantine_root`.
+    /// A session whose quarantined entries go below `quarantine_root`, which
+    /// is spelled canonically here, while harness starts: afterwards it is
+    /// reached without following a symlink.
     pub fn new(quarantine_root: &Path) -> Arc<GuardSession> {
         let default: SurvivorProbe = Arc::new(|| false);
         Arc::new(GuardSession {
             quarantine_root: canonical_as_far_as_it_exists(quarantine_root),
             probe: Mutex::new(default),
             workspaces: Mutex::default(),
+            #[cfg(test)]
+            hooks: Mutex::default(),
         })
     }
 
@@ -138,6 +174,34 @@ impl GuardSession {
         probe()
     }
 
+    /// Scans `workspace` with the session's rules.
+    fn scan(&self, workspace: &Path, rules: &IgnoreRules) -> GitIndex {
+        #[cfg(test)]
+        let budget = lock(&self.hooks).budget.clone().unwrap_or(Budget::DEFAULT);
+        #[cfg(not(test))]
+        let budget = Budget::DEFAULT;
+        let index = discover_with_budget(workspace, Some(&self.quarantine_root), rules, budget);
+        #[cfg(test)]
+        {
+            let after_scan = lock(&self.hooks).after_scan.take();
+            if let Some(after_scan) = after_scan {
+                after_scan();
+            }
+        }
+        index
+    }
+
+    fn quarantine(&self, workspace: &Path) -> Quarantine {
+        let quarantine = Quarantine::new(&self.quarantine_root, workspace);
+        #[cfg(test)]
+        let quarantine = {
+            let mut quarantine = quarantine;
+            quarantine.stuck = lock(&self.hooks).stuck.clone();
+            quarantine
+        };
+        quarantine
+    }
+
     /// Starts guarding one command in the canonical `workspace`: see the
     /// module docs. `placeholders` runs after the workspace is indexed and
     /// before the existing protected names are recorded (the Linux full tier
@@ -153,17 +217,22 @@ impl GuardSession {
     ) -> GitGuard {
         let rules = self.rules(workspace);
         let tree = Tree::new(workspace);
-        let mut quarantine = Quarantine::new(&self.quarantine_root, workspace);
+        let mut quarantine = self.quarantine(workspace);
         let mut findings = Findings::default();
         if let Some(mut kept) = self.take_kept(workspace) {
             let survivors = self.survivors();
             kept.check(&tree, &mut quarantine, survivors);
             findings.before = kept.found;
+            findings.left_before = kept.left_over;
         }
 
-        let index = discover(workspace, Some(&self.quarantine_root), &rules);
+        let index = self.scan(workspace, &rules);
         placeholders(&index);
-        let candidates = candidates(workspace, &index.gitdirs);
+        // What an incomplete scan did not reach is still known: the
+        // linked-worktree and submodule gitdirs in each gitdir it found.
+        let nested = nested_in(&index.gitdirs);
+        let gitdirs: BTreeSet<PathBuf> = index.gitdirs.union(&nested).cloned().collect();
+        let candidates = candidates(workspace, &gitdirs);
         let existing: BTreeSet<PathBuf> = candidates
             .iter()
             .filter(|path| may_exist(&tree, path))
@@ -176,7 +245,7 @@ impl GuardSession {
             .chain(&index.links)
             .map(|path| (path.clone(), Tracked::new(Identity::of(&tree, path))))
             .collect();
-        let top_existed = exists(&tree, &workspace.join(".git"));
+        let top_existed = may_exist(&tree, &workspace.join(".git"));
         // A gitfile names the gitdir git uses, so it is saved like the
         // protected files.
         let roots: Vec<PathBuf> = existing
@@ -193,6 +262,8 @@ impl GuardSession {
                 tree,
                 save_all,
                 index,
+                gitdirs,
+                nested,
                 candidates,
                 existing,
                 identities,
@@ -252,6 +323,7 @@ impl GuardSession {
     /// handle was made.
     fn check_between(&self, workspace: &Path, generation: u64) {
         let survivors = self.survivors();
+        let mut quarantine = self.quarantine(workspace);
         let mut workspaces = lock(&self.workspaces);
         let Some(entry) = workspaces.get_mut(workspace) else {
             return;
@@ -262,10 +334,9 @@ impl GuardSession {
         let Some(kept) = entry.kept.as_mut() else {
             return;
         };
-        let mut quarantine = kept
-            .quarantine
-            .take()
-            .unwrap_or_else(|| Quarantine::new(&self.quarantine_root, workspace));
+        if let Some(used) = kept.quarantine.take() {
+            quarantine = used;
+        }
         kept.check(&Tree::new(workspace), &mut quarantine, survivors);
         kept.quarantine = Some(quarantine);
     }
@@ -308,17 +379,13 @@ impl GitGuard {
     }
 
     /// Runs every check once more, walks the workspace for new `.git`
-    /// entries, keeps where things stand for the checks before the next
-    /// command, and says what was done, if anything.
+    /// entries, keeps what the checks before the next command compare
+    /// against, and says what was done, if anything.
     pub fn finish(self) -> Option<GuardReport> {
         let mut state = lock(&self.state);
         state.check();
         let rules = self.session.rules(&state.workspace);
-        let now = discover(
-            &state.workspace,
-            Some(&self.session.quarantine_root),
-            &rules,
-        );
+        let now = self.session.scan(&state.workspace, &rules);
         let new: Vec<PathBuf> = now
             .dot_gits
             .difference(&state.index.dot_gits)
@@ -327,16 +394,27 @@ impl GitGuard {
         if state.index.incomplete {
             // Both scans may have missed different parts: what the second
             // found may have been there all along.
-            state.findings.unchecked = new;
+            state.findings.unchecked.extend(new);
         } else {
             // What the first scan did not find is new, whether or not the
             // second one was complete.
+            let State {
+                tree,
+                quarantine,
+                findings,
+                ..
+            } = &mut *state;
+            let mut pass = Pass::new(tree, quarantine);
             for dot_git in new {
-                state.take(&dot_git, What::Repository);
+                let taken = pass.take(&dot_git, What::Repository);
+                findings.after.push(taken);
             }
-            state.findings.uncheckable = now.incomplete;
+            findings.left_after += pass.refused;
+            pass.report_unlocked(&mut findings.after);
+            findings.uncheckable = now.incomplete;
         }
         state.finished = true;
+        state.quarantine.close();
         let kept = state.keep(self.session.survivors());
         self.session.keep(&state.workspace, kept);
         state.findings.report(&state.workspace)
@@ -371,11 +449,7 @@ impl WatchHandle {
                 if state.finished {
                     return Vec::new();
                 }
-                watched_dirs(
-                    &state.workspace,
-                    &state.index.gitdirs,
-                    Some(&state.snapshot),
-                )
+                watched_dirs(&state.tree, &state.gitdirs, Some(&state.snapshot))
             }
             Watched::Between {
                 session,
@@ -383,7 +457,7 @@ impl WatchHandle {
                 generation,
             } => session
                 .with_kept(workspace, *generation, |kept| {
-                    watched_dirs(workspace, &kept.gitdirs, kept.snapshot.as_ref())
+                    watched_dirs(&Tree::new(workspace), &kept.gitdirs, kept.snapshot.as_ref())
                 })
                 .unwrap_or_default(),
         }
@@ -400,7 +474,7 @@ impl WatchHandle {
                 let state = lock(state);
                 relevant(
                     &state.workspace,
-                    &state.index.gitdirs,
+                    &state.gitdirs,
                     Some(&state.snapshot),
                     dir,
                     name,
@@ -439,10 +513,17 @@ struct State {
     tree: Tree,
     save_all: bool,
     index: GitIndex,
+    /// The gitdirs checked: the ones indexed, and [`nested`](Self::nested).
+    gitdirs: BTreeSet<PathBuf>,
+    /// The linked-worktree and submodule gitdirs in the indexed gitdirs when
+    /// the command started, that the index lacks: an incomplete scan may not
+    /// have reached them.
+    nested: BTreeSet<PathBuf>,
     /// Every path a protected name could appear at: the protected names in
     /// each gitdir, and `.harness` and `HEAD` at the top of the workspace.
     candidates: BTreeSet<PathBuf>,
-    /// The candidates that existed when the command started.
+    /// The candidates that existed (or could not be looked at) when the
+    /// command started.
     existing: BTreeSet<PathBuf>,
     /// What each `.git` entry, gitdir and link was when the command started,
     /// and is expected to be now.
@@ -464,208 +545,443 @@ impl State {
         if self.finished {
             return;
         }
-        self.check_identities();
-        let new: Vec<PathBuf> = self
-            .candidates
-            .difference(&self.existing)
-            .filter(|path| exists(&self.tree, path))
-            .cloned()
-            .collect();
-        for path in new {
-            self.take(&path, What::New);
-        }
-        let gitdirs: Vec<PathBuf> = self
-            .index
-            .gitdirs
-            .iter()
-            .filter(|gitdir| !below_any(&self.detached, gitdir))
-            .cloned()
-            .collect();
-        for gitdir in gitdirs {
-            for found in nested_gitdirs(&gitdir) {
-                if !self.index.gitdirs.contains(&found) {
-                    self.take(&found, What::Gitdir);
-                }
-            }
-        }
-        let top = self.workspace.join(".git");
-        if !self.top_existed && exists(&self.tree, &top) {
-            self.take(&top, What::Repository);
-        }
         let State {
+            workspace,
             tree,
+            index,
+            gitdirs,
+            nested,
+            candidates,
+            existing,
+            identities,
+            detached,
+            top_existed,
             snapshot,
             quarantine,
-            detached,
             findings,
             ..
         } = self;
-        undo(
+        let mut pass = Pass::new(tree, quarantine);
+        check_identities(&mut pass, identities, snapshot, detached, findings);
+        let new: Vec<PathBuf> = candidates
+            .difference(existing)
+            .filter(|path| pass.exists(path))
+            .cloned()
+            .collect();
+        for path in new {
+            let taken = pass.take(&path, What::New);
+            findings.after.push(taken);
+        }
+        for gitdir in gitdirs.iter().filter(|gitdir| !below_any(detached, gitdir)) {
+            for found in nested_gitdirs(gitdir) {
+                if index.gitdirs.contains(&found) || nested.contains(&found) {
+                    continue;
+                }
+                if index.incomplete {
+                    // The scan may not have reached it before the command
+                    // either.
+                    findings.unchecked.insert(found);
+                } else {
+                    let taken = pass.take(&found, What::Gitdir);
+                    findings.after.push(taken);
+                }
+            }
+        }
+        let top = workspace.join(".git");
+        if !*top_existed && pass.exists(&top) {
+            let taken = pass.take(&top, What::Repository);
+            findings.after.push(taken);
+        }
+        pass.undo(
             snapshot,
-            tree,
-            quarantine,
             |path| below_any(detached, path),
             &mut findings.after,
         );
+        findings.left_after = pass.refused;
+        pass.report_unlocked(&mut findings.after);
     }
 
-    /// Quarantines whatever replaced a `.git` entry, gitdir or link, and
-    /// puts a symlink or gitfile back. Notes the ones that are gone.
-    fn check_identities(&mut self) {
-        let paths: Vec<PathBuf> = self.identities.keys().cloned().collect();
-        for path in paths {
-            let now = Identity::of(&self.tree, &path);
-            let Some(tracked) = self.identities.get(&path) else {
-                continue;
-            };
-            if now == tracked.expected {
-                continue;
-            }
-            let original = tracked.original.clone();
-            if now == Identity::Missing {
-                self.gone(&path);
-                continue;
-            }
-            if now == Identity::Unreachable {
-                let outcome = unreachable(&self.tree, &path);
-                self.after(&path, What::Unreachable, outcome);
-                self.detached.insert(path.clone());
-                self.expect(&path, now);
-                continue;
-            }
-            let moved = match self.quarantine.take(&path) {
-                Ok(moved) => moved,
-                Err(err) if nothing_there(&err) => {
-                    self.gone(&path);
-                    continue;
-                }
-                Err(err) => {
-                    let outcome = Outcome::Failed(format!("could not move it: {err}"));
-                    self.after(&path, What::Replaced, outcome);
-                    self.detached.insert(path.clone());
-                    self.expect(&path, now);
-                    continue;
-                }
-            };
-            let restored = match &original {
-                Identity::Symlink { target } => Some(
-                    self.tree
-                        .parent(&path)
-                        .and_then(|(dir, name)| dir.symlink(target, &name)),
-                ),
-                Identity::Inode { dir: false, .. } if self.snapshot.saved(&path) => {
-                    Some(self.snapshot.restore(&self.tree, &path))
-                }
-                _ => None,
-            };
-            let outcome = match restored {
-                None => Outcome::Moved(moved),
-                Some(Ok(())) => Outcome::Restored(Some(moved)),
-                Some(Err(err)) => Outcome::Failed(format!(
-                    "moved to {}, but could not put the earlier version back: {err}",
-                    moved.display()
-                )),
-            };
-            if matches!(outcome, Outcome::Restored(_)) {
-                self.detached.remove(&path);
-            } else {
-                self.detached.insert(path.clone());
-            }
-            self.expect(&path, Identity::of(&self.tree, &path));
-            self.after(&path, What::Replaced, outcome);
-        }
-    }
-
-    /// `path`, a `.git` entry, gitdir or link, is no longer where it was.
-    fn gone(&mut self, path: &Path) {
-        self.findings.gone.insert(path.to_path_buf());
-        self.detached.insert(path.to_path_buf());
-        self.expect(path, Identity::Missing);
-    }
-
-    fn expect(&mut self, path: &Path, identity: Identity) {
-        if let Some(tracked) = self.identities.get_mut(path) {
-            tracked.expected = identity;
-        }
-    }
-
-    fn after(&mut self, path: &Path, what: What, outcome: Outcome) {
-        let finding = Finding {
-            path: path.to_path_buf(),
-            what,
-            outcome,
-        };
-        push(&mut self.findings.after, Some(finding));
-    }
-
-    fn take(&mut self, path: &Path, what: What) {
-        push(
-            &mut self.findings.after,
-            take(&mut self.quarantine, path, what),
-        );
-    }
-
-    /// Where things stand now that the command has ended and the guard has
-    /// undone what it could: the gitdirs still where they were, the
-    /// protected names in them and at the top of the workspace, and in the
-    /// basic tier the protected files and gitfiles as they are now.
-    fn keep(&self, survivors: bool) -> Kept {
+    /// What the checks until the next command compare against: the state
+    /// before this command, which the guard restored, never what is on disk
+    /// now. The names that existed before the command and still may; the
+    /// gitdirs that were directories then and are still the ones indexed;
+    /// and in the basic tier the snapshot taken before the command.
+    fn keep(&mut self, survivors: bool) -> Kept {
         let gitdirs: BTreeSet<PathBuf> = self
-            .index
             .gitdirs
             .iter()
             .filter(|gitdir| !below_any(&self.detached, gitdir))
-            .filter(|gitdir| self.tree.stat(gitdir).is_ok_and(|s| s.kind == Kind::Dir))
+            .filter(|gitdir| {
+                self.identities.get(*gitdir).is_none_or(|tracked| {
+                    matches!(tracked.original, Identity::Inode { dir: true, .. })
+                })
+            })
             .cloned()
             .collect();
         let candidates = candidates(&self.workspace, &gitdirs);
-        let existing: BTreeSet<PathBuf> = candidates
-            .iter()
+        // An intersection can only shrink: nothing planted or left
+        // unmoved since the command started gets in.
+        let existing: BTreeSet<PathBuf> = self
+            .existing
+            .intersection(&candidates)
             .filter(|path| may_exist(&self.tree, path))
             .cloned()
             .collect();
-        let snapshot = self.save_all.then(|| {
-            let dot_gits: BTreeSet<PathBuf> = self
-                .index
-                .dot_gits
-                .iter()
-                .filter(|dot_git| !below_any(&self.detached, dot_git))
-                .cloned()
-                .collect();
-            let roots: Vec<PathBuf> = existing
-                .iter()
-                .cloned()
-                .chain(gitfiles(&self.tree, &dot_gits))
-                .collect();
-            Snapshot::take(&self.tree, &roots, true)
-        });
+        let snapshot = self.save_all.then(|| std::mem::take(&mut self.snapshot));
         Kept {
             gitdirs,
             candidates,
             existing,
             snapshot,
+            detached: self.detached.clone(),
             survivors,
-            found: Vec::new(),
+            found: List::default(),
+            left_over: 0,
             quarantine: None,
         }
     }
 }
 
-/// Where things stood when a command's guard finished, for the checks until
-/// the next command begins.
+/// Quarantines whatever replaced a `.git` entry, gitdir or link, and puts a
+/// symlink or gitfile back. Notes the ones that are gone.
+fn check_identities(
+    pass: &mut Pass,
+    identities: &mut BTreeMap<PathBuf, Tracked>,
+    snapshot: &Snapshot,
+    detached: &mut BTreeSet<PathBuf>,
+    findings: &mut Findings,
+) {
+    for (path, tracked) in identities.iter_mut() {
+        let now = pass.identity(path);
+        if now == tracked.expected {
+            continue;
+        }
+        let finding = |what, outcome| {
+            Some(Finding {
+                path: path.clone(),
+                what,
+                outcome,
+            })
+        };
+        match now {
+            Identity::Missing => {
+                findings.gone.insert(path.clone());
+                detached.insert(path.clone());
+                tracked.expected = now;
+                continue;
+            }
+            Identity::Unreachable => {
+                findings
+                    .after
+                    .push(finding(What::Unreachable, pass.unreachable(path)));
+                detached.insert(path.clone());
+                tracked.expected = now;
+                continue;
+            }
+            Identity::Symlink { .. } | Identity::Inode { .. } => {}
+        }
+        let moved = match pass.move_out(path) {
+            None => continue,
+            Some(Ok(moved)) => moved,
+            Some(Err(err)) if nothing_there(&err) => {
+                findings.gone.insert(path.clone());
+                detached.insert(path.clone());
+                tracked.expected = Identity::Missing;
+                continue;
+            }
+            Some(Err(err)) => {
+                let outcome = Outcome::Failed(format!("could not move it: {err}"));
+                findings.after.push(finding(What::Replaced, outcome));
+                detached.insert(path.clone());
+                tracked.expected = now;
+                continue;
+            }
+        };
+        let restored = match &tracked.original {
+            Identity::Symlink { target } => Some(pass.retry(path, |pass| {
+                let (dir, name) = pass.tree.parent(path)?;
+                dir.symlink(target, &name)
+            })),
+            Identity::Inode { dir: false, .. } if snapshot.saved(path) => {
+                Some(pass.retry(path, |pass| snapshot.restore(pass.tree, path)))
+            }
+            _ => None,
+        };
+        let outcome = match restored {
+            None => Outcome::Moved(moved),
+            Some(Ok(())) => Outcome::Restored(Some(moved)),
+            Some(Err(err)) => Outcome::Failed(format!(
+                "moved to {}, but could not put the earlier version back: {err}",
+                moved.display()
+            )),
+        };
+        if matches!(outcome, Outcome::Restored(_)) {
+            detached.remove(path);
+        } else {
+            detached.insert(path.clone());
+        }
+        tracked.expected = Identity::of(pass.tree, path);
+        findings.after.push(finding(What::Replaced, outcome));
+    }
+}
+
+/// One check: what it may still change, and the directories whose owner
+/// permissions it gave back on the way.
+struct Pass<'a> {
+    tree: &'a Tree,
+    quarantine: &'a mut Quarantine,
+    /// Changes this check may still make.
+    left: usize,
+    /// Changes it did not make, past [`MAX_CHANGES`].
+    refused: usize,
+    unlocked: BTreeSet<PathBuf>,
+}
+
+impl<'a> Pass<'a> {
+    fn new(tree: &'a Tree, quarantine: &'a mut Quarantine) -> Pass<'a> {
+        quarantine.forget_sources();
+        Pass {
+            tree,
+            quarantine,
+            left: MAX_CHANGES,
+            refused: 0,
+            unlocked: BTreeSet::new(),
+        }
+    }
+
+    /// Whether this check may make one more change.
+    fn allow(&mut self) -> bool {
+        match self.left.checked_sub(1) {
+            Some(left) => {
+                self.left = left;
+                true
+            }
+            None => {
+                self.refused += 1;
+                false
+            }
+        }
+    }
+
+    /// `op` on `path`, and once more if it was refused for want of
+    /// permission and the guard could give the owner of a directory on the
+    /// way the permissions back.
+    fn retry<T>(
+        &mut self,
+        path: &Path,
+        mut op: impl FnMut(&mut Self) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let first = op(self);
+        if let Err(err) = &first
+            && denied(err)
+            && self.unlock(path)
+        {
+            return op(self);
+        }
+        first
+    }
+
+    /// Gives the owner read, write and search permission back on each
+    /// directory from the workspace down to `path`, `path` included, where
+    /// they lost any of them. Whether it changed anything.
+    fn unlock(&mut self, path: &Path) -> bool {
+        let root = self.tree.root();
+        let Ok(rel) = path.strip_prefix(root) else {
+            return false;
+        };
+        let mut changed = false;
+        // The workspace itself, by its trusted path.
+        if let Ok(meta) = std::fs::symlink_metadata(root)
+            && meta.is_dir()
+        {
+            let mode = meta.permissions().mode() & 0o7777;
+            if mode & 0o700 != 0o700
+                && std::fs::set_permissions(root, PermissionsExt::from_mode(mode | 0o700)).is_ok()
+            {
+                self.unlocked.insert(root.to_path_buf());
+                changed = true;
+            }
+        }
+        let Ok(mut dir) = Dir::open(root) else {
+            return changed;
+        };
+        let mut at = root.to_path_buf();
+        for name in rel {
+            let Ok(Stat {
+                kind: Kind::Dir,
+                mode,
+                ..
+            }) = dir.stat(name)
+            else {
+                break;
+            };
+            at.push(name);
+            if mode & 0o700 != 0o700 {
+                if dir.chmod(name, mode | 0o700).is_err() {
+                    break;
+                }
+                self.unlocked.insert(at.clone());
+                changed = true;
+            }
+            match dir.open_dir(name) {
+                Ok(next) => dir = next,
+                Err(_) => break,
+            }
+        }
+        changed
+    }
+
+    /// Whether anything is at `path`, reached without following a symlink,
+    /// giving the owner permissions back where that is what stops a look.
+    fn exists(&mut self, path: &Path) -> bool {
+        self.retry(path, |pass| pass.tree.stat(path)).is_ok()
+    }
+
+    /// What `path` is now, giving the owner permissions back where that is
+    /// what stops a look.
+    fn identity(&mut self, path: &Path) -> Identity {
+        let identity = Identity::of(self.tree, path);
+        if identity == Identity::Unreachable && self.unlock(path) {
+            Identity::of(self.tree, path)
+        } else {
+            identity
+        }
+    }
+
+    /// Why harness cannot look at `path`.
+    fn unreachable(&self, path: &Path) -> Outcome {
+        let why = match self.tree.stat(path) {
+            Err(err) => err.to_string(),
+            Ok(_) => "it changed while harness looked at it".into(),
+        };
+        Outcome::Failed(why)
+    }
+
+    /// Moves `path` to quarantine. `None` when this check may make no more
+    /// changes.
+    fn move_out(&mut self, path: &Path) -> Option<io::Result<PathBuf>> {
+        if !self.allow() {
+            return None;
+        }
+        Some(self.retry(path, |pass| pass.quarantine.take(path)))
+    }
+
+    /// Moves `path` to quarantine, if something is there.
+    fn take(&mut self, path: &Path, what: What) -> Option<Finding> {
+        let outcome = match self.move_out(path)? {
+            Ok(to) => Outcome::Moved(to),
+            Err(err) if nothing_there(&err) => return None,
+            Err(err) => Outcome::Failed(format!("could not move it: {err}")),
+        };
+        Some(Finding {
+            path: path.to_path_buf(),
+            what,
+            outcome,
+        })
+    }
+
+    /// Restores `path` from `snapshot`; what was there was `moved` to
+    /// quarantine, if anything (which counted as the change).
+    fn restore(
+        &mut self,
+        snapshot: &Snapshot,
+        path: &Path,
+        what: What,
+        moved: Option<PathBuf>,
+    ) -> Option<Finding> {
+        if moved.is_none() && !self.allow() {
+            return None;
+        }
+        let outcome = match self.retry(path, |pass| snapshot.restore(pass.tree, path)) {
+            Ok(()) => Outcome::Restored(moved),
+            Err(err) => match moved {
+                Some(to) => Outcome::Failed(format!(
+                    "moved to {}, but could not restore the earlier version: {err}",
+                    to.display()
+                )),
+                None => Outcome::Failed(format!("could not restore the earlier version: {err}")),
+            },
+        };
+        Some(Finding {
+            path: path.to_path_buf(),
+            what,
+            outcome,
+        })
+    }
+
+    /// Undoes each difference from `snapshot`, except below the paths `skip`
+    /// picks: moves what is new or changed to quarantine, and restores what
+    /// was there.
+    fn undo(&mut self, snapshot: &Snapshot, skip: impl Fn(&Path) -> bool, found: &mut List) {
+        let tree = self.tree;
+        snapshot.walk(tree, skip, |path, difference| {
+            let finding = match difference {
+                Difference::Unreachable => {
+                    if self.unlock(path) {
+                        return Next::Again;
+                    }
+                    Some(Finding {
+                        path: path.to_path_buf(),
+                        what: What::Unreachable,
+                        outcome: self.unreachable(path),
+                    })
+                }
+                Difference::Added => self.take(path, What::Added),
+                Difference::Changed => match self.move_out(path) {
+                    None => None,
+                    Some(Ok(moved)) => self.restore(snapshot, path, What::Changed, Some(moved)),
+                    Some(Err(err)) if nothing_there(&err) => {
+                        self.restore(snapshot, path, What::Changed, None)
+                    }
+                    Some(Err(err)) => Some(Finding {
+                        path: path.to_path_buf(),
+                        what: What::Changed,
+                        outcome: Outcome::Failed(format!("could not move it: {err}")),
+                    }),
+                },
+                // With the directory it was in gone as well, there is nowhere
+                // to restore it to; what happened to the directory is
+                // reported.
+                Difference::Missing if tree.parent(path).is_err_and(|err| absent(&err)) => None,
+                Difference::Missing => self.restore(snapshot, path, What::Deleted, None),
+                Difference::Permissions => self.restore(snapshot, path, What::Changed, None),
+            };
+            found.push(finding);
+            Next::Go
+        });
+    }
+
+    /// Reports the directories whose owner permissions this check gave back.
+    fn report_unlocked(&mut self, found: &mut List) {
+        for dir in std::mem::take(&mut self.unlocked) {
+            found.push(Some(Finding {
+                path: dir,
+                what: What::Locked,
+                outcome: Outcome::Unlocked,
+            }));
+        }
+    }
+}
+
+/// What the checks until the next command compare against: the state
+/// before the last command, which its guard restored.
 #[derive(Debug)]
 struct Kept {
     gitdirs: BTreeSet<PathBuf>,
     candidates: BTreeSet<PathBuf>,
     existing: BTreeSet<PathBuf>,
-    /// The protected files and gitfiles, after the guard's own restores
-    /// (the basic tier only).
+    /// The protected files and gitfiles before the command (the basic tier
+    /// only).
     snapshot: Option<Snapshot>,
+    /// Below these, the snapshot is not compared: see [`State::detached`].
+    detached: BTreeSet<PathBuf>,
     /// Whether processes a sandboxed command started were running when the
     /// guard finished, or at any check since.
     survivors: bool,
     /// What the checks since found.
-    found: Vec<Finding>,
+    found: List,
+    /// Changes the last check did not make, past [`MAX_CHANGES`].
+    left_over: usize,
     /// Where the checks between commands move things.
     quarantine: Option<Quarantine>,
 }
@@ -676,100 +992,44 @@ impl Kept {
     /// the protected files and gitfiles.
     fn check(&mut self, tree: &Tree, quarantine: &mut Quarantine, survivors: bool) {
         self.survivors |= survivors;
+        let mut pass = Pass::new(tree, quarantine);
         let new: Vec<PathBuf> = self
             .candidates
             .difference(&self.existing)
-            .filter(|path| exists(tree, path))
+            .filter(|path| pass.exists(path))
             .cloned()
             .collect();
         for path in new {
-            push(&mut self.found, take(quarantine, &path, What::New));
+            let taken = pass.take(&path, What::New);
+            self.found.push(taken);
         }
         if self.survivors
             && let Some(snapshot) = &self.snapshot
         {
-            undo(snapshot, tree, quarantine, |_| false, &mut self.found);
+            let detached = &self.detached;
+            pass.undo(snapshot, |path| below_any(detached, path), &mut self.found);
+        }
+        self.left_over = pass.refused;
+        pass.report_unlocked(&mut self.found);
+    }
+}
+
+/// The linked-worktree and submodule gitdirs in `gitdirs`, and in those,
+/// and so on, that `gitdirs` lacks: at most [`MAX_NESTED`].
+fn nested_in(gitdirs: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    let mut nested = BTreeSet::new();
+    let mut pending: Vec<PathBuf> = gitdirs.iter().cloned().collect();
+    while let Some(gitdir) = pending.pop() {
+        for found in nested_gitdirs(&gitdir) {
+            if nested.len() == MAX_NESTED {
+                return nested;
+            }
+            if !gitdirs.contains(&found) && nested.insert(found.clone()) {
+                pending.push(found);
+            }
         }
     }
-}
-
-/// Undoes each difference from `snapshot`, except below the paths `skip`
-/// picks: moves what is new or changed to quarantine, and restores what was
-/// there.
-fn undo(
-    snapshot: &Snapshot,
-    tree: &Tree,
-    quarantine: &mut Quarantine,
-    skip: impl Fn(&Path) -> bool,
-    found: &mut Vec<Finding>,
-) {
-    snapshot.walk(tree, skip, |path, difference| {
-        let finding = match difference {
-            Difference::Added => take(quarantine, path, What::Added),
-            Difference::Changed => match quarantine.take(path) {
-                Ok(moved) => Some(restore(snapshot, tree, path, What::Changed, Some(moved))),
-                Err(err) if nothing_there(&err) => {
-                    Some(restore(snapshot, tree, path, What::Changed, None))
-                }
-                Err(err) => Some(Finding {
-                    path: path.to_path_buf(),
-                    what: What::Changed,
-                    outcome: Outcome::Failed(format!("could not move it: {err}")),
-                }),
-            },
-            // With the directory it was in gone as well, there is nowhere to
-            // restore it to; what happened to the directory is reported.
-            Difference::Missing if tree.parent(path).is_err_and(|err| absent(&err)) => None,
-            Difference::Missing => Some(restore(snapshot, tree, path, What::Deleted, None)),
-            Difference::Permissions => Some(restore(snapshot, tree, path, What::Changed, None)),
-            Difference::Unreachable => Some(Finding {
-                path: path.to_path_buf(),
-                what: What::Unreachable,
-                outcome: unreachable(tree, path),
-            }),
-        };
-        push(found, finding);
-    });
-}
-
-/// Restores `path` from `snapshot`; what was there was `moved` to
-/// quarantine, if anything.
-fn restore(
-    snapshot: &Snapshot,
-    tree: &Tree,
-    path: &Path,
-    what: What,
-    moved: Option<PathBuf>,
-) -> Finding {
-    let outcome = match snapshot.restore(tree, path) {
-        Ok(()) => Outcome::Restored(moved),
-        Err(err) => match moved {
-            Some(to) => Outcome::Failed(format!(
-                "moved to {}, but could not restore the earlier version: {err}",
-                to.display()
-            )),
-            None => Outcome::Failed(format!("could not restore the earlier version: {err}")),
-        },
-    };
-    Finding {
-        path: path.to_path_buf(),
-        what,
-        outcome,
-    }
-}
-
-/// Moves `path` to quarantine, if something is there.
-fn take(quarantine: &mut Quarantine, path: &Path, what: What) -> Option<Finding> {
-    let outcome = match quarantine.take(path) {
-        Ok(to) => Outcome::Moved(to),
-        Err(err) if nothing_there(&err) => return None,
-        Err(err) => Outcome::Failed(format!("could not move it: {err}")),
-    };
-    Some(Finding {
-        path: path.to_path_buf(),
-        what,
-        outcome,
-    })
+    nested
 }
 
 /// Whether `err` means nothing is at the path. A symlink on the way is not
@@ -779,6 +1039,11 @@ fn nothing_there(err: &io::Error) -> bool {
         err.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
     )
+}
+
+/// Whether `err` is a refusal for want of permission.
+fn denied(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EACCES | libc::EPERM))
 }
 
 /// Every path a protected name could appear at, given `gitdirs`.
@@ -802,11 +1067,6 @@ fn gitfiles<'a>(
         .cloned()
 }
 
-/// Whether anything is at `path`, reached without following a symlink.
-fn exists(tree: &Tree, path: &Path) -> bool {
-    tree.stat(path).is_ok()
-}
-
 /// Whether something may be at `path`: it is there, or harness cannot look
 /// (a directory above it cannot be read). What harness could not see is not
 /// taken for new once it can.
@@ -814,27 +1074,18 @@ fn may_exist(tree: &Tree, path: &Path) -> bool {
     tree.stat(path).map_or_else(|err| !absent(&err), |_| true)
 }
 
-/// Why harness cannot look at `path`.
-fn unreachable(tree: &Tree, path: &Path) -> Outcome {
-    let why = match tree.stat(path) {
-        Err(err) => err.to_string(),
-        Ok(_) => "it changed while harness looked at it".into(),
-    };
-    Outcome::Failed(why)
-}
-
 /// Whether `path` is one of `paths` or below one.
 fn below_any(paths: &BTreeSet<PathBuf>, path: &Path) -> bool {
     paths.iter().any(|above| path.starts_with(above))
 }
 
-/// See [`WatchHandle::dirs`].
+/// See [`WatchHandle::dirs`]. Each is looked at without following a symlink.
 fn watched_dirs(
-    workspace: &Path,
+    tree: &Tree,
     gitdirs: &BTreeSet<PathBuf>,
     snapshot: Option<&Snapshot>,
 ) -> Vec<PathBuf> {
-    let mut dirs = vec![workspace.to_path_buf()];
+    let mut dirs = Vec::new();
     for gitdir in gitdirs {
         dirs.push(gitdir.clone());
         dirs.push(gitdir.join("worktrees"));
@@ -843,7 +1094,8 @@ fn watched_dirs(
     if let Some(snapshot) = snapshot {
         dirs.extend(snapshot.dirs().map(Path::to_path_buf));
     }
-    dirs.retain(|dir| std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()));
+    dirs.retain(|dir| tree.stat(dir).is_ok_and(|stat| stat.kind == Kind::Dir));
+    dirs.push(tree.root().to_path_buf());
     dirs.sort();
     dirs.dedup();
     dirs

@@ -53,11 +53,22 @@ fn gone(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_err()
 }
 
-/// The one entry the quarantine holds at `rel` (relative to the workspace).
+/// The one entry the quarantine holds for `rel` (relative to the workspace),
+/// where every `.git` in the path is stored as `dot-git`.
 fn quarantined(env: &Env, rel: &str) -> PathBuf {
+    let stored: PathBuf = Path::new(rel)
+        .iter()
+        .map(|name| {
+            if name == ".git" {
+                OsStr::new("dot-git")
+            } else {
+                name
+            }
+        })
+        .collect();
     let mut found: Vec<PathBuf> = std::fs::read_dir(&env.quarantine)
         .unwrap()
-        .map(|e| e.unwrap().path().join(rel))
+        .map(|e| e.unwrap().path().join(&stored))
         .filter(|p| std::fs::symlink_metadata(p).is_ok())
         .collect();
     assert_eq!(found.len(), 1, "{rel} in quarantine: {found:?}");
@@ -590,54 +601,149 @@ fn a_protected_directory_swapped_for_a_symlink_is_never_followed() {
     );
 }
 
-#[test]
-fn metadata_made_unreachable_is_reported_and_blocks_the_command() {
-    // A hook planted, then its gitdir (or the directory above a repository) made unreadable:
-    // git would pick the hook up once the permissions are put back. As root, where
-    // permissions do not stop harness, the hook is moved instead; blocked either way.
-    use std::os::unix::fs::PermissionsExt;
+/// Whether this runs as root, whom permissions do not stop.
+fn root() -> bool {
     // SAFETY: no preconditions.
-    let root = unsafe { libc::geteuid() } == 0;
+    unsafe { libc::geteuid() == 0 }
+}
+
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+#[test]
+fn metadata_locked_away_from_the_guard_is_unlocked_and_undone() {
+    // A hook planted, then its gitdir (or the directory above a repository)
+    // made unreadable: git would pick the hook up once the permissions are
+    // back. The guard gives the owner the permissions back and moves it.
+    use std::os::unix::fs::PermissionsExt;
     let env = env();
     std::fs::create_dir_all(env.ws.join("sub/.git/hooks")).unwrap();
     std::fs::write(env.ws.join("sub/.git/HEAD"), "ref: x\n").unwrap();
-    for (locked, hook, unreachable) in [
-        (
-            ".git",
-            ".git/hooks/post-checkout",
-            "\n- .git/hooks: could not be checked; ",
-        ),
-        (
-            "sub",
-            "sub/.git/hooks/post-checkout",
-            "\n- sub/.git: could not be checked; ",
-        ),
+    for (locked, hook) in [
+        (".git", ".git/hooks/post-checkout"),
+        ("sub", "sub/.git/hooks/post-checkout"),
     ] {
-        let locked = env.ws.join(locked);
+        let dir = env.ws.join(locked);
         let guard = env.session.begin(&env.ws, true, |_| {});
         std::fs::write(env.ws.join(hook), "echo pwned\n").unwrap();
-        std::fs::set_permissions(&locked, PermissionsExt::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o000)).unwrap();
         let report = guard.finish().expect("a report");
-        std::fs::set_permissions(&locked, PermissionsExt::from_mode(0o755)).unwrap();
-        assert!(report.blocked, "{locked:?}: {}", report.message);
+        let unlocked = mode(&dir) & 0o700 == 0o700;
+        std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o755)).unwrap();
+        assert!(report.blocked, "{locked}: {}", report.message);
+        assert!(root() || unlocked, "{locked}: {}", report.message);
+        assert!(gone(&env.ws.join(hook)), "{locked}: {}", report.message);
         assert!(
-            root || report.message.contains(unreachable),
-            "{locked:?}: {}",
+            root()
+                || report.message.contains(&format!(
+                    "\n- {locked}: its owner lost read, write or search permission; gave them back"
+                )),
+            "{locked}: {}",
             report.message
         );
-        let _ = std::fs::remove_file(env.ws.join(hook));
-        // With the permissions back, what was there all along is not taken for new.
+        // What was there all along is not taken for new.
         let next = env.session.begin(&env.ws, true, |_| {}).finish();
         assert!(
             next.as_ref()
                 .is_none_or(|next| !next.message.contains(": new;")),
-            "{locked:?}: {next:?}"
+            "{locked}: {next:?}"
         );
         assert_eq!(
             read(&env.ws.join(".git/config")),
             "[core]\n\tbare = false\n"
         );
     }
+}
+
+#[test]
+fn a_move_refused_for_want_of_write_permission_is_tried_again_with_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = env();
+    let git = env.ws.join(".git");
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    std::fs::write(git.join("commondir"), "/tmp/evil\n").unwrap();
+    std::fs::set_permissions(&git, PermissionsExt::from_mode(0o555)).unwrap();
+    let report = guard.finish().expect("a report");
+    let unlocked = mode(&git);
+    std::fs::set_permissions(&git, PermissionsExt::from_mode(0o755)).unwrap();
+    assert!(report.blocked);
+    assert!(gone(&git.join("commondir")), "{}", report.message);
+    assert!(
+        report
+            .message
+            .contains("\n- .git/commondir: new; moved to "),
+        "{}",
+        report.message
+    );
+    if !root() {
+        assert_eq!(unlocked, 0o755, "{}", report.message);
+        assert!(
+            report.message.contains(
+                "\n- .git: its owner lost read, write or search permission; gave them back"
+            ),
+            "{}",
+            report.message
+        );
+    }
+}
+
+/// Every entry below `dir`, at any depth.
+fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        found.push(path.clone());
+        if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+            walk(&path, found);
+        }
+    }
+}
+
+#[test]
+fn a_quarantined_repository_is_not_a_live_repository() {
+    let env = env();
+    std::fs::create_dir_all(env.ws.join(".git/modules/m")).unwrap();
+    std::fs::write(env.ws.join(".git/modules/m/HEAD"), "ref: x\n").unwrap();
+    std::fs::create_dir_all(env.ws.join("gf")).unwrap();
+    std::fs::write(env.ws.join("gf/.git"), "gitdir: ../.git/modules/m\n").unwrap();
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    // A planted repository, with another one inside it.
+    std::fs::create_dir_all(env.ws.join("sub/.git/hooks")).unwrap();
+    std::fs::write(env.ws.join("sub/.git/config"), "[core]\n\tpager = evil\n").unwrap();
+    std::fs::create_dir_all(env.ws.join("sub/.git/inner/.git")).unwrap();
+    // A replaced top-level `.git`, and a replaced gitfile.
+    std::fs::rename(env.ws.join(".git"), env.ws.join("moved")).unwrap();
+    std::fs::create_dir_all(env.ws.join(".git/hooks")).unwrap();
+    std::fs::remove_file(env.ws.join("gf/.git")).unwrap();
+    std::fs::write(env.ws.join("gf/.git"), "gitdir: /tmp/evil\n").unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(report.blocked);
+    let mut stored = Vec::new();
+    walk(&env.quarantine, &mut stored);
+    let live: Vec<_> = stored
+        .iter()
+        .filter(|path| path.file_name() == Some(OsStr::new(".git")))
+        .collect();
+    assert!(live.is_empty(), "{live:?}");
+    let repository = quarantined(&env, "sub/.git");
+    assert!(repository.ends_with("sub/dot-git"));
+    assert_eq!(read(&repository.join("config")), "[core]\n\tpager = evil\n");
+    assert!(repository.join("inner/dot-git").is_dir());
+    assert!(quarantined(&env, ".git").join("hooks").is_dir());
+    assert_eq!(read(&quarantined(&env, "gf/.git")), "gitdir: /tmp/evil\n");
+    assert!(
+        report.message.contains(&format!(
+            "\n- sub/.git: a new repository; moved to {}",
+            repository.display()
+        )),
+        "{}",
+        report.message
+    );
 }
 
 #[test]

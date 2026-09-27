@@ -16,10 +16,10 @@ use crate::wrappers::{self, Next, assigned_name, runs_programs};
 
 /// Longer input is not parsed (it is only roughly scanned for deny matches).
 const MAX_INPUT_CHARS: usize = 10_000;
-/// Longer input is not even roughly scanned, which bounds the scan's time and memory: it
-/// is undecomposable, so it prompts, and whenever a deny rule exists it counts as possibly
-/// hiding a denied command (see [`crate::Verdict::Ask`]'s `may_deny`).
-const MAX_SCAN_CHARS: usize = 262_144;
+/// Longer input, in bytes, is not even roughly scanned, which bounds the scan's time and
+/// memory: it is undecomposable, so it prompts, and whenever a deny rule exists it counts as
+/// possibly hiding a denied command (see [`crate::Verdict::Ask`]'s `may_deny`).
+const MAX_SCAN_BYTES: usize = 262_144;
 /// Builtins whose `NAME=value` operands set shell variables.
 const DECLARATION_BUILTINS: &[&str] = &["export", "declare", "typeset", "local", "readonly"];
 /// Builtins that evaluate their operands' text as arithmetic, subscripts or variable
@@ -144,13 +144,12 @@ impl Walker<'_> {
         if depth > MAX_DEPTH {
             return self.undecomposable("nested too deeply".into());
         }
-        let chars = src.chars().count();
-        if chars > MAX_SCAN_CHARS {
+        if src.len() > MAX_SCAN_BYTES {
             return self.undecomposable(format!(
-                "longer than {MAX_SCAN_CHARS} characters; not checked against deny rules"
+                "longer than {MAX_SCAN_BYTES} bytes; not checked against deny rules"
             ));
         }
-        if chars > MAX_INPUT_CHARS {
+        if src.chars().count() > MAX_INPUT_CHARS {
             self.undecomposable(format!("longer than {MAX_INPUT_CHARS} characters"));
             return self.rough_scan(src, depth);
         }

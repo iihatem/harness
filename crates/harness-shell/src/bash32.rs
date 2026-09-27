@@ -755,6 +755,10 @@ impl Reader<'_> {
     /// `parse_dparen` at a `((` (at `b[i]`, its second `(` at `b[second]`): an arithmetic
     /// command if the matching `)` is followed by another, which is skipped; otherwise bash
     /// reads the text again as a nested subshell.
+    ///
+    /// The substitutions in an arithmetic command are not checked here. That is safe only
+    /// because the analysis makes every arithmetic command undecomposable, and roughly
+    /// scans its text (`parse.rs`, `control_flow`).
     fn arithmetic_command(&self, i: usize, second: usize) -> Result<usize, Stop> {
         let inner = pair(self.b, second + 1, None, '(', ')', Flags::default(), 0)?;
         if self.b.get(inner.end + 1) == Some(&')') {
@@ -1207,11 +1211,11 @@ fn ends5(t: &[char], from: usize, depth: usize) -> Option<usize> {
             '"' => i = dquote_end5(t, i + 1, depth + 1)?,
             '`' => i = string_extract_backquote(t, i + 1)? + 1,
             '$' if next == Some('(') && t.get(i + 2) == Some(&'(') => {
-                i = arithmetic_end(t, i + 3)?;
+                i = arithmetic_end(t, i + 3, depth + 1)?;
             }
             '$' if next == Some('(') => i = ends5(t, i + 2, depth + 1)? + 1,
             '$' if next == Some('{') => i = brace_end5(t, i + 2, depth + 1)? + 1,
-            '(' if word_start && next == Some('(') => i = arithmetic_end(t, i + 2)?,
+            '(' if word_start && next == Some('(') => i = arithmetic_end(t, i + 2, depth + 1)?,
             '(' => {
                 parens += 1;
                 i += 1;
@@ -1290,7 +1294,7 @@ fn dquote_end5(t: &[char], from: usize, depth: usize) -> Option<usize> {
             '"' => return Some(i + 1),
             '`' => i = string_extract_backquote(t, i + 1)? + 1,
             '$' if next == Some('(') && t.get(i + 2) == Some(&'(') => {
-                i = arithmetic_end(t, i + 3)?;
+                i = arithmetic_end(t, i + 3, depth + 1)?;
             }
             '$' if next == Some('(') => i = ends5(t, i + 2, depth + 1)? + 1,
             '$' if next == Some('{') => i = brace_end5(t, i + 2, depth + 1)? + 1,
@@ -1328,17 +1332,21 @@ fn brace_end5(t: &[char], from: usize, depth: usize) -> Option<usize> {
 }
 
 /// The index after the `))` closing arithmetic whose text starts at `t[from]`, after its
-/// `((`: parentheses are counted and quotes skipped.
-fn arithmetic_end(t: &[char], from: usize) -> Option<usize> {
-    let mut depth = 0usize;
+/// `((`: parentheses are counted and quotes skipped. `depth` counts the constructs it is
+/// nested in.
+fn arithmetic_end(t: &[char], from: usize, depth: usize) -> Option<usize> {
+    if depth > MAX_NESTING {
+        return None;
+    }
+    let mut parens = 0usize;
     let mut i = from;
     while let Some(&c) = t.get(i) {
         match c {
             '\\' => i += 1,
             '\'' => i += t[i + 1..].iter().position(|&c| c == '\'')? + 1,
-            '"' => i = dquote_end5(t, i + 1, 1)? - 1,
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
+            '"' => i = dquote_end5(t, i + 1, depth + 1)? - 1,
+            '(' => parens += 1,
+            ')' if parens > 0 => parens -= 1,
             ')' => return (t.get(i + 1) == Some(&')')).then_some(i + 2),
             _ => {}
         }
@@ -1457,6 +1465,16 @@ mod tests {
         assert_eq!(end("$(cat <<-EOF\n\tit's\n\tEOF\n)"), Some(24));
         assert_eq!(end("$(echo $((1<<2)))"), Some(16));
         assert_eq!(end("$(cat <<EOF\nit's\n)"), None);
+        // Nesting past the limit is not followed, through arithmetic and quotes too.
+        let nest = |n: usize| {
+            let mut inner = "1".to_string();
+            for _ in 0..n {
+                inner = format!("$((\"{inner}\"))");
+            }
+            format!("$(echo {inner})")
+        };
+        assert_eq!(end(&nest(10)), Some(nest(10).chars().count() - 1));
+        assert_eq!(end(&nest(MAX_NESTING)), None);
         assert_eq!(substitution_misread(" # c"), Some(COMMENT_MISREAD));
         assert_eq!(substitution_misread("true;# c"), Some(COMMENT_MISREAD));
         assert_eq!(substitution_misread("echo a # c\n"), None);

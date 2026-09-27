@@ -62,8 +62,8 @@ fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (out, PEAK.load(Relaxed).saturating_sub(base))
 }
 
-/// Longer commands are not scanned at all.
-const MAX_SCAN_CHARS: usize = 262_144;
+/// Longer commands, in bytes, are not scanned at all.
+const MAX_SCAN_BYTES: usize = 262_144;
 const MIB: usize = 1 << 20;
 
 fn rules() -> Rules {
@@ -74,7 +74,7 @@ fn rules() -> Rules {
     }
 }
 
-/// `prefix` followed by `unit` repeated, `len` characters in all.
+/// `prefix` followed by `unit` (ASCII) repeated, `len` bytes in all.
 fn shape(prefix: &str, unit: &str, len: usize) -> String {
     let mut s = String::with_capacity(len + unit.len());
     s.push_str(prefix);
@@ -91,20 +91,34 @@ fn rough_scan_memory_is_bounded() {
     // The rough scan cannot tell where this body ends, so it splits what follows several
     // ways (see `fallback.rs`).
     let untracked = "cat <<\\EOF\nit's\nEOF\n";
-    let mut failures = Vec::new();
-    for (prefix, unit) in [
+    let mut shapes: Vec<(String, String)> = [
         (untracked, "$("),
         (untracked, "a\n"),
         ("", "a\n"),
         ("", ";"),
-    ] {
-        let cmd = shape(prefix, unit, MAX_SCAN_CHARS);
-        let (verdict, peak) = peak_during(|| evaluate(&cmd, &rules(), Path::new("/work/proj")));
+    ]
+    .iter()
+    .map(|&(prefix, unit)| {
+        let name = format!("{prefix:?} + {unit:?}");
+        (name, shape(prefix, unit, MAX_SCAN_BYTES))
+    })
+    .collect();
+    // Distinct lines of multi-byte characters, just under the limit in bytes.
+    let mut distinct = String::new();
+    for i in 0.. {
+        let line = format!("é{i}\n");
+        if distinct.len() + line.len() > MAX_SCAN_BYTES {
+            break;
+        }
+        distinct.push_str(&line);
+    }
+    shapes.push(("distinct lines of `é`".into(), distinct));
+    let mut failures = Vec::new();
+    for (name, cmd) in &shapes {
+        let (verdict, peak) = peak_during(|| evaluate(cmd, &rules(), Path::new("/work/proj")));
         let mib = peak as f64 / MIB as f64;
         if !matches!(verdict, Verdict::Ask { .. }) || peak >= 32 * MIB {
-            failures.push(format!(
-                "{prefix:?} + {unit:?}: peak {mib:.1} MiB, {verdict:?}"
-            ));
+            failures.push(format!("{name}: peak {mib:.1} MiB, {verdict:?}"));
         }
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
@@ -139,6 +153,14 @@ fn commands_over_the_scan_limit_ask() {
                 ..
             }
         ),
+        "{verdict:?}"
+    );
+    // The limit is in bytes: fewer than 262144 characters, but more bytes.
+    let wide = format!("curl x; echo {}", "é".repeat(MAX_SCAN_BYTES / 2));
+    assert!(wide.chars().count() < MAX_SCAN_BYTES && wide.len() > MAX_SCAN_BYTES);
+    let verdict = evaluate(&wide, &rules(), Path::new("/work/proj"));
+    assert!(
+        matches!(verdict, Verdict::Ask { may_deny: true, ref reason, .. } if reason.contains("262144 bytes")),
         "{verdict:?}"
     );
 }

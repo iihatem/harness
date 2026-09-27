@@ -19,6 +19,7 @@ fn policy(mode: Mode, workspace: &Path, read_dirs: Vec<PathBuf>) -> PermissionEn
         read_dirs,
         rules: Default::default(),
         sandbox_available: false,
+        writes_need_approval: false,
     })
 }
 

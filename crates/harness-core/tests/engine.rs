@@ -11,6 +11,25 @@ fn engine(mode: Mode, ws: &Path, sandbox: bool, rules: RuleSet) -> PermissionEng
         read_dirs: vec![],
         rules,
         sandbox_available: sandbox,
+        writes_need_approval: false,
+    })
+}
+
+/// Like `engine`, but with `writes_need_approval` set — the policy a too-broad workspace
+/// (`/`, `$HOME`, or an ancestor of it) gets from the CLI.
+fn engine_with_writes_needing_approval(
+    mode: Mode,
+    ws: &Path,
+    sandbox: bool,
+    rules: RuleSet,
+) -> PermissionEngine {
+    PermissionEngine::new(EngineConfig {
+        mode,
+        workspace: ws.to_path_buf(),
+        read_dirs: vec![],
+        rules,
+        sandbox_available: sandbox,
+        writes_need_approval: true,
     })
 }
 
@@ -676,6 +695,64 @@ fn writes_into_a_gitfile_gitdir_ask() {
     let e = engine(Mode::Auto, &ws2, true, RuleSet::default());
     assert!(is_ask(&e.check(&write("g/config"))));
     assert_eq!(e.check(&write("src/lib.rs")), Decision::Allow);
+}
+
+// --- writes_need_approval: a too-broad workspace makes every write ask, as in `ask` mode ---
+
+#[test]
+fn writes_need_approval_forces_asking_in_auto_and_full_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    for mode in [Mode::Auto, Mode::FullAccess] {
+        let e = engine_with_writes_needing_approval(mode, &ws, true, RuleSet::default());
+        // Ordinary writes inside the workspace, which would otherwise be auto-allowed...
+        assert!(is_ask(&e.check(&write("src/main.rs"))), "{mode}");
+        // ...including dotfiles, which is the whole point of the flag.
+        assert!(is_ask(&e.check(&write(".bashrc"))), "{mode}");
+    }
+}
+
+#[test]
+fn writes_need_approval_still_lets_deny_rules_win() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let e = engine_with_writes_needing_approval(
+        Mode::FullAccess,
+        &ws,
+        true,
+        rules(&[], &["write:secrets/*"], &[]),
+    );
+    assert!(is_deny(&e.check(&write("secrets/key.pem"))));
+}
+
+#[test]
+fn writes_need_approval_still_denies_outright_in_plan_and_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    for mode in [Mode::Plan, Mode::ReadOnly] {
+        let e = engine_with_writes_needing_approval(mode, &ws, true, RuleSet::default());
+        assert!(is_deny(&e.check(&write("a.txt"))), "{mode}");
+    }
+}
+
+#[test]
+fn writes_need_approval_still_honors_allow_rules_and_session_approvals() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let e = engine_with_writes_needing_approval(
+        Mode::Auto,
+        &ws,
+        true,
+        rules(&["write:docs/*"], &[], &[]),
+    );
+    assert_eq!(e.check(&write("docs/guide.md")), Decision::Allow);
+    assert!(is_ask(&e.check(&write("src/main.rs"))));
+    assert!(e.remember(&write("src/main.rs")));
+    assert_eq!(e.check(&write("src/main.rs")), Decision::Allow);
 }
 
 // --- The write tools ask before writing into `.harness/` or a top-level `HEAD` ---

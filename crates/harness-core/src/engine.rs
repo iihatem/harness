@@ -30,6 +30,12 @@ pub struct EngineConfig {
     pub read_dirs: Vec<PathBuf>,
     pub rules: RuleSet,
     pub sandbox_available: bool,
+    /// Set when the workspace is `/`, `$HOME`, or an ancestor of `$HOME`
+    /// (`harness_sandbox::workspace_is_too_broad`), where a writable sandbox would cover the
+    /// user's dotfiles and so is never used. Every file write then needs approval, exactly as it
+    /// would in `ask` mode, whatever the actual mode is — deny rules still win, and plan/read-only
+    /// still deny writes outright.
+    pub writes_need_approval: bool,
 }
 
 pub struct PermissionEngine {
@@ -49,6 +55,7 @@ pub struct PermissionEngine {
     /// Config `read:`/`write:` confirm rules, expanded the same way as `deny_paths`.
     confirm_paths: Vec<PathRule>,
     sandbox_available: bool,
+    writes_need_approval: bool,
     /// Where `<workspace>/.git` sends git when it is a symlink or a `gitdir:` file, resolved.
     /// Writes under it are guarded like writes under `.git`.
     linked_gitdir: Option<PathBuf>,
@@ -271,6 +278,7 @@ impl PermissionEngine {
             deny_paths,
             confirm_paths,
             sandbox_available: config.sandbox_available,
+            writes_need_approval: config.writes_need_approval,
             session_bash: Mutex::new(Vec::new()),
             session_paths: Mutex::new(HashSet::new()),
         }
@@ -444,7 +452,7 @@ impl PermissionEngine {
         if let Some(rule) = self.deny_confirm_rule(&self.deny_paths, "write", &target, &lexical) {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
-        if self.mode == Mode::FullAccess {
+        if self.mode == Mode::FullAccess && !self.writes_need_approval {
             return Decision::Allow;
         }
         if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
@@ -463,7 +471,8 @@ impl PermissionEngine {
                 inside.display()
             ));
         }
-        if self.mode == Mode::Auto
+        if (!self.writes_need_approval
+            && (self.mode == Mode::Auto || self.mode == Mode::FullAccess))
             || self
                 .allow_rule(&self.allow_paths, "write", &target)
                 .is_some()

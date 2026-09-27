@@ -141,6 +141,7 @@ pub async fn run(
             confirm: setup.config.confirm.clone(),
         },
         sandbox_available: sandboxed,
+        writes_need_approval: workspace_too_broad,
     }));
     for rule in policy.unknown_rules() {
         eprintln!(

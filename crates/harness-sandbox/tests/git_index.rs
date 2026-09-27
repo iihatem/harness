@@ -672,3 +672,35 @@ fn rules_that_could_not_all_be_read_make_every_index_incomplete() {
     let index = index_with(&ws, None, &rules);
     assert!(index.incomplete, "{index:?}");
 }
+
+// An ignore file whose matcher would be costly is not used: the matcher's
+// regex set can take gigabytes to search with.
+
+#[test]
+fn a_gitignore_whose_matcher_would_be_costly_is_not_used() {
+    let (_d, ws) = workspace();
+    gitdir(&ws, ".git");
+    let wild: String = (0..3000).map(|i| format!("*a{i}*b*c*/\n")).collect();
+    write(&ws, ".gitignore", &wild);
+    // It would ignore `a1bc`.
+    gitdir(&ws, "a1bc/r/.git");
+    let index = index(&ws, None);
+    assert_eq!(index.dot_gits, set(&ws, &[".git", "a1bc/r/.git"]));
+    assert!(index.incomplete, "{index:?}");
+}
+
+#[test]
+fn a_large_ordinary_gitignore_is_used() {
+    let (_d, ws) = workspace();
+    gitdir(&ws, ".git");
+    write(
+        &ws,
+        ".gitignore",
+        include_str!("fixtures/templates.gitignore"),
+    );
+    gitdir(&ws, "node_modules/pkg/.git");
+    gitdir(&ws, "Debug/r/.git");
+    gitdir(&ws, "crates/core/.git");
+    let index = complete(&ws, None);
+    assert_eq!(index.dot_gits, set(&ws, &[".git", "crates/core/.git"]));
+}

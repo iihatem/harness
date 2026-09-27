@@ -2,9 +2,18 @@
 //!
 //! The workspace is hostile: a sandboxed command can write any of it, and
 //! the Linux guard runs [`discover`] in the harness process around every
-//! command. So the walks never follow a symlink, open nothing but regular
-//! files (through [`read_regular`]), and stop after [`MAX_ENTRIES`]
-//! directory entries or [`MAX_TIME`].
+//! command. So the walks never follow a symlink and open nothing but regular
+//! files (through [`read_regular`]). Their cost is bounded: a budget of
+//! [`MAX_ENTRIES`] directory entries and `readlink` lookups, and a deadline
+//! of [`MAX_TIME`]. The clock is looked at every [`CLOCK_EVERY`] steps, for
+//! each directory matched against the rules, and before each symlink
+//! resolution, so a walk can run past the deadline by the work between two
+//! looks: [`CLOCK_EVERY`] directory entries or ignore files read (each
+//! bounded by [`MAX_IGNORE_BYTES`] and the pattern caps), one directory
+//! matched (bounded by [`MAX_WILD_COST`]), or one resolution of at most
+//! [`MAX_LOOKUPS`] lookups. A last look when the walk ends reports any
+//! overrun as incomplete. What the ignore matchers hold in memory is bounded
+//! by [`MAX_PATTERNS_TOTAL`] and [`MAX_WILD_COST`].
 //!
 //! The ignore rules are read once, by [`read_ignore_rules`] when a session
 //! starts, and [`discover`] reads no ignore file: a command could otherwise
@@ -25,7 +34,7 @@ use std::time::{Duration, Instant};
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
-use super::linked::{common_dir, gitdir_at, linked_gitdirs_at, noting, within};
+use super::linked::{Allowance, common_dir, gitdir_at, linked_gitdirs_at, noting, within};
 use super::read::{missing, read_regular};
 
 /// Directory entries one walk reads before it stops. Each gitdir
@@ -35,9 +44,20 @@ const MAX_ENTRIES: usize = 200_000;
 /// How long one walk may take before it stops.
 const MAX_TIME: Duration = Duration::from_secs(5);
 
-/// Steps (an entry read, a directory matched against the rules, an ignore
-/// file read) between two looks at the clock.
+/// Steps (an entry read, an ignore file read, a gitdir followed) between two
+/// looks at the clock. The clock is also looked at for each directory
+/// matched against the rules, before each symlink resolution, and when a
+/// walk ends.
 const CLOCK_EVERY: u32 = 64;
+
+/// Entries one symlink resolution (a `.git`, a gitfile, a `commondir`, and
+/// the chains they lead through) may look at, each a `readlink` charged to
+/// the budget: git's own limit of 40 symlinks lets one run to tens of
+/// thousands. Past it, the resolution gives up and the walk is incomplete.
+const MAX_LOOKUPS: usize = 4096;
+
+/// The longest path a symlink resolution may reach: `PATH_MAX` on Linux.
+const MAX_RESOLVED_PATH: usize = 4096;
 
 /// How many directories below `modules/` are searched for submodule gitdirs
 /// (a submodule's name can contain `/`).
@@ -52,9 +72,29 @@ const DATA_DIRS: [&str; 5] = ["objects", "refs", "logs", "lfs", "info"];
 const MAX_IGNORE_BYTES: u64 = 1 << 20;
 
 /// The most of all ignore files together that one reading of the rules
-/// reads: a bound on the memory and time its matchers take. None of a file
-/// past it applies.
+/// reads: a bound on the bytes read and parsed. (What the matchers built
+/// from them cost is bounded by the pattern caps below.) None of a file past
+/// it applies.
 const MAX_IGNORE_TOTAL: u64 = 4 << 20;
+
+/// Patterns one ignore file may hold. None of a larger one applies. A plain
+/// pattern costs its matcher about 1 KB (measured: 10,000 names, 12 MB).
+const MAX_PATTERNS: usize = 10_000;
+
+/// Patterns all the ignore files one reading of the rules uses may hold
+/// together: about 35 MB of matchers.
+const MAX_PATTERNS_TOTAL: usize = 30_000;
+
+/// What the wildcard patterns (see [`is_wild`]) of all the ignore files one
+/// reading uses may cost, a file's cost being how many it holds times their
+/// bytes. The matcher tests them together in one regex set, and searching
+/// it takes memory that grows with that product: measured at about 100
+/// bytes per unit at worst (3,000 patterns like `*a1*b*c*/`, 37 KB, took
+/// 5 GB; at this cap, the worst shapes found took 49 to 84 MB). A large
+/// ordinary file costs a fraction of it: GitHub's Node, Python,
+/// VisualStudio, Java, Go, macOS and JetBrains templates together, 112
+/// wildcard patterns in 1,714 bytes, cost 192,000.
+const MAX_WILD_COST: usize = 1_000_000;
 
 /// How many nested `.gitignore` files apply to one directory: each is
 /// matched against every directory below it. Below a deeper one, none do.
@@ -78,10 +118,12 @@ pub struct GitIndex {
     pub links: BTreeSet<PathBuf>,
     /// Whether the walk may have missed something, so the sets above are not
     /// the whole workspace: a directory could not be read; a gitfile or
-    /// `commondir` file is there but could not be read; a `modules/` tree
-    /// went deeper than 64 directories; the walk stopped after 200,000
-    /// directory entries or 5 seconds; or the [`IgnoreRules`] it was given
-    /// are incomplete.
+    /// `commondir` file is there but could not be read; a symlink resolution
+    /// gave up (past 4,096 lookups or a 4,096-byte path); a `modules/` tree
+    /// went deeper than 64 directories; the walk ran out of its budget of
+    /// 200,000 directory entries and lookups; it ran past 5 seconds (it
+    /// stops at the next look at the clock, so it can overrun by one step's
+    /// work); or the [`IgnoreRules`] it was given are incomplete.
     pub incomplete: bool,
 }
 
@@ -108,11 +150,14 @@ struct Recorded {
 
 impl IgnoreRules {
     /// Whether an ignore file could not be used: it was not a regular file,
-    /// could not be read, was over 1 MiB, over 4 MiB with the others read, or
-    /// the 33rd nested `.gitignore`, or held a negation the matcher cannot
-    /// take as git would. Also when a directory, gitfile or `commondir` file
-    /// could not be read, or the reading stopped after 200,000 directory
-    /// entries or 5 seconds, so ignore files may have gone unread. Every
+    /// could not be read, was over 1 MiB or over 4 MiB with the others read,
+    /// held over 10,000 patterns or over 30,000 with the others, held
+    /// wildcard patterns whose matcher would be costly, was the 33rd nested
+    /// `.gitignore`, or held a negation the matcher cannot take as git
+    /// would. Also when a directory, gitfile or `commondir` file could not be
+    /// read, a symlink resolution gave up, or the reading ran out of its
+    /// budget or past its deadline, so ignore files may have gone unread.
+    /// Every
     /// [`GitIndex`] built with these rules is then incomplete: its walk sees
     /// more than git would, never less (below a `.gitignore` that could not
     /// be used, no rules apply).
@@ -172,6 +217,7 @@ pub(crate) fn read_ignore_rules_with_budget(
         recorded: Recorded::default(),
     };
     walk_workspace(&mut walk, workspace, skip, &mut reading);
+    walk.finish();
     let mut recorded = reading.recorded;
     recorded.incomplete = walk.incomplete;
     IgnoreRules(Arc::new(recorded))
@@ -219,11 +265,14 @@ pub(crate) fn discover_with_budget(
     // those of linked worktrees and submodules.
     let mut pending: Vec<PathBuf> = index.gitdirs.iter().cloned().collect();
     while let Some(gitdir) = pending.pop() {
-        if !walk.take() {
+        if !walk.take() || !walk.in_time() {
             break;
         }
         let mut visited = Vec::new();
-        let common = noting(common_dir(&gitdir, &mut visited), &mut walk.incomplete);
+        let mut allowance = walk.allowance();
+        let common = common_dir(&gitdir, &mut visited, &mut allowance);
+        walk.charge(&allowance);
+        let common = noting(common, &mut walk.incomplete);
         // As for a gitfile: the entries on the way, but not the gitdir it
         // starts from or the directories above that.
         index.links.extend(
@@ -237,6 +286,7 @@ pub(crate) fn discover_with_budget(
             }
         }
     }
+    walk.finish();
     index.incomplete = walk.incomplete || rules.incomplete();
     index
 }
@@ -337,7 +387,9 @@ fn walk_workspace(walk: &mut Walk, workspace: &Path, skip: Option<&Path>, visit:
             if !entry.kind.is_dir() || entry.name == ".git" {
                 continue;
             }
-            if !walk.tick() {
+            // Matching a directory against the rules can take milliseconds
+            // (see `MAX_WILD_COST`): the clock is looked at for each.
+            if !walk.tick() || !walk.in_time() {
                 break;
             }
             let path = dir.join(&entry.name);
@@ -410,8 +462,10 @@ impl Visit for Indexing<'_> {
         self.index.dot_gits.insert(path.clone());
         if kind.is_dir() {
             self.index.gitdirs.insert(path);
-        } else {
-            let linked = linked_gitdirs_at(dir, self.workspace);
+        } else if walk.in_time() {
+            let mut allowance = walk.allowance();
+            let linked = linked_gitdirs_at(dir, self.workspace, &mut allowance);
+            walk.charge(&allowance);
             walk.incomplete |= linked.unreadable;
             self.index.gitdirs.extend(linked.gitdirs);
             self.index.links.extend(linked.entries);
@@ -473,6 +527,8 @@ struct Walk {
     steps: u32,
     exhausted: bool,
     ignore_bytes_left: u64,
+    patterns_left: usize,
+    wild_cost_left: usize,
     incomplete: bool,
 }
 
@@ -484,6 +540,8 @@ impl Walk {
             steps: 0,
             exhausted: false,
             ignore_bytes_left: MAX_IGNORE_TOTAL,
+            patterns_left: MAX_PATTERNS_TOTAL,
+            wild_cost_left: MAX_WILD_COST,
             incomplete: false,
         }
     }
@@ -491,17 +549,49 @@ impl Walk {
     /// Counts one step. `false`, and the walk is incomplete, once the budget
     /// is spent; the clock is looked at every [`CLOCK_EVERY`] steps.
     fn tick(&mut self) -> bool {
-        if self.exhausted {
-            return false;
-        }
-        if self.steps.is_multiple_of(CLOCK_EVERY)
-            && self.deadline.is_some_and(|d| Instant::now() >= d)
-        {
-            self.stop();
+        if self.exhausted || (self.steps.is_multiple_of(CLOCK_EVERY) && !self.in_time()) {
             return false;
         }
         self.steps = self.steps.wrapping_add(1);
         true
+    }
+
+    /// Looks at the clock: `false`, and the walk stops, past the deadline.
+    fn in_time(&mut self) -> bool {
+        if self.past_deadline() {
+            self.stop();
+        }
+        !self.exhausted
+    }
+
+    fn past_deadline(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
+    /// Ends the walk with one more look at the clock, so that an overrun
+    /// since the last is reported.
+    fn finish(&mut self) {
+        if self.past_deadline() {
+            self.incomplete = true;
+        }
+    }
+
+    /// What one symlink resolution may look at: [`MAX_LOOKUPS`], or what is
+    /// left of the budget.
+    fn allowance(&self) -> Allowance {
+        Allowance::new(self.entries_left.min(MAX_LOOKUPS), MAX_RESOLVED_PATH)
+    }
+
+    /// Charges what a resolution looked at to the budget. One that gave up
+    /// leaves the walk incomplete.
+    fn charge(&mut self, allowance: &Allowance) {
+        self.entries_left = self.entries_left.saturating_sub(allowance.spent);
+        if allowance.ran_out {
+            self.incomplete = true;
+            if self.entries_left == 0 {
+                self.stop();
+            }
+        }
     }
 
     /// Takes one entry from the budget: [`Walk::tick`], and one entry fewer.
@@ -614,16 +704,14 @@ impl Walk {
     /// its gitdir, or in the common one its `commondir` names. Missing unless
     /// that is in the workspace.
     fn exclude(&mut self, holder: &Path, workspace: &Path) -> IgnoreFile {
-        let Some(gitdir) = noting(gitdir_at(holder), &mut self.incomplete) else {
+        if !self.in_time() {
             return IgnoreFile::Missing;
-        };
-        let common = if std::fs::symlink_metadata(gitdir.join("commondir")).is_ok() {
-            match noting(common_dir(&gitdir, &mut Vec::new()), &mut self.incomplete) {
-                Some(common) => common,
-                None => return IgnoreFile::Missing,
-            }
-        } else {
-            gitdir
+        }
+        let mut allowance = self.allowance();
+        let common = self.resolve_common(holder, &mut allowance);
+        self.charge(&allowance);
+        let Some(common) = common else {
+            return IgnoreFile::Missing;
         };
         if !within(&common, workspace) {
             return IgnoreFile::Missing;
@@ -631,10 +719,26 @@ impl Walk {
         self.ignore_file(holder, &common.join("info/exclude"))
     }
 
+    /// The gitdir the `.git` in `holder` leads to, or the common one its
+    /// `commondir` names.
+    fn resolve_common(&mut self, holder: &Path, allowance: &mut Allowance) -> Option<PathBuf> {
+        let gitdir = noting(gitdir_at(holder, allowance), &mut self.incomplete)?;
+        if std::fs::symlink_metadata(gitdir.join("commondir")).is_err() {
+            return Some(gitdir);
+        }
+        noting(
+            common_dir(&gitdir, &mut Vec::new(), allowance),
+            &mut self.incomplete,
+        )
+    }
+
     /// The ignore file `file`, for the paths below `root`. Unusable, and the
     /// walk is incomplete, when it is not a regular file, cannot be read, is
     /// larger than [`MAX_IGNORE_BYTES`] or than what is left of
-    /// [`MAX_IGNORE_TOTAL`], or holds a negation git would match differently.
+    /// [`MAX_IGNORE_TOTAL`], holds more patterns than [`MAX_PATTERNS`] or
+    /// what is left of [`MAX_PATTERNS_TOTAL`], or wildcard patterns that cost
+    /// more than what is left of [`MAX_WILD_COST`] (checked before its
+    /// matcher is built), or holds a negation git would match differently.
     fn ignore_file(&mut self, root: &Path, file: &Path) -> IgnoreFile {
         if !self.tick() {
             return IgnoreFile::Unusable;
@@ -650,6 +754,13 @@ impl Walk {
         if read > limit {
             return self.unusable();
         }
+        let cost = Cost::of(&bytes);
+        if cost.patterns > MAX_PATTERNS.min(self.patterns_left) || cost.wild() > self.wild_cost_left
+        {
+            return self.unusable();
+        }
+        self.patterns_left -= cost.patterns;
+        self.wild_cost_left -= cost.wild();
         match gitignore(root, &bytes) {
             Some(gitignore) => IgnoreFile::Found(Arc::new(gitignore)),
             None => self.unusable(),
@@ -669,10 +780,8 @@ impl Walk {
 /// a directory git reads. An ignore pattern like that is left out, which
 /// only makes the walk see more.
 fn gitignore(root: &Path, bytes: &[u8]) -> Option<Gitignore> {
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     let mut builder = GitignoreBuilder::new(root);
-    for line in bytes.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+    for line in lines(bytes) {
         let negation = line.starts_with(b"!");
         let added =
             std::str::from_utf8(line).is_ok_and(|line| builder.add_line(None, line).is_ok());
@@ -681,6 +790,69 @@ fn gitignore(root: &Path, bytes: &[u8]) -> Option<Gitignore> {
         }
     }
     builder.build().ok()
+}
+
+/// The lines of an ignore file as git splits them: after a UTF-8 BOM, on
+/// `\n`, without the `\r` before it.
+fn lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    bytes
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+}
+
+/// What the matcher built from an ignore file would cost.
+#[derive(Debug, Default)]
+struct Cost {
+    patterns: usize,
+    wild: usize,
+    wild_bytes: usize,
+}
+
+impl Cost {
+    /// Counted before the matcher is built: its patterns (every line that is
+    /// not blank or a comment), and those of them that are wild.
+    fn of(bytes: &[u8]) -> Cost {
+        let mut cost = Cost::default();
+        for line in lines(bytes) {
+            if line.starts_with(b"#") || line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            cost.patterns += 1;
+            if is_wild(line) {
+                cost.wild += 1;
+                cost.wild_bytes += line.len();
+            }
+        }
+        cost
+    }
+
+    /// How many wild patterns times their bytes: what searching their regex
+    /// set takes memory in proportion to.
+    fn wild(&self) -> usize {
+        self.wild.saturating_mul(self.wild_bytes)
+    }
+}
+
+/// Whether the matcher tests `pattern` in its regex set, rather than looking
+/// it up: any wildcard (`*`, `?`, `[`, or an escape), except in `*.ext`,
+/// which it looks up by extension. A leading `!`, a leading or trailing `/`,
+/// and a leading `**/` are looked up too (measured: `*suffix` and `prefix*`
+/// patterns are not; they cost about 8 KB each to build).
+fn is_wild(pattern: &[u8]) -> bool {
+    let is_meta = |b: &u8| matches!(b, b'*' | b'?' | b'[' | b'\\');
+    let mut pattern = pattern.trim_ascii_end();
+    pattern = pattern.strip_prefix(b"!").unwrap_or(pattern);
+    pattern = pattern.strip_prefix(b"/").unwrap_or(pattern);
+    pattern = pattern.strip_suffix(b"/").unwrap_or(pattern);
+    pattern = pattern.strip_prefix(b"**/").unwrap_or(pattern);
+    if !pattern.iter().any(is_meta) {
+        return false;
+    }
+    match pattern.strip_prefix(b"*.") {
+        Some(ext) => ext.is_empty() || ext.iter().any(|b| is_meta(b) || matches!(b, b'/' | b'.')),
+        None => true,
+    }
 }
 
 /// The ignore rules for what is directly in one directory: the
@@ -735,6 +907,7 @@ impl Rules {
 
 #[cfg(test)]
 mod tests {
+    use super::super::linked::long_chain;
     use super::*;
 
     fn workspace() -> (tempfile::TempDir, PathBuf) {
@@ -757,20 +930,26 @@ mod tests {
             std::fs::create_dir_all(ws.join(format!("r{i}/.git"))).unwrap();
         }
         let none = IgnoreRules::default();
-        // 20 entries in the workspace, one (`.git`) in each repository, and
-        // each of the 20 gitdirs followed.
-        let enough = discover_with_budget(&ws, None, &none, entries(60));
+        // A lookup for each component of an absolute path resolved.
+        let lookups = |rel: &str| ws.join(rel).components().count() - 1;
+        // 20 entries in the workspace and one (`.git`) in each repository;
+        // then each of the 20 gitdirs followed, and a lookup of its
+        // `commondir`.
+        let spent = 20 + 20 + 20 * (1 + lookups("r0/.git/commondir"));
+        let enough = discover_with_budget(&ws, None, &none, entries(spent));
         assert!(!enough.incomplete, "{enough:?}");
         assert_eq!(enough.dot_gits.len(), 20);
-        let short = discover_with_budget(&ws, None, &none, entries(59));
+        let short = discover_with_budget(&ws, None, &none, entries(spent - 1));
         assert!(short.incomplete, "{short:?}");
         // Spent during the walk, it stops the walk there.
         let shorter = discover_with_budget(&ws, None, &none, entries(30));
         assert!(shorter.incomplete, "{shorter:?}");
         assert_eq!(shorter.dot_gits.len(), 10, "{shorter:?}");
 
-        assert!(!read_ignore_rules_with_budget(&ws, None, entries(40)).incomplete());
-        assert!(read_ignore_rules_with_budget(&ws, None, entries(39)).incomplete());
+        // The entries, and a lookup of each `.git` for its `info/exclude`.
+        let spent = 20 + 20 + 20 * lookups("r0/.git");
+        assert!(!read_ignore_rules_with_budget(&ws, None, entries(spent)).incomplete());
+        assert!(read_ignore_rules_with_budget(&ws, None, entries(spent - 1)).incomplete());
     }
 
     #[test]
@@ -806,16 +985,91 @@ mod tests {
         assert!(index.dot_gits.is_empty(), "{index:?}");
     }
 
+    /// Wildcard patterns of the kind that made matchers take gigabytes (at
+    /// 3,000 of them, matched against names like [`adversarial_name`]).
+    fn adversarial_patterns(count: usize) -> String {
+        (0..count).map(|i| format!("*a{i}*b*c*/\n")).collect()
+    }
+
+    /// A name that keeps many of [`adversarial_patterns`] partly matched.
+    fn adversarial_name(j: usize) -> String {
+        let mut name = String::new();
+        let mut i = j;
+        while name.len() < 200 {
+            name.push_str(&format!("a{i}"));
+            i += 7;
+        }
+        name + "bbc"
+    }
+
+    /// Writes `text` to `dir/name` and has `walk` read it as an ignore file.
+    fn read_as_ignore_file(walk: &mut Walk, dir: &Path, name: &str, text: &str) -> IgnoreFile {
+        std::fs::write(dir.join(name), text).unwrap();
+        walk.ignore_file(dir, &dir.join(name))
+    }
+
+    #[test]
+    fn an_ignore_file_whose_matcher_would_be_costly_is_not_used() {
+        let (_d, dir) = workspace();
+        // Refused before a matcher is built, and nothing is matched here.
+        let mut walk = Walk::new(Budget::DEFAULT);
+        let file = read_as_ignore_file(&mut walk, &dir, "wild", &adversarial_patterns(3000));
+        assert!(matches!(file, IgnoreFile::Unusable));
+        assert!(walk.incomplete);
+        // More patterns than one file may hold, even plain ones.
+        let mut walk = Walk::new(Budget::DEFAULT);
+        let plain: String = (0..=MAX_PATTERNS).map(|i| format!("name{i}\n")).collect();
+        let file = read_as_ignore_file(&mut walk, &dir, "plain", &plain);
+        assert!(matches!(file, IgnoreFile::Unusable));
+        assert!(walk.incomplete);
+    }
+
+    #[test]
+    fn what_the_matchers_cost_in_all_is_bounded() {
+        let (_d, dir) = workspace();
+        // About 230,000 of `MAX_WILD_COST` each: four fit, a fifth does not.
+        let mut walk = Walk::new(Budget::DEFAULT);
+        let wild = adversarial_patterns(150);
+        for i in 0..4 {
+            let file = read_as_ignore_file(&mut walk, &dir, &format!("w{i}"), &wild);
+            assert!(matches!(file, IgnoreFile::Found(_)), "file {i}");
+        }
+        let file = read_as_ignore_file(&mut walk, &dir, "w4", &wild);
+        assert!(matches!(file, IgnoreFile::Unusable));
+        // Patterns in all.
+        let mut walk = Walk::new(Budget::DEFAULT);
+        let plain: String = (0..MAX_PATTERNS).map(|i| format!("name{i}\n")).collect();
+        for i in 0..MAX_PATTERNS_TOTAL / MAX_PATTERNS {
+            let file = read_as_ignore_file(&mut walk, &dir, &format!("p{i}"), &plain);
+            assert!(matches!(file, IgnoreFile::Found(_)), "file {i}");
+        }
+        let file = read_as_ignore_file(&mut walk, &dir, "one", "one\n");
+        assert!(matches!(file, IgnoreFile::Unusable));
+    }
+
+    #[test]
+    fn a_large_ordinary_ignore_file_is_used() {
+        let (_d, dir) = workspace();
+        let templates = include_str!("../../tests/fixtures/templates.gitignore");
+        let mut walk = Walk::new(Budget::DEFAULT);
+        let file = read_as_ignore_file(&mut walk, &dir, "templates", templates);
+        assert!(matches!(file, IgnoreFile::Found(_)));
+        // Twice as large, too.
+        let mut walk = Walk::new(Budget::DEFAULT);
+        let file = read_as_ignore_file(&mut walk, &dir, "twice", &templates.repeat(2));
+        assert!(matches!(file, IgnoreFile::Found(_)));
+        assert!(!walk.incomplete);
+    }
+
     #[test]
     fn the_clock_is_looked_at_while_directories_are_matched() {
-        // 3,000 wildcard patterns, and 3,000 directories that each match some
-        // of them: seconds of matching, with no directory read in between.
+        // As costly a matcher as one may be, and 2,000 directories that keep
+        // it busy: seconds of matching, with no directory read in between.
         let (_d, ws) = workspace();
         std::fs::create_dir(ws.join(".git")).unwrap();
-        let patterns: String = (0..3000).map(|i| format!("*x{i}*y*/\n")).collect();
-        std::fs::write(ws.join(".gitignore"), patterns).unwrap();
-        for j in 0..3000 {
-            std::fs::create_dir(ws.join(format!("d{j}x{j}qy"))).unwrap();
+        std::fs::write(ws.join(".gitignore"), adversarial_patterns(200)).unwrap();
+        for j in 0..2000 {
+            std::fs::create_dir(ws.join(adversarial_name(j))).unwrap();
         }
         let started = Instant::now();
         let soon = Budget {
@@ -825,7 +1079,111 @@ mod tests {
         let rules = read_ignore_rules_with_budget(&ws, None, soon);
         let took = started.elapsed();
         assert!(rules.incomplete(), "{rules:?}");
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+    }
+
+    /// `run()`, which must finish within 10 seconds, and how long it took.
+    fn timed<T: Send + 'static>(run: impl FnOnce() -> T + Send + 'static) -> (T, Duration) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let value = run();
+            let _ = tx.send((value, started.elapsed()));
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("took longer than 10s")
+    }
+
+    /// `holders` directories whose `.git` leads through three long symlink
+    /// chains (see `linked::long_chain`), shared by all of them.
+    fn chained_holders(ws: &Path, holders: usize) {
+        std::fs::create_dir_all(ws.join("gd")).unwrap();
+        std::fs::create_dir_all(ws.join("common")).unwrap();
+        long_chain(ws, "a", 38, "gitfile");
+        let gitfile = format!("gitdir: {}\n", ws.join("b0").display());
+        std::fs::write(ws.join("gitfile"), gitfile).unwrap();
+        long_chain(ws, "b", 39, "gd");
+        std::fs::write(ws.join("gd/commondir"), "../c0\n").unwrap();
+        long_chain(ws, "c", 39, "common");
+        for h in 0..holders {
+            std::fs::create_dir(ws.join(format!("h{h}"))).unwrap();
+            std::os::unix::fs::symlink("../a0", ws.join(format!("h{h}/.git"))).unwrap();
+        }
+    }
+
+    #[test]
+    fn long_symlink_chains_do_not_outlast_the_deadline() {
+        let (_d, ws) = workspace();
+        chained_holders(&ws, 3);
+        let soon = Budget {
+            time: Duration::from_millis(50),
+            ..Budget::DEFAULT
+        };
+        let (index, took) =
+            timed(move || discover_with_budget(&ws, None, &IgnoreRules::default(), soon));
+        assert!(index.incomplete, "{index:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn many_holders_sharing_long_chains_cost_little() {
+        let (_d, ws) = workspace();
+        chained_holders(&ws, 20);
+        let (index, took) = timed(move || {
+            discover_with_budget(&ws, None, &IgnoreRules::default(), Budget::DEFAULT)
+        });
+        assert_eq!(index.dot_gits.len(), 20, "{:?}", index.dot_gits);
+        // Each resolution looks at over 10,000 entries: past what one may.
+        assert!(index.incomplete, "{index:?}");
         assert!(took < Duration::from_secs(3), "{took:?}");
+    }
+
+    #[test]
+    fn the_clock_is_looked_at_before_each_resolution() {
+        let (_d, ws) = workspace();
+        chained_holders(&ws, 60);
+        // What one resolution costs here (it gives up at `MAX_LOOKUPS`).
+        let one = (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                let mut allowance = Allowance::new(MAX_LOOKUPS, MAX_RESOLVED_PATH);
+                linked_gitdirs_at(&ws.join("h0"), &ws, &mut allowance);
+                assert!(allowance.ran_out);
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        // Each holder is one step: without a look at the clock before each
+        // resolution, the next would come about 14 holders in.
+        let soon = Budget {
+            time: one * 3,
+            ..Budget::DEFAULT
+        };
+        let (index, took) =
+            timed(move || discover_with_budget(&ws, None, &IgnoreRules::default(), soon));
+        assert!(index.incomplete, "{index:?}");
+        assert!(took < one * 8, "{took:?} for {one:?} each");
+    }
+
+    #[test]
+    fn a_walk_that_ends_past_its_deadline_says_so() {
+        let (_d, ws) = workspace();
+        // One resolution of about 2,700 entries, all of it after the last
+        // look at the clock (the gitdir is outside, so nothing follows it).
+        long_chain(&ws, "a", 30, "/nonexistent-harness-gitdir");
+        std::fs::create_dir(ws.join("h")).unwrap();
+        std::os::unix::fs::symlink("../a0", ws.join("h/.git")).unwrap();
+        let soon = Budget {
+            time: Duration::from_millis(2),
+            ..Budget::DEFAULT
+        };
+        let (index, took) =
+            timed(move || discover_with_budget(&ws, None, &IgnoreRules::default(), soon));
+        assert!(
+            took > Duration::from_millis(2),
+            "too fast to test: {took:?}"
+        );
+        assert!(index.incomplete, "{index:?}");
     }
 
     #[test]

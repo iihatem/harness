@@ -544,6 +544,24 @@ pub(crate) fn continued(line: &str) -> bool {
     line.bytes().rev().take_while(|&c| c == b'\\').count() % 2 == 1
 }
 
+/// `body` with each line that ends in an odd number of backslashes joined to the next,
+/// the backslash and newline removed: bash reads the body of a here-document with an
+/// unquoted delimiter this way before it expands it (bash 3.2 `read_a_line` with
+/// `remove_quoted_newline`), so `$\⏎(` is a `$(` there.
+pub(crate) fn join_continuations(body: &str) -> Cow<'_, str> {
+    if !body.split('\n').any(continued) {
+        return Cow::Borrowed(body);
+    }
+    let mut out = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        match line.strip_suffix('\n') {
+            Some(text) if continued(text) => out.push_str(&text[..text.len() - 1]),
+            _ => out.push_str(line),
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// Whether bash and brush-parser read the here-document delimiter word `raw` alike.
 fn delimiters_agree(raw: &str) -> bool {
     let (mut quote, mut prev) = (None, None);
@@ -1084,6 +1102,10 @@ mod tests {
         assert!(!ends_elsewhere("foo\\\\\nEOF\n", "EOF", false));
         assert!(!ends_elsewhere("a \\\nb\nEOF", "EOF", false));
         assert!(!ends_elsewhere("\\\nEOF\n", "EOF", false));
+        // bash joins an unquoted body's continuation lines before expanding it.
+        assert_eq!(join_continuations("a\nb"), "a\nb");
+        assert_eq!(join_continuations("$\\\n(x)\n"), "$(x)\n");
+        assert_eq!(join_continuations("a\\\\\nb\\\nc\\"), "a\\\\\nbc\\");
         // For `<<-`, the joined line's own tabs are stripped, not those of its parts.
         assert!(!ends_elsewhere("\tEO\\\n\tF\nx\n\tEOF\n", "EOF", true));
         assert!(!ends_elsewhere("\ta \\\n\t  b\n\tEOF\n", "EOF", true));

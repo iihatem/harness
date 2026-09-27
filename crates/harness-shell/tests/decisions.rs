@@ -986,6 +986,25 @@ fn a_lost_here_document_does_not_hide_later_commands() {
 }
 
 #[test]
+fn unquoted_heredoc_bodies_join_continuation_lines() {
+    use Want::Deny;
+    // bash joins a body line ending in a backslash with the next before it expands the
+    // body, so `$\⏎(` is a `$(` and `curl x` runs.
+    check(
+        &probe_rules(),
+        &[
+            ("cat <<EOF\n$\\\n(curl x)\nEOF", Deny),
+            ("cat <<EOF\nx $\\\n(echo a\ncurl x\n)\nEOF", Deny),
+            ("echo \"$(cat <<EOF\n$\\\n(curl x)\nEOF\n)\"", Deny),
+            (
+                "echo \"$(cat <<EOF\nx $\\\n(echo a\ncurl x\n)\nEOF\n)\"",
+                Deny,
+            ),
+        ],
+    );
+}
+
+#[test]
 fn heredoc_operators_in_expansions_are_not_trusted() {
     use Want::{Ask, Deny};
     // brush-parser takes a `<<` in `${…}` for a here-document, so it reads `curl x` as

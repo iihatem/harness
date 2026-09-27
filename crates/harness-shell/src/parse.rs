@@ -598,13 +598,17 @@ impl Walker<'_> {
                 ) {
                     self.rescan = Some(why);
                 }
-                // A quoted delimiter (`<<'EOF'`) makes the body literal.
-                if doc.requires_expansion && !self.too_nested(&doc.doc.value, true, depth) {
-                    let mut scan = Scan::default();
-                    if let Err(why) = argv::heredoc_substitutions(&doc.doc.value, &mut scan) {
-                        self.undecomposable(why);
+                // A quoted delimiter (`<<'EOF'`) makes the body literal. bash joins the
+                // continuation lines of any other body before it expands it.
+                if doc.requires_expansion {
+                    let body = argv::join_continuations(body);
+                    if !self.too_nested(&body, true, depth) {
+                        let mut scan = Scan::default();
+                        if let Err(why) = argv::heredoc_substitutions(&body, &mut scan) {
+                            self.undecomposable(why);
+                        }
+                        self.scanned(scan, cwd, depth);
                     }
-                    self.scanned(scan, cwd, depth);
                 }
             }
             IoRedirect::HereString(_, w) => {

@@ -899,6 +899,39 @@ fn rough_scan_tracks_here_documents_as_bash_does() {
 }
 
 #[test]
+fn here_documents_bash_ends_elsewhere_are_not_trusted() {
+    use Want::{Allow, Deny, Unlisted};
+    // brush-parser takes these bodies to run to the last line; bash ends them earlier or
+    // later and runs `curl x`.
+    check(
+        &probe_rules(),
+        &[
+            ("cat <<$'EOF'\nbody\nEOF\ncurl x\n$EOF", Deny),
+            ("cat <<$\"EOF\"\nbody\nEOF\ncurl x\n$EOF", Deny),
+            ("cat <<\"E\\OF\"\nbody\nE\\OF\ncurl x\nEOF", Deny),
+            ("cat <<\"E'OF\"\nbody\nE'OF\ncurl x\nEOF", Deny),
+            ("cat <<'E\"OF'\nbody\nE\"OF\ncurl x\nEOF", Deny),
+            ("cat <<'E\\OF'\nbody\nE\\OF\ncurl x\nEOF", Deny),
+            ("cat <<EOF\nEO\\\nF\ncurl x\nEOF", Deny),
+            ("cat <<EOF\nfoo\\\nEOF\ncat <<X\nEOF\ncurl x\nX", Deny),
+            ("cat <<-EOF\n\tEO\\\nF\ncurl x\n\tEOF", Deny),
+            ("echo \"$(cat <<EOF\nEO\\\nF\ncurl x\nEOF\n)\"", Deny),
+            // Delimiters and bodies both read alike.
+            ("cat <<\\EOF\nbody\nEOF", Allow),
+            ("cat <<E\\OF\nbody\nEOF", Allow),
+            ("cat <<E\"OF\"\nbody\nEOF", Allow),
+            ("cat <<\"E\\$OF\"\nbody\nE$OF", Allow),
+            ("cat <<'EOF'\nEO\\\nF\nEOF", Allow),
+            ("cat <<EOF\nfoo\\\\\nEOF", Allow),
+            (
+                "cat > Dockerfile <<EOF\nRUN apt-get update && \\\n    apt-get install -y x\nEOF",
+                Unlisted,
+            ),
+        ],
+    );
+}
+
+#[test]
 fn brackets_in_declaration_values_are_inert() {
     use Want::{Ask, Unlisted};
     check(

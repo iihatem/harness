@@ -463,6 +463,74 @@ fn name_brace_end(b: &[u8], from: usize) -> Option<usize> {
     (b.get(from + len) == Some(&b'}')).then_some(from + len)
 }
 
+/// Why bash may end a here-document elsewhere than brush-parser does, if it may.
+/// brush-parser compares each line with the delimiter word stripped of every quote
+/// character and backslash, and never joins lines. bash decodes `$'…'`, keeps quote
+/// characters and most backslashes that are themselves quoted, and in the body of an
+/// unquoted delimiter joins a line ending in an odd number of backslashes with the next
+/// before comparing.
+pub(crate) fn heredoc_misread(
+    delimiter: &str,
+    body: &str,
+    expands: bool,
+    strip_tabs: bool,
+) -> Option<&'static str> {
+    if !delimiters_agree(delimiter) {
+        Some("bash may read the here-document delimiter differently")
+    } else if expands && joins_elsewhere(body, delimiter, strip_tabs) {
+        Some("a here-document body line ends in a backslash, so bash may end it elsewhere")
+    } else {
+        None
+    }
+}
+
+/// Whether bash and brush-parser read the here-document delimiter word `raw` alike.
+fn delimiters_agree(raw: &str) -> bool {
+    let (mut quote, mut prev) = (None, None);
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\\') => {
+                chars.next();
+            }
+            (None, '\'' | '"') if prev == Some('$') => return false,
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (Some('\''), '"' | '\\') | (Some('"'), '\'') => return false,
+            (Some(_), '\\') => match chars.next() {
+                Some('$' | '`' | '"' | '\\') => {}
+                _ => return false,
+            },
+            _ => {}
+        }
+        prev = Some(c);
+    }
+    quote.is_none()
+}
+
+/// Whether bash, joining lines as it reads the body of an unquoted delimiter, ends the
+/// here-document elsewhere than at the line after `body`, where brush-parser ends it.
+/// With `<<-`, any joined line counts, as tab stripping is not modelled.
+fn joins_elsewhere(body: &str, delimiter: &str, strip_tabs: bool) -> bool {
+    let (mut joined, mut continued) = (String::new(), false);
+    for line in body.split_terminator('\n') {
+        continued = line.bytes().rev().take_while(|&c| c == b'\\').count() % 2 == 1;
+        if continued {
+            if strip_tabs {
+                return true;
+            }
+            joined.push_str(&line[..line.len() - 1]);
+            continue;
+        }
+        joined.push_str(line);
+        if joined == delimiter {
+            return true;
+        }
+        joined.clear();
+    }
+    continued
+}
+
 /// Whether the here-document delimiter word at the start of `b` is missing, has no
 /// visible character besides quotes, or has a backtick, `$(`, `$[`, `${`, or a quoted,
 /// escaped or unquoted bracket or brace (or a quoted or escaped parenthesis). A word
@@ -906,5 +974,42 @@ mod tests {
         ] {
             assert_eq!(quoted(src).len(), before, "{src:?}");
         }
+    }
+
+    #[test]
+    fn here_document_ends_bash_reads_differently() {
+        for alike in [
+            "EOF",
+            "'EOF'",
+            "\"EOF\"",
+            r"\EOF",
+            r"E\OF",
+            "E\"OF\"",
+            r#""E\$OF""#,
+            r#""E\"OF""#,
+            r"\$'EOF'",
+            "'E$OF'",
+            "$X",
+            "EOF$",
+        ] {
+            assert!(delimiters_agree(alike), "{alike}");
+        }
+        for differs in [
+            "$'EOF'",
+            "$\"EOF\"",
+            r#""E\OF""#,
+            "\"E'OF\"",
+            "'E\"OF'",
+            r"'E\OF'",
+            "'EOF",
+        ] {
+            assert!(!delimiters_agree(differs), "{differs}");
+        }
+        assert!(joins_elsewhere("EO\\\nF\n", "EOF", false));
+        assert!(joins_elsewhere("foo\\\n", "EOF", false));
+        assert!(joins_elsewhere("a\\\nb\n", "EOF", true));
+        assert!(!joins_elsewhere("foo\\\\\n", "EOF", false));
+        assert!(!joins_elsewhere("a \\\nb\n", "EOF", false));
+        assert!(!joins_elsewhere("", "EOF", false));
     }
 }

@@ -83,6 +83,7 @@ pub(crate) fn analyze(src: &str, ws: &Workspace) -> Analysis {
         out: Analysis::default(),
         lists: 0,
         data: 0,
+        misread: None,
     };
     walker.program(src, &mut Cwd::at(ws.root()), 0);
     walker.out
@@ -108,6 +109,8 @@ struct Walker<'a> {
     lists: usize,
     /// Rough commands from possible here-document data currently being walked.
     data: usize,
+    /// Why a here-document in the program being walked may end elsewhere in bash.
+    misread: Option<&'static str>,
 }
 
 impl Walker<'_> {
@@ -143,8 +146,17 @@ impl Walker<'_> {
             brush_parser::Parser::new(std::io::Cursor::new(src), &argv::parser_options());
         match parser.parse_program() {
             Ok(program) => {
+                let outer = self.misread.take();
                 for list in &program.complete_commands {
                     self.list(list, cwd, depth);
+                }
+                // What follows such a here-document may be commands brush-parser took
+                // for its body, in this program or in any enclosing one.
+                let misread = self.misread;
+                self.misread = outer.or(misread);
+                if let Some(why) = misread {
+                    self.undecomposable(why.into());
+                    self.rough_scan(src, depth);
                 }
             }
             Err(e) => {
@@ -541,6 +553,12 @@ impl Walker<'_> {
                 }
             }
             IoRedirect::HereDocument(_, doc) => {
+                let (delimiter, body) = (&doc.here_end.value, &doc.doc.value);
+                if let Some(why) =
+                    argv::heredoc_misread(delimiter, body, doc.requires_expansion, doc.remove_tabs)
+                {
+                    self.misread = Some(why);
+                }
                 // A quoted delimiter (`<<'EOF'`) makes the body literal.
                 if doc.requires_expansion && !self.too_nested(&doc.doc.value, true, depth) {
                     let mut scan = Scan::default();

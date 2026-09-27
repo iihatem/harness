@@ -187,7 +187,8 @@ async fn sandbox_denials_are_flagged() {
         .await;
     assert!(out.is_error && out.sandbox_denied);
     assert!(
-        out.content.contains("the sandbox blocked"),
+        out.content
+            .contains("[the sandbox may have blocked part of this command]"),
         "{}",
         out.content
     );

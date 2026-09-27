@@ -12,6 +12,22 @@ use tokio::io::AsyncReadExt;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
 
+/// Where bash is looked for, in order. Fixed absolute paths, so no `bash` on `PATH` is ever used.
+const BASH_PATHS: [&str; 3] = [
+    "/bin/bash",
+    "/usr/bin/bash",
+    "/run/current-system/sw/bin/bash",
+];
+
+/// The shell to run commands with, and its arguments before the script: the first bash in
+/// `BASH_PATHS` that `is_file` finds, without startup files, else `/bin/sh`.
+fn shell(is_file: impl Fn(&Path) -> bool) -> (&'static str, Vec<&'static str>) {
+    match BASH_PATHS.into_iter().find(|p| is_file(Path::new(p))) {
+        Some(bash) => (bash, vec!["--noprofile", "--norc", "-c"]),
+        None => ("/bin/sh", vec!["-c"]),
+    }
+}
+
 pub struct BashTool;
 
 #[async_trait]
@@ -45,11 +61,7 @@ impl Tool for BashTool {
 
         // `exec 2>&1` merges stderr into stdout for the whole script, preserving interleaving.
         let script = format!("exec 2>&1\n{command}");
-        let (shell, mut args): (&str, Vec<&str>) = if Path::new("/bin/bash").exists() {
-            ("/bin/bash", vec!["--noprofile", "--norc", "-c"])
-        } else {
-            ("/bin/sh", vec!["-c"])
-        };
+        let (shell, mut args) = shell(Path::is_file);
         args.push(&script);
 
         let sandbox = ctx.sandbox.as_ref().filter(|_| !ctx.unsandboxed);
@@ -120,7 +132,7 @@ impl Tool for BashTool {
                         if status.success() {
                             ToolOutput::ok(body)
                         } else if sandbox.is_some_and(|s| s.is_denial(status.code(), &text)) {
-                            let mut out = ToolOutput::error(format!("{body}\n[the sandbox blocked part of this command]"));
+                            let mut out = ToolOutput::error(format!("{body}\n[the sandbox may have blocked part of this command]"));
                             out.sandbox_denied = true;
                             out
                         } else {
@@ -153,5 +165,28 @@ fn kill_group(pgid: Option<i32>) {
             nix::unistd::Pid::from_raw(pgid),
             nix::sys::signal::Signal::SIGKILL,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bash_is_looked_for_at_fixed_paths_before_falling_back_to_sh() {
+        let only = |path: &'static str| move |p: &Path| p == Path::new(path);
+        for bash in [
+            "/bin/bash",
+            "/usr/bin/bash",
+            "/run/current-system/sw/bin/bash",
+        ] {
+            assert_eq!(
+                shell(only(bash)),
+                (bash, vec!["--noprofile", "--norc", "-c"])
+            );
+        }
+        assert_eq!(shell(|_| true).0, "/bin/bash");
+        assert_eq!(shell(only("/usr/local/bin/bash")), ("/bin/sh", vec!["-c"]));
+        assert_eq!(shell(|_| false), ("/bin/sh", vec!["-c"]));
     }
 }

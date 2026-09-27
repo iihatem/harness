@@ -161,7 +161,7 @@ async fn network_access_is_blocked_headless() {
     let (_env, out) = run_bash("curl -sS --max-time 5 https://example.com", "", |_| {}).await;
     assert_eq!(out.status.code(), Some(3), "{}", tool_output(&out));
     assert!(
-        tool_output(&out).contains("[the sandbox blocked"),
+        tool_output(&out).contains("[the sandbox may have blocked"),
         "{}",
         tool_output(&out)
     );
@@ -213,7 +213,7 @@ async fn planting_a_git_hook_fails_in_the_sandbox() {
     assert!(!env.ws.path().join(".git/hooks/pre-commit").exists());
     assert_eq!(out.status.code(), Some(3), "{}", tool_output(&out));
     assert!(
-        tool_output(&out).contains("[the sandbox blocked"),
+        tool_output(&out).contains("[the sandbox may have blocked"),
         "{}",
         tool_output(&out)
     );

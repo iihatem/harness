@@ -969,6 +969,11 @@ fn a_lost_here_document_does_not_hide_later_commands() {
             "cat <<A $(cat <<B)\nit's\nA\necho 'a\n'; curl x",
             "echo ${x:-<<EOF}\nEOF\necho 'a\n'; curl x",
             "cat <(cat <<EOF)\nit's\nEOF\necho 'a\n'; curl x",
+            // Only the line joined across a continuation ends the second body.
+            "cat <<\\A\nA\ncat <<EOF\nit's\nEO\\\nF\necho 'a\n'; curl x",
+            // The `<<` in `((…))` is no here-document, so the body of the next one starts
+            // after this line, not after an end of the first.
+            "(( y <<= 1 )); cat <<$'EOF'\nit's\nEOF\necho 'a\n'; curl x",
         ]
         .map(String::from),
     );

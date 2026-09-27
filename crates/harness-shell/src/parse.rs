@@ -83,7 +83,7 @@ pub(crate) fn analyze(src: &str, ws: &Workspace) -> Analysis {
         out: Analysis::default(),
         lists: 0,
         data: 0,
-        misread: None,
+        rescan: None,
         sources: Vec::new(),
     };
     walker.program(src, &mut Cwd::at(ws.root()), 0);
@@ -110,8 +110,10 @@ struct Walker<'a> {
     lists: usize,
     /// Rough commands from possible here-document data currently being walked.
     data: usize,
-    /// Why a here-document in the program being walked may end elsewhere in bash.
-    misread: Option<&'static str>,
+    /// Why the program being walked must also be roughly scanned: a here-document bash
+    /// may end elsewhere, or a process substitution, whose here-documents bash may end
+    /// elsewhere too.
+    rescan: Option<&'static str>,
     /// The text of the programs being walked, innermost last.
     sources: Vec<String>,
 }
@@ -154,18 +156,18 @@ impl Walker<'_> {
                 self.rough_scan(src, depth);
             }
             Some(Ok(program)) => {
-                let outer = self.misread.take();
+                let outer = self.rescan.take();
                 self.sources.push(src.to_owned());
                 for list in &program.complete_commands {
                     self.list(list, cwd, depth);
                 }
                 self.sources.pop();
-                // What follows such a here-document may be commands brush-parser took
-                // for its body, in this program or in any enclosing one.
-                let misread = self.misread;
-                self.misread = outer.or(misread);
+                // What follows a here-document bash may end elsewhere may be commands
+                // brush-parser took for its body, in this program or in any enclosing one.
+                let rescan = self.rescan;
+                self.rescan = outer.or(rescan);
                 let panicked = argv::parser_panics() > panics;
-                if let Some(why) = misread.or(panicked.then_some(argv::PARSER_PANICKED)) {
+                if let Some(why) = rescan.or(panicked.then_some(argv::PARSER_PANICKED)) {
                     self.undecomposable(why.into());
                     self.rough_scan(src, depth);
                 }
@@ -440,6 +442,7 @@ impl Walker<'_> {
             Item::IoRedirect(r) => self.redirect(r, cwd, depth),
             Item::ProcessSubstitution(_, sub) => {
                 self.undecomposable("uses process substitution".into());
+                self.rescan = Some("uses process substitution");
                 self.list(&sub.list, &mut cwd.clone(), depth);
                 argv.push(Tok::Dyn);
             }
@@ -559,6 +562,7 @@ impl Walker<'_> {
                     }
                     Target::ProcessSubstitution(_, sub) => {
                         self.undecomposable("uses process substitution".into());
+                        self.rescan = Some("uses process substitution");
                         self.list(&sub.list, &mut cwd.clone(), depth);
                     }
                 }
@@ -586,7 +590,7 @@ impl Walker<'_> {
                     doc.requires_expansion,
                     doc.remove_tabs,
                 ) {
-                    self.misread = Some(why);
+                    self.rescan = Some(why);
                 }
                 // A quoted delimiter (`<<'EOF'`) makes the body literal.
                 if doc.requires_expansion && !self.too_nested(&doc.doc.value, true, depth) {

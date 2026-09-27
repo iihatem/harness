@@ -916,6 +916,11 @@ fn here_documents_bash_ends_elsewhere_are_not_trusted() {
             ("cat <<EOF\nfoo\\\nEOF\ncat <<X\nEOF\ncurl x\nX", Deny),
             ("cat <<-EOF\n\tEO\\\nF\ncurl x\n\tEOF", Deny),
             ("echo \"$(cat <<EOF\nEO\\\nF\ncurl x\nEOF\n)\"", Deny),
+            // bash reads no body for a here-document still waiting when a process
+            // substitution ends.
+            ("cat <(cat <<EOF)\ncurl x\nEOF", Deny),
+            ("cat >(cat <<EOF)\ncurl x\nEOF", Deny),
+            ("cat <(cat <<EOF)\ncurl x\nEOF\n(", Deny),
             // Delimiters and bodies both read alike.
             ("cat <<\\EOF\nbody\nEOF", Allow),
             ("cat <<E\\OF\nbody\nEOF", Allow),
@@ -939,6 +944,40 @@ fn here_documents_bash_ends_elsewhere_are_not_trusted() {
             ),
         ],
     );
+}
+
+#[test]
+fn a_lost_here_document_does_not_hide_later_commands() {
+    use Want::Deny;
+    // The scan cannot tell where bash ends these bodies. Their quotes would flip the
+    // quote state of text after them, where a quoted string spans lines before `curl x`.
+    let mut programs = Vec::new();
+    for delimiter in ["\\EOF", "E\\OF", "'E'OF", "E\"OF\""] {
+        for body in ["it's", "say \"hi"] {
+            for later in ["echo 'a\n'; curl x", "echo \"a\n\"; curl x"] {
+                programs.push(format!("cat <<{delimiter}\n{body}\nEOF\n{later}"));
+            }
+        }
+    }
+    programs.extend(
+        [
+            "cat <<$'EOF'\nit's\nEOF\necho 'a\n'; curl x",
+            "cat <<EOF\nit's \\\nx\nEOF\necho 'a\n'; curl x",
+            "x=$(cat <<EOF\nit's\nEOF\n)\necho 'a\n'; curl x",
+            "echo \"${x:-'a'}\"\ncat <<EOF\nit's\nEOF\necho 'a\n'; curl x",
+            "cat <<\\A\nit's\nA\ncat <<B\nx\nB\necho 'a\n'; curl x",
+            "cat <<A $(cat <<B)\nit's\nA\necho 'a\n'; curl x",
+            "echo ${x:-<<EOF}\nEOF\necho 'a\n'; curl x",
+            "cat <(cat <<EOF)\nit's\nEOF\necho 'a\n'; curl x",
+        ]
+        .map(String::from),
+    );
+    let mut table = Vec::new();
+    for refusal in ["(", "export a[${a[${b}]}]=1"] {
+        table.extend(programs.iter().map(|p| (format!("{p}\n{refusal}"), Deny)));
+    }
+    let table: Vec<(&str, Want)> = table.iter().map(|(c, w)| (c.as_str(), *w)).collect();
+    check(&default_rules(), &table);
 }
 
 #[test]
@@ -1071,7 +1110,8 @@ fn heredoc_delimiters_the_parser_mishandles_ask_quickly() {
         ("\\$'a\\'' <<$(( ) '", Ask),
         ("echo $'\\'' <<$(( ) '", Ask),
         ("echo $\\\n'x' <<$(( ) '", Ask),
-        ("echo a#'b\n' <<$(( ) '", Ask),
+        ("echo a#'<<$(( )'", Unlisted),
+        ("echo x #'\nx <<$(( )\n'", Ask),
         ("# it's\nx <<$(( )\n'", Ask),
         ("echo `echo '` <<$(( ) '", Ask),
         ("echo ${x:-'} <<$(( ) '} '", Ask),

@@ -12,7 +12,7 @@ use brush_parser::word::{Parameter, ParameterExpr, WordPiece, WordPieceWithSourc
 pub(crate) const MAX_DEPTH: usize = 8;
 
 /// One argv element after quote removal.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Tok {
     /// Fully known text.
     Lit(String),

@@ -84,6 +84,7 @@ pub(crate) fn analyze(src: &str, ws: &Workspace) -> Analysis {
         lists: 0,
         data: 0,
         misread: None,
+        sources: Vec::new(),
     };
     walker.program(src, &mut Cwd::at(ws.root()), 0);
     walker.out
@@ -111,6 +112,8 @@ struct Walker<'a> {
     data: usize,
     /// Why a here-document in the program being walked may end elsewhere in bash.
     misread: Option<&'static str>,
+    /// The text of the programs being walked, innermost last.
+    sources: Vec<String>,
 }
 
 impl Walker<'_> {
@@ -152,9 +155,11 @@ impl Walker<'_> {
             }
             Some(Ok(program)) => {
                 let outer = self.misread.take();
+                self.sources.push(src.to_owned());
                 for list in &program.complete_commands {
                     self.list(list, cwd, depth);
                 }
+                self.sources.pop();
                 // What follows such a here-document may be commands brush-parser took
                 // for its body, in this program or in any enclosing one.
                 let misread = self.misread;
@@ -560,9 +565,27 @@ impl Walker<'_> {
             }
             IoRedirect::HereDocument(_, doc) => {
                 let (delimiter, body) = (&doc.here_end.value, &doc.doc.value);
-                if let Some(why) =
-                    argv::heredoc_misread(delimiter, body, doc.requires_expansion, doc.remove_tabs)
-                {
+                // The body as written, through the delimiter line, if lines may join.
+                let raw = || {
+                    let loc = doc.doc.loc.as_ref()?;
+                    let src = self.sources.last()?;
+                    let len = loc.end.index.checked_sub(loc.start.index)?;
+                    Some(
+                        src.chars()
+                            .skip(loc.start.index)
+                            .take(len)
+                            .collect::<String>(),
+                    )
+                };
+                let continued = doc.requires_expansion && body.lines().any(|l| l.ends_with('\\'));
+                let raw = if continued { raw() } else { None };
+                if let Some(why) = argv::heredoc_misread(
+                    delimiter,
+                    body,
+                    raw.as_deref(),
+                    doc.requires_expansion,
+                    doc.remove_tabs,
+                ) {
                     self.misread = Some(why);
                 }
                 // A quoted delimiter (`<<'EOF'`) makes the body literal.

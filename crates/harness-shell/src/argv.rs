@@ -519,20 +519,29 @@ fn name_brace_end(b: &[u8], from: usize) -> Option<usize> {
 /// character and backslash, and never joins lines. bash decodes `$'…'`, keeps quote
 /// characters and most backslashes that are themselves quoted, and in the body of an
 /// unquoted delimiter joins a line ending in an odd number of backslashes with the next
-/// before comparing.
+/// before comparing. `raw` is the body as written through its delimiter line (brush-parser
+/// strips tabs from `body` for `<<-`); without it, a line that may join counts as a
+/// disagreement.
 pub(crate) fn heredoc_misread(
     delimiter: &str,
     body: &str,
+    raw: Option<&str>,
     expands: bool,
     strip_tabs: bool,
 ) -> Option<&'static str> {
+    let joins = expands && body.lines().any(continued);
     if !delimiters_agree(delimiter) {
         Some("bash may read the here-document delimiter differently")
-    } else if expands && joins_elsewhere(body, delimiter, strip_tabs) {
+    } else if joins && raw.is_none_or(|raw| ends_elsewhere(raw, delimiter, strip_tabs)) {
         Some("a here-document body line ends in a backslash, so bash may end it elsewhere")
     } else {
         None
     }
+}
+
+/// Whether bash joins `line` with the next: it ends in an odd number of backslashes.
+pub(crate) fn continued(line: &str) -> bool {
+    line.bytes().rev().take_while(|&c| c == b'\\').count() % 2 == 1
 }
 
 /// Whether bash and brush-parser read the here-document delimiter word `raw` alike.
@@ -559,27 +568,39 @@ fn delimiters_agree(raw: &str) -> bool {
     quote.is_none()
 }
 
-/// Whether bash, joining lines as it reads the body of an unquoted delimiter, ends the
-/// here-document elsewhere than at the line after `body`, where brush-parser ends it.
-/// With `<<-`, any joined line counts, as tab stripping is not modelled.
-fn joins_elsewhere(body: &str, delimiter: &str, strip_tabs: bool) -> bool {
-    let (mut joined, mut continued) = (String::new(), false);
-    for line in body.split_terminator('\n') {
-        continued = line.bytes().rev().take_while(|&c| c == b'\\').count() % 2 == 1;
-        if continued {
-            if strip_tabs {
-                return true;
-            }
+/// Whether bash ends a here-document of an unquoted delimiter elsewhere than at the last
+/// line of `raw`, its text as written through the delimiter line, where brush-parser ends
+/// it. bash joins each line ending in an odd number of backslashes with the next and, for
+/// `<<-`, strips the leading tabs of the joined line before comparing it.
+fn ends_elsewhere(raw: &str, delimiter: &str, strip_tabs: bool) -> bool {
+    fn stripped(line: &str, tabs: bool) -> &str {
+        if tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        }
+    }
+    let lines: Vec<&str> = raw.split_terminator('\n').collect();
+    if lines
+        .last()
+        .is_none_or(|last| stripped(last, strip_tabs) != delimiter)
+    {
+        // Not the text brush-parser read.
+        return true;
+    }
+    let mut joined = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if continued(line) {
             joined.push_str(&line[..line.len() - 1]);
             continue;
         }
         joined.push_str(line);
-        if joined == delimiter {
-            return true;
+        if stripped(&joined, strip_tabs) == delimiter {
+            return i + 1 < lines.len();
         }
         joined.clear();
     }
-    continued
+    true
 }
 
 /// Whether the here-document delimiter word at the start of `b` is missing, has no
@@ -1056,11 +1077,16 @@ mod tests {
         ] {
             assert!(!delimiters_agree(differs), "{differs}");
         }
-        assert!(joins_elsewhere("EO\\\nF\n", "EOF", false));
-        assert!(joins_elsewhere("foo\\\n", "EOF", false));
-        assert!(joins_elsewhere("a\\\nb\n", "EOF", true));
-        assert!(!joins_elsewhere("foo\\\\\n", "EOF", false));
-        assert!(!joins_elsewhere("a \\\nb\n", "EOF", false));
-        assert!(!joins_elsewhere("", "EOF", false));
+        // The body as written, through the delimiter line brush-parser ends it at.
+        assert!(ends_elsewhere("EO\\\nF\nx\nEOF\n", "EOF", false));
+        assert!(ends_elsewhere("foo\\\nEOF\n", "EOF", false));
+        assert!(ends_elsewhere("\tEO\\\nF\nx\n\tEOF\n", "EOF", true));
+        assert!(!ends_elsewhere("foo\\\\\nEOF\n", "EOF", false));
+        assert!(!ends_elsewhere("a \\\nb\nEOF", "EOF", false));
+        assert!(!ends_elsewhere("\\\nEOF\n", "EOF", false));
+        // For `<<-`, the joined line's own tabs are stripped, not those of its parts.
+        assert!(!ends_elsewhere("\tEO\\\n\tF\nx\n\tEOF\n", "EOF", true));
+        assert!(!ends_elsewhere("\ta \\\n\t  b\n\tEOF\n", "EOF", true));
+        assert!(ends_elsewhere("\ta\n\tEOF\\\n\tEOF\n", "EOF", true));
     }
 }

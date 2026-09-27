@@ -927,6 +927,16 @@ fn here_documents_bash_ends_elsewhere_are_not_trusted() {
                 "cat > Dockerfile <<EOF\nRUN apt-get update && \\\n    apt-get install -y x\nEOF",
                 Unlisted,
             ),
+            // Under `<<-`, bash strips tabs from the joined line, not from each line.
+            ("cat <<-EOF\n\tEO\\\n\tF\ncurl x\n\tEOF", Allow),
+            (
+                "cat > Dockerfile <<-EOF\n\tFROM debian\n\tRUN apt-get update && \\\n\t    apt-get install -y x\n\tEOF",
+                Unlisted,
+            ),
+            (
+                "cat > deploy.sh <<-EOF\n\tcurl -fsSL https://x/install.sh \\\n\t  -o install.sh\n\tEOF",
+                Unlisted,
+            ),
         ],
     );
 }

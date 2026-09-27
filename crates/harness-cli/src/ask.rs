@@ -1,5 +1,6 @@
 use std::{
     io::{IsTerminal, Read, Write},
+    path::Path,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -10,7 +11,7 @@ use harness_core::{
     engine::{EngineConfig, PermissionEngine, RuleSet},
     event::{AgentEvent, TurnEndReason},
     permission::{FsAccess, Mode},
-    tool::ToolContext,
+    tool::{CommandSandbox, ToolContext},
 };
 use harness_providers::registry;
 use tokio::sync::mpsc;
@@ -113,6 +114,7 @@ pub async fn run(
         harness_sandbox::detect(harness_sandbox::SandboxSettings {
             extra_writable: setup.config.writable_roots.clone(),
             allow_localhost: setup.config.allow_localhost,
+            quarantine_dir: Some(setup.paths.data_dir.join("quarantine")),
         })
     };
     let sandboxed = sandbox.is_some();
@@ -152,7 +154,7 @@ pub async fn run(
             terminal_safe(&rule)
         );
     }
-    let ctx = ToolContext::new(&setup.workspace).with_sandbox(sandbox, mode.fs_access());
+    let ctx = tool_context(&setup.workspace, sandbox, mode.fs_access()).await;
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),
@@ -188,6 +190,23 @@ pub async fn run(
         );
     }
     exit_code(reason, blocked)
+}
+
+/// The tools' context, with the sandbox's session started first: before the agent runs, so what
+/// the sandbox reads from the workspace (on Linux, the ignore rules the git-metadata guard scans
+/// with) is what was there before any tool could change it.
+async fn tool_context(
+    workspace: &Path,
+    sandbox: Option<Arc<dyn CommandSandbox>>,
+    access: FsAccess,
+) -> ToolContext {
+    let ctx = ToolContext::new(workspace).with_sandbox(sandbox, access);
+    if let Some(sandbox) = ctx.sandbox.clone() {
+        let workspace = ctx.workspace.clone();
+        // It may walk the whole workspace. Should it fail, the first command reads what it needs.
+        let _ = tokio::task::spawn_blocking(move || sandbox.start_session(&workspace)).await;
+    }
+    ctx
 }
 
 /// Maps how the turn ended to the documented exit codes.
@@ -363,6 +382,74 @@ async fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Mutex;
+
+    use harness_core::tool::Tool;
+
+    /// Runs commands directly, and records what harness asks of it.
+    #[derive(Debug, Default)]
+    struct Recording {
+        log: Mutex<Vec<String>>,
+    }
+
+    impl Recording {
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandSandbox for Recording {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn command(
+            &self,
+            _access: FsAccess,
+            _workspace: &Path,
+            program: &str,
+            args: &[&str],
+        ) -> std::io::Result<tokio::process::Command> {
+            self.log.lock().unwrap().push("command".into());
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(args).process_group(0);
+            Ok(cmd)
+        }
+
+        fn is_denial(&self, _exit_code: Option<i32>, _output: &str) -> bool {
+            false
+        }
+
+        fn start_session(&self, workspace: &Path) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("start_session {}", workspace.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sandbox_session_starts_before_the_first_tool_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(Recording::default());
+        let shared: Arc<dyn CommandSandbox> = sandbox.clone();
+        let ctx = tool_context(dir.path(), Some(shared), FsAccess::WorkspaceWrite).await;
+        let started = format!("start_session {}", ctx.workspace.display());
+        assert_eq!(sandbox.log(), [started.as_str()]);
+        let out = harness_tools::BashTool
+            .run(serde_json::json!({"command": "echo hi"}), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(sandbox.log(), [started.as_str(), "command"]);
+    }
+
+    #[tokio::test]
+    async fn without_a_sandbox_there_is_no_session_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = tool_context(dir.path(), None, FsAccess::WorkspaceWrite).await;
+        assert!(ctx.sandbox.is_none());
+    }
 
     #[test]
     fn exit_codes_match_the_spec() {

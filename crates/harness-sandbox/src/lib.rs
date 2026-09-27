@@ -16,6 +16,16 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 mod policy;
+// The processes sandboxed commands leave running, for the Linux basic tier. Its platform-neutral
+// parts are unit-tested on every host.
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+mod procs;
 mod roots;
 
 use std::{
@@ -42,6 +52,9 @@ pub struct SandboxSettings {
     pub extra_writable: Vec<PathBuf>,
     /// Allow loopback networking (`sandbox.allow_localhost`; macOS only).
     pub allow_localhost: bool,
+    /// Where the Linux git-metadata guard moves what it takes out of the workspace. The CLI
+    /// passes `<data dir>/quarantine`; `None` means `harness-quarantine` in the temp directory.
+    pub quarantine_dir: Option<PathBuf>,
 }
 
 impl SandboxSettings {

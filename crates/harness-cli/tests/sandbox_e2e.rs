@@ -137,6 +137,71 @@ async fn auto_mode_runs_commands_in_the_sandbox_without_approval() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_sandboxed_commands_exit_status_and_output_reach_the_result() {
+    if !host_has_sandbox() {
+        return;
+    }
+    // On Linux harness reaps orphans as a child subreaper; the command it waits for is never one.
+    let (_env, out) = run_bash("echo out; exit 7", "", |_| {}).await;
+    assert_eq!(out.status.code(), Some(0), "{}", tool_output(&out));
+    assert!(
+        tool_output(&out).starts_with("exit code 7\nout\n"),
+        "{}",
+        tool_output(&out)
+    );
+}
+
+/// What the Linux git-metadata guard says reaches the tool result: here, that it could not scan
+/// the whole workspace (an ignore file it cannot use), which does not block the command.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn what_the_linux_guard_reports_reaches_the_tool_result() {
+    if !host_has_sandbox() {
+        return;
+    }
+    let (_env, out) = run_bash("echo hi", "", |env| {
+        std::os::unix::fs::symlink("elsewhere", env.ws.path().join(".gitignore")).unwrap();
+    })
+    .await;
+    assert_eq!(out.status.code(), Some(0), "{}", tool_output(&out));
+    assert!(
+        tool_output(&out).contains("harness could not scan the whole workspace"),
+        "{}",
+        tool_output(&out)
+    );
+}
+
+/// The spec's "Planting a hook in the Linux basic tier": the hook is moved to the quarantine in
+/// the data directory, the tool result says so, and the command counts as blocked (exit 3).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hook_planted_in_the_linux_basic_tier_is_quarantined_and_blocks() {
+    if !host_has_sandbox() {
+        return;
+    }
+    let tier = harness_sandbox::detect(harness_sandbox::SandboxSettings::default())
+        .map(|sandbox| sandbox.git_protection());
+    if !matches!(tier, Some(harness_core::tool::GitProtection::Basic { .. })) {
+        eprintln!("skipping: the sandbox here is not in the basic tier");
+        return;
+    }
+    let (env, out) = run_bash("echo 'echo pwned' > .git/hooks/pre-commit", "", |_| {}).await;
+    assert_eq!(out.status.code(), Some(3), "{}", tool_output(&out));
+    assert!(!env.ws.path().join(".git/hooks/pre-commit").exists());
+    let output = tool_output(&out);
+    assert!(output.contains("[the sandbox undid changes"), "{output}");
+    assert!(output.contains("- .git/hooks/pre-commit: "), "{output}");
+    let quarantine = env.home.path().join("data/quarantine");
+    let stored: Vec<_> = std::fs::read_dir(&quarantine)
+        .unwrap_or_else(|e| panic!("no quarantine at {quarantine:?}: {e}"))
+        .map(|entry| entry.unwrap().path().join("dot-git/hooks/pre-commit"))
+        .filter(|path| path.exists())
+        .collect();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(std::fs::read_to_string(&stored[0]).unwrap(), "echo pwned\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn writes_outside_the_workspace_are_blocked_headless() {
     if !host_has_sandbox() {
         return;

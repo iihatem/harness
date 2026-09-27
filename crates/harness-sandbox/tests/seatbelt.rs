@@ -1146,6 +1146,7 @@ async fn t06_extra_writable_root_is_writable_but_its_sibling_is_not() {
     let settings = SandboxSettings {
         extra_writable: vec![extra.clone()],
         allow_localhost: false,
+        ..SandboxSettings::default()
     };
 
     let (code, out) = sh_in(

@@ -37,12 +37,25 @@ pub struct PermissionsConfig {
     pub read_dirs: Vec<String>,
 }
 
+/// `sandbox.linux_git_protection`: what to do on Linux when user namespaces are unavailable, so
+/// git metadata is protected only after each command (the basic tier).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinuxGitProtection {
+    /// Run commands in the basic tier after a startup warning.
+    #[default]
+    BestEffort,
+    /// Treat the basic tier as no sandbox: every shell command asks first.
+    Required,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
     #[serde(default)]
     pub writable_roots: Vec<String>,
     pub allow_localhost: Option<bool>,
+    pub linux_git_protection: Option<LinuxGitProtection>,
 }
 
 /// One `config.toml` file as written by the user.
@@ -84,6 +97,7 @@ pub struct Config {
     pub read_dirs: Vec<PathBuf>,
     pub writable_roots: Vec<PathBuf>,
     pub allow_localhost: bool,
+    pub linux_git_protection: LinuxGitProtection,
     pub warnings: Vec<String>,
 }
 
@@ -115,12 +129,14 @@ pub struct Widening {
     pub fingerprint: String,
 }
 
-/// The mode and step limit in effect without the project config: the global config's, or the
-/// defaults. A project setting that does not go beyond them narrows and needs no trust.
+/// The mode, step limit and Linux git protection in effect without the project config: the global
+/// config's, or the defaults. A project setting that does not go beyond them narrows and needs no
+/// trust.
 #[derive(Debug, Clone, Copy)]
 struct Baseline {
     mode: Mode,
     max_steps: u32,
+    linux_git_protection: LinuxGitProtection,
 }
 
 impl Baseline {
@@ -132,6 +148,9 @@ impl Baseline {
             max_steps: global
                 .and_then(|g| g.max_steps)
                 .unwrap_or(DEFAULT_MAX_STEPS),
+            linux_git_protection: global
+                .and_then(|g| g.sandbox.linux_git_protection)
+                .unwrap_or_default(),
         }
     }
 }
@@ -173,6 +192,11 @@ fn widening(project: &ConfigFile, baseline: Baseline) -> Option<Widening> {
     }
     if let Some(true) = project.sandbox.allow_localhost {
         items.push("sandbox.allow_localhost = true".to_string());
+    }
+    if project.sandbox.linux_git_protection == Some(LinuxGitProtection::BestEffort)
+        && baseline.linux_git_protection == LinuxGitProtection::Required
+    {
+        items.push("sandbox.linux_git_protection = \"best-effort\"".to_string());
     }
     if items.is_empty() {
         return None;
@@ -221,6 +245,7 @@ pub fn load(
         cfg.read_dirs = expand_all(&global.permissions.read_dirs, base, home);
         cfg.writable_roots = expand_all(&global.sandbox.writable_roots, base, home);
         cfg.allow_localhost = global.sandbox.allow_localhost.unwrap_or(false);
+        cfg.linux_git_protection = global.sandbox.linux_git_protection.unwrap_or_default();
     }
     let path = project_file(workspace);
     if let Some(project) = parse_file(&path)? {
@@ -235,6 +260,9 @@ pub fn load(
         }
         if let Some(false) = project.sandbox.allow_localhost {
             cfg.allow_localhost = false;
+        }
+        if let Some(LinuxGitProtection::Required) = project.sandbox.linux_git_protection {
+            cfg.linux_git_protection = LinuxGitProtection::Required;
         }
         match widening(&project, baseline) {
             None => {}
@@ -256,6 +284,9 @@ pub fn load(
                     .extend(expand_all(&project.sandbox.writable_roots, workspace, home));
                 if let Some(allow) = project.sandbox.allow_localhost {
                     cfg.allow_localhost = allow;
+                }
+                if let Some(protection) = project.sandbox.linux_git_protection {
+                    cfg.linux_git_protection = protection;
                 }
             }
             Some(w) => cfg.warnings.push(format!(

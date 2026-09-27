@@ -1497,9 +1497,10 @@ impl Tracked {
 }
 
 /// What an entry is, for noticing that it was replaced. Two are the same
-/// when of one kind and, for an inode, the same device, number and (where
-/// both are known) birth time: a filesystem may give a freed inode's number
-/// to the next file at once.
+/// when of one kind and, for an inode, the same device and number, and for a
+/// file (where both are known) birth time: a filesystem may give a freed
+/// inode's number to the next file at once. Not for a directory: overlayfs
+/// gives one a new birth time when it copies it up.
 #[derive(Debug, Clone)]
 enum Identity {
     /// Nothing is there, or nothing reachable without a symlink.
@@ -1540,7 +1541,7 @@ impl PartialEq for Identity {
                 dir == other_dir
                     && dev == other_dev
                     && ino == other_ino
-                    && same_birth(*birth, *other_birth)
+                    && (*dir || same_birth(*birth, *other_birth))
             }
             _ => false,
         }
@@ -1559,11 +1560,12 @@ impl Identity {
             Ok((parent, name, stat)) if stat.kind == Kind::Symlink => parent
                 .read_link(&name)
                 .map_or(Identity::Unreachable, |target| Identity::Symlink { target }),
+            // A directory is known by its inode alone: see [`Stat::same_entry`].
             Ok((_, _, stat)) => Identity::Inode {
                 dir: stat.kind == Kind::Dir,
                 dev: stat.dev,
                 ino: stat.ino,
-                birth: stat.birth,
+                birth: stat.birth.filter(|_| stat.kind != Kind::Dir),
             },
         }
     }

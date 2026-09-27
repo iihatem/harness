@@ -721,3 +721,24 @@ fn an_entry_born_again_under_the_same_inode_is_another() {
     assert_eq!(inode(None), inode(Some((10, 0))));
     assert_eq!(inode(Some((10, 0))), inode(None));
 }
+
+#[test]
+fn a_directory_is_known_by_its_inode_alone() {
+    // Overlayfs keeps a directory's device and inode across copy-up, and
+    // gives it a new birth time: the first commit in a container copies up
+    // `.git`, which must not look replaced.
+    let dir = |birth| Identity::Inode {
+        dir: true,
+        dev: 1,
+        ino: 7,
+        birth,
+    };
+    assert_eq!(dir(Some((10, 0))), dir(Some((20, 5))));
+    let file = |birth| Identity::Inode {
+        dir: false,
+        dev: 1,
+        ino: 7,
+        birth,
+    };
+    assert_ne!(file(Some((10, 0))), file(Some((20, 5))));
+}

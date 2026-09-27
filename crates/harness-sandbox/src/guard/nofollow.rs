@@ -23,6 +23,8 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 
 /// How a directory is opened: never through a symlink, and never waiting on
 /// a FIFO swapped in for it.
@@ -54,20 +56,23 @@ pub(crate) struct Stat {
     pub(crate) size: u64,
     pub(crate) mtime: (i64, i64),
     pub(crate) ctime: (i64, i64),
-    /// When the inode was created, where the system says: `statx` on Linux,
+    /// When a file (not a directory) was created, where the system says so
+    /// reliably: `statx` on a filesystem known to keep it on Linux,
     /// `st_birthtime` on macOS. A filesystem may give a freed inode's number
     /// to the next file at once (ext4 does); its birth time tells them apart.
     pub(crate) birth: Option<(i64, i64)>,
 }
 
 impl Stat {
-    /// Whether `other` is the same entry: the same type, device, inode and
-    /// (where both are known) birth time.
+    /// Whether `other` is the same entry: the same type, device, inode and,
+    /// for anything but a directory, (where both are known) birth time. A
+    /// directory is known by its inode alone: overlayfs keeps a directory's
+    /// device and inode across copy-up, and gives it a new birth time.
     pub(crate) fn same_entry(&self, other: &Stat) -> bool {
         self.kind == other.kind
             && self.dev == other.dev
             && self.ino == other.ino
-            && same_birth(self.birth, other.birth)
+            && (self.kind == Kind::Dir || same_birth(self.birth, other.birth))
     }
 
     /// Whether `other` is the same entry, not written to since: the same
@@ -86,14 +91,15 @@ impl Stat {
     )]
     fn from_raw(st: &libc::stat) -> Stat {
         let mode = st.st_mode as u32;
+        let kind = kind_of(mode);
         #[cfg(target_os = "macos")]
-        let birth = (st.st_birthtime != 0 || st.st_birthtime_nsec != 0)
+        let birth = (kind != Kind::Dir && (st.st_birthtime != 0 || st.st_birthtime_nsec != 0))
             .then_some((st.st_birthtime as i64, st.st_birthtime_nsec as i64));
         // Linux gives birth times through `statx` only.
         #[cfg(not(target_os = "macos"))]
         let birth = None;
         Stat {
-            kind: kind_of(mode),
+            kind,
             mode: mode & 0o7777,
             dev: st.st_dev as u64,
             ino: st.st_ino as u64,
@@ -136,6 +142,9 @@ fn kind_of(mode: u32) -> Kind {
 /// field the guard needs: `fstatat` answers then.
 #[cfg(target_os = "linux")]
 fn statx(dir: RawFd, name: &CStr, flags: libc::c_int) -> Option<io::Result<Stat>> {
+    if !statx_works() {
+        return None;
+    }
     const NEEDED: libc::c_uint = libc::STATX_TYPE
         | libc::STATX_MODE
         | libc::STATX_NLINK
@@ -170,9 +179,10 @@ fn statx(dir: RawFd, name: &CStr, flags: libc::c_int) -> Option<io::Result<Stat>
         return None;
     }
     let mode = u32::from(stx.stx_mode);
+    let kind = kind_of(mode);
     let time = |at: libc::statx_timestamp| (at.tv_sec, i64::from(at.tv_nsec));
     Some(Ok(Stat {
-        kind: kind_of(mode),
+        kind,
         mode: mode & 0o7777,
         // As `stat` spells it.
         dev: libc::makedev(stx.stx_dev_major, stx.stx_dev_minor),
@@ -181,17 +191,120 @@ fn statx(dir: RawFd, name: &CStr, flags: libc::c_int) -> Option<io::Result<Stat>
         size: stx.stx_size,
         mtime: time(stx.stx_mtime),
         ctime: time(stx.stx_ctime),
-        birth: (stx.stx_mask & libc::STATX_BTIME != 0).then(|| time(stx.stx_btime)),
+        // Whether the filesystem keeps it reliably is for the caller to say.
+        birth: (kind != Kind::Dir && stx.stx_mask & libc::STATX_BTIME != 0)
+            .then(|| time(stx.stx_btime)),
     }))
+}
+
+/// Whether `statx` can be used in this process: tried once, on `/`. A
+/// seccomp profile may refuse it with any error (`ENOSYS`, `EPERM`,
+/// `EACCES`); `fstatat` answers then, for good.
+#[cfg(target_os = "linux")]
+fn statx_works() -> bool {
+    static WORKS: OnceLock<bool> = OnceLock::new();
+    *WORKS.get_or_init(|| {
+        let mut stx = MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: the path is NUL-terminated, `stx` is a `statx` buffer,
+        // and both outlive the call.
+        let done = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                libc::AT_FDCWD,
+                c"/".as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+                libc::STATX_BASIC_STATS,
+                stx.as_mut_ptr(),
+            )
+        };
+        let probe = if done == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+        statx_usable(&probe)
+    })
+}
+
+/// Whether `statx` is usable, given what it did on `/`, where nothing but a
+/// refusal of the call itself can go wrong.
+#[cfg(any(target_os = "linux", test))]
+fn statx_usable(probe: &io::Result<()>) -> bool {
+    probe.is_ok()
+}
+
+/// Whether a filesystem with the magic number `magic` (`statfs`'s
+/// `f_type`) is known to keep a file's birth time: ext2/3/4, xfs, btrfs and
+/// tmpfs. Not overlayfs, which gives a file copied up a new one, nor FUSE,
+/// NFS, CIFS or SMB, nor anything else unknown.
+#[cfg(any(target_os = "linux", test))]
+fn keeps_birth_times(magic: u64) -> bool {
+    // `f_type` is signed on some targets: a magic number over `i32::MAX`
+    // may come sign-extended.
+    matches!(
+        magic & 0xFFFF_FFFF,
+        0xEF53 | 0x5846_5342 | 0x9123_683E | 0x0102_1994
+    )
+}
+
+/// Whether the filesystem the open `fd` is on keeps birth times.
+#[cfg(target_os = "linux")]
+fn fs_keeps_births(fd: RawFd) -> bool {
+    let mut fs = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `fs` is a `statfs` buffer that outlives the call; on success
+    // `fstatfs` has initialized it.
+    if unsafe { libc::fstatfs(fd, fs.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: initialized by the successful call above. The sign, where
+    // `f_type` has one, is masked off in `keeps_birth_times`.
+    let magic = unsafe { fs.assume_init_ref() }.f_type as u64;
+    keeps_birth_times(magic)
+}
+
+/// The device the open `fd` is on.
+#[cfg(target_os = "linux")]
+fn device(fd: RawFd) -> Option<u64> {
+    let mut st = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `st` is large enough; on success `fstat` has initialized it.
+    if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: initialized by the successful call above.
+    Some(unsafe { st.assume_init_ref() }.st_dev)
 }
 
 /// An open directory.
 #[derive(Debug)]
 pub(crate) struct Dir {
     fd: OwnedFd,
+    /// The device of this directory's filesystem when that keeps birth
+    /// times reliably (`None` when not), found the first time it matters.
+    #[cfg(target_os = "linux")]
+    births: OnceLock<Option<u64>>,
 }
 
 impl Dir {
+    fn from_fd(fd: OwnedFd) -> Dir {
+        Dir {
+            fd,
+            #[cfg(target_os = "linux")]
+            births: OnceLock::new(),
+        }
+    }
+
+    /// Whether a birth time `statx` gave for an entry on device `dev` in
+    /// this directory can be trusted: the entry is on this directory's
+    /// filesystem (not a mount point), and that keeps birth times.
+    #[cfg(target_os = "linux")]
+    fn keeps_births(&self, dev: u64) -> bool {
+        let fd = self.raw();
+        let births = self
+            .births
+            .get_or_init(|| fs_keeps_births(fd).then(|| device(fd)).flatten());
+        *births == Some(dev)
+    }
+
     /// Opens the trusted directory `path`. Its last component must not be a
     /// symlink; the ones before it are followed.
     pub(crate) fn open(path: &Path) -> io::Result<Dir> {
@@ -199,15 +312,15 @@ impl Dir {
         // SAFETY: `path` is NUL-terminated and outlives the call.
         let fd = cvt(unsafe { libc::open(path.as_ptr(), DIR_FLAGS) })?;
         // SAFETY: `open` just returned this descriptor, which nothing else owns.
-        Ok(Dir {
-            fd: unsafe { OwnedFd::from_raw_fd(fd) },
-        })
+        Ok(Dir::from_fd(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
     /// Another descriptor for this directory.
     pub(crate) fn try_clone(&self) -> io::Result<Dir> {
         Ok(Dir {
             fd: self.fd.try_clone()?,
+            #[cfg(target_os = "linux")]
+            births: self.births.clone(),
         })
     }
 
@@ -228,9 +341,7 @@ impl Dir {
 
     /// The directory `name` in this one, when it is not a symlink.
     pub(crate) fn open_dir(&self, name: &OsStr) -> io::Result<Dir> {
-        Ok(Dir {
-            fd: self.open_at(name, DIR_FLAGS, 0)?,
-        })
+        Ok(Dir::from_fd(self.open_at(name, DIR_FLAGS, 0)?))
     }
 
     /// This directory's `fstat`.
@@ -243,7 +354,12 @@ impl Dir {
         let name = plain_name(name)?;
         #[cfg(target_os = "linux")]
         if let Some(found) = statx(self.raw(), &name, 0) {
-            return found;
+            return found.map(|mut stat| {
+                if stat.birth.is_some() && !self.keeps_births(stat.dev) {
+                    stat.birth = None;
+                }
+                stat
+            });
         }
         let mut st = MaybeUninit::<libc::stat>::uninit();
         // SAFETY: `name` is NUL-terminated and `st` is large enough; on
@@ -523,9 +639,7 @@ impl Dir {
         #[cfg(target_os = "linux")]
         {
             let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            Ok(Dir {
-                fd: self.open_at(name, flags, 0)?,
-            })
+            Ok(Dir::from_fd(self.open_at(name, flags, 0)?))
         }
         #[cfg(not(target_os = "linux"))]
         self.open_dir(name)
@@ -573,7 +687,7 @@ fn openat2_beneath(dir: &Dir, rel: &Path) -> Option<io::Result<Dir>> {
             // SAFETY: `openat2` just returned this descriptor, which nothing
             // else owns.
             let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
-            return Some(Ok(Dir { fd }));
+            return Some(Ok(Dir::from_fd(fd)));
         }
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
@@ -665,7 +779,12 @@ fn set_errno(value: libc::c_int) {
 fn fstat(fd: RawFd) -> io::Result<Stat> {
     #[cfg(target_os = "linux")]
     if let Some(found) = statx(fd, c"", libc::AT_EMPTY_PATH) {
-        return found;
+        return found.map(|mut stat| {
+            if stat.birth.is_some() && !fs_keeps_births(fd) {
+                stat.birth = None;
+            }
+            stat
+        });
     }
     let mut st = MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `st` is large enough; on success `fstat` has initialized it.
@@ -1074,6 +1193,57 @@ mod tests {
             ..seen
         };
         assert!(unknown.same_entry(&seen) && seen.same_entry(&unknown));
+    }
+
+    #[test]
+    fn a_directory_is_the_same_entry_whatever_its_birth_time() {
+        let (_d, base) = tree();
+        let seen = Tree::new(&base).stat(&base.join("a")).unwrap();
+        assert_eq!(seen.kind, Kind::Dir);
+        let copied_up = Stat {
+            birth: Some((1, 2)),
+            ..seen
+        };
+        let before = Stat {
+            birth: Some((3, 4)),
+            ..seen
+        };
+        assert!(copied_up.same_entry(&before));
+        let file = |birth| Stat {
+            kind: Kind::File,
+            birth,
+            ..seen
+        };
+        assert!(!file(Some((1, 2))).same_entry(&file(Some((3, 4)))));
+    }
+
+    #[test]
+    fn birth_times_are_trusted_on_filesystems_known_to_keep_them() {
+        for (magic, kept) in [
+            (0xEF53, true),       // ext2, ext3, ext4
+            (0x5846_5342, true),  // xfs
+            (0x9123_683E, true),  // btrfs
+            (0x0102_1994, true),  // tmpfs
+            (0x794C_7630, false), // overlayfs
+            (0x6573_5546, false), // fuse
+            (0x6969, false),      // nfs
+            (0xFF53_4D42, false), // cifs
+            (0xFE53_4D42, false), // smb2
+            (0, false),
+        ] {
+            assert_eq!(keeps_birth_times(magic), kept, "{magic:#x}");
+        }
+        // A signed `f_type` holding a magic number over `i32::MAX`.
+        assert!(keeps_birth_times(0x9123_683E_u32 as i32 as i64 as u64));
+    }
+
+    #[test]
+    fn statx_is_given_up_for_good_when_its_probe_fails() {
+        assert!(statx_usable(&Ok(())));
+        for errno in [libc::ENOSYS, libc::EPERM, libc::EACCES, libc::EINVAL] {
+            let failed = Err(io::Error::from_raw_os_error(errno));
+            assert!(!statx_usable(&failed), "{errno}");
+        }
     }
 
     #[test]

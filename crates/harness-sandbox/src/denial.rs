@@ -1,12 +1,13 @@
 /// Keywords that, together with a non-zero, non-harness-bug exit code,
 /// indicate the sandbox (rather than the command itself) most likely
 /// caused the failure. Matched case-insensitively against combined
-/// stdout+stderr.
-const SANDBOX_DENIED_KEYWORDS: [&str; 5] = [
+/// stdout+stderr. The bare word "sandbox" is not one: it appears in
+/// ordinary output (crate and file names, like this crate's own) far more
+/// often than in a denial.
+const SANDBOX_DENIED_KEYWORDS: [&str; 4] = [
     "operation not permitted",
     "permission denied",
     "read-only file system",
-    "sandbox",
     "failed to write file",
 ];
 
@@ -108,6 +109,17 @@ mod tests {
         let bare_refused = "curl: (7) connect() to 127.0.0.1:9 failed: Connection refused\n";
         assert!(!looks_like_sandbox_denial(Some(7), bare_refused, true));
         assert!(looks_like_sandbox_denial(Some(7), output, true));
+    }
+
+    #[test]
+    fn the_word_sandbox_alone_is_not_a_denial() {
+        let build = "error: could not compile `harness-sandbox` (lib) due to 2 previous errors\n";
+        assert!(!looks_like_sandbox_denial(Some(101), build, false));
+        assert!(!looks_like_sandbox_denial(
+            Some(1),
+            "FAILED tests/sandbox_e2e.rs\n",
+            true
+        ));
     }
 
     #[test]

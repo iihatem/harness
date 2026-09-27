@@ -4,10 +4,21 @@ use std::process::Stdio;
 
 use harness_sandbox::{FsAccess, SandboxSettings, detect};
 
+/// Called when `detect` found no sandbox: the test is skipped, unless
+/// `HARNESS_REQUIRE_LINUX_SANDBOX=1` says this host must have one (CI's Linux job sets it), in which
+/// case it fails, as the other sandbox tests do.
+fn skip_unless_required() {
+    assert!(
+        std::env::var("HARNESS_REQUIRE_LINUX_SANDBOX").as_deref() != Ok("1"),
+        "HARNESS_REQUIRE_LINUX_SANDBOX=1 but detect() found no sandbox on this host"
+    );
+    eprintln!("skipping: no OS sandbox on this host");
+}
+
 #[tokio::test]
 async fn the_detected_sandbox_confines_writes_to_the_workspace() {
     let Some(sandbox) = detect(SandboxSettings::default()) else {
-        eprintln!("skipping: no OS sandbox on this host");
+        skip_unless_required();
         return;
     };
     assert!(
@@ -51,6 +62,7 @@ async fn the_detected_sandbox_confines_writes_to_the_workspace() {
 #[tokio::test]
 async fn read_only_access_blocks_workspace_writes() {
     let Some(sandbox) = detect(SandboxSettings::default()) else {
+        skip_unless_required();
         return;
     };
     let ws = tempfile::tempdir().unwrap();

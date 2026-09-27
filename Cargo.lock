@@ -1010,6 +1010,7 @@ name = "harness-sandbox"
 version = "0.1.0"
 dependencies = [
  "harness-core",
+ "ignore",
  "landlock",
  "libc",
  "seccompiler",

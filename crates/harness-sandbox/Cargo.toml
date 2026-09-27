@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 harness-core.workspace = true
+ignore.workspace = true
 tokio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

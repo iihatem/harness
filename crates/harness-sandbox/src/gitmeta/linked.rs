@@ -1,5 +1,6 @@
-//! Finds the gitdir a workspace's `.git` leads to when `.git` is a symlink or
-//! a gitfile, so the Seatbelt profile can protect it like `.git` itself.
+//! Finds the gitdir a `.git` leads to when it is a symlink or a gitfile, so
+//! the Seatbelt profile (for the workspace's own `.git`) and the Linux guard
+//! (for every `.git`) can protect it like a `.git` directory.
 //!
 //! Git follows a `.git` symlink, and reads a `.git` file (a gitfile, also
 //! when reached through a symlink) as `gitdir: <path>`, relative to the
@@ -22,9 +23,9 @@ const MAX_SYMLINKS: usize = 40;
 /// The most of a gitfile or `commondir` file read. A path is shorter.
 const MAX_POINTER_BYTES: u64 = 4096;
 
-/// What the profile protects for a workspace whose `.git` is a symlink or a
-/// gitfile. Only paths inside the workspace are listed; nothing outside it is
-/// writable from the workspace-write sandbox except the temp and cache roots.
+/// What to protect for a `.git` that is a symlink or a gitfile. Only paths
+/// inside the workspace are listed; nothing outside it is writable from the
+/// workspace-write sandbox except the temp and cache roots.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct LinkedGitdirs {
     /// Gitdirs git uses in this workspace: the one `.git` leads to, and the
@@ -32,8 +33,9 @@ pub(crate) struct LinkedGitdirs {
     pub gitdirs: Vec<PathBuf>,
     /// Entries below the workspace that the way to those gitdirs passes
     /// through: each symlink and directory, the gitfile, and the gitdirs
-    /// themselves. `.git` itself is left out: the profile protects every
-    /// `.git` entry already.
+    /// themselves. `.git` itself is left out, and so is the directory that
+    /// holds it and everything above that: the profile and the guard protect
+    /// every `.git` entry already.
     pub entries: Vec<PathBuf>,
 }
 
@@ -45,8 +47,16 @@ pub(crate) struct LinkedGitdirs {
 /// names where git would look once it is created). The entries on the way
 /// are listed even when no gitdir is found, so a symlinked gitfile git
 /// rejects today cannot be rewritten into one it accepts.
+#[cfg(target_os = "macos")]
 pub(crate) fn linked_gitdirs(workspace: &Path) -> LinkedGitdirs {
-    let dot_git = workspace.join(".git");
+    linked_gitdirs_at(workspace, workspace)
+}
+
+/// [`linked_gitdirs`] for the `.git` in `holder`, a directory in the
+/// canonical `workspace` (or the workspace itself). A gitfile's path is
+/// relative to `holder`.
+pub(crate) fn linked_gitdirs_at(holder: &Path, workspace: &Path) -> LinkedGitdirs {
+    let dot_git = holder.join(".git");
     let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
         return LinkedGitdirs::default();
     };
@@ -56,7 +66,7 @@ pub(crate) fn linked_gitdirs(workspace: &Path) -> LinkedGitdirs {
 
     let mut visited = Vec::new();
     let mut gitdirs = Vec::new();
-    if let Some(gitdir) = gitdir_of(workspace, &dot_git, &mut visited) {
+    if let Some(gitdir) = gitdir_of(holder, &dot_git, &mut visited) {
         let common = pointer(&gitdir.join("commondir"), b"")
             .and_then(|common| follow(&gitdir.join(common), &mut visited));
         gitdirs.push(gitdir);
@@ -65,7 +75,7 @@ pub(crate) fn linked_gitdirs(workspace: &Path) -> LinkedGitdirs {
 
     let mut entries: Vec<PathBuf> = Vec::new();
     for entry in visited {
-        if entry != workspace
+        if !holder.starts_with(&entry)
             && entry != dot_git
             && within(&entry, workspace)
             && !entries.contains(&entry)
@@ -79,7 +89,7 @@ pub(crate) fn linked_gitdirs(workspace: &Path) -> LinkedGitdirs {
 
 /// Where git finds the gitdir through `dot_git`: the directory it resolves
 /// to, or, when it resolves to a regular file, the path that gitfile names.
-fn gitdir_of(workspace: &Path, dot_git: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
+fn gitdir_of(holder: &Path, dot_git: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
     let target = follow(dot_git, visited)?;
     if !std::fs::metadata(&target).is_ok_and(|m| m.is_file()) {
         // A directory, a path that does not exist, or something git cannot
@@ -88,13 +98,13 @@ fn gitdir_of(workspace: &Path, dot_git: &Path, visited: &mut Vec<PathBuf>) -> Op
     }
     let named = pointer(&target, b"gitdir: ")?;
     // Relative to the directory holding `.git`, even through a symlink.
-    follow(&workspace.join(named), visited)
+    follow(&holder.join(named), visited)
 }
 
 /// The path a gitfile (`prefix` `gitdir: `) or a `commondir` file (no prefix)
 /// holds, as git reads it: up to the first NUL, without trailing newlines.
 /// `None` if it is not a regular file, lacks the prefix, or names nothing.
-fn pointer(file: &Path, prefix: &[u8]) -> Option<PathBuf> {
+pub(super) fn pointer(file: &Path, prefix: &[u8]) -> Option<PathBuf> {
     if !std::fs::metadata(file).is_ok_and(|m| m.is_file()) {
         return None;
     }
@@ -117,7 +127,7 @@ fn pointer(file: &Path, prefix: &[u8]) -> Option<PathBuf> {
 /// is taken as written, and so is everything after it. Every entry looked at
 /// is pushed to `visited`, each symlink before it is followed. `None` after
 /// [`MAX_SYMLINKS`] symlinks.
-fn follow(path: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
+pub(super) fn follow(path: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
     let mut resolved = PathBuf::from("/");
     let mut pending = VecDeque::new();
     prepend(&mut pending, path);
@@ -159,18 +169,25 @@ fn prepend(pending: &mut VecDeque<Option<OsString>>, path: &Path) {
     }
 }
 
-/// Whether `path` is `base` or below it, comparing names ASCII
+/// Whether `path` is `base` or below it. On macOS names are compared ASCII
 /// case-insensitively: on the default case-insensitive volume a symlink may
 /// spell the workspace in another case, and Seatbelt's rules match either.
-fn within(path: &Path, base: &Path) -> bool {
+/// Elsewhere names must match exactly.
+pub(crate) fn within(path: &Path, base: &Path) -> bool {
     let mut components = path.components();
     base.components().all(|b| {
-        components.next().is_some_and(|c| {
-            c.as_os_str()
-                .as_bytes()
-                .eq_ignore_ascii_case(b.as_os_str().as_bytes())
-        })
+        components
+            .next()
+            .is_some_and(|c| same_name(c.as_os_str(), b.as_os_str()))
     })
+}
+
+fn same_name(a: &OsStr, b: &OsStr) -> bool {
+    if cfg!(target_os = "macos") {
+        a.as_bytes().eq_ignore_ascii_case(b.as_bytes())
+    } else {
+        a == b
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +195,11 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    /// The workspace's own `.git`, as the macOS profile asks for it.
+    fn linked_gitdirs(workspace: &Path) -> LinkedGitdirs {
+        linked_gitdirs_at(workspace, workspace)
+    }
 
     fn workspace() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -351,5 +373,34 @@ mod tests {
         symlink("fifo", ws.join(".git")).unwrap();
         // Reading it would block forever; it is taken as the gitdir's path.
         check(&ws, &["fifo"], &["fifo"]);
+    }
+
+    #[test]
+    fn a_nested_gitfile_is_read_relative_to_its_own_directory() {
+        let (_d, ws) = workspace();
+        mkdirs(&ws, ".git/modules/sub");
+        mkdirs(&ws, "sub");
+        std::fs::write(ws.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        let found = linked_gitdirs_at(&ws.join("sub"), &ws);
+        assert_eq!(
+            found.gitdirs,
+            vec![ws.join(".git/modules/sub")],
+            "{found:?}"
+        );
+        assert!(found.entries.contains(&ws.join(".git/modules/sub")));
+        // The directory holding `.git`, and everything above it, is not "on the way".
+        assert!(!found.entries.contains(&ws.join("sub")), "{found:?}");
+        assert!(!found.entries.contains(&ws), "{found:?}");
+    }
+
+    #[test]
+    fn names_are_case_insensitive_only_on_macos() {
+        let inside = within(Path::new("/Work/Repo/x"), Path::new("/work/repo"));
+        assert_eq!(inside, cfg!(target_os = "macos"));
+        assert!(within(Path::new("/work/repo/x"), Path::new("/work/repo")));
+        assert!(!within(
+            Path::new("/work/repository"),
+            Path::new("/work/repo")
+        ));
     }
 }

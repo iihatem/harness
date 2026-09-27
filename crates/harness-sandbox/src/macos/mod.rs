@@ -2,7 +2,6 @@
 
 mod availability;
 mod command;
-mod gitdir;
 mod profile;
 
 use std::{io, path::Path};

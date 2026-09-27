@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use harness_core::permission::Mode;
+use harness_core::{agent::DEFAULT_MAX_STEPS, permission::Mode};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -115,10 +115,43 @@ pub struct Widening {
     pub fingerprint: String,
 }
 
-pub fn widening(project: &ConfigFile) -> Option<Widening> {
+/// The mode and step limit in effect without the project config: the global config's, or the
+/// defaults. A project setting that does not go beyond them narrows and needs no trust.
+#[derive(Debug, Clone, Copy)]
+struct Baseline {
+    mode: Mode,
+    max_steps: u32,
+}
+
+impl Baseline {
+    fn new(global: Option<&ConfigFile>, workspace: &Path) -> Baseline {
+        Baseline {
+            mode: global
+                .and_then(|g| g.mode)
+                .unwrap_or_else(|| default_mode(workspace)),
+            max_steps: global
+                .and_then(|g| g.max_steps)
+                .unwrap_or(DEFAULT_MAX_STEPS),
+        }
+    }
+}
+
+/// `auto` inside a git work tree (changes are recoverable), `ask` elsewhere.
+pub fn default_mode(workspace: &Path) -> Mode {
+    if workspace.ancestors().any(|dir| dir.join(".git").exists()) {
+        Mode::Auto
+    } else {
+        Mode::Ask
+    }
+}
+
+fn widening(project: &ConfigFile, baseline: Baseline) -> Option<Widening> {
     let mut items = Vec::new();
-    if let Some(mode) = project.mode.filter(|m| !m.is_narrow()) {
+    if let Some(mode) = project.mode.filter(|m| !m.grants_at_most(baseline.mode)) {
         items.push(format!("mode = \"{mode}\""));
+    }
+    if let Some(steps) = project.max_steps.filter(|&n| n > baseline.max_steps) {
+        items.push(format!("max_steps = {steps}"));
     }
     if let Some(model) = &project.model {
         items.push(format!("model = {model:?}"));
@@ -153,10 +186,15 @@ pub fn project_file(workspace: &Path) -> PathBuf {
 }
 
 /// The widening settings in the workspace's project config, if any (shown by `harness trust`).
-pub fn project_widening(workspace: &Path) -> Result<Option<Widening>, ConfigError> {
+/// Whether a mode or step limit widens depends on the global config, so it is read too.
+pub fn project_widening(
+    global_file: &Path,
+    workspace: &Path,
+) -> Result<Option<Widening>, ConfigError> {
+    let baseline = Baseline::new(parse_file(global_file)?.as_ref(), workspace);
     Ok(parse_file(&project_file(workspace))?
         .as_ref()
-        .and_then(widening))
+        .and_then(|project| widening(project, baseline)))
 }
 
 /// Loads the global config, then the workspace's `.harness/config.toml`. Project settings that narrow
@@ -169,7 +207,9 @@ pub fn load(
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let home = home.as_deref();
     let mut cfg = Config::default();
-    if let Some(global) = parse_file(global_file)? {
+    let global = parse_file(global_file)?;
+    let baseline = Baseline::new(global.as_ref(), workspace);
+    if let Some(global) = global {
         let base = global_file.parent().unwrap_or(Path::new("/"));
         cfg.model = global.model;
         cfg.mode = global.mode;
@@ -187,20 +227,23 @@ pub fn load(
         cfg.deny.extend(project.permissions.deny.iter().cloned());
         cfg.confirm
             .extend(project.permissions.confirm.iter().cloned());
-        if project.max_steps.is_some() {
-            cfg.max_steps = project.max_steps;
+        if let Some(steps) = project.max_steps.filter(|&n| n <= baseline.max_steps) {
+            cfg.max_steps = Some(steps);
         }
-        if let Some(mode) = project.mode.filter(|m| m.is_narrow()) {
+        if let Some(mode) = project.mode.filter(|m| m.grants_at_most(baseline.mode)) {
             cfg.mode = Some(mode);
         }
         if let Some(false) = project.sandbox.allow_localhost {
             cfg.allow_localhost = false;
         }
-        match widening(&project) {
+        match widening(&project, baseline) {
             None => {}
             Some(w) if trust.is_trusted(workspace, &w.fingerprint) => {
-                if let Some(mode) = project.mode.filter(|m| !m.is_narrow()) {
-                    cfg.mode = Some(mode);
+                if project.mode.is_some() {
+                    cfg.mode = project.mode;
+                }
+                if project.max_steps.is_some() {
+                    cfg.max_steps = project.max_steps;
                 }
                 if project.model.is_some() {
                     cfg.model = project.model.clone();

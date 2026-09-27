@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use harness_config::config;
 use harness_core::{
     agent::{Agent, AgentConfig, NonInteractive},
     engine::{EngineConfig, PermissionEngine, RuleSet},
@@ -84,7 +85,7 @@ pub async fn run(
 
     let mode = mode_flag
         .or(setup.config.mode)
-        .unwrap_or_else(|| setup::default_mode(&setup.workspace));
+        .unwrap_or_else(|| config::default_mode(&setup.workspace));
     if mode == Mode::FullAccess {
         eprintln!("warning: full-access mode: commands run without approval or sandbox");
     }

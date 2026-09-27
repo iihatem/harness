@@ -1,10 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use harness_config::{
     config::{self, Config},
     paths::Paths,
 };
-use harness_core::permission::Mode;
 
 /// Everything a command needs about where it runs.
 pub struct Setup {
@@ -31,15 +30,6 @@ pub fn load() -> Result<Setup, String> {
         config,
         workspace,
     })
-}
-
-/// `auto` inside a git work tree (changes are recoverable), `ask` elsewhere.
-pub fn default_mode(workspace: &Path) -> Mode {
-    if workspace.ancestors().any(|dir| dir.join(".git").exists()) {
-        Mode::Auto
-    } else {
-        Mode::Ask
-    }
 }
 
 pub fn env(key: &str) -> Option<String> {

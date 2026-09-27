@@ -40,7 +40,7 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
             }
         };
     }
-    let widening = match config::project_widening(&workspace) {
+    let widening = match config::project_widening(&paths.global_config_file(), &workspace) {
         Ok(Some(widening)) => widening,
         Ok(None) => {
             println!("No project settings in {} need trust.", workspace.display());

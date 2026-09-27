@@ -19,11 +19,6 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Modes that grant no more than `ask` does. Only these may come from an untrusted project config.
-    pub fn is_narrow(self) -> bool {
-        matches!(self, Mode::Plan | Mode::ReadOnly | Mode::Ask)
-    }
-
     /// Whether this mode lets the agent do no more than `other` does. Plan and read-only rank
     /// lowest (and equal), then ask, auto, and full-access.
     pub fn grants_at_most(self, other: Mode) -> bool {

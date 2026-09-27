@@ -4,6 +4,7 @@
 
 mod index;
 mod linked;
+mod read;
 
 pub use index::{GitIndex, discover};
 #[cfg(target_os = "macos")]

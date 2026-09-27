@@ -9,12 +9,17 @@
 //! hooks from the dir it names (`get_common_dir_noenv`). Seatbelt matches
 //! resolved paths, so none of these gitdirs has a `.git` component the
 //! profile's `.git` rules would see.
+//!
+//! Symlinks are resolved with `readlink` alone, and gitfiles and `commondir`
+//! files are read with [`read_regular`]: whatever the workspace holds, looking
+//! never blocks.
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+
+use super::read::read_regular;
 
 /// Symlinks followed on one path before giving up, as the kernel does for a
 /// loop.
@@ -67,8 +72,7 @@ pub(crate) fn linked_gitdirs_at(holder: &Path, workspace: &Path) -> LinkedGitdir
     let mut visited = Vec::new();
     let mut gitdirs = Vec::new();
     if let Some(gitdir) = gitdir_of(holder, &dot_git, &mut visited) {
-        let common = pointer(&gitdir.join("commondir"), b"")
-            .and_then(|common| follow(&gitdir.join(common), &mut visited));
+        let common = common_dir(&gitdir, &mut visited);
         gitdirs.push(gitdir);
         gitdirs.extend(common);
     }
@@ -87,6 +91,18 @@ pub(crate) fn linked_gitdirs_at(holder: &Path, workspace: &Path) -> LinkedGitdir
     LinkedGitdirs { gitdirs, entries }
 }
 
+/// Where the `.git` in `holder` leads, inside the workspace or not: the
+/// directory it is or resolves to, or the path its gitfile names.
+pub(super) fn gitdir_at(holder: &Path) -> Option<PathBuf> {
+    gitdir_of(holder, &holder.join(".git"), &mut Vec::new())
+}
+
+/// The directory `gitdir`'s `commondir` file names, relative to `gitdir`, as
+/// git resolves it. Every entry on the way is pushed to `visited`.
+pub(super) fn common_dir(gitdir: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
+    pointer(&gitdir.join("commondir"), b"").and_then(|common| follow(&gitdir.join(common), visited))
+}
+
 /// Where git finds the gitdir through `dot_git`: the directory it resolves
 /// to, or, when it resolves to a regular file, the path that gitfile names.
 fn gitdir_of(holder: &Path, dot_git: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
@@ -103,17 +119,11 @@ fn gitdir_of(holder: &Path, dot_git: &Path, visited: &mut Vec<PathBuf>) -> Optio
 
 /// The path a gitfile (`prefix` `gitdir: `) or a `commondir` file (no prefix)
 /// holds, as git reads it: up to the first NUL, without trailing newlines.
-/// `None` if it is not a regular file, lacks the prefix, or names nothing.
-pub(super) fn pointer(file: &Path, prefix: &[u8]) -> Option<PathBuf> {
-    if !std::fs::metadata(file).is_ok_and(|m| m.is_file()) {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::open(file)
-        .ok()?
-        .take(MAX_POINTER_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
+/// `None` if it does not resolve to a regular file (git follows a symlinked
+/// `commondir`), lacks the prefix, or names nothing.
+fn pointer(file: &Path, prefix: &[u8]) -> Option<PathBuf> {
+    let file = follow(file, &mut Vec::new())?;
+    let bytes = read_regular(&file, MAX_POINTER_BYTES).ok()?;
     let text = bytes.split(|&b| b == 0).next().unwrap_or_default();
     let mut path = text.strip_prefix(prefix)?;
     while let [rest @ .., b'\n' | b'\r'] = path {
@@ -127,7 +137,7 @@ pub(super) fn pointer(file: &Path, prefix: &[u8]) -> Option<PathBuf> {
 /// is taken as written, and so is everything after it. Every entry looked at
 /// is pushed to `visited`, each symlink before it is followed. `None` after
 /// [`MAX_SYMLINKS`] symlinks.
-pub(super) fn follow(path: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
+fn follow(path: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
     let mut resolved = PathBuf::from("/");
     let mut pending = VecDeque::new();
     prepend(&mut pending, path);

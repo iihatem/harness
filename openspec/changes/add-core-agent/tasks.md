@@ -31,7 +31,9 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 - [ ] 2.9 Agent: approve-for-session and sandbox-denial re-run; verify `cargo test -p harness-core --test agent`
 - [ ] 2.10 CLI wiring and end-to-end sandbox behaviour; verify `cargo test -p harness-cli --test sandbox_e2e`
 - [ ] 2.11 CI pinned to ubuntu-24.04, README safety section; verify CI green on the P2 pull request
-- [ ] 2.12 (deferred past M1) bubblewrap sandbox on Linux and macOS kernel-log denial correlation
+- [ ] 2.12 (deferred past M1) macOS kernel-log denial correlation
+- [ ] 2.13 Linux git-metadata protection (required for M1): a mount-namespace/bubblewrap backend with read-only binds over `.git` config, hooks and commondir, `.harness/` and a top-level `HEAD`, used when available, with Landlock + seccomp as the fallback; verify with Linux integration tests in CI
+- [ ] 2.14 P2 follow-ups from the final review: here-document tracking in the fallback scan must not turn deny matches into prompts; a quote-aware heredoc pre-screen so quoted `<<` patterns stay decomposable; escape config parse errors before printing; the write tool asks before editing dotfiles when the workspace is `$HOME`; fix the design.md wording on nested symlinked gitdirs
 
 ## 3. P3 Memory (plan written after P2)
 

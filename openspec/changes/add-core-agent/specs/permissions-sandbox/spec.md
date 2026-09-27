@@ -133,9 +133,9 @@ The system SHALL classify every shell command as allow-listed (every sub-command
 ### Requirement: The sandbox protects repository hooks and config
 In workspace-write sandboxes the system SHALL protect `.git/config`, `.git/hooks`, `commondir`, the `.git` directory entry itself, a top-level `HEAD` file, and `.harness/` inside the workspace, while allowing other writes under `.git` so that commit, checkout, and stash work.
 
-On macOS, and on Linux when unprivileged user namespaces are available (the full tier), writes to these paths MUST fail. On Linux, names that do not exist yet MUST be caught by a guard that moves them to a quarantine directory, never deleting them, and reports it in the tool result.
+On macOS, and on Linux when unprivileged user namespaces are available (the full tier), writes to these paths MUST fail. On Linux, names that do not exist yet MUST be caught by a guard that moves them to a quarantine directory, never deleting them, and reports it in the tool result. The guard's scan for new repositories MUST use the ignore rules as they were when the session started, so that an ignore rule written during the session cannot hide a new repository.
 
-When user namespaces are unavailable (the basic tier), the system MUST warn at startup and point to `harness sandbox doctor`, and the guard MUST also restore changed protected files after each command. With `sandbox.linux_git_protection = "required"`, the basic tier MUST require approval for every shell command in `ask` and `auto`.
+When user namespaces are unavailable (the basic tier), the system MUST warn at startup and point to `harness sandbox doctor`. The guard MUST restore changed protected files after each command, and, while a process started by an earlier sandboxed command is still running, also before each later command. With `sandbox.linux_git_protection = "required"`, the basic tier MUST require approval for every shell command in `ask` and `auto`.
 
 #### Scenario: Planting a hook
 - **WHEN** a sandboxed command runs `echo x > .git/hooks/pre-commit` in `auto` mode on macOS, or on Linux in the full tier
@@ -154,6 +154,15 @@ When user namespaces are unavailable (the basic tier), the system MUST warn at s
 #### Scenario: A new nested repository on Linux
 - **WHEN** a sandboxed command runs `git init sub` in `auto` mode on Linux
 - **THEN** `sub/.git` is moved to the quarantine directory and the tool result says so
+
+#### Scenario: Hiding a new repository behind an ignore rule
+- **WHEN** a sandboxed command on Linux adds `sub/` to `.gitignore` and then runs `git init sub`
+- **THEN** `sub/.git` is moved to the quarantine directory and the tool result says so
+
+#### Scenario: A background process changes config in the Linux basic tier
+- **WHEN** user namespaces are blocked and a sandboxed command starts a background process that rewrites `.git/config` after the command ends
+- **THEN** `.git/config` is restored before the next command runs, the changed version is kept in the quarantine directory
+- **AND** that command's result says so, without the command counting as blocked
 
 #### Scenario: Strict git protection without user namespaces
 - **WHEN** user namespaces are blocked, `sandbox.linux_git_protection = "required"`, and the model runs `ls` in `auto` mode

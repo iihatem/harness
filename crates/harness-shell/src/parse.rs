@@ -792,6 +792,14 @@ impl Walker<'_> {
         if name == "alias" {
             self.alias_operands(&argv);
         }
+        if name == "shopt" && shopt_sets(&argv[1..]) {
+            // extglob changes how bash parses later words (the analysis parses with it off),
+            // and expand_aliases what they run.
+            self.undecomposable(
+                "`shopt` changes a shell option, which can change how bash reads later commands"
+                    .into(),
+            );
+        }
         if same_shell {
             match word {
                 "cd" => cwd.cd(cd_target(&argv[1..])),
@@ -908,6 +916,25 @@ fn evaluates_operands(name: &str, argv: &[Tok]) -> bool {
             && argv
                 .get(1)
                 .is_some_and(|t| t.lit().is_none_or(|s| s.starts_with("-v"))))
+}
+
+/// Whether `shopt ARGS` may set or unset an option: `-s`, `-u` or `-o` is among its
+/// options, or a word that may be an option is only known at run time. Its options end at
+/// the first word that is not one.
+fn shopt_sets(args: &[Tok]) -> bool {
+    for arg in args {
+        match arg.lit() {
+            None => return true,
+            Some("--") => return false,
+            Some(s) if s.len() > 1 && s.starts_with('-') => {
+                if s[1..].contains(['s', 'u', 'o']) {
+                    return true;
+                }
+            }
+            Some(_) => return false,
+        }
+    }
+    false
 }
 
 /// Whether the NAME of a `NAME=value` operand (or a bare NAME) has a subscript or glob

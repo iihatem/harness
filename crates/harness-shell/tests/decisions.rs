@@ -1110,6 +1110,38 @@ fn bash32_backslash_newline_in_quoted_bodies() {
 }
 
 #[test]
+fn shell_option_changes_ask() {
+    use Want::{Ask, Unlisted};
+    // With extglob on, bash reads `!( … )` on later lines as a pattern word, in which a
+    // `#` starts no comment, so `curl x` runs; the analysis parses with extglob off.
+    // Aliases likewise change what a later word runs.
+    check_asks_may_deny(
+        &probe_rules(),
+        &[
+            "shopt -s extglob\n!( true # '\necho ' )\ncurl x\n' )",
+            "bash -O extglob -c \"!( true # '\necho ' )\ncurl x\n' )\"",
+        ],
+    );
+    check(
+        &probe_rules(),
+        &[
+            ("shopt -s expand_aliases", Ask),
+            ("shopt -u extglob", Ask),
+            ("shopt -o -s posix", Ask),
+            ("shopt -qs extglob", Ask),
+            ("shopt -po errexit", Ask),
+            ("shopt $opt extglob", Ask),
+            ("bash +O extglob -c 'echo'", Ask),
+            // Queries change nothing.
+            ("shopt", Unlisted),
+            ("shopt -p", Unlisted),
+            ("shopt -q extglob", Unlisted),
+            ("shopt extglob -s", Unlisted),
+        ],
+    );
+}
+
+#[test]
 fn brush_misreads_comments_in_substitutions() {
     use Want::Deny;
     // bash 5 bypasses: bash reads a comment in these substitutions and runs `curl x`;

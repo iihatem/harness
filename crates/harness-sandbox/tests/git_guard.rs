@@ -420,6 +420,36 @@ fn a_gitfile_replaced_by_a_new_file_is_restored() {
     std::fs::create_dir_all(env.ws.join("sub")).unwrap();
     std::fs::write(env.ws.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
     let guard = env.session.begin(&env.ws, true, |_| {});
+    // A new file renamed over the gitfile: its inode differs, whatever the
+    // filesystem reuses.
+    std::fs::write(env.ws.join("sub/new"), "gitdir: /tmp/evil\n").unwrap();
+    std::fs::rename(env.ws.join("sub/new"), env.ws.join("sub/.git")).unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(report.blocked);
+    assert_eq!(
+        read(&env.ws.join("sub/.git")),
+        "gitdir: ../.git/modules/sub\n"
+    );
+    assert_eq!(read(&quarantined(&env, "sub/.git")), "gitdir: /tmp/evil\n");
+    assert!(
+        report
+            .message
+            .contains("- sub/.git: moved or replaced; restored the earlier version"),
+        "{}",
+        report.message
+    );
+}
+
+#[test]
+fn a_gitfile_removed_and_written_again_is_restored() {
+    // The new file may get the old one's inode back (ext4 does): it is then
+    // found changed rather than replaced, and undone all the same.
+    let env = env();
+    std::fs::create_dir_all(env.ws.join(".git/modules/sub")).unwrap();
+    std::fs::write(env.ws.join(".git/modules/sub/HEAD"), "ref: x\n").unwrap();
+    std::fs::create_dir_all(env.ws.join("sub")).unwrap();
+    std::fs::write(env.ws.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+    let guard = env.session.begin(&env.ws, true, |_| {});
     std::fs::remove_file(env.ws.join("sub/.git")).unwrap();
     std::fs::write(env.ws.join("sub/.git"), "gitdir: /tmp/evil\n").unwrap();
     let report = guard.finish().expect("a report");
@@ -432,7 +462,10 @@ fn a_gitfile_replaced_by_a_new_file_is_restored() {
     assert!(
         report
             .message
-            .contains("- sub/.git: moved or replaced; restored the earlier version"),
+            .contains("- sub/.git: moved or replaced; restored the earlier version")
+            || report
+                .message
+                .contains("- sub/.git: changed; restored the earlier version"),
         "{}",
         report.message
     );

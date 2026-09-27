@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::nofollow::{Dir, Kind, Stat, Tree, absent, stat_file};
+use super::nofollow::{Dir, Kind, Stat, Tree, absent, same_birth, stat_file};
 
 /// Larger files are compared by size, times and inode, and are not saved.
 const MAX_FILE_BYTES: u64 = 1 << 20;
@@ -41,10 +41,12 @@ enum Node {
     Symlink {
         target: PathBuf,
     },
-    /// A FIFO, socket or device node: compared by inode, never opened.
+    /// A FIFO, socket or device node: compared by inode (and birth time),
+    /// never opened.
     Other {
         dev: u64,
         ino: u64,
+        birth: Option<(i64, i64)>,
     },
 }
 
@@ -61,6 +63,7 @@ struct Stamp {
     mtime: (i64, i64),
     ctime: (i64, i64),
     ino: u64,
+    birth: Option<(i64, i64)>,
 }
 
 impl Stamp {
@@ -70,7 +73,17 @@ impl Stamp {
             mtime: stat.mtime,
             ctime: stat.ctime,
             ino: stat.ino,
+            birth: stat.birth,
         }
+    }
+
+    /// Whether `stat` is of the file stamped, not written since.
+    fn matches(&self, stat: &Stat) -> bool {
+        self.len == stat.size
+            && self.mtime == stat.mtime
+            && self.ctime == stat.ctime
+            && self.ino == stat.ino
+            && same_birth(self.birth, stat.birth)
     }
 }
 
@@ -171,6 +184,7 @@ impl Snapshot {
             Kind::Other if everything => Node::Other {
                 dev: stat.dev,
                 ino: stat.ino,
+                birth: stat.birth,
             },
             Kind::File | Kind::Other => return false,
         };
@@ -437,13 +451,18 @@ fn unchanged(parent: &Dir, name: &OsStr, stat: &Stat, node: &Node) -> bool {
                         stat.size == bytes.len() as u64
                             && read_regular(parent, name, stat, stat.size).as_ref() == Some(bytes)
                     }
-                    Content::Unsaved(stamp) => Stamp::of(stat) == *stamp,
+                    Content::Unsaved(stamp) => stamp.matches(stat),
                 }
         }
         Node::Symlink { target } => {
             stat.kind == Kind::Symlink && parent.read_link(name).is_ok_and(|t| t == *target)
         }
-        Node::Other { dev, ino } => stat.dev == *dev && stat.ino == *ino,
+        Node::Other { dev, ino, birth } => {
+            stat.kind == Kind::Other
+                && stat.dev == *dev
+                && stat.ino == *ino
+                && same_birth(stat.birth, *birth)
+        }
     }
 }
 

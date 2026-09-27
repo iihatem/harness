@@ -51,7 +51,7 @@ use crate::gitmeta::{
     Budget, GITDIR_PROTECTED, GitIndex, IgnoreRules, WORKSPACE_PROTECTED, discover_with_budget,
     nested_gitdirs, read_ignore_rules,
 };
-use nofollow::{Dir, Kind, Stat, Tree, absent};
+use nofollow::{Dir, Kind, Stat, Tree, absent, same_birth};
 use quarantine::Quarantine;
 use report::{Finding, Findings, List, Outcome, What};
 use snapshot::{Difference, Next, Snapshot};
@@ -1496,8 +1496,11 @@ impl Tracked {
     }
 }
 
-/// What an entry is, for noticing that it was replaced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What an entry is, for noticing that it was replaced. Two are the same
+/// when of one kind and, for an inode, the same device, number and (where
+/// both are known) birth time: a filesystem may give a freed inode's number
+/// to the next file at once.
+#[derive(Debug, Clone)]
 enum Identity {
     /// Nothing is there, or nothing reachable without a symlink.
     Missing,
@@ -1510,7 +1513,38 @@ enum Identity {
         dir: bool,
         dev: u64,
         ino: u64,
+        birth: Option<(i64, i64)>,
     },
+}
+
+impl PartialEq for Identity {
+    fn eq(&self, other: &Identity) -> bool {
+        match (self, other) {
+            (Identity::Missing, Identity::Missing)
+            | (Identity::Unreachable, Identity::Unreachable) => true,
+            (Identity::Symlink { target }, Identity::Symlink { target: other }) => target == other,
+            (
+                Identity::Inode {
+                    dir,
+                    dev,
+                    ino,
+                    birth,
+                },
+                Identity::Inode {
+                    dir: other_dir,
+                    dev: other_dev,
+                    ino: other_ino,
+                    birth: other_birth,
+                },
+            ) => {
+                dir == other_dir
+                    && dev == other_dev
+                    && ino == other_ino
+                    && same_birth(*birth, *other_birth)
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Identity {
@@ -1529,6 +1563,7 @@ impl Identity {
                 dir: stat.kind == Kind::Dir,
                 dev: stat.dev,
                 ino: stat.ino,
+                birth: stat.birth,
             },
         }
     }

@@ -534,8 +534,9 @@ fn a_replaced_gitfile_left_undone_is_put_back_at_the_next_begin() {
     std::fs::write(&gitfile, "gitdir: ../.git/modules/sub\n").unwrap();
     cap(&env, 0);
     let guard = env.session.begin(&env.ws, true, |_| {});
-    std::fs::remove_file(&gitfile).unwrap();
-    std::fs::write(&gitfile, "gitdir: /tmp/evil\n").unwrap();
+    // Renamed over it, so its inode differs whatever the filesystem reuses.
+    std::fs::write(env.ws.join("sub/new"), "gitdir: /tmp/evil\n").unwrap();
+    std::fs::rename(env.ws.join("sub/new"), &gitfile).unwrap();
     let report = guard.finish().expect("a report");
     assert!(
         report.message.contains("\n- sub/.git: moved or replaced]"),
@@ -704,4 +705,19 @@ fn a_move_that_keeps_failing_blocks_only_the_first_command() {
         report.message
     );
     assert!(!planted.exists());
+}
+
+#[test]
+fn an_entry_born_again_under_the_same_inode_is_another() {
+    let inode = |birth| Identity::Inode {
+        dir: false,
+        dev: 1,
+        ino: 7,
+        birth,
+    };
+    assert_eq!(inode(Some((10, 0))), inode(Some((10, 0))));
+    assert_ne!(inode(Some((10, 0))), inode(Some((10, 1))));
+    // Where the system keeps no birth time, only the inode tells.
+    assert_eq!(inode(None), inode(Some((10, 0))));
+    assert_eq!(inode(Some((10, 0))), inode(None));
 }

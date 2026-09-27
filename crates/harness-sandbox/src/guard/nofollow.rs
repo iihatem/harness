@@ -54,12 +54,20 @@ pub(crate) struct Stat {
     pub(crate) size: u64,
     pub(crate) mtime: (i64, i64),
     pub(crate) ctime: (i64, i64),
+    /// When the inode was created, where the system says: `statx` on Linux,
+    /// `st_birthtime` on macOS. A filesystem may give a freed inode's number
+    /// to the next file at once (ext4 does); its birth time tells them apart.
+    pub(crate) birth: Option<(i64, i64)>,
 }
 
 impl Stat {
-    /// Whether `other` is the same entry: the same type, device and inode.
+    /// Whether `other` is the same entry: the same type, device, inode and
+    /// (where both are known) birth time.
     pub(crate) fn same_entry(&self, other: &Stat) -> bool {
-        self.kind == other.kind && self.dev == other.dev && self.ino == other.ino
+        self.kind == other.kind
+            && self.dev == other.dev
+            && self.ino == other.ino
+            && same_birth(self.birth, other.birth)
     }
 
     /// Whether `other` is the same entry, not written to since: the same
@@ -78,14 +86,14 @@ impl Stat {
     )]
     fn from_raw(st: &libc::stat) -> Stat {
         let mode = st.st_mode as u32;
-        let kind = match mode & (libc::S_IFMT as u32) {
-            m if m == libc::S_IFDIR as u32 => Kind::Dir,
-            m if m == libc::S_IFREG as u32 => Kind::File,
-            m if m == libc::S_IFLNK as u32 => Kind::Symlink,
-            _ => Kind::Other,
-        };
+        #[cfg(target_os = "macos")]
+        let birth = (st.st_birthtime != 0 || st.st_birthtime_nsec != 0)
+            .then_some((st.st_birthtime as i64, st.st_birthtime_nsec as i64));
+        // Linux gives birth times through `statx` only.
+        #[cfg(not(target_os = "macos"))]
+        let birth = None;
         Stat {
-            kind,
+            kind: kind_of(mode),
             mode: mode & 0o7777,
             dev: st.st_dev as u64,
             ino: st.st_ino as u64,
@@ -93,8 +101,88 @@ impl Stat {
             size: st.st_size as u64,
             mtime: (st.st_mtime as i64, st.st_mtime_nsec as i64),
             ctime: (st.st_ctime as i64, st.st_ctime_nsec as i64),
+            birth,
         }
     }
+}
+
+/// Whether two birth times can be one entry's: equal, or one of them
+/// unknown.
+pub(crate) fn same_birth(one: Option<(i64, i64)>, other: Option<(i64, i64)>) -> bool {
+    match (one, other) {
+        (Some(one), Some(other)) => one == other,
+        _ => true,
+    }
+}
+
+/// The kind of entry the file type bits of `mode` say.
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "`mode_t` differs between Linux and macOS"
+)]
+fn kind_of(mode: u32) -> Kind {
+    match mode & (libc::S_IFMT as u32) {
+        m if m == libc::S_IFDIR as u32 => Kind::Dir,
+        m if m == libc::S_IFREG as u32 => Kind::File,
+        m if m == libc::S_IFLNK as u32 => Kind::Symlink,
+        _ => Kind::Other,
+    }
+}
+
+/// `statx` of `name` in the directory `dir` (of `dir` itself when `flags`
+/// has `AT_EMPTY_PATH` and `name` is empty), never following a symlink,
+/// with the birth time when the filesystem keeps one. `None` where `statx`
+/// is missing or refused (an old kernel, a seccomp profile), or leaves out a
+/// field the guard needs: `fstatat` answers then.
+#[cfg(target_os = "linux")]
+fn statx(dir: RawFd, name: &CStr, flags: libc::c_int) -> Option<io::Result<Stat>> {
+    const NEEDED: libc::c_uint = libc::STATX_TYPE
+        | libc::STATX_MODE
+        | libc::STATX_NLINK
+        | libc::STATX_INO
+        | libc::STATX_SIZE
+        | libc::STATX_MTIME
+        | libc::STATX_CTIME;
+    let mut stx = MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: `name` is NUL-terminated, `stx` is a `statx` buffer, and both
+    // outlive the call.
+    let done = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            dir,
+            name.as_ptr(),
+            // As `fstatat` does since Linux 4.14: no automount.
+            flags | libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+            libc::STATX_BASIC_STATS | libc::STATX_BTIME,
+            stx.as_mut_ptr(),
+        )
+    };
+    if done != 0 {
+        let err = io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::ENOSYS | libc::EPERM) => None,
+            _ => Some(Err(err)),
+        };
+    }
+    // SAFETY: zeroed, then filled in by the successful call above.
+    let stx = unsafe { stx.assume_init() };
+    if stx.stx_mask & NEEDED != NEEDED {
+        return None;
+    }
+    let mode = u32::from(stx.stx_mode);
+    let time = |at: libc::statx_timestamp| (at.tv_sec, i64::from(at.tv_nsec));
+    Some(Ok(Stat {
+        kind: kind_of(mode),
+        mode: mode & 0o7777,
+        // As `stat` spells it.
+        dev: libc::makedev(stx.stx_dev_major, stx.stx_dev_minor),
+        ino: stx.stx_ino,
+        nlink: u64::from(stx.stx_nlink),
+        size: stx.stx_size,
+        mtime: time(stx.stx_mtime),
+        ctime: time(stx.stx_ctime),
+        birth: (stx.stx_mask & libc::STATX_BTIME != 0).then(|| time(stx.stx_btime)),
+    }))
 }
 
 /// An open directory.
@@ -153,6 +241,10 @@ impl Dir {
     /// The entry `name`'s `lstat`.
     pub(crate) fn stat(&self, name: &OsStr) -> io::Result<Stat> {
         let name = plain_name(name)?;
+        #[cfg(target_os = "linux")]
+        if let Some(found) = statx(self.raw(), &name, 0) {
+            return found;
+        }
         let mut st = MaybeUninit::<libc::stat>::uninit();
         // SAFETY: `name` is NUL-terminated and `st` is large enough; on
         // success `fstatat` has initialized it.
@@ -571,6 +663,10 @@ fn set_errno(value: libc::c_int) {
 }
 
 fn fstat(fd: RawFd) -> io::Result<Stat> {
+    #[cfg(target_os = "linux")]
+    if let Some(found) = statx(fd, c"", libc::AT_EMPTY_PATH) {
+        return found;
+    }
     let mut st = MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `st` is large enough; on success `fstat` has initialized it.
     cvt(unsafe { libc::fstat(fd, st.as_mut_ptr()) })?;
@@ -955,6 +1051,29 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn birth_times_tell_an_inode_used_again_apart() {
+        let (_d, base) = tree();
+        let c = Tree::new(&base).dir(&base.join("a/b/c")).unwrap();
+        let seen = c.stat(os("file")).unwrap();
+        let (file, opened) = c.open_regular(os("file")).unwrap();
+        // The same entry, by name and by descriptor.
+        assert_eq!(seen.birth, opened.birth);
+        assert_eq!(stat_file(&file).unwrap().birth, seen.birth);
+        #[cfg(target_os = "macos")]
+        assert!(seen.birth.is_some(), "APFS keeps birth times");
+        let born_again = Stat {
+            birth: seen.birth.map(|(secs, nanos)| (secs, nanos + 1)),
+            ..seen
+        };
+        assert_eq!(born_again.same_entry(&seen), seen.birth.is_none());
+        let unknown = Stat {
+            birth: None,
+            ..seen
+        };
+        assert!(unknown.same_entry(&seen) && seen.same_entry(&unknown));
     }
 
     #[test]

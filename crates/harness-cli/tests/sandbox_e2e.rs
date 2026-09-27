@@ -291,3 +291,96 @@ async fn unknown_rule_tool_warns_once_and_json_output_stays_parseable() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_mode_without_a_sandbox_refuses_commands() {
+    let server = MockServer::start().await;
+    bash_then_done(&server, "touch made.txt").await;
+    let env = Env::new(&server.uri(), "");
+    let (env, out) = tokio::task::spawn_blocking(move || {
+        let out = env
+            .cmd()
+            .env("HARNESS_SANDBOX", "none")
+            .args(["--mode", "plan", "ask", "--json", "go"])
+            .output()
+            .unwrap();
+        (env, out)
+    })
+    .await
+    .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", tool_output(&out));
+    assert!(
+        tool_output(&out).contains("shell commands need the OS sandbox in plan and read-only mode"),
+        "{}",
+        tool_output(&out)
+    );
+    assert!(!env.ws.path().join("made.txt").exists());
+}
+
+/// Runs `command` through `harness ask --json` with `$HOME` set to `home(workspace)`.
+async fn run_bash_with_home(
+    command: &str,
+    mode: &str,
+    home: impl FnOnce(&std::path::Path) -> std::path::PathBuf,
+) -> (Env, std::process::Output) {
+    let server = MockServer::start().await;
+    bash_then_done(&server, command).await;
+    let env = Env::new(&server.uri(), "");
+    let home = home(env.ws.path());
+    std::fs::create_dir_all(&home).unwrap();
+    let mode = mode.to_string();
+    tokio::task::spawn_blocking(move || {
+        let out = env
+            .cmd()
+            .env("HOME", &home)
+            .args(["--mode", &mode, "ask", "--json", "go"])
+            .output()
+            .unwrap();
+        (env, out)
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_workspace_at_or_above_home_gets_no_writable_sandbox() {
+    // `$HOME` is the workspace itself, then a directory inside it.
+    for home_below in [false, true] {
+        let (env, out) = run_bash_with_home("echo hi > made.txt", "auto", |ws| {
+            if home_below {
+                ws.join("me")
+            } else {
+                ws.to_path_buf()
+            }
+        })
+        .await;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{stderr}");
+        assert!(!env.ws.path().join("made.txt").exists(), "{stderr}");
+        let warnings: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("warning:"))
+            .collect();
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("home directory or above"),
+            "{stderr}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_mode_in_a_workspace_at_home_keeps_the_read_only_sandbox() {
+    if !host_has_sandbox() {
+        return;
+    }
+    let (env, out) =
+        run_bash_with_home("ls && touch made.txt", "plan", |ws| ws.to_path_buf()).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("home directory or above"), "{stderr}");
+    assert!(
+        tool_output(&out).contains("[the sandbox may have blocked"),
+        "{}",
+        tool_output(&out)
+    );
+    assert!(!env.ws.path().join("made.txt").exists());
+}

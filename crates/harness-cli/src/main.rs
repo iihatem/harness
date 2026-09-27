@@ -2,6 +2,7 @@ mod ask;
 mod models;
 mod prompt;
 mod setup;
+mod term;
 mod trust;
 
 use std::process::ExitCode;

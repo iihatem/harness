@@ -23,7 +23,7 @@ pub fn load() -> Result<Setup, String> {
     let config =
         config::load(&paths.global_config_file(), &workspace, &trust).map_err(|e| e.to_string())?;
     for warning in &config.warnings {
-        eprintln!("warning: {warning}");
+        eprintln!("warning: {}", crate::term::terminal_safe(warning));
     }
     Ok(Setup {
         paths,

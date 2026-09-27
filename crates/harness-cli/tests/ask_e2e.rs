@@ -1,3 +1,4 @@
+use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -492,6 +493,39 @@ async fn ctrl_c_during_a_never_closing_stdin_exits_130() {
         .mount(&server)
         .await;
     let env = Env::new(&server.uri(), "model = \"mock/test-model\"");
+
+    // `ask::run` installs its SIGINT handler first thing, but a SIGINT that lands before the child
+    // gets that far (a slow start under load) kills it outright, which says nothing about the code
+    // under test. So a child killed by the signal itself is retried with a longer delay; only an
+    // exit code counts as a result.
+    let mut delay = Duration::from_millis(700);
+    let mut attempts = 1;
+    let status = loop {
+        let status = interrupt_while_stdin_stays_open(&env, delay).await;
+        if status.signal() == Some(nix::sys::signal::Signal::SIGINT as i32) && attempts < 5 {
+            attempts += 1;
+            delay *= 2;
+            continue;
+        }
+        break status;
+    };
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "{status:?} after {attempts} attempt(s)"
+    );
+
+    let received = server.received_requests().await.unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "expected no chat request before SIGINT, got {}",
+        received.len()
+    );
+}
+
+/// Runs `harness ask` with a stdin pipe that gets one line and is never closed, sends SIGINT after
+/// `delay`, and returns how the child ended.
+async fn interrupt_while_stdin_stays_open(env: &Env, delay: Duration) -> std::process::ExitStatus {
     let mut child = std::process::Command::new(BIN)
         .args(["--model", "mock/test-model", "ask", "hi"])
         .current_dir(env.ws.path())
@@ -512,7 +546,7 @@ async fn ctrl_c_during_a_never_closing_stdin_exits_130() {
     }
     let pid = nix::unistd::Pid::from_raw(child.id() as i32);
 
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    tokio::time::sleep(delay).await;
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
 
     let wait = tokio::task::spawn_blocking(move || child.wait().unwrap());
@@ -525,16 +559,63 @@ async fn ctrl_c_during_a_never_closing_stdin_exits_130() {
             )
         }
     };
-    assert_eq!(status.code(), Some(130));
-
-    let received = server.received_requests().await.unwrap_or_default();
-    assert!(
-        received.is_empty(),
-        "expected no chat request before SIGINT, got {}",
-        received.len()
-    );
-
     drop(stdin_writer);
+    status
+}
+
+// Review Focus: rule text and model-supplied command text reach the terminal in warnings and
+// approval reasons; raw control characters there could rewrite what the user sees.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_characters_reach_the_terminal_only_escaped() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(stream(&[text_chunk("done")]))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let args = json!({"command": "echo \u{1b}c\u{7}ok"}).to_string();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(stream(&[tool_chunk("c1", "bash", &args)]))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let env = Env::new(
+        &server.uri(),
+        "model = \"mock/test-model\"\n[permissions]\nallow = [\"shell:\\u001B[2Jrm*\"]\n",
+    );
+    let output = tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .env("HARNESS_SANDBOX", "none")
+            .args(["--mode", "ask", "ask", "go"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(
+        !stderr.contains(['\u{1b}', '\u{7}']),
+        "raw control characters on stderr: {stderr:?}"
+    );
+    let line = |needle: &str| {
+        stderr
+            .lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no line with {needle:?} in {stderr:?}"))
+            .to_string()
+    };
+    assert!(
+        line("names an unknown tool").contains("shell:\\u{1b}[2Jrm*"),
+        "{stderr}"
+    );
+    assert!(
+        line("blocked:").contains("echo \\u{1b}c\\u{7}ok"),
+        "{stderr}"
+    );
 }
 
 #[test]

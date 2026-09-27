@@ -10,6 +10,8 @@ use harness_core::permission::Mode;
 pub fn system_prompt(workspace: &Path, date: &str, mode: Mode, sandboxed: bool) -> String {
     let sandbox_line = if !sandboxed && mode == Mode::FullAccess {
         "No OS sandbox is active."
+    } else if !sandboxed && matches!(mode, Mode::Plan | Mode::ReadOnly) {
+        "No OS sandbox is active, so shell commands and file edits are refused; use the read, grep and glob tools instead."
     } else if !sandboxed {
         "No OS sandbox is active, so every shell command needs approval and will be refused; use the file tools instead."
     } else if matches!(mode, Mode::Plan | Mode::ReadOnly) {
@@ -109,6 +111,18 @@ mod tests {
         );
         let full_access = system_prompt(Path::new("/p"), "2026-09-26", Mode::FullAccess, false);
         assert!(!full_access.contains("every shell command needs approval"));
+    }
+
+    #[test]
+    fn plan_and_read_only_without_a_sandbox_say_commands_are_refused() {
+        for mode in [Mode::Plan, Mode::ReadOnly] {
+            let prompt = system_prompt(Path::new("/p"), "2026-09-26", mode, false);
+            assert!(
+                prompt.contains("shell commands and file edits are refused"),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("needs approval"), "{prompt}");
+        }
     }
 
     #[test]

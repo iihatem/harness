@@ -9,14 +9,14 @@ use harness_core::{
     agent::{Agent, AgentConfig, NonInteractive},
     engine::{EngineConfig, PermissionEngine, RuleSet},
     event::{AgentEvent, TurnEndReason},
-    permission::Mode,
+    permission::{FsAccess, Mode},
     tool::ToolContext,
 };
 use harness_providers::registry;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{models, prompt, setup};
+use crate::{models, prompt, setup, term::terminal_safe};
 
 pub async fn run(
     model_flag: Option<String>,
@@ -100,7 +100,11 @@ pub async fn run(
     let output_dir = setup.paths.state_dir.join("tool-output").join(run_id);
     let sandbox_disabled_by_env =
         std::env::var("HARNESS_SANDBOX").as_deref() == Ok("none") && mode != Mode::FullAccess;
-    let sandbox = if mode == Mode::FullAccess || sandbox_disabled_by_env {
+    // Write access to `/`, `$HOME` or an ancestor of it would cover the user's dotfiles. Plan and
+    // read-only modes keep their read-only sandbox.
+    let workspace_too_broad = mode.fs_access() == FsAccess::WorkspaceWrite
+        && harness_sandbox::workspace_is_too_broad(&setup.workspace);
+    let sandbox = if mode == Mode::FullAccess || sandbox_disabled_by_env || workspace_too_broad {
         None
     } else {
         harness_sandbox::detect(harness_sandbox::SandboxSettings {
@@ -113,6 +117,11 @@ pub async fn run(
         if sandbox_disabled_by_env {
             eprintln!(
                 "warning: the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval"
+            );
+        } else if workspace_too_broad {
+            eprintln!(
+                "warning: the workspace {} is your home directory or above, where the sandbox would make your dotfiles writable, so it is off; every shell command will need approval",
+                terminal_safe(&setup.workspace.display().to_string())
             );
         } else {
             eprintln!(
@@ -134,7 +143,10 @@ pub async fn run(
         sandbox_available: sandboxed,
     }));
     for rule in policy.unknown_rules() {
-        eprintln!("warning: rule `{rule}` names an unknown tool (use bash:, read:, or write:)");
+        eprintln!(
+            "warning: rule `{}` names an unknown tool (use bash:, read:, or write:)",
+            terminal_safe(&rule)
+        );
     }
     let ctx = ToolContext::new(&setup.workspace).with_sandbox(sandbox, mode.fs_access());
     let mut config = AgentConfig::new(
@@ -304,23 +316,28 @@ async fn render(
             AgentEvent::ActionBlocked { reason, .. } => {
                 blocked = true;
                 if !json {
-                    eprintln!("blocked: {reason}");
+                    eprintln!("blocked: {}", terminal_safe(reason));
                 }
             }
             AgentEvent::ToolCallRequested {
                 name, arguments, ..
             } if !json => {
                 let shown: String = arguments.chars().take(120).collect();
-                eprintln!("-> {name} {shown}");
+                eprintln!("-> {} {}", terminal_safe(name), terminal_safe(&shown));
             }
             AgentEvent::Retrying {
                 attempt,
                 reason,
                 delay_ms,
             } if !json => {
-                eprintln!("retrying (attempt {attempt}) in {delay_ms} ms: {reason}");
+                eprintln!(
+                    "retrying (attempt {attempt}) in {delay_ms} ms: {}",
+                    terminal_safe(reason)
+                );
             }
-            AgentEvent::Error { message, .. } if !json => eprintln!("error: {message}"),
+            AgentEvent::Error { message, .. } if !json => {
+                eprintln!("error: {}", terminal_safe(message))
+            }
             AgentEvent::TurnFinished {
                 reason: TurnEndReason::StepLimit,
             } if !json => {

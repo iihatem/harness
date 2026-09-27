@@ -263,12 +263,15 @@ fn write_section(root_keys: &[String]) -> String {
 ; - `config.worktree`: read once extensions.worktreeConfig is set;
 ; - in `.git/worktrees/<id>`, config and hooks are ignored while `commondir`
 ;   is there, and git falls back to them if it is not, so they are protected
-;   too.
+;   too;
+; - `gitweb/` and `pid`: `git instaweb` runs the httpd it finds in `gitweb/`
+;   and an existing `gitweb/gitweb_config.perl`, and `git instaweb --stop`
+;   runs `kill $(cat pid)`.
 ; Git writes none of these during commit, checkout, switch or stash; other
 ; writes inside `.git` stay allowed so those keep working. Denied as a result:
 ; `git worktree add` (creates `commondir`), `git worktree remove/prune`
-; (delete it), and `git config --worktree` or `git sparse-checkout` once
-; worktreeConfig is set (write `config.worktree`).
+; (delete it), `git config --worktree` or `git sparse-checkout` once
+; worktreeConfig is set (write `config.worktree`), and `git instaweb`.
 ; These are path rules: moving a parent dir (a nested repo, `.git/modules/*`,
 ; `.git/worktrees/<id>`) out to a writable root, editing it there and moving
 ; it back is not covered. The top-level `.git` cannot be moved.
@@ -276,7 +279,7 @@ fn write_section(root_keys: &[String]) -> String {
   (regex (string-append "^" (regex-quote (param "WORKSPACE")) "(/.*)?/\\.git$"))
   (regex (string-append "^" (regex-quote (param "WORKSPACE"))
                         "(/.*)?/\\.git(/modules/.+|/worktrees/[^/]+)?"
-                        "/(config|config\\.worktree|commondir|hooks(/.*)?)$"))
+                        "/(config|config\\.worktree|commondir|hooks(/.*)?|gitweb(/.*)?|pid)$"))
   (subpath (string-append (param "WORKSPACE") "/.harness"))
   (literal (string-append (param "WORKSPACE") "/HEAD")))
 (deny file-write-unlink (with message (param "LOG_TAG"))

@@ -1953,3 +1953,169 @@ async fn t15_linked_worktree_gitdir_cannot_redirect_config_or_hooks() {
 
     c.finish();
 }
+
+// ---------------------------------------------------------------------------
+// T16. `gitweb/` and `pid` in every kind of gitdir
+// ---------------------------------------------------------------------------
+//
+// `git instaweb` runs files from `$GIT_DIR/gitweb/` (it looks for the httpd
+// there and uses an existing `gitweb_config.perl`), and `git instaweb --stop`
+// runs `kill $(cat "$GIT_DIR/pid")`.
+
+/// A `sleep` this test starts, so a planted `pid` names a process of its own.
+/// Killed when dropped.
+struct Sleeper(std::process::Child);
+
+impl Sleeper {
+    fn start() -> Self {
+        Sleeper(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("start sleep"),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// Whether it is still running after `git instaweb --stop` returned (a
+    /// signal it sent may take a moment to be delivered and reaped).
+    fn survives(&mut self) -> bool {
+        for _ in 0..20 {
+            if self.0.try_wait().expect("poll sleep").is_some() {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        true
+    }
+}
+
+impl Drop for Sleeper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The user's `git instaweb --stop`, unsandboxed, in `dir`.
+fn user_instaweb_stop(dir: &Path) -> String {
+    let out = host_git(dir)
+        .args(["instaweb", "--stop"])
+        .output()
+        .expect("run git instaweb --stop");
+    format!(
+        "exit={:?} stderr={:?}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// Whether this git has `instaweb` (a minimal git install may not).
+fn git_has_instaweb() -> bool {
+    let out = host_git(Path::new("/"))
+        .arg("--exec-path")
+        .output()
+        .expect("run git --exec-path");
+    let exec_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Path::new(&exec_path).join("git-instaweb").is_file()
+}
+
+/// End to end: after `plant` (run from the workspace root) runs in the
+/// sandbox, the user's `git instaweb --stop` in `worktree` must not kill the
+/// process whose pid it planted. A control first runs the same script
+/// unsandboxed in an identical workspace and requires the process to be
+/// killed, so the check cannot pass just because git ignores the file.
+async fn expect_planted_pid_not_killed(
+    c: &mut Checks,
+    label: &str,
+    worktree: &str,
+    plant: impl Fn(u32) -> String,
+) {
+    let (_ctl_dir, ctl) = gitdirs_workspace();
+    let mut victim = Sleeper::start();
+    let script = plant(victim.pid());
+    let out = std::process::Command::new("/bin/sh")
+        .args(["-c", &script])
+        .current_dir(&ctl)
+        .output()
+        .expect("run the control plant");
+    assert!(
+        out.status.success(),
+        "{label}: control `{script}` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stop = user_instaweb_stop(&ctl.join(worktree));
+    assert!(
+        !victim.survives(),
+        "{label}: control failed: `{script}` run outside the sandbox did not make \
+         `git instaweb --stop` in {worktree} kill the planted pid, so the sandboxed check would \
+         prove nothing: {stop}"
+    );
+
+    let (_ws_dir, ws) = gitdirs_workspace();
+    let mut victim = Sleeper::start();
+    let script = plant(victim.pid());
+    let (code, out) = ws_sh(&ws, &script).await;
+    let stop = user_instaweb_stop(&ws.join(worktree));
+    c.check(victim.survives(), || {
+        format!(
+            "{label}: after the sandboxed `{script}` (exit={code:?} output={:?}), the user's \
+             `git instaweb --stop` in {worktree} killed the planted pid: {stop}",
+            out.trim()
+        )
+    });
+}
+
+#[tokio::test]
+async fn t16_gitweb_and_pid_cannot_be_planted_in_any_gitdir() {
+    if skip_if_nested("t16_gitweb_and_pid_cannot_be_planted_in_any_gitdir") {
+        return;
+    }
+    let mut c = Checks::default();
+    let (_d, ws) = gitdirs_workspace();
+
+    for (gitdir, _) in [TOP, NESTED, MODULE, LINKED] {
+        expect_gitdir_file_protected(&mut c, &ws, &format!("{gitdir}/pid")).await;
+
+        let gitweb = ws.join(gitdir).join("gitweb");
+        expect_denied(
+            &mut c,
+            &ws,
+            &format!("{gitdir}/gitweb (absent): create"),
+            &format!("mkdir '{gitdir}/gitweb' && echo planted > '{gitdir}/gitweb/lighttpd'"),
+            || !gitweb.exists(),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&gitweb);
+
+        // As an earlier `git instaweb` leaves it.
+        std::fs::create_dir_all(gitweb.join("tmp")).unwrap();
+        expect_gitdir_file_protected(&mut c, &ws, &format!("{gitdir}/gitweb/gitweb_config.perl"))
+            .await;
+        expect_denied(
+            &mut c,
+            &ws,
+            &format!("{gitdir}/gitweb (exists): rename away"),
+            &format!("mv '{gitdir}/gitweb' '{gitdir}/gitweb.old'"),
+            || gitweb.join("tmp").is_dir(),
+        )
+        .await;
+    }
+
+    if git_has_instaweb() {
+        for (gitdir, worktree) in [TOP, NESTED, MODULE, LINKED] {
+            expect_planted_pid_not_killed(&mut c, &format!("{gitdir}/pid"), worktree, |pid| {
+                format!("echo {pid} > '{gitdir}/pid'")
+            })
+            .await;
+        }
+    } else {
+        eprintln!("[seatbelt.rs] t16: this git has no `instaweb`; skipping the end-to-end checks");
+    }
+
+    c.finish();
+}

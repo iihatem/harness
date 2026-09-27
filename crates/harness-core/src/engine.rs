@@ -32,9 +32,11 @@ pub struct EngineConfig {
     pub sandbox_available: bool,
     /// Set when the workspace is `/`, `$HOME`, or an ancestor of `$HOME`
     /// (`harness_sandbox::workspace_is_too_broad`), where a writable sandbox would cover the
-    /// user's dotfiles and so is never used. Every file write then needs approval, exactly as it
-    /// would in `ask` mode, whatever the actual mode is — deny rules still win, and plan/read-only
-    /// still deny writes outright.
+    /// user's dotfiles and so is never used. In `auto` mode, every file write then needs
+    /// approval, exactly as it would in `ask` mode. It has no effect in any other mode: deny
+    /// rules always win, plan/read-only always deny writes outright, and `full-access` keeps its
+    /// spec semantics (everything runs without approval except what a deny rule forbids) — the
+    /// user explicitly opted into that.
     pub writes_need_approval: bool,
 }
 
@@ -452,7 +454,7 @@ impl PermissionEngine {
         if let Some(rule) = self.deny_confirm_rule(&self.deny_paths, "write", &target, &lexical) {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
-        if self.mode == Mode::FullAccess && !self.writes_need_approval {
+        if self.mode == Mode::FullAccess {
             return Decision::Allow;
         }
         if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
@@ -471,8 +473,7 @@ impl PermissionEngine {
                 inside.display()
             ));
         }
-        if (!self.writes_need_approval
-            && (self.mode == Mode::Auto || self.mode == Mode::FullAccess))
+        if (self.mode == Mode::Auto && !self.writes_need_approval)
             || self
                 .allow_rule(&self.allow_paths, "write", &target)
                 .is_some()

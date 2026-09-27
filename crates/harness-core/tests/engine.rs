@@ -700,17 +700,22 @@ fn writes_into_a_gitfile_gitdir_ask() {
 // --- writes_need_approval: a too-broad workspace makes every write ask, as in `ask` mode ---
 
 #[test]
-fn writes_need_approval_forces_asking_in_auto_and_full_access() {
+fn writes_need_approval_forces_asking_in_auto_but_not_full_access() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     std::fs::create_dir(&ws).unwrap();
-    for mode in [Mode::Auto, Mode::FullAccess] {
-        let e = engine_with_writes_needing_approval(mode, &ws, true, RuleSet::default());
-        // Ordinary writes inside the workspace, which would otherwise be auto-allowed...
-        assert!(is_ask(&e.check(&write("src/main.rs"))), "{mode}");
-        // ...including dotfiles, which is the whole point of the flag.
-        assert!(is_ask(&e.check(&write(".bashrc"))), "{mode}");
-    }
+
+    let auto = engine_with_writes_needing_approval(Mode::Auto, &ws, true, RuleSet::default());
+    // Ordinary writes inside the workspace, which would otherwise be auto-allowed...
+    assert!(is_ask(&auto.check(&write("src/main.rs"))));
+    // ...including dotfiles, which is the whole point of the flag.
+    assert!(is_ask(&auto.check(&write(".bashrc"))));
+
+    // full-access keeps its spec semantics: the user explicitly opted into no approval, except
+    // what a deny rule forbids, so the flag has no effect on it.
+    let full = engine_with_writes_needing_approval(Mode::FullAccess, &ws, true, RuleSet::default());
+    assert_eq!(full.check(&write("src/main.rs")), Decision::Allow);
+    assert_eq!(full.check(&write(".bashrc")), Decision::Allow);
 }
 
 #[test]

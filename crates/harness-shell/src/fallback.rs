@@ -17,6 +17,10 @@ const RESTART_BUDGET: usize = 16;
 /// A chain of untracked here-documents on one line has at most this many candidate ends
 /// per here-document.
 const MAX_CANDIDATES: usize = 64;
+/// Substitutions nested deeper than this are not opened: their `$(`, `<(`, `>(` or
+/// backtick only ends a command, and here-documents are no longer tracked. Each open one
+/// holds a [`Frame`].
+const MAX_SUBSTITUTIONS: usize = 64;
 
 const KEYWORDS: &[&str] = &[
     "!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for", "in",
@@ -314,6 +318,8 @@ struct Splitter {
     stack: Vec<Frame>,
     /// Open backtick substitutions.
     backticks: usize,
+    /// The commands this split found so far: each is kept once.
+    seen: HashSet<(Vec<Tok>, bool)>,
 }
 
 struct Frame {
@@ -356,6 +362,7 @@ impl Splitter {
             depth,
             stack: Vec::new(),
             backticks: 0,
+            seen: HashSet::new(),
         }
     }
 
@@ -400,9 +407,9 @@ impl Splitter {
                 let closes =
                     self.quote.is_none() && self.stack.last().is_some_and(|f| f.opener == '`');
                 if closes {
-                    self.close()
+                    self.close();
                 } else {
-                    self.open('`')
+                    self.open('`');
                 }
                 return;
             }
@@ -562,7 +569,9 @@ impl Splitter {
                 }
                 _ => self.push(c),
             },
-            '`' if live => self.open('`'),
+            '`' if live => {
+                self.open('`');
+            }
             '$' if live && self.next_if_eq('(') => self.open_substitution(),
             ' ' | '\t' | '<' | '>' => self.end_word(),
             ';' | '&' | '|' | '\n' | '(' | ')' | '{' | '}' => self.end_command(),
@@ -852,21 +861,42 @@ impl Splitter {
         }
     }
 
+    /// Ends the command being split. Only commands with words, each once, are kept: every
+    /// split of a long text could otherwise hold one per operator it reads.
     fn end_command(&mut self) {
         self.end_word();
         let data = matches!(self.text, Text::Body { .. });
-        let words = take(&mut self.words);
-        self.commands.push(Rough { words, data });
+        let mut words = take(&mut self.words);
+        if words.is_empty() {
+            return;
+        }
+        words.shrink_to_fit();
+        if self.seen.insert((words.clone(), data)) {
+            self.commands.push(Rough { words, data });
+        }
     }
 
     /// Opens a `$(…)` (its `$(` is consumed).
     fn open_substitution(&mut self) {
         let arithmetic = self.peek() == Some('(');
-        self.open('(');
-        self.arithmetic = arithmetic;
+        if self.open('(') {
+            self.arithmetic = arithmetic;
+        }
     }
 
-    fn open(&mut self, opener: char) {
+    /// Opens a substitution, unless [`MAX_SUBSTITUTIONS`] are open in a split that follows
+    /// bash: then its opener only ends the current command, and a `(` counts as a plain
+    /// parenthesis. The [`Splitter::legacy`] split is not limited, so every command the scan
+    /// found before it followed bash is still found. Returns whether it opened.
+    fn open(&mut self, opener: char) -> bool {
+        if !self.legacy && self.stack.len() >= MAX_SUBSTITUTIONS {
+            self.lose_track();
+            self.end_command();
+            if let Some(f) = self.stack.last_mut().filter(|_| opener == '(') {
+                f.parens += 1;
+            }
+            return false;
+        }
         self.backticks += usize::from(opener == '`');
         self.stack.push(Frame {
             words: take(&mut self.words),
@@ -882,6 +912,7 @@ impl Splitter {
         self.text = Text::Program;
         self.arithmetic = false;
         self.in_word = false;
+        true
     }
 
     fn close(&mut self) {
@@ -1166,6 +1197,32 @@ mod tests {
             let took = start.elapsed();
             assert!(took < std::time::Duration::from_secs(1), "{took:?}");
         }
+    }
+
+    #[test]
+    fn substitutions_nested_past_the_limit_are_still_split() {
+        let deep = MAX_SUBSTITUTIONS + 8;
+        for (open, close) in [("$(", ")"), ("echo \"$(", ")\""), ("<(", ")")] {
+            let src = format!(
+                "{}curl x{}; git push",
+                open.repeat(deep),
+                close.repeat(deep)
+            );
+            let found = words(&rough_commands(&src));
+            for want in [cmd(&["curl", "x"], false), cmd(&["git", "push"], false)] {
+                assert!(found.contains(&want), "{open:?}: {want:?} in {found:?}");
+            }
+        }
+        // Past the limit a split only ends commands; the one that reads the text as the
+        // scan did before it followed bash opens every substitution.
+        let mut split = Splitter::new(
+            format!("{}a", "$(".repeat(deep)).chars().collect(),
+            0,
+            Text::Program,
+            0,
+        );
+        split.run();
+        assert!(split.lost.is_some());
     }
 
     #[test]

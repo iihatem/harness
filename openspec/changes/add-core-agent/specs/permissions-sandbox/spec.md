@@ -149,6 +149,7 @@ When user namespaces are unavailable (the basic tier), the system MUST warn at s
 - **WHEN** user namespaces are blocked and a sandboxed command in `auto` mode writes `.git/hooks/pre-commit`
 - **THEN** the file is moved to the quarantine directory after the command
 - **AND** the tool result says so
+- **AND** the command counts as blocked: headless runs exit 3 and no re-run outside the sandbox is offered
 
 #### Scenario: A new nested repository on Linux
 - **WHEN** a sandboxed command runs `git init sub` in `auto` mode on Linux

@@ -12,9 +12,9 @@ A terminal-first, open-source coding agent written in Rust, built for **hybrid d
 - Approval modes: `plan`, `read-only`, `ask`, `auto`, `full-access`. Default is `auto` inside a git repository and `ask` elsewhere.
 - Exit codes for scripting: `0` success, `1` runtime error, `2` invalid usage or no model, `3` an action was blocked for lack of approval, `130` interrupted.
 
-**Sandboxed by default.** In `auto`, `plan` and `read-only` modes every shell command runs in an OS sandbox (Seatbelt on macOS, Landlock + seccomp on Linux 6.2+): no network access, and writes only inside the workspace and temp directories (none in `plan`/`read-only`). On macOS, git hooks and `.git` configuration stay read-only inside the sandbox; on Linux they do not yet (see Known limitations). Destructive commands (force-push, `reset --hard`, `rm -rf` of the workspace), commands the analyser cannot fully parse, and commands the sandbox blocks all need approval; headless runs refuse them and exit `3`. If the system has no usable sandbox, harness warns and asks before every command.
+**Sandboxed by default.** In every mode except `full-access`, every shell command runs in an OS sandbox (Seatbelt on macOS, Landlock + seccomp on Linux 6.2+): no network access, and writes only inside the workspace and temp directories (none in `plan`/`read-only`). On macOS, git hooks and `.git` configuration stay read-only inside the sandbox; on Linux they do not yet (see Known limitations). Destructive commands (force-push, `reset --hard`, `rm -rf` of the workspace), commands the analyser cannot fully parse, and re-running a command without the sandbox when the sandbox may have blocked it all need approval; headless runs refuse them and exit `3`. `plan` and `read-only` never offer that re-run. If the system has no usable sandbox, harness warns and asks before every command, and `plan`/`read-only` refuse shell commands. A workspace that is your home directory or one of its parents gets no writable sandbox, since it would cover your dotfiles: harness warns, and `ask` and `auto` ask before every command there.
 
-Set `HARNESS_SANDBOX=none` to turn the sandbox off (every shell command then needs approval).
+Set `HARNESS_SANDBOX=none` to turn the sandbox off (every shell command then needs approval, and `plan`/`read-only` refuse them).
 
 ## Quick start
 
@@ -45,15 +45,18 @@ confirm = ["bash:terraform apply*"]
 writable_roots = ["~/.cargo"]
 ```
 
-Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, model, providers, sandbox) only apply after `harness trust`.
+Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, `read_dirs`, model, providers, sandbox settings, a `mode` wider than your global or default mode, a `max_steps` above your global limit) only apply after `harness trust`.
 
 ## Known limitations
 
 - **Linux git metadata:** Landlock can only grant access, so inside a writable workspace it cannot keep `.git/hooks` and `.git/config` read-only. A sandboxed command could plant a git hook that runs on your next `git` command. A stronger Linux backend is planned.
 - **Linux kernels older than 6.2** (Landlock ABI < 3) get no sandbox, so harness asks before every command.
+- **Linux `/dev/shm`** is writable from the sandbox in `ask` and `auto` modes, because Python's `multiprocessing` needs it.
 - **Shell analysis is best effort.** Deny rules match the commands harness can see through wrappers such as `env`, `sudo`, `bash -c` and `xargs`. They do not see inside script files or interpreters (`python -c`, `node -e`), and wrappers such as `busybox` are not unwrapped. The OS sandbox is the security boundary; rules are guardrails.
+- **`git -c` asks.** Git configuration on the command line can run programs, so every `git -c` needs approval unless its key is one that cannot: `user.name`, `user.email`, `init.defaultBranch`, `color.*`, `advice.*`, `core.quotepath`, and `commit.gpgsign`/`tag.gpgsign` set to `false`.
+- **Sandboxed commands can read any file.** The sandbox limits writes and network access, not reads. `read:` and `write:` rules govern only the file tools, not what a shell command opens, and a `read:` deny rule on a single file does not stop `grep` or `glob` from searching the directory that holds it.
 - **Hard links:** on macOS, files with more than one hard link cannot be modified inside the sandbox. On Linux, hard links that already point outside the workspace stay writable.
-- **Git inside the sandbox** cannot create repositories or worktrees in the workspace (`git init`, `git clone`, `git worktree add`). A nested repository can still be moved out of the workspace, edited and moved back.
+- **Git inside the sandbox** cannot create repositories or worktrees in the workspace (`git init`, `git clone`, `git worktree add`). A nested repository can still be moved out of the workspace, edited and moved back. `.git/rebase-merge/git-rebase-todo` stays writable, so a sandboxed command could add `exec` lines that run the next time you continue a rebase (`git rebase --continue`). A workspace that is a linked worktree (its `.git` file points into another repository's `.git/worktrees/`) cannot commit inside the sandbox, because that gitdir is outside the workspace. A repository outside the workspace in a writable temp or `writable_roots` directory gets no protection.
 - **Path rules** are matched after resolving symlinks. On macOS, write `/private/tmp/...` rather than `/tmp/...` in `allow` rules.
 
 ## Roadmap

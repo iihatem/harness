@@ -143,6 +143,11 @@ pub struct GuardReport {
 /// Checks and repairs protected git metadata around one sandboxed command. Implemented by
 /// `harness-sandbox` on Linux.
 pub trait CommandGuard: Send {
+    /// Called right after the command was spawned, with its process id, so the guard never
+    /// reaps the process the caller waits for. The default does nothing.
+    fn started(&mut self, pid: u32) {
+        let _ = pid;
+    }
     /// Called once the command has ended: it exited, timed out, was interrupted, or never started.
     fn finish(self: Box<Self>) -> Option<GuardReport>;
 }
@@ -179,6 +184,11 @@ pub trait CommandSandbox: Send + Sync + std::fmt::Debug {
     ) -> std::io::Result<tokio::process::Command>;
     /// Whether a failed command's output looks like the sandbox blocked it.
     fn is_denial(&self, exit_code: Option<i32>, output: &str) -> bool;
+    /// Called once when the session starts, before the agent runs, so the sandbox can read what
+    /// it needs from `workspace` before any tool can have changed it. The default does nothing.
+    fn start_session(&self, workspace: &Path) {
+        let _ = workspace;
+    }
     /// [`command`](Self::command), plus a guard already started for it. The caller must finish the
     /// guard after the command ends, however it ends. The default starts no guard.
     fn prepare(

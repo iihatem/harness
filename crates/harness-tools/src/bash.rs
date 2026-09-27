@@ -67,7 +67,7 @@ impl Tool for BashTool {
         args.push(&script);
 
         let sandbox = ctx.sandbox.clone().filter(|_| !ctx.unsandboxed);
-        let (cmd, guard) = match &sandbox {
+        let (cmd, mut guard) = match &sandbox {
             Some(sandbox) => {
                 match prepare(sandbox.clone(), ctx.access, &ctx.workspace, shell, &args).await {
                     Ok(prepared) => (prepared.command, prepared.guard),
@@ -82,7 +82,8 @@ impl Tool for BashTool {
                 (cmd, None)
             }
         };
-        let mut output = run_command(cmd, ctx, shell, secs, sandbox.as_deref()).await;
+        let mut output =
+            run_command(cmd, ctx, shell, secs, sandbox.as_deref(), guard.as_mut()).await;
         // The guard is finished however the command ended: exited, timed out, interrupted, or
         // never started.
         if let Some(guard) = guard
@@ -135,13 +136,14 @@ async fn finish(guard: Box<dyn CommandGuard>) -> Option<GuardReport> {
 }
 
 /// Runs `cmd` until it exits, times out after `secs`, or the user interrupts it, and reports its
-/// exit code and output.
+/// exit code and output. `guard` is told the pid of the process spawned.
 async fn run_command(
     mut cmd: tokio::process::Command,
     ctx: &ToolContext,
     shell: &str,
     secs: u64,
     sandbox: Option<&dyn CommandSandbox>,
+    guard: Option<&mut Box<dyn CommandGuard>>,
 ) -> ToolOutput {
     let mut child = match cmd
         .current_dir(&ctx.workspace)
@@ -156,6 +158,11 @@ async fn run_command(
         Ok(child) => child,
         Err(e) => return ToolOutput::error(format!("failed to start {shell}: {e}")),
     };
+    // Before anything else: the guard must know which process this task waits for, so it never
+    // reaps it itself.
+    if let (Some(guard), Some(pid)) = (guard, child.id()) {
+        guard.started(pid);
+    }
     let pgid = child.id().map(|id| id as i32);
     let mut stdout = child.stdout.take().expect("stdout is piped");
 
@@ -244,11 +251,33 @@ async fn reap(child: &mut tokio::process::Child, pgid: Option<i32>) {
     let Some(pgid) = pgid else { return };
     let pgid = nix::unistd::Pid::from_raw(pgid);
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
-    while nix::sys::signal::killpg(pgid, None).is_ok() {
-        if tokio::time::Instant::now() >= deadline {
+    loop {
+        reap_orphaned_members(pgid);
+        if nix::sys::signal::killpg(pgid, None).is_err() || tokio::time::Instant::now() >= deadline
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Reaps the members of the process group `pgid` that are harness's own children. On Linux,
+/// harness is a child subreaper in the basic tier of git-metadata protection, so once the shell
+/// dies the rest of its group reparents to harness, and each member stays a zombie, still in the
+/// group, until harness reaps it. Only this group is waited for, never `-1`: its one member
+/// harness spawned, and tokio waits for, is the shell, which `reap` has reaped already.
+fn reap_orphaned_members(pgid: nix::unistd::Pid) {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    // A group id of 1 would make this `waitpid(-1)`.
+    if pgid.as_raw() <= 1 {
+        return;
+    }
+    let group = nix::unistd::Pid::from_raw(-pgid.as_raw());
+    // Each round reaps one zombie; the group, killed, makes no new ones.
+    while let Ok(status) = waitpid(group, Some(WaitPidFlag::WNOHANG)) {
+        if status == WaitStatus::StillAlive {
+            break;
+        }
     }
 }
 

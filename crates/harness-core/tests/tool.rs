@@ -137,3 +137,25 @@ fn a_sandbox_without_a_guard_prepares_its_plain_command() {
     assert_eq!(std.get_args().collect::<Vec<_>>(), ["hi"]);
     assert_eq!(Plain.git_protection(), GitProtection::Full);
 }
+
+#[test]
+fn a_sandbox_without_a_session_to_start_does_nothing_when_it_starts() {
+    // The default: nothing to read from the workspace, nothing to set up.
+    Plain.start_session(Path::new("/nonexistent/workspace"));
+}
+
+/// A guard that only implements `finish`.
+struct Finishing;
+
+impl harness_core::tool::CommandGuard for Finishing {
+    fn finish(self: Box<Self>) -> Option<harness_core::tool::GuardReport> {
+        None
+    }
+}
+
+#[test]
+fn a_guard_that_does_not_track_processes_ignores_the_started_command() {
+    let mut guard: Box<dyn harness_core::tool::CommandGuard> = Box::new(Finishing);
+    guard.started(4242);
+    assert_eq!(guard.finish(), None);
+}

@@ -215,11 +215,17 @@ use harness_core::tool::{CommandGuard, GuardReport, SandboxedCommand};
 #[derive(Debug, Default)]
 struct GuardLog {
     events: Mutex<Vec<String>>,
+    /// The process ids `started` was given.
+    pids: Mutex<Vec<u32>>,
 }
 
 impl GuardLog {
     fn events(&self) -> Vec<String> {
         self.events.lock().unwrap().clone()
+    }
+
+    fn pids(&self) -> Vec<u32> {
+        self.pids.lock().unwrap().clone()
     }
 }
 
@@ -243,6 +249,11 @@ struct LoggingGuard {
 }
 
 impl CommandGuard for LoggingGuard {
+    fn started(&mut self, pid: u32) {
+        self.log.events.lock().unwrap().push("started".into());
+        self.log.pids.lock().unwrap().push(pid);
+    }
+
     fn finish(self: Box<Self>) -> Option<GuardReport> {
         self.log.events.lock().unwrap().push("finished".into());
         self.report
@@ -349,11 +360,27 @@ fn blocking_report() -> Option<GuardReport> {
 async fn a_guard_report_is_appended_and_a_blocking_one_marks_the_command_blocked() {
     let (_dir, ctx, log) = guarded(blocking_report(), false);
     let out = BashTool.run(json!({"command": "echo hi"}), &ctx).await;
-    assert_eq!(log.events(), ["prepared", "finished"]);
+    assert_eq!(log.events(), ["prepared", "started", "finished"]);
     assert!(out.is_error && out.guard_blocked && !out.sandbox_denied);
     assert_eq!(
         out.content,
         "exit code 0\nhi\n\n[the sandbox undid changes: .git/hooks/pre-commit]\n"
+    );
+}
+
+#[tokio::test]
+async fn the_guard_is_told_the_pid_of_the_shell_it_guards_before_it_finishes() {
+    let (_dir, ctx, log) = guarded(None, false);
+    let out = BashTool
+        .run(json!({"command": "echo \"[$$]\""}), &ctx)
+        .await;
+    assert_eq!(log.events(), ["prepared", "started", "finished"]);
+    let pids = log.pids();
+    assert_eq!(pids.len(), 1);
+    assert!(
+        out.content.contains(&format!("[{}]", pids[0])),
+        "{} (started: {pids:?})",
+        out.content
     );
 }
 
@@ -380,7 +407,7 @@ async fn a_report_that_blocks_nothing_leaves_the_result_as_it_was() {
 async fn no_report_leaves_the_output_unchanged() {
     let (_dir, ctx, log) = guarded(None, false);
     let out = BashTool.run(json!({"command": "echo hi"}), &ctx).await;
-    assert_eq!(log.events(), ["prepared", "finished"]);
+    assert_eq!(log.events(), ["prepared", "started", "finished"]);
     assert_eq!(out.content, "exit code 0\nhi\n");
 }
 
@@ -390,7 +417,7 @@ async fn the_guard_finishes_after_a_timeout() {
     let out = BashTool
         .run(json!({"command": "sleep 30", "timeout_secs": 1}), &ctx)
         .await;
-    assert_eq!(log.events(), ["prepared", "finished"]);
+    assert_eq!(log.events(), ["prepared", "started", "finished"]);
     assert!(out.content.contains("timed out"), "{}", out.content);
     assert!(out.guard_blocked && !out.sandbox_denied);
 }
@@ -404,7 +431,7 @@ async fn the_guard_finishes_after_an_interrupt() {
         cancel.cancel();
     });
     let out = BashTool.run(json!({"command": "sleep 30"}), &ctx).await;
-    assert_eq!(log.events(), ["prepared", "finished"]);
+    assert_eq!(log.events(), ["prepared", "started", "finished"]);
     assert!(out.content.contains("interrupted"), "{}", out.content);
 }
 
@@ -457,7 +484,7 @@ async fn a_blocking_guard_report_clears_a_heuristic_sandbox_denial() {
     // since a guard-blocked result is never offered a re-run.
     let (_dir, ctx, log) = guarded_with(blocking_report(), false, true);
     let out = BashTool.run(json!({"command": "exit 1"}), &ctx).await;
-    assert_eq!(log.events(), ["prepared", "finished"]);
+    assert_eq!(log.events(), ["prepared", "started", "finished"]);
     assert!(
         out.guard_blocked && out.is_error && !out.sandbox_denied,
         "{}",
@@ -488,5 +515,33 @@ async fn a_panicking_guard_is_reported_blocked_not_denied() {
         out.content.contains("could not check git metadata"),
         "{}",
         out.content
+    );
+}
+
+/// With the test process a child subreaper, as harness is in the Linux basic tier, the members of
+/// a timed-out command's process group reparent to it when the shell dies, and stay zombies in
+/// the group until reaped. `reap` reaps them while it waits for the group, so none is left.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_timed_out_commands_orphaned_group_members_are_reaped() {
+    nix::sys::prctl::set_child_subreaper(true).expect("become a child subreaper");
+    let (_dir, ctx) = ctx();
+    let out = BashTool
+        .run(
+            json!({"command": "echo \"[$$]\"; sleep 30 & sleep 30 & wait", "timeout_secs": 1}),
+            &ctx,
+        )
+        .await;
+    assert!(out.content.contains("timed out"), "{}", out.content);
+    let pgid: i32 = out
+        .content
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .and_then(|(pid, _)| pid.parse().ok())
+        .unwrap_or_else(|| panic!("no pid in {}", out.content));
+    // A group with only zombies left still exists: `killpg` reaches it.
+    assert!(
+        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None).is_err(),
+        "members of the command's group are left over"
     );
 }

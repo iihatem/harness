@@ -6,7 +6,7 @@ use std::mem::take;
 use crate::argv::{Tok, decode_ansi_c};
 
 /// Here-documents nested in substitutions inside here-document bodies deeper than this
-/// are split as program text.
+/// are not tracked.
 const MAX_HEREDOC_DEPTH: usize = 8;
 /// A here-document delimiter is looked for this far at most.
 const MAX_DELIMITER_CHARS: usize = 1024;
@@ -27,7 +27,9 @@ pub(crate) struct Rough {
 /// Splits `src` into rough commands: quotes are removed (`$'…'` decoded), operators and
 /// parentheses end a command, and `$(…)`/backtick bodies become commands of their
 /// own. Leading keywords and `NAME=value` words are dropped. Here-document bodies are
-/// split into [`Rough::data`] commands.
+/// split into [`Rough::data`] commands where the scan can tell, as bash would, where
+/// they start and end; from the first here-document where it cannot, the text is split
+/// as program text, and line by line as well.
 pub(crate) fn rough_commands(src: &str) -> Vec<Rough> {
     Splitter::new(src, Text::Program, 0).split()
 }
@@ -73,6 +75,20 @@ struct Heredoc {
     delimiter: String,
     quoted: bool,
     strip_tabs: bool,
+    /// The substitution depth of its operator; its body starts after a newline at that
+    /// depth.
+    level: usize,
+}
+
+/// An open `${…}` or `$[…]`: a `<<` in it is text, and a newline in it does not start
+/// here-document bodies.
+struct Brace {
+    /// `}` or `]`.
+    close: char,
+    /// The quote it was opened in.
+    quote: Option<char>,
+    /// Open brackets of a `$[…]`, its own included.
+    brackets: usize,
 }
 
 struct Splitter {
@@ -91,6 +107,14 @@ struct Splitter {
     /// Open `((…))` arithmetic commands.
     arithmetic_commands: usize,
     heredocs: Vec<Heredoc>,
+    /// Open `${…}`/`$[…]` expansions of the current substitution.
+    braces: Vec<Brace>,
+    /// Whether here-documents are tracked at all.
+    track: bool,
+    /// The start of the line where here-document tracking stopped. From there, text that
+    /// bash reads as here-document data may be split as program text, where a quote in it
+    /// could hide a later command, so that text is also split line by line.
+    lost: Option<usize>,
     /// Here-document bodies this text is nested in.
     depth: usize,
     /// Outer contexts of the open `$(…)`/backtick substitutions.
@@ -104,6 +128,7 @@ struct Frame {
     quote: Option<char>,
     text: Text,
     arithmetic: bool,
+    braces: Vec<Brace>,
     opener: char,
     parens: usize,
 }
@@ -123,6 +148,9 @@ impl Splitter {
             arithmetic: false,
             arithmetic_commands: 0,
             heredocs: Vec::new(),
+            braces: Vec::new(),
+            track: true,
+            lost: None,
             depth,
             stack: Vec::new(),
         }
@@ -139,6 +167,14 @@ impl Splitter {
             self.close();
         }
         self.end_command();
+        if let Some(from) = self.lost {
+            let rest: String = self.src[from..].iter().collect();
+            for line in rest.split('\n') {
+                let mut line = Splitter::new(line, self.text, self.depth);
+                line.track = false;
+                self.commands.extend(line.split());
+            }
+        }
         let dropped = |w: &Tok| {
             w.lit()
                 .is_some_and(|w| KEYWORDS.contains(&w) || is_assignment(w))
@@ -189,6 +225,7 @@ impl Splitter {
             if c == '$' && self.next_if_eq('(') {
                 return self.open_substitution();
             }
+            self.expansion(c);
         }
         match self.quote {
             Some('\'') if c == '\'' => self.quote = None,
@@ -251,11 +288,52 @@ impl Splitter {
                 }
                 '\n' => {
                     self.end_command();
-                    self.heredoc_bodies();
+                    if self.braces.is_empty() {
+                        self.heredoc_bodies();
+                    }
                 }
                 ';' | '&' | '|' | '{' | '}' => self.end_command(),
                 _ => self.push(c),
             },
+        }
+    }
+
+    /// Follows `${…}` and `$[…]` in program text outside single quotes.
+    fn expansion(&mut self, c: char) {
+        let quote = self.quote;
+        match c {
+            '$' if matches!(self.peek(), Some('{' | '[')) => {
+                let close = if self.peek() == Some('{') { '}' } else { ']' };
+                self.braces.push(Brace {
+                    close,
+                    quote,
+                    brackets: 0,
+                });
+            }
+            // bash versions disagree on whether single quotes quote directly inside a
+            // double-quoted `${…}`, so where it ends is unknown.
+            '\'' if self.braces.last().is_some_and(|b| b.quote == Some('"')) => {
+                self.lose_track();
+            }
+            '[' | ']' | '}' => {
+                let Some(b) = self.braces.last_mut().filter(|b| b.quote == quote) else {
+                    return;
+                };
+                match (c, b.close) {
+                    ('[', ']') => b.brackets += 1,
+                    (']', ']') => {
+                        b.brackets = b.brackets.saturating_sub(1);
+                        if b.brackets == 0 {
+                            self.braces.pop();
+                        }
+                    }
+                    ('}', '}') => {
+                        self.braces.pop();
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
 
@@ -298,74 +376,118 @@ impl Splitter {
         self.in_word = true;
     }
 
-    /// After a `<` followed by another: a here-string (`<<<`), or a here-document whose
-    /// body follows the current line. The delimiter word itself is left to be read as a
-    /// word.
+    /// After a `<` followed by another: a here-string (`<<<`), a shift in arithmetic or
+    /// text in `${…}`/`$[…]`, or a here-document whose body follows the current line. The
+    /// delimiter word itself is left to be read as a word.
     fn redirection(&mut self) {
         self.at += 1;
-        let arithmetic = self.arithmetic || self.arithmetic_commands > 0;
-        if self.next_if_eq('<') || arithmetic || self.depth >= MAX_HEREDOC_DEPTH {
+        if self.next_if_eq('<') || self.arithmetic || !self.braces.is_empty() {
             return;
         }
+        // bash reads backtick text only when it runs it, and may end `((…))` elsewhere.
+        let trusted = self.arithmetic_commands == 0
+            && self.depth < MAX_HEREDOC_DEPTH
+            && !self.stack.iter().any(|f| f.opener == '`');
+        match self.delimiter() {
+            Some(doc) if trusted && self.track && self.lost.is_none() => self.heredocs.push(doc),
+            _ => self.lose_track(),
+        }
+    }
+
+    /// The here-document whose `<<` was just read, if its delimiter is plain text or plain
+    /// text in one pair of quotes: bash versions read other spellings (`$'…'`, backslashes,
+    /// partial quoting, expansions) differently.
+    fn delimiter(&self) -> Option<Heredoc> {
         let strip_tabs = self.peek() == Some('-');
         let mut i = self.at + usize::from(strip_tabs);
         while matches!(self.src.get(i), Some(' ' | '\t')) {
             i += 1;
         }
-        let end = self.src.len().min(i + MAX_DELIMITER_CHARS);
-        let (mut delimiter, mut quoted, mut quote) = (String::new(), false, None);
-        while let Some(&c) = self.src.get(i).filter(|_| i < end) {
+        let quote = self.src.get(i).copied().filter(|&c| c == '\'' || c == '"');
+        i += usize::from(quote.is_some());
+        let start = i;
+        while self.src.get(i).is_some_and(|&c| is_plain(c)) && i - start < MAX_DELIMITER_CHARS {
             i += 1;
-            match (quote, c) {
-                (_, '\n') | (None, ' ' | '\t' | ';' | '&' | '|' | '<' | '>' | '(' | ')') => break,
-                (None, '\'' | '"') => {
-                    quote = Some(c);
-                    quoted = true;
-                }
-                (Some(q), _) if c == q => quote = None,
-                (None | Some('"'), '\\') => {
-                    quoted = true;
-                    delimiter.extend(self.src.get(i));
-                    i += 1;
-                }
-                _ => delimiter.push(c),
+        }
+        let delimiter: String = self.src[start..i].iter().collect();
+        if let Some(q) = quote {
+            if self.src.get(i) != Some(&q) {
+                return None;
             }
+            i += 1;
         }
-        if !delimiter.is_empty() || quoted {
-            self.heredocs.push(Heredoc {
-                delimiter,
-                quoted,
-                strip_tabs,
-            });
-        }
+        let ends = self.src.get(i).is_none_or(|c| " \t\n;&|<>()".contains(*c));
+        (ends && !delimiter.is_empty()).then(|| Heredoc {
+            delimiter,
+            quoted: quote.is_some(),
+            strip_tabs,
+            level: self.stack.len(),
+        })
     }
 
-    /// Splits the bodies of the here-documents started on the line that just ended.
+    /// Splits the bodies of the here-documents started in this substitution on the line
+    /// that just ended.
     fn heredoc_bodies(&mut self) {
-        for doc in take(&mut self.heredocs) {
-            let mut body = String::new();
-            while self.at < self.src.len() {
-                let end = self.src[self.at..]
-                    .iter()
-                    .position(|&c| c == '\n')
-                    .map_or(self.src.len(), |p| self.at + p);
-                let line: String = self.src[self.at..end].iter().collect();
-                self.at = (end + 1).min(self.src.len());
-                let line = if doc.strip_tabs {
-                    line.trim_start_matches('\t')
-                } else {
-                    &line
-                };
-                if line == doc.delimiter {
-                    break;
-                }
-                body.push_str(line);
-                body.push('\n');
+        let level = self.stack.len();
+        let first = self
+            .heredocs
+            .iter()
+            .position(|d| d.level == level)
+            .unwrap_or(self.heredocs.len());
+        for doc in self.heredocs.split_off(first) {
+            let start = self.at;
+            let (body, continued) = self.read_body(&doc);
+            // bash joins a line ending in a backslash with the next before comparing it
+            // with the delimiter, and bash 3.2 reads a body in `$(…)` as program text
+            // while looking for the `)`.
+            let doubtful = continued && !doc.quoted
+                || level > 0 && body.contains(['(', ')', '\'', '"', '`', '\\']);
+            if doubtful {
+                self.at = start;
+                return self.lose_track();
             }
             let text = Text::Body { live: !doc.quoted };
             let depth = self.depth + 1;
             self.commands
                 .extend(Splitter::new(&body, text, depth).split());
+        }
+    }
+
+    /// Reads a here-document body up to its delimiter line, and whether a line of it ends
+    /// in a backslash.
+    fn read_body(&mut self, doc: &Heredoc) -> (String, bool) {
+        let (mut body, mut continued) = (String::new(), false);
+        while self.at < self.src.len() {
+            let end = self.src[self.at..]
+                .iter()
+                .position(|&c| c == '\n')
+                .map_or(self.src.len(), |p| self.at + p);
+            let line: String = self.src[self.at..end].iter().collect();
+            self.at = (end + 1).min(self.src.len());
+            let line = if doc.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                &line
+            };
+            if line == doc.delimiter {
+                break;
+            }
+            continued |= line.ends_with('\\');
+            body.push_str(line);
+            body.push('\n');
+        }
+        (body, continued)
+    }
+
+    /// Stops tracking here-documents (see [`Splitter::lost`]).
+    fn lose_track(&mut self) {
+        self.heredocs.clear();
+        if self.track && self.lost.is_none() {
+            let line = self.src[..self.at]
+                .iter()
+                .rposition(|&c| c == '\n')
+                .map_or(0, |p| p + 1);
+            self.lost = Some(line);
         }
     }
 
@@ -404,6 +526,7 @@ impl Splitter {
             quote: self.quote.take(),
             text: self.text,
             arithmetic: self.arithmetic,
+            braces: take(&mut self.braces),
             opener,
             parens: 0,
         });
@@ -414,6 +537,15 @@ impl Splitter {
 
     fn close(&mut self) {
         self.end_command();
+        // bash reads no body for a here-document still waiting when its substitution
+        // ends.
+        if self
+            .heredocs
+            .last()
+            .is_some_and(|d| d.level == self.stack.len())
+        {
+            self.lose_track();
+        }
         if let Some(f) = self.stack.pop() {
             self.words = f.words;
             self.word = f.word;
@@ -421,9 +553,16 @@ impl Splitter {
             self.quote = f.quote;
             self.text = f.text;
             self.arithmetic = f.arithmetic;
+            self.braces = f.braces;
             self.in_word = true;
         }
     }
+}
+
+/// Whether `c` may be in a here-document delimiter the scan tracks: it neither quotes,
+/// escapes nor expands.
+fn is_plain(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "_-.,:/+=@%^!?~".contains(c)
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -520,6 +659,33 @@ mod tests {
                 cmd(&["curl", "x"], false),
                 cmd(&["it's", ""], true),
                 cmd(&["curl", "y"], true),
+            ]
+        );
+    }
+
+    #[test]
+    fn here_documents_bash_may_read_differently_are_program_text() {
+        // A `<<` in `${…}` is text, and a body starts after a newline outside it.
+        assert_eq!(
+            words(&rough_commands("cat <<A ${x:-<<B\n}\na\nA\nb")),
+            [
+                cmd(&["cat", "A", "$"], false),
+                cmd(&["x:-", "B"], false),
+                cmd(&["a"], true),
+                cmd(&["b"], false),
+            ]
+        );
+        // bash reads this delimiter as `EOF`. From its line on, the text is program text,
+        // split line by line as well, so the quote in `it's` cannot hide `curl y`.
+        assert_eq!(
+            words(&rough_commands("cat <<$'EOF'\nit's\nEOF\ncurl y")),
+            [
+                cmd(&["cat", "EOF"], false),
+                cmd(&["its\nEOF\ncurl y"], false),
+                cmd(&["cat", "EOF"], false),
+                cmd(&["its"], false),
+                cmd(&["EOF"], false),
+                cmd(&["curl", "y"], false),
             ]
         );
     }

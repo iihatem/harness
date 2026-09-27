@@ -833,6 +833,72 @@ fn heredoc_data_never_denies() {
 }
 
 #[test]
+fn rough_scan_tracks_here_documents_as_bash_does() {
+    use Want::{Ask, Deny};
+    // bash runs `curl x` as a command of its own in each of these.
+    let later = [
+        // Delimiters other than plain text, or plain text in one pair of quotes.
+        "cat <<$'EOF'\nbody\nEOF\ncurl x",
+        "cat <<$'E\\x4fF'\nbody\nEOF\ncurl x",
+        "cat <<$\"EOF\"\nbody\nEOF\ncurl x",
+        "cat <<\"E\\OF\"\nbody\nE\\OF\ncurl x",
+        "cat <<'E\"OF'\nbody\nE\"OF\ncurl x",
+        "cat <<$(x)\nbody\n$(x)\ncurl x",
+        "cat <<${X}\nbody\n${X}\ncurl x",
+        "cat <<\\EOF\nbody\nEOF\ncurl x",
+        "cat <<E\\OF\nbody\nEOF\ncurl x",
+        "cat <<'E'OF\nbody\nEOF\ncurl x",
+        "cat <<'END OF'\nbody\nEND OF\ncurl x",
+        "cat <<$'EOF'\nit's\nEOF\ncurl x",
+        // `<<` inside `${…}`, `$[…]` or arithmetic is not an operator.
+        "echo ${x:-<<EOF}\ncurl x\nEOF",
+        "echo ${x:-\"}\"<<EOF}\ncurl x\nEOF",
+        "echo \"${x:-'}'<<EOF}\"\ncurl x\nEOF",
+        "echo $[1<<2]\ncurl x\n2]",
+        "echo $[a[1]<<2]\ncurl x\n2]",
+        "(( x <<= 1 ))\ncurl x",
+        // bash joins a body line ending in a backslash with the next before comparing.
+        "cat <<EOF\nEO\\\nF\ncurl x\nEOF",
+        "cat <<-EOF\n\tEO\\\nF\ncurl x\n\tEOF",
+        "cat <<EOF\nit's\\\nEOF\nEOF\ncurl x",
+        // A body starts after the next newline of the substitution holding the operator,
+        // and bash 3.2 ends a `$(…)` at a `)` in a here-document body.
+        "echo $(cat <<EOF)\ncurl x\nEOF",
+        "echo `cat <<EOF`\ncurl x\nEOF",
+        "cat <<EOF $(\ncurl x\n)\nbody\nEOF",
+        "cat <<'EOF' ${x:-\n$(curl x)}\nbody\nEOF",
+        "cat <<'EOF' $((1+\n$(curl x)))\nbody\nEOF",
+        "x=$(cat <<EOF\n)\ncurl x\nEOF\n)",
+        "x=$(cat <<EOF\nit's\nEOF\n)\ncurl x",
+    ];
+    // `curl x` is here-document data in each of these.
+    let data = [
+        "cat <<EOF\ncurl x\nEOF",
+        "cat <<'EOF'\ncurl x\nEOF",
+        "cat <<\"EOF\"\ncurl x\nEOF",
+        "cat << EOF_1.x\ncurl x\nEOF_1.x",
+        "echo \"${HOME}\" ${x:-a} $[1+2] $((3<<1))\ncat <<EOF\ncurl x\nEOF",
+        "x=$(cat <<EOF\ncurl x\nEOF\n)",
+        "cat <<EOF $(echo a\necho b)\ncurl x\nEOF",
+        "cat <<A <<'B'\ncurl a\nA\ncurl b\nB",
+    ];
+    // Each program is refused as a whole, so the rough scan decides.
+    let mut table = Vec::new();
+    for refusal in ["(", "export a[${a[${b}]}]=1"] {
+        table.extend(later.map(|p| (format!("{p}\n{refusal}"), Deny)));
+        table.extend(data.map(|p| (format!("{p}\n{refusal}"), Ask)));
+    }
+    let table: Vec<(&str, Want)> = table.iter().map(|(c, w)| (c.as_str(), *w)).collect();
+    check(&default_rules(), &table);
+    for (cmd, _) in table.iter().filter(|(_, want)| *want == Ask) {
+        match eval_with(&default_rules(), cmd) {
+            Verdict::Ask { may_deny, .. } => assert!(may_deny, "{cmd:?}"),
+            other => panic!("{cmd:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn brackets_in_declaration_values_are_inert() {
     use Want::{Ask, Unlisted};
     check(

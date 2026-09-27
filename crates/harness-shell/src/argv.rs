@@ -1,7 +1,10 @@
 //! Shell words → argv tokens, plus the canonical quoting used for display and rule matching.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::ops::Range;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::Once;
 
 use brush_parser::word::{Parameter, ParameterExpr, WordPiece, WordPieceWithSource};
 
@@ -28,6 +31,47 @@ impl Tok {
             _ => None,
         }
     }
+}
+
+/// Why text is undecomposable when brush-parser panicked on it.
+pub(crate) const PARSER_PANICKED: &str = "the shell parser failed on this text";
+
+thread_local! {
+    /// Whether this thread is inside a brush-parser call, whose panics go unreported.
+    static QUIET: Cell<bool> = const { Cell::new(false) };
+    /// brush-parser panics caught on this thread.
+    static PANICS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Runs a brush-parser call, `None` if it panicked: brush-parser 0.4 panics on some input
+/// (`tokenizer.rs:674` and `:1018`), which must not take down the session.
+///
+/// A panic hook installed once keeps these panics off stderr and passes every other panic
+/// to the hook it replaced. Setting and restoring a hook around each call instead would
+/// race with panics on other threads, which could go unreported or get the wrong hook
+/// restored after them.
+pub(crate) fn guarded<T>(call: impl FnOnce() -> T) -> Option<T> {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if !QUIET.get() {
+                previous(info);
+            }
+        }));
+    });
+    let quiet = QUIET.replace(true);
+    let result = panic::catch_unwind(AssertUnwindSafe(call));
+    QUIET.set(quiet);
+    if result.is_err() {
+        PANICS.set(PANICS.get() + 1);
+    }
+    result.ok()
+}
+
+/// How many brush-parser panics [`guarded`] has caught on this thread.
+pub(crate) fn parser_panics() -> usize {
+    PANICS.get()
 }
 
 /// Parser options matching a non-interactive `bash -c`.
@@ -196,11 +240,14 @@ fn parse(text: &str, heredoc: bool) -> Result<Option<Vec<WordPieceWithSource>>, 
         return Err(why.into());
     }
     let options = parser_options();
-    let pieces = if heredoc {
-        brush_parser::word::parse_heredoc(text, &options)
-    } else {
-        brush_parser::word::parse(text, &options)
-    };
+    let pieces = guarded(|| {
+        if heredoc {
+            brush_parser::word::parse_heredoc(text, &options)
+        } else {
+            brush_parser::word::parse(text, &options)
+        }
+    })
+    .ok_or(PARSER_PANICKED)?;
     Ok(pieces.ok())
 }
 
@@ -329,10 +376,14 @@ pub(crate) fn too_nested(text: &str, heredoc: bool) -> Option<&'static str> {
 }
 
 /// Like [`too_nested`], for the words brush-parser word-parses while parsing the
-/// program itself: those shaped like an array-element assignment (`name[…]…`).
+/// program itself: those shaped like an array-element assignment (`name[…]…`). Also
+/// refuses a program the tokenizer panics on.
 pub(crate) fn program_too_nested(src: &str) -> Option<&'static str> {
     let options = parser_options().tokenizer_options();
-    let tokens = brush_parser::tokenize_str_with_options(src, &options).ok()?;
+    let Some(tokens) = guarded(|| brush_parser::tokenize_str_with_options(src, &options)) else {
+        return Some(PARSER_PANICKED);
+    };
+    let tokens = tokens.ok()?;
     tokens.iter().find_map(|token| match token {
         brush_parser::Token::Word(w, _) => {
             let name = name_len(w.as_bytes(), 0);

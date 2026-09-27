@@ -142,10 +142,15 @@ impl Walker<'_> {
             self.undecomposable(why.into());
             return self.rough_scan(src, depth);
         }
+        let panics = argv::parser_panics();
         let mut parser =
             brush_parser::Parser::new(std::io::Cursor::new(src), &argv::parser_options());
-        match parser.parse_program() {
-            Ok(program) => {
+        match argv::guarded(|| parser.parse_program()) {
+            None => {
+                self.undecomposable(argv::PARSER_PANICKED.into());
+                self.rough_scan(src, depth);
+            }
+            Some(Ok(program)) => {
                 let outer = self.misread.take();
                 for list in &program.complete_commands {
                     self.list(list, cwd, depth);
@@ -154,12 +159,13 @@ impl Walker<'_> {
                 // for its body, in this program or in any enclosing one.
                 let misread = self.misread;
                 self.misread = outer.or(misread);
-                if let Some(why) = misread {
+                let panicked = argv::parser_panics() > panics;
+                if let Some(why) = misread.or(panicked.then_some(argv::PARSER_PANICKED)) {
                     self.undecomposable(why.into());
                     self.rough_scan(src, depth);
                 }
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 self.undecomposable(format!("shell syntax not understood ({e})"));
                 self.rough_scan(src, depth);
             }

@@ -932,6 +932,51 @@ fn here_documents_bash_ends_elsewhere_are_not_trusted() {
 }
 
 #[test]
+fn parser_panics_ask_and_are_scanned() {
+    use Want::{Ask, Deny};
+    // brush-parser 0.4 panics on these (`tokenizer.rs:674` and `:1018`).
+    let panics = [
+        "$(\tEOF$(<<EOF $y| ${#}|\tEOF\nEOF",
+        "$(<<-EOF\tEOF ${y}\"$( ${#}\nEOF\n",
+        "cat <<< $(<<EOF ${#} ${#}\nEOF",
+        "echo \"'\"  $y<<EOF ${#}\tEOF<<EOF ${#}$(\nEOF",
+        "echo \"'\" |$(<<EOF ${#}x\nEOF",
+        "$(<<-EOF $y) ${#}\"$( ${ ${y}\nEOF",
+        "x\r# ${y}<<-EOF|;${  ${#};\nEOF",
+        "$(;<<-EOF ${y}\n<<EOFEOF\n\tEOF",
+        "$(\nx\n<<EOF $y)${<<EOF\nEOF",
+        "cat <<< $(cat <<-EOF\tEOF ${y}EOF$( $(\n\tEOF",
+        "cat <<EOF;|$(  ${#} ${y}x${\nEOF",
+        "echo \"'\" )${<<EOF ${#}\n<<-EOF\nEOF",
+        "$\"|$(;<<-EOF\n) \n\tEOF",
+        "$(<<'EOF' ${y}<<EOF<<EOF\nEOF",
+        "$(cat <<'EOF' ${y}$(\nEOF\n",
+        "$(<<EOF ${#}<<EOF\nEOF",
+        "x\r#<<EOF; ${#}\"${<<-EOF<<EOF\tEOF}\"$(\nEOF",
+        "echo \"'\" }` ${#}\n<<-EOF )${  ${#}<<'EOF'\nEOF`",
+        "x\r#${<<EOF\n}\nEOF",
+        "$(cat <<EOF ${y}\nEOF",
+    ];
+    let mut table = Vec::new();
+    for cmd in panics {
+        table.push((cmd.to_string(), Ask));
+        table.push((format!("curl x; {cmd}"), Deny));
+    }
+    let failures: Vec<String> = table
+        .iter()
+        .filter_map(|(cmd, want)| {
+            let got = std::panic::catch_unwind(|| eval_with(&default_rules(), cmd));
+            match got {
+                Ok(v) if kind(&v) == *want => None,
+                Ok(v) => Some(format!("{cmd:?}: want {want:?}, got {v:?}")),
+                Err(_) => Some(format!("{cmd:?}: evaluate panicked")),
+            }
+        })
+        .collect();
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[test]
 fn brackets_in_declaration_values_are_inert() {
     use Want::{Ask, Unlisted};
     check(

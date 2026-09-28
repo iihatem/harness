@@ -7,6 +7,7 @@ use std::{
     fs::{File, OpenOptions},
     hash::{BuildHasher, Hasher},
     io::{BufRead, BufReader, Read, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -352,12 +353,17 @@ impl Session {
 impl Store {
     fn write(&mut self, entries: &[Entry]) -> std::io::Result<()> {
         if self.file.is_none() {
+            // Sessions hold prompts, code and tool output: only their owner may read them.
             if let Some(dir) = self.path.parent() {
-                std::fs::create_dir_all(dir)?;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir)?;
             }
             let file = OpenOptions::new()
                 .append(true)
                 .create_new(true)
+                .mode(0o600)
                 .open(&self.path)?;
             file.try_lock().map_err(std::io::Error::from)?;
             self.file = Some(file);

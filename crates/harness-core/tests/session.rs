@@ -212,3 +212,18 @@ fn a_session_that_cannot_be_saved_keeps_working_in_memory() {
     assert_eq!(texts(&session), ["one", "answer one"]);
     assert_eq!(session.path(), None);
 }
+
+// Review D I2: sessions hold prompts, code and tool output, so only their owner may read them.
+#[test]
+fn session_files_and_their_folders_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let project = sessions.join("project-key");
+    let mut session = Session::create(&project, Path::new("/work"));
+    session.append(user("one"));
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(session.path().unwrap()), 0o600);
+    assert_eq!(mode(&project), 0o700);
+    assert_eq!(mode(&sessions), 0o700);
+}

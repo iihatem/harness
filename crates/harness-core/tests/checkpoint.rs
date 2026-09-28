@@ -970,8 +970,16 @@ fn a_shadow_repository_inside_the_workspace_is_refused() {
         base.join("link/data/p.git"),
         base.join("elsewhere/missing/../../ws/data/p.git"),
     ] {
+        // Re-review E, nit c: the cause is where harness runs, and the message says so.
         match Checkpoints::open(&gitdir, &f.ws, "s1") {
-            Err(CheckpointError::Exposed { root, .. }) => assert_eq!(root, f.ws),
+            Err(e @ CheckpointError::InWorkspace { .. }) => {
+                let message = e.to_string();
+                assert!(
+                    message.contains(&format!("inside the workspace {}", f.ws.display()))
+                        && message.contains("run harness in a project directory"),
+                    "{message}"
+                );
+            }
             other => panic!("{}: {other:?}", gitdir.display()),
         }
     }
@@ -986,11 +994,16 @@ fn a_shadow_repository_where_commands_can_write_is_refused() {
     let tmp = f.ws.parent().unwrap().join("tmp");
     std::fs::create_dir(&tmp).unwrap();
     let roots = [f.ws.clone(), tmp.clone()];
+    match checkpoint::check_location(&tmp.join("harness/checkpoints/p.git"), &f.ws, &roots) {
+        Err(CheckpointError::Exposed { root, .. }) => assert_eq!(root, tmp),
+        other => panic!("{other:?}"),
+    }
+    // The workspace is among the roots the CLI passes: it is named as the cause.
     assert!(matches!(
-        checkpoint::check_location(&tmp.join("harness/checkpoints/p.git"), &roots),
-        Err(CheckpointError::Exposed { .. })
+        checkpoint::check_location(&f.ws.join("data/p.git"), &f.ws, &roots),
+        Err(CheckpointError::InWorkspace { .. })
     ));
-    checkpoint::check_location(&f.gitdir, &roots).unwrap();
+    checkpoint::check_location(&f.gitdir, &f.ws, &roots).unwrap();
 }
 
 // Review E minor 14: the snapshots of sessions that no longer exist are pruned: their refs, their

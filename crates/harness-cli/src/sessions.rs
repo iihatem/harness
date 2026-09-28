@@ -44,7 +44,7 @@ pub fn checkpoints(
         .data_dir
         .join("checkpoints")
         .join(format!("{key}.git"));
-    let opened = checkpoint::check_location(&gitdir, writable)
+    let opened = checkpoint::check_location(&gitdir, &setup.workspace, writable)
         .and_then(|()| Checkpoints::open(&gitdir, &setup.workspace, session.id()));
     match opened {
         Ok(checkpoints) => {

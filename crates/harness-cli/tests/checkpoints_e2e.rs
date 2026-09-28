@@ -169,7 +169,8 @@ async fn a_checkpoint_repository_inside_the_workspace_disables_checkpoints() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("warning: checkpoints are disabled: the checkpoint repository")
-                && stderr.contains("where commands can change it"),
+                && stderr.contains("is inside the workspace")
+                && stderr.contains("run harness in a project directory"),
             "{stderr}"
         );
         assert_eq!(checkpoint_events(&output.stdout), 0);

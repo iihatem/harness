@@ -92,6 +92,12 @@ pub enum CheckpointError {
         root.display()
     )]
     Exposed { gitdir: PathBuf, root: PathBuf },
+    #[error(
+        "the checkpoint repository {} is inside the workspace {}, the directory harness works on (as when harness runs in your home directory); run harness in a project directory, or set HARNESS_HOME or XDG_DATA_HOME to a directory outside it",
+        gitdir.display(),
+        workspace.display()
+    )]
+    InWorkspace { gitdir: PathBuf, workspace: PathBuf },
     #[error("{source}; snapshot {before} holds the files as they were just before")]
     Restore {
         before: String,
@@ -155,7 +161,7 @@ impl Checkpoints {
         if !crate::session::is_valid_id(session_id) {
             return Err(CheckpointError::InvalidSession(session_id.to_string()));
         }
-        check_location(gitdir, &[workspace.to_path_buf()])?;
+        check_location(gitdir, workspace, &[])?;
         let mut version = Command::new(git);
         version
             .arg("--version")
@@ -1090,11 +1096,22 @@ fn failure(command: &str, stderr: &[u8]) -> CheckpointError {
     }
 }
 
-/// Fails when the shadow repository `gitdir` is inside one of `roots`, directories that commands
-/// can write to: a command could then change the repository's configuration, which checkpoint git
-/// reads outside any sandbox, and the snapshots themselves.
-pub fn check_location(gitdir: &Path, roots: &[PathBuf]) -> Result<(), CheckpointError> {
+/// Fails when the shadow repository `gitdir` is inside `workspace` (the directory harness works
+/// on, and snapshots) or one of `roots` (directories commands can write to): a command could then
+/// change the repository's configuration, which checkpoint git reads outside any sandbox, and the
+/// snapshots themselves. Inside the workspace, the error says the workspace is the cause.
+pub fn check_location(
+    gitdir: &Path,
+    workspace: &Path,
+    roots: &[PathBuf],
+) -> Result<(), CheckpointError> {
     let gitdir = resolve(gitdir);
+    if gitdir.starts_with(resolve(workspace)) {
+        return Err(CheckpointError::InWorkspace {
+            gitdir,
+            workspace: workspace.to_path_buf(),
+        });
+    }
     for root in roots {
         if gitdir.starts_with(resolve(root)) {
             return Err(CheckpointError::Exposed {

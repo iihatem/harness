@@ -411,6 +411,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Held by every unit test that makes a child of this process in another
+/// session, or reaches [`look_and_reap`] (through `prepare`, say):
+/// [`look_and_reap`] reaps any such child that is not registered, and a
+/// registration pending meanwhile stops it reaping at all. Tests run in
+/// parallel threads of one process.
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    lock(&SERIAL)
+}
+
 /// Whether [`track_orphans`] made this process a child subreaper: 0 not
 /// asked, 1 active, 2 refused.
 #[cfg(all(
@@ -849,6 +864,7 @@ mod tests {
     ))]
     #[test]
     fn the_reaper_leaves_a_managed_zombie_to_its_waiter_and_reaps_an_orphan_through_a_pidfd() {
+        let _serial = serial();
         let mut managed = zombie_in_its_own_session();
         let mut registration = Registration::new();
         registration.started(managed.id());
@@ -896,6 +912,7 @@ mod tests {
     ))]
     #[test]
     fn a_zombie_waited_for_already_is_not_reaped_again() {
+        let _serial = serial();
         let mut child = zombie_in_its_own_session();
         let pid = i32::try_from(child.id()).unwrap();
         assert_eq!(child.wait().expect("its exit status").code(), Some(3));
@@ -909,6 +926,7 @@ mod tests {
     ))]
     #[test]
     fn where_pidfds_are_refused_an_orphan_is_reaped_by_its_pid() {
+        let _serial = serial();
         let (me, my_sid) = me();
         let mut gone = zombie_in_its_own_session();
         let pid = i32::try_from(gone.id()).unwrap();

@@ -524,6 +524,7 @@ mod tests {
 
     #[test]
     fn a_watcher_that_cannot_start_is_said_once_in_the_next_report() {
+        let _serial = procs::serial();
         if !linux_sandbox_available() {
             eprintln!("skipping: linux sandbox unavailable");
             return;

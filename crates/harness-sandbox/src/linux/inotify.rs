@@ -322,15 +322,21 @@ mod tests {
         }
     }
 
-    /// Counts its checks. A change to one of `names`, or to a watched
-    /// directory itself, is relevant; with `everything`, any change is. Each
-    /// check runs `on_check` in the first directory. Records how many checks
-    /// had run when it was told no process is left.
+    /// Counts its checks, and apart those that followed a change it found
+    /// relevant (`heeded`): the check of a tick, every two seconds, follows
+    /// none unless one came, so what `heeded` counts does not depend on when
+    /// ticks fall. A change to one of `names`, or to a watched directory
+    /// itself, is relevant; with `everything`, any change is. Each check runs
+    /// `on_check` in the first directory. Records how many checks had run
+    /// when it was told no process is left.
     struct Counting {
         dirs: Vec<PathBuf>,
         names: &'static [&'static str],
         everything: bool,
         checks: Arc<AtomicUsize>,
+        heeded: Arc<AtomicUsize>,
+        /// A relevant change came since the last check.
+        armed: AtomicBool,
         on_check: fn(&Path, usize),
         gone: Arc<Mutex<Option<usize>>>,
     }
@@ -343,6 +349,8 @@ mod tests {
                 names: &["config"],
                 everything: false,
                 checks: Arc::clone(&checks),
+                heeded: Arc::default(),
+                armed: AtomicBool::new(false),
                 on_check: |_, _| {},
                 gone: Arc::default(),
             };
@@ -356,10 +364,18 @@ mod tests {
         }
 
         fn relevant(&self, _dir: &Path, name: Option<&OsStr>) -> bool {
-            self.everything || name.is_none_or(|name| self.names.iter().any(|n| name == *n))
+            let relevant =
+                self.everything || name.is_none_or(|name| self.names.iter().any(|n| name == *n));
+            if relevant {
+                self.armed.store(true, Ordering::SeqCst);
+            }
+            relevant
         }
 
         fn check(&self) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.heeded.fetch_add(1, Ordering::SeqCst);
+            }
             let n = self.checks.fetch_add(1, Ordering::SeqCst);
             (self.on_check)(&self.dirs[0], n);
         }
@@ -378,12 +394,15 @@ mod tests {
     fn a_relevant_change_runs_a_check_and_others_do_not() {
         let dir = tempfile::tempdir().unwrap();
         let (target, checks) = Counting::new(&[dir.path()]);
+        let heeded = Arc::clone(&target.heeded);
         let watcher = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap();
         std::fs::write(dir.path().join("index.lock"), "x").unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(count(&checks), 0);
+        // At most the check of a tick.
+        assert!(count(&checks) <= 1, "{} checks", count(&checks));
+        assert_eq!(count(&heeded), 0);
         std::fs::write(dir.path().join("config"), "x").unwrap();
-        wait_until("the change is checked", || count(&checks) > 0);
+        wait_until("the change is checked", || count(&heeded) > 0);
         watcher.stop();
     }
 
@@ -398,12 +417,15 @@ mod tests {
             std::fs::write(&temp, "saved\n").unwrap();
             std::fs::remove_file(&temp).unwrap();
         };
+        let heeded = Arc::clone(&target.heeded);
         let watcher = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap();
         std::fs::write(dir.path().join("pre-commit"), "echo pwned\n").unwrap();
-        wait_until("the change is checked", || count(&checks) > 0);
+        wait_until("the change is checked", || count(&heeded) > 0);
         std::thread::sleep(Duration::from_millis(500));
-        // The planted file's own events may come in two reads.
-        assert!(count(&checks) <= 2, "{} checks", count(&checks));
+        // The planted file's own events may come in two reads; the check of
+        // a tick may come besides.
+        assert!(count(&heeded) <= 2, "{} checks heeded", count(&heeded));
+        assert!(count(&checks) <= 3, "{} checks", count(&checks));
         watcher.stop();
     }
 
@@ -475,19 +497,20 @@ mod tests {
         // relevant change in the directory above it.
         let (mut target, checks) = Counting::new(&[&watched, dir.path()]);
         target.names = &["config", "hooks"];
+        let heeded = Arc::clone(&target.heeded);
         let watcher = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap();
         let old = dir.path().join("elsewhere");
         std::fs::rename(&watched, &old).unwrap();
         std::fs::create_dir(&watched).unwrap();
         wait_until("the move is checked", || count(&checks) > 0);
         std::thread::sleep(Duration::from_millis(200));
-        let before = count(&checks);
+        let before = count(&heeded);
         std::fs::write(old.join("config"), "x").unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(count(&checks), before, "a change where it went was checked");
+        assert_eq!(count(&heeded), before, "a change where it went was checked");
         std::fs::write(watched.join("config"), "x").unwrap();
         wait_until("a change at its path is checked", || {
-            count(&checks) > before
+            count(&heeded) > before
         });
         watcher.stop();
     }
@@ -534,10 +557,13 @@ mod tests {
         std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(".git")).unwrap();
         let (mut target, checks) = Counting::new(&[&dir.path().join(".git/hooks")]);
         target.everything = true;
+        let heeded = Arc::clone(&target.heeded);
         let watcher = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap();
         std::fs::write(elsewhere.path().join("hooks/config"), "x").unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(count(&checks), 0, "it watched where the symlink points");
+        assert_eq!(count(&heeded), 0, "it watched where the symlink points");
+        // At most the check of a tick.
+        assert!(count(&checks) <= 1, "{} checks", count(&checks));
         watcher.stop();
     }
 

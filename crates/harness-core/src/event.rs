@@ -68,6 +68,12 @@ pub enum AgentEvent {
     CheckpointCreated {
         commit: String,
     },
+    /// The older part of the conversation was replaced by `summary`.
+    Compacted {
+        summary: String,
+        tokens_before: u64,
+        tokens_after: u64,
+    },
     TurnFinished {
         reason: TurnEndReason,
     },

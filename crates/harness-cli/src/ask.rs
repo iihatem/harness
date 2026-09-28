@@ -188,6 +188,10 @@ pub async fn run(
     if let Some(steps) = setup.config.max_steps {
         config.max_steps = steps;
     }
+    config.compaction = harness_core::compaction::CompactionConfig {
+        threshold: setup.config.compaction.threshold(),
+        keep_recent: setup.config.compaction.keep_recent(),
+    };
     // `with_piped_stdin` returns the prompt with any piped text appended.
     let turn = crate::slash::turn_input(
         &typed,
@@ -437,6 +441,16 @@ async fn render(
             }
             AgentEvent::Warning { message } if !json => {
                 eprintln!("warning: {}", terminal_safe(message))
+            }
+            AgentEvent::Compacted {
+                summary,
+                tokens_before,
+                tokens_after,
+            } if !json => {
+                eprintln!(
+                    "compacted the conversation from about {tokens_before} to {tokens_after} tokens; summary:\n{}",
+                    terminal_safe_text(summary)
+                );
             }
             AgentEvent::TurnFinished {
                 reason: TurnEndReason::StepLimit,

@@ -563,3 +563,45 @@ fn a_trusted_project_may_relax_required_git_protection() {
     assert_eq!(cfg.linux_git_protection, LinuxGitProtection::BestEffort);
     assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
 }
+
+#[test]
+fn compaction_settings_default_and_are_read_as_percentages() {
+    let (cfg, _) = load_project(None, "", true);
+    assert_eq!(cfg.compaction.threshold(), 0.8);
+    assert_eq!(cfg.compaction.keep_recent(), 0.2);
+    let (cfg, widening) = load_project(
+        Some("[compaction]\nthreshold_percent = 70\n"),
+        "[compaction]\nkeep_recent_percent = 10\n",
+        true,
+    );
+    assert_eq!(cfg.compaction.threshold(), 0.7);
+    assert_eq!(cfg.compaction.keep_recent(), 0.1);
+    assert_eq!(widening, None, "compaction settings need no trust");
+}
+
+#[test]
+fn impossible_compaction_settings_are_errors_naming_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.toml");
+    for (text, problem) in [
+        ("[compaction]\nthreshold_percent = 0\n", "between 1 and 100"),
+        (
+            "[compaction]\nthreshold_percent = 150\n",
+            "between 1 and 100",
+        ),
+        (
+            "[compaction]\nthreshold_percent = 50\nkeep_recent_percent = 60\n",
+            "below compaction.threshold_percent",
+        ),
+        ("[compaction]\nkeep = 5\n", "unknown field"),
+    ] {
+        std::fs::write(&file, text).unwrap();
+        let err = config::load(&file, dir.path(), &TrustStore::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("config.toml") && err.contains(problem),
+            "{err}"
+        );
+    }
+}

@@ -14,13 +14,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     checkpoint::{CheckpointError, Checkpoints},
+    compaction::{self, CompactionConfig},
     event::{AgentEvent, ErrorKind, TurnEndReason},
-    message::{ChatRequest, Message, ToolCall},
+    message::{ChatRequest, Message, ToolCall, Usage},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
     permission::{Action, Decision, FsAccess, Mode, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
     retry::RetryPolicy,
     session::{Entry, EntryKind, RewindScope, Session},
+    tokens::DEFAULT_CONTEXT_WINDOW,
     tool::{Tool, ToolContext, ToolOutput, ToolRegistry},
     turn::{InputPart, TurnInput, TurnModel},
 };
@@ -64,6 +66,9 @@ pub struct AgentConfig {
     pub output_limit: usize,
     pub output_dir: PathBuf,
     pub retry: RetryPolicy,
+    /// The model's context window in tokens.
+    pub context_window: u64,
+    pub compaction: CompactionConfig,
 }
 
 impl AgentConfig {
@@ -81,6 +86,8 @@ impl AgentConfig {
             output_limit: DEFAULT_OUTPUT_LIMIT,
             output_dir,
             retry: RetryPolicy::default(),
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            compaction: CompactionConfig::default(),
         }
     }
 }
@@ -129,6 +136,19 @@ struct ModelReply {
     finish: Option<FinishReason>,
     /// Whether any output was already shown to the user (then the call must not be retried).
     emitted: bool,
+    /// The token counts the provider reported for this call.
+    usage: Option<Usage>,
+}
+
+/// Why the conversation is being compacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    /// Estimated usage reached the threshold.
+    Auto,
+    /// The user asked (`/compact`).
+    Manual,
+    /// The provider rejected a request as longer than the context window.
+    Overflow,
 }
 
 /// How one model call (including its retries) ended.
@@ -156,6 +176,9 @@ pub struct Agent {
     checkpoints: Option<Arc<Checkpoints>>,
     /// Whether the current turn already took its snapshot.
     turn_checkpointed: bool,
+    /// Tokens the provider reported for the last request and its reply, and how many messages
+    /// they covered; `None` until a provider reports usage, and after the history changes.
+    reported_usage: Option<(u64, usize)>,
     validators: HashMap<String, jsonschema::Validator>,
     invalid_calls: u32,
     /// Tool-call ids already used in this session, so a missing or repeated id (from a model or
@@ -197,6 +220,7 @@ impl Agent {
             warnings: Vec::new(),
             checkpoints: None,
             turn_checkpointed: false,
+            reported_usage: None,
             validators,
             invalid_calls: 0,
             used_call_ids: HashSet::new(),
@@ -243,6 +267,7 @@ impl Agent {
         }
         self.history = history;
         self.history_ids = ids;
+        self.reported_usage = None;
     }
 
     /// Snapshots the workspace before each turn's first change, so it can be rewound.
@@ -490,10 +515,28 @@ impl Agent {
             return self.finish(TurnEndReason::Interrupted, events);
         }
 
+        let mut auto_compaction_failed = false;
         for _ in 0..self.config.max_steps {
-            let reply = match self.call_model(events, &cancel).await {
+            if !auto_compaction_failed
+                && self.near_the_window()
+                && let Err(e) = self
+                    .compact_history(None, Trigger::Auto, events, &cancel)
+                    .await
+            {
+                auto_compaction_failed = true;
+                if !cancel.is_cancelled() {
+                    let _ = events.send(AgentEvent::Warning {
+                        message: format!("could not compact the conversation: {e}"),
+                    });
+                }
+            }
+            let reply = match self.call_model_compacting(events, &cancel).await {
                 ModelOutcome::Reply(mut reply) => {
                     self.dedupe_call_ids(&mut reply.tool_calls);
+                    if let Some(usage) = reply.usage {
+                        let total = usage.input_tokens + usage.output_tokens;
+                        self.reported_usage = Some((total, self.history.len() + 1));
+                    }
                     reply
                 }
                 ModelOutcome::Failed(error, partial) => return self.fail(error, partial, events),
@@ -561,6 +604,175 @@ impl Agent {
             }
         }
         message
+    }
+
+    /// Compacts the conversation now (`/compact`): the older part is replaced by a summary the
+    /// model writes, with `focus` saying what to keep in particular.
+    pub async fn compact(
+        &mut self,
+        focus: Option<&str>,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
+        let result = self
+            .compact_history(focus, Trigger::Manual, events, &cancel)
+            .await;
+        for message in self.warnings.drain(..) {
+            let _ = events.send(AgentEvent::Warning { message });
+        }
+        result
+    }
+
+    /// Estimated tokens of the next request: what the provider last reported plus an estimate
+    /// for the messages added since, or else an estimate of the whole request.
+    fn estimated_tokens(&self) -> u64 {
+        if let Some((reported, covered)) = self.reported_usage
+            && covered <= self.history.len()
+        {
+            let added: u64 = self.history[covered..]
+                .iter()
+                .map(compaction::message_tokens)
+                .sum();
+            return reported + added;
+        }
+        compaction::request_tokens(
+            &self.config.system_prompt,
+            &self.tools.specs(),
+            &self.history,
+        )
+    }
+
+    /// Whether the next request would reach the compaction threshold.
+    fn near_the_window(&self) -> bool {
+        let threshold = self.config.context_window as f64 * self.config.compaction.threshold;
+        self.estimated_tokens() as f64 >= threshold
+    }
+
+    /// Replaces the older part of the conversation by a summary. The kept part fits the
+    /// configured share of the window; failing that, automatic and overflow compaction keep the
+    /// current turn, and `/compact` summarizes everything. The summary is saved as a compaction
+    /// entry, so the summarized messages stay in the session and can be rewound to.
+    async fn compact_history(
+        &mut self,
+        focus: Option<&str>,
+        trigger: Trigger,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        let window = self.config.context_window;
+        let budget = (window as f64 * self.config.compaction.keep_recent) as u64;
+        let fits = compaction::cut(&self.history, budget);
+        let turn_start = self
+            .history
+            .iter()
+            .rposition(|m| matches!(m, Message::User { .. }))
+            .unwrap_or(0);
+        let cut = match trigger {
+            Trigger::Auto => fits.or(Some(turn_start)),
+            // The provider's window is smaller than assumed: keep no more than the current turn.
+            Trigger::Overflow => Some(fits.unwrap_or(0).max(turn_start)),
+            Trigger::Manual => fits.or(Some(self.history.len())),
+        }
+        .filter(|&cut| cut > 0)
+        .ok_or("there is nothing to compact yet")?;
+        let before = self.estimated_tokens();
+        let model = self
+            .turn_model
+            .as_ref()
+            .map_or(self.config.model_name.clone(), |m| m.name.clone());
+        let request = compaction::summary_request(&model, &self.history[..cut], focus, window / 2);
+        let summary = self.summarize(request, events, cancel).await?;
+        let first_kept = self.history_ids.get(cut).cloned();
+        self.session.append(EntryKind::Compaction {
+            summary: summary.clone(),
+            first_kept,
+        });
+        self.after_session_change();
+        let _ = events.send(AgentEvent::Compacted {
+            summary,
+            tokens_before: before,
+            tokens_after: self.estimated_tokens(),
+        });
+        Ok(())
+    }
+
+    /// Asks the model answering this turn for the summary `request` asks for, retrying transient
+    /// errors like any model call.
+    async fn summarize(
+        &self,
+        request: ChatRequest,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<String, String> {
+        let provider = self
+            .turn_model
+            .as_ref()
+            .map_or(&self.provider, |m| &m.provider)
+            .clone();
+        let mut attempt = 1;
+        loop {
+            let collect = async {
+                let mut text = String::new();
+                let mut stream = provider.stream(request.clone());
+                while let Some(item) = stream.next().await {
+                    if let ProviderEvent::TextDelta(delta) = item? {
+                        text.push_str(&delta);
+                    }
+                }
+                Ok::<String, ProviderError>(text)
+            };
+            let result = tokio::select! {
+                result = collect => result,
+                _ = cancel.cancelled() => return Err("interrupted".into()),
+            };
+            match result {
+                Ok(text) if text.trim().is_empty() => {
+                    return Err("the model returned an empty summary".into());
+                }
+                Ok(text) => return Ok(text.trim().to_string()),
+                Err(error) if error.is_retryable() && attempt < self.config.retry.max_attempts => {
+                    let delay = self.config.retry.delay(attempt, error.retry_after());
+                    let _ = events.send(AgentEvent::Retrying {
+                        attempt,
+                        reason: error.to_string(),
+                        delay_ms: delay.as_millis() as u64,
+                    });
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = cancel.cancelled() => return Err("interrupted".into()),
+                    }
+                    attempt += 1;
+                }
+                Err(error) => return Err(describe(&error)),
+            }
+        }
+    }
+
+    /// [`call_model`](Self::call_model); when the provider rejects the request as longer than its
+    /// context window, the conversation is compacted and the request sent once more.
+    async fn call_model_compacting(
+        &mut self,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> ModelOutcome {
+        let outcome = self.call_model(events, cancel).await;
+        match &outcome {
+            ModelOutcome::Failed(error, partial)
+                if error.is_context_overflow() && !partial.emitted => {}
+            _ => return outcome,
+        }
+        match self
+            .compact_history(None, Trigger::Overflow, events, cancel)
+            .await
+        {
+            Ok(()) => self.call_model(events, cancel).await,
+            Err(e) => {
+                let _ = events.send(AgentEvent::Warning {
+                    message: format!("could not compact the conversation: {e}"),
+                });
+                outcome
+            }
+        }
     }
 
     /// The id of the model answering the current turn.
@@ -691,6 +903,7 @@ impl Agent {
                 }
                 ProviderEvent::ToolCall(call) => reply.tool_calls.push(call),
                 ProviderEvent::Usage(usage) => {
+                    reply.usage = Some(usage);
                     let _ = events.send(AgentEvent::Usage {
                         model: self.model_id().to_string(),
                         usage,

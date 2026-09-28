@@ -48,6 +48,32 @@ impl ProviderError {
         }
     }
 
+    /// Whether the provider rejected the request as longer than the model's context window.
+    /// Providers say so in different words, so this looks for the usual phrases.
+    pub fn is_context_overflow(&self) -> bool {
+        let text = match self {
+            ProviderError::Http {
+                status: 400 | 413 | 422,
+                body,
+                ..
+            } => body,
+            ProviderError::Protocol(message) => message,
+            _ => return false,
+        };
+        let text = text.to_lowercase();
+        [
+            "context_length_exceeded",
+            "maximum context length",
+            "context length",
+            "context window",
+            "exceeds the available context",
+            "prompt is too long",
+            "too many tokens",
+        ]
+        .iter()
+        .any(|phrase| text.contains(phrase))
+    }
+
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             ProviderError::Http { retry_after, .. } => *retry_after,

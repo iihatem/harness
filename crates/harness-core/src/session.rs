@@ -13,7 +13,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{message::Message, time};
+use crate::{compaction, message::Message, time};
 
 /// The session file format written by this version.
 pub const FORMAT_VERSION: u32 = 1;
@@ -44,6 +44,12 @@ pub enum EntryKind {
         /// A note from harness, such as a mode change, rather than something the user typed.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         note: bool,
+    },
+    /// A summary that replaces the conversation before `first_kept` (all of it when `None`) on
+    /// this branch. The summarized entries stay in the file.
+    Compaction {
+        summary: String,
+        first_kept: Option<String>,
     },
     /// A snapshot of the workspace taken before the turn's first change.
     Checkpoint { commit: String },
@@ -315,12 +321,28 @@ impl Session {
         out
     }
 
-    /// The conversation on the active branch, with each message's entry id.
+    /// The conversation on the active branch, with each message's entry id. A compaction
+    /// replaces the messages before its first kept one with its summary.
     pub fn messages(&self) -> Vec<(String, Message)> {
         let mut out = Vec::new();
         for entry in self.branch() {
-            if let EntryKind::Message { message, .. } = &entry.kind {
-                out.push((entry.id.clone(), message.clone()));
+            match &entry.kind {
+                EntryKind::Message { message, .. } => {
+                    out.push((entry.id.clone(), message.clone()));
+                }
+                EntryKind::Compaction {
+                    summary,
+                    first_kept,
+                } => {
+                    let from = first_kept
+                        .as_ref()
+                        .and_then(|id| out.iter().position(|(entry, _)| entry == id))
+                        .unwrap_or(out.len());
+                    let kept = out.split_off(from);
+                    out = vec![(entry.id.clone(), compaction::summary_message(summary))];
+                    out.extend(kept);
+                }
+                _ => {}
             }
         }
         out

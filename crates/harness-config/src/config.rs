@@ -3,7 +3,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use harness_core::{agent::DEFAULT_MAX_STEPS, permission::Mode};
+use harness_core::{
+    agent::DEFAULT_MAX_STEPS,
+    compaction::{DEFAULT_KEEP_RECENT, DEFAULT_THRESHOLD},
+    permission::Mode,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -61,6 +65,44 @@ pub struct SandboxConfig {
     pub linux_git_protection: Option<LinuxGitProtection>,
 }
 
+/// `[compaction]`: when the conversation is summarized, in percent of the context window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionSettings {
+    /// Compact when estimated usage reaches this share of the context window (1 to 100).
+    pub threshold_percent: Option<u8>,
+    /// Keep this share of the context window of recent messages as they are (below the
+    /// threshold).
+    pub keep_recent_percent: Option<u8>,
+}
+
+impl CompactionSettings {
+    /// The threshold as a fraction of the context window.
+    pub fn threshold(&self) -> f64 {
+        self.threshold_percent
+            .map_or(DEFAULT_THRESHOLD, |p| f64::from(p) / 100.0)
+    }
+
+    /// The share kept as recent messages, as a fraction of the context window.
+    pub fn keep_recent(&self) -> f64 {
+        self.keep_recent_percent
+            .map_or(DEFAULT_KEEP_RECENT, |p| f64::from(p) / 100.0)
+    }
+
+    /// What is wrong with these settings, if anything.
+    fn problem(&self) -> Option<String> {
+        if self.threshold_percent.is_some_and(|p| p == 0 || p > 100) {
+            return Some("compaction.threshold_percent must be between 1 and 100".into());
+        }
+        if self.keep_recent() >= self.threshold() {
+            return Some(
+                "compaction.keep_recent_percent must be below compaction.threshold_percent".into(),
+            );
+        }
+        None
+    }
+}
+
 /// One `config.toml` file as written by the user.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +116,8 @@ pub struct ConfigFile {
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    #[serde(default)]
+    pub compaction: CompactionSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +137,7 @@ pub struct Config {
     pub model: Option<String>,
     pub mode: Option<Mode>,
     pub max_steps: Option<u32>,
+    pub compaction: CompactionSettings,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
@@ -240,6 +285,12 @@ pub fn load(
     let mut cfg = Config::default();
     let global = parse_file(global_file)?;
     let baseline = Baseline::new(global.as_ref(), workspace);
+    if let Some(message) = global.as_ref().and_then(|g| g.compaction.problem()) {
+        return Err(ConfigError::Parse {
+            path: global_file.to_path_buf(),
+            message,
+        });
+    }
     if let Some(global) = global {
         let base = global_file.parent().unwrap_or(Path::new("/"));
         cfg.model = global.model;
@@ -249,6 +300,7 @@ pub fn load(
         cfg.allow = global.permissions.allow;
         cfg.deny = global.permissions.deny;
         cfg.confirm = global.permissions.confirm;
+        cfg.compaction = global.compaction;
         cfg.read_dirs = expand_all(&global.permissions.read_dirs, base, home);
         cfg.writable_roots = expand_all(&global.sandbox.writable_roots, base, home);
         cfg.allow_localhost = global.sandbox.allow_localhost.unwrap_or(false);
@@ -259,6 +311,17 @@ pub fn load(
         cfg.deny.extend(project.permissions.deny.iter().cloned());
         cfg.confirm
             .extend(project.permissions.confirm.iter().cloned());
+        // Compaction settings change when the conversation is summarized, not what the agent
+        // may do, so they apply without trust.
+        if project.compaction.threshold_percent.is_some() {
+            cfg.compaction.threshold_percent = project.compaction.threshold_percent;
+        }
+        if project.compaction.keep_recent_percent.is_some() {
+            cfg.compaction.keep_recent_percent = project.compaction.keep_recent_percent;
+        }
+        if let Some(message) = cfg.compaction.problem() {
+            return Err(ConfigError::Parse { path, message });
+        }
         if let Some(steps) = project.max_steps.filter(|&n| n <= baseline.max_steps) {
             cfg.max_steps = Some(steps);
         }

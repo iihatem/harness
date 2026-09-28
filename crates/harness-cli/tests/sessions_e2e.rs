@@ -256,6 +256,7 @@ async fn a_killed_run_keeps_its_completed_turns() {
     })
     .await
     .unwrap();
+    // The killed turn's prompt and the next one are consecutive user messages, sent as one.
     let last = conversations(&server).await.pop().unwrap();
     assert_eq!(
         last,
@@ -264,8 +265,7 @@ async fn a_killed_run_keeps_its_completed_turns() {
             "assistant: answer",
             "user: two",
             "assistant: answer",
-            "user: three",
-            "user: one more"
+            "user: three\n\none more"
         ]
     );
     drop(env);

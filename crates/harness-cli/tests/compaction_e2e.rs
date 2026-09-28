@@ -82,6 +82,16 @@ async fn last_request(server: &MockServer) -> Vec<String> {
         .collect()
 }
 
+/// The content of the last message of the last request.
+async fn last_message(server: &MockServer) -> String {
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+    body["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 // Spec: provider reports context overflow.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_context_overflow_is_compacted_and_retried_once() {
@@ -114,10 +124,11 @@ async fn a_context_overflow_is_compacted_and_retried_once() {
     })
     .await
     .unwrap();
+    // The summary and the next prompt are consecutive user messages, sent as one.
     let last = last_request(&server).await;
-    assert_eq!(last.len(), 2, "{last:?}");
+    assert_eq!(last.len(), 1, "{last:?}");
     assert!(last[0].starts_with("user: [Summary of the earlier conversation]"));
-    assert_eq!(last[1], "user: second question");
+    assert!(last_message(&server).await.ends_with("\n\nsecond question"));
 }
 
 // Spec: automatic compaction.
@@ -145,7 +156,7 @@ async fn a_conversation_near_the_window_is_compacted_before_the_next_request() {
     .await
     .unwrap();
     let last = last_request(&server).await;
-    assert_eq!(last.len(), 2, "{last:?}");
+    assert_eq!(last.len(), 1, "{last:?}");
     assert!(last[0].starts_with("user: [Summary of the earlier conversation]"));
-    assert!(last[1].starts_with("user: pears"));
+    assert!(last_message(&server).await.contains("\n\npears "));
 }

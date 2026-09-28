@@ -5,7 +5,7 @@ Sessions preserve conversations on disk so they survive crashes, can be resumed 
 ## ADDED Requirements
 
 ### Requirement: Sessions are persisted incrementally
-The system SHALL persist each session as an append-only JSON Lines file in the `sessions/<project-key>/` directory of the harness data directory, where `<project-key>` is derived from the canonical repository root path, or from the canonical working directory outside a repository. Each entry MUST be appended as soon as it is complete and MUST carry an `id` and a `parent_id`.
+The system SHALL persist each session as an append-only JSON Lines file in the `sessions/<project-key>/` directory of the harness data directory, where `<project-key>` is derived from the canonical repository root path, or from the canonical working directory outside a repository. Each entry MUST be appended as soon as it is complete and MUST carry an `id` and a `parent_id`. Session files MUST be readable and writable only by the user who owns them. A file MUST be loaded as a session only when it is a regular file named after the session id its first line gives, and that id consists of 1 to 64 ASCII letters, digits and dashes.
 
 #### Scenario: Entries survive a crash
 - **WHEN** the harness process is killed after two completed turns
@@ -14,6 +14,14 @@ The system SHALL persist each session as an append-only JSON Lines file in the `
 #### Scenario: Session in use
 - **WHEN** a second harness process tries to continue a session that another process is using
 - **THEN** it refuses with an error instead of writing to the file
+
+#### Scenario: Session files are private
+- **WHEN** a session is saved
+- **THEN** only the user who owns the file can read or write it, and only that user can open the folders that hold it
+
+#### Scenario: Session id that does not match its file
+- **WHEN** the first line of a session file gives a session id other than the file's name
+- **THEN** the file is not loaded as a session
 
 ### Requirement: Sessions branch instead of losing history
 The system SHALL treat the session as a tree of entries whose active branch runs from the root to the current leaf. Rewinding the conversation MUST move the current leaf to an earlier entry, and new entries MUST be appended as children of that entry, leaving the previous branch intact in the file.
@@ -30,6 +38,10 @@ The system SHALL resume the most recent session for the current project with `ha
 - **WHEN** the user runs `harness -c` in a project with previous sessions
 - **THEN** the most recent session's active branch is loaded and the next turn has access to it
 
+#### Scenario: Continue after a run killed during a tool call
+- **WHEN** harness is killed while a tool call runs, and the user continues the session
+- **THEN** the next request carries a result for every tool call, and the unfinished call's result says harness stopped before it finished and its effects are unknown
+
 ### Requirement: Truncated session files are tolerated
 The system SHALL ignore an incomplete final line when loading a session file and warn the user, loading all complete entries.
 
@@ -38,14 +50,18 @@ The system SHALL ignore an incomplete final line when loading a session file and
 - **THEN** the session loads with all complete entries and a warning is shown
 
 ### Requirement: Context is compacted automatically and on demand
-The system SHALL compact the conversation when estimated context usage reaches a configurable threshold (default 80% of the effective context window) and when the user runs `/compact`, optionally with focus instructions. Compaction MUST replace older history with a model-generated summary while keeping the most recent turns verbatim within a configurable budget (default 20% of the context window). The summary MUST be shown to the user and stored as a compaction entry, and the original entries MUST remain in the file so the user can rewind to before the compaction.
+The system SHALL compact the conversation when estimated context usage reaches a configurable threshold (default 80% of the effective context window) and when the user runs `/compact`, optionally with focus instructions. Usage MUST be estimated from the input tokens the provider reported for the last request plus estimates for later messages; output tokens MUST NOT count. Compaction MUST replace older history with a model-generated summary while keeping the most recent turns verbatim within a configurable budget (default 20% of the context window). When no recent part fits the budget, automatic compaction MUST keep the current turn, or only its last step when the turn itself reaches the threshold. Summarizing nothing but an earlier summary MUST count as nothing to compact, and once an automatic compaction leaves usage at or above the threshold, automatic compaction MUST wait until usage drops below it. The summary MUST be shown to the user and stored as a compaction entry, and the original entries MUST remain in the file so the user can rewind to before the compaction.
 
 #### Scenario: Automatic compaction
 - **WHEN** a turn would bring estimated usage above 80% of the context window
 - **THEN** a compaction event is emitted before the next model call, the summary is displayed, and the request fits within the window
 
+#### Scenario: Long turn
+- **WHEN** the current turn alone reaches the threshold and its last step does not fit the budget
+- **THEN** compaction keeps only that step, the next request fits within the window, and an earlier summary is never summarized on its own
+
 ### Requirement: Context overflow triggers compaction and one retry
-When a provider rejects a request because it exceeds the context window, the system SHALL compact the conversation and retry the request once. If the retry also fails, the system MUST emit an error event.
+When a provider rejects a request because it exceeds the context window, the system SHALL compact the conversation and retry the request once. If the retry also fails, the system MUST emit an error event. A context overflow MUST be recognised only from an error response or an error the provider reports in its stream, never from a response the system could not parse.
 
 #### Scenario: Provider reports context overflow
 - **WHEN** the provider responds with a context-length error

@@ -55,11 +55,14 @@ pub struct Checkpoints {
     workspace: PathBuf,
     /// This session's index, so sessions in one project never share one.
     index: PathBuf,
+    /// The index a restore builds its target in.
+    scratch: PathBuf,
     /// This session's large files, excluded from its next snapshot.
     excludes: PathBuf,
     /// The ref that keeps this session's snapshots reachable.
     reference: String,
     timeout: Duration,
+    restore_timeout: Duration,
 }
 
 impl Checkpoints {
@@ -84,22 +87,32 @@ impl Checkpoints {
         if !crate::session::is_valid_id(session_id) {
             return Err(CheckpointError::InvalidSession(session_id.to_string()));
         }
-        let found = Command::new(git)
+        let mut version = Command::new(git);
+        version
             .arg("--version")
             .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .output();
-        if !found.is_ok_and(|out| out.status.success()) {
-            return Err(CheckpointError::GitMissing);
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+        match output_within(&mut version, SNAPSHOT_TIMEOUT) {
+            Ok(Some(out)) if out.status.success() => {}
+            // A git that cannot say its version in the time a whole snapshot may take is no use.
+            Ok(None) => {
+                return Err(CheckpointError::Git {
+                    command: "--version".into(),
+                    message: format!("no answer within {} seconds", SNAPSHOT_TIMEOUT.as_secs()),
+                });
+            }
+            _ => return Err(CheckpointError::GitMissing),
         }
         let checkpoints = Checkpoints {
             git: git.to_path_buf(),
             gitdir: gitdir.to_path_buf(),
             workspace: workspace.to_path_buf(),
             index: gitdir.join("indexes").join(session_id),
+            scratch: gitdir.join("indexes").join(format!("restore-{session_id}")),
             excludes: gitdir.join("excludes").join(session_id),
             reference: format!("refs/harness/{session_id}"),
             timeout: SNAPSHOT_TIMEOUT,
+            restore_timeout: RESTORE_TIMEOUT,
         };
         if !gitdir.join("HEAD").is_file() {
             std::fs::create_dir_all(gitdir)?;
@@ -130,15 +143,32 @@ impl Checkpoints {
         self
     }
 
+    /// Replaces the time a restore may take (for tests).
+    pub fn with_restore_timeout(mut self, timeout: Duration) -> Self {
+        self.restore_timeout = timeout;
+        self
+    }
+
     /// Snapshots the workspace and returns the commit. Files over [`MAX_FILE_SIZE`], git-ignored
     /// files, `.git`, `node_modules` and `target` are left out.
     pub fn snapshot(&self, message: &str) -> Result<String, CheckpointError> {
-        let result = self.snapshot_within(message, self.timeout);
+        self.unlock_after(self.snapshot_within(message, self.timeout))
+    }
+
+    /// Passes `result` on, first removing the locks git leaves when it is killed at a time limit
+    /// (on this session's indexes and ref), so later snapshots and restores still work. Only this
+    /// process uses them: the session is locked to it.
+    fn unlock_after<T>(&self, result: Result<T, CheckpointError>) -> Result<T, CheckpointError> {
         if matches!(result, Err(CheckpointError::TooSlow)) {
-            // git was killed; it may have left its lock behind.
-            let mut lock = self.index.clone().into_os_string();
-            lock.push(".lock");
-            let _ = std::fs::remove_file(lock);
+            for path in [
+                &self.index,
+                &self.scratch,
+                &self.gitdir.join(&self.reference),
+            ] {
+                let mut lock = path.clone().into_os_string();
+                lock.push(".lock");
+                let _ = std::fs::remove_file(lock);
+            }
         }
         result
     }
@@ -234,7 +264,11 @@ impl Checkpoints {
     /// again.
     pub fn restore(&self, commit: &str) -> Result<String, CheckpointError> {
         check_commit(commit)?;
-        let before = self.snapshot_within("before a rewind", RESTORE_TIMEOUT)?;
+        self.unlock_after(self.restore_unchecked(commit))
+    }
+
+    fn restore_unchecked(&self, commit: &str) -> Result<String, CheckpointError> {
+        let before = self.snapshot_within("before a rewind", self.restore_timeout)?;
         // Paths `commit` has that exist now but are not in `before` are files snapshots leave
         // out; restoring them would overwrite something no snapshot holds.
         let now: HashSet<Vec<u8>> = self.tree_paths(&before)?.into_iter().collect();
@@ -248,14 +282,11 @@ impl Checkpoints {
         let tree = if keep.is_empty() {
             format!("{commit}^{{tree}}")
         } else {
-            let scratch = self.gitdir.join("indexes").join(format!(
-                "restore-{}",
-                self.reference.rsplit('/').next().unwrap_or("session")
-            ));
+            let scratch = &self.scratch;
             let with_index = |args: &[OsString]| -> Result<String, CheckpointError> {
                 let mut cmd = self.command();
-                cmd.env("GIT_INDEX_FILE", &scratch).args(args);
-                self.run(cmd, "update-index", Instant::now() + RESTORE_TIMEOUT)
+                cmd.env("GIT_INDEX_FILE", scratch).args(args);
+                self.run(cmd, "update-index", Instant::now() + self.restore_timeout)
             };
             with_index(&["read-tree".into(), commit.into()])?;
             for chunk in keep.chunks(500) {
@@ -268,10 +299,10 @@ impl Checkpoints {
                 with_index(&args)?;
             }
             let tree = with_index(&["write-tree".into()])?;
-            let _ = std::fs::remove_file(&scratch);
+            let _ = std::fs::remove_file(scratch);
             tree
         };
-        self.git(&["read-tree", "--reset", "-u", &tree], RESTORE_TIMEOUT)?;
+        self.git(&["read-tree", "--reset", "-u", &tree], self.restore_timeout)?;
         Ok(before)
     }
 
@@ -288,7 +319,7 @@ impl Checkpoints {
     fn tree_paths(&self, commit: &str) -> Result<Vec<Vec<u8>>, CheckpointError> {
         let listed = self.git_bytes(
             &["ls-tree", "-r", "-z", "--name-only", commit],
-            Instant::now() + RESTORE_TIMEOUT,
+            Instant::now() + self.restore_timeout,
         )?;
         Ok(listed
             .split(|b| *b == 0)

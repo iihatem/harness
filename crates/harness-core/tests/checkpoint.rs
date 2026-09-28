@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use harness_core::checkpoint::{CheckpointError, Checkpoints, MAX_FILE_SIZE};
 
@@ -360,5 +360,55 @@ fn programs_named_in_the_shadow_config_do_not_run() {
         !marker.exists(),
         "{}",
         std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+}
+
+// Review E minor 12: a restore that runs out of time leaves no lock behind either, so later
+// snapshots and restores still work.
+#[test]
+fn a_restore_that_runs_out_of_time_leaves_no_lock() {
+    let f = fixture();
+    f.write("a.txt", "one\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    f.write("a.txt", "two\n");
+    // What git killed at the time limit leaves behind.
+    let locks = [
+        f.gitdir.join("indexes/s1.lock"),
+        f.gitdir.join("indexes/restore-s1.lock"),
+        f.gitdir.join("refs/harness/s1.lock"),
+    ];
+    for lock in &locks {
+        std::fs::write(lock, "").unwrap();
+    }
+    let slow = Checkpoints::open(&f.gitdir, &f.ws, "s1")
+        .unwrap()
+        .with_restore_timeout(Duration::ZERO);
+    assert!(matches!(
+        slow.restore(&first),
+        Err(CheckpointError::TooSlow)
+    ));
+    for lock in &locks {
+        assert!(!lock.exists(), "{}", lock.display());
+    }
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(f.read("a.txt").as_deref(), Some("one\n"));
+    checkpoints.snapshot("turn 2").unwrap();
+}
+
+// Review E minor 12: finding git has a time limit too.
+#[test]
+fn a_git_that_does_not_answer_is_given_up_on() {
+    let f = fixture();
+    let git = f.ws.parent().unwrap().join("git");
+    std::fs::write(&git, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&git, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let start = Instant::now();
+    let opened = Checkpoints::open_with_git(&git, &f.gitdir, &f.ws, "s1");
+    assert!(opened.is_err());
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        start.elapsed()
     );
 }

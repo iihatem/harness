@@ -2,7 +2,7 @@
 
 A terminal-first, open-source coding agent written in Rust, built for **hybrid development**: mix local models with frontier models so you get work done while saving subscription usage.
 
-> **Status: early development.** Milestone 1, phases P1 (foundation) and P2 (safety) are complete: a headless `harness ask` that runs multi-step coding tasks against any OpenAI-compatible model in a sandboxed environment. Sessions, more providers, and the interactive terminal UI are in progress. Not ready for daily use yet.
+> **Status: early development.** Milestone 1, phases P1 (foundation), P2 (safety) and P3 (memory) are complete: a headless `harness ask` that runs multi-step coding tasks against any OpenAI-compatible model in a sandboxed environment, with project instructions, slash commands, saved sessions and checkpoints. More providers and the interactive terminal UI are in progress. Not ready for daily use yet.
 
 ## What works today
 
@@ -11,6 +11,11 @@ A terminal-first, open-source coding agent written in Rust, built for **hybrid d
 - Providers: any OpenAI-compatible endpoint. Built in: `ollama`, `lmstudio`, `llamacpp`, `openrouter` (`OPENROUTER_API_KEY`).
 - Approval modes: `plan`, `read-only`, `ask`, `auto`, `full-access`. Default is `auto` inside a git repository and `ask` elsewhere.
 - Exit codes for scripting: `0` success, `1` runtime error, `2` invalid usage or no model, `3` an action was blocked for lack of approval, `130` interrupted.
+- Project instructions: `AGENTS.md` (or `CLAUDE.md` where a directory has no `AGENTS.md`) from `~/.config/harness/`, the repository root, and each directory down to the working directory, with `@path` import lines. They go into a system prompt that stays the same for the whole run, so model servers can reuse their prompt caches.
+- Slash commands in `harness ask`: Markdown commands from `.harness/commands`, `.claude/commands` or `.opencode/commands` in the project, and from `~/.config/harness/commands` and `~/.claude/commands`, so OpenSpec's `/opsx:*` commands work as they are. `$ARGUMENTS`, `$1`…`$9`, `@file` and `` !`command` `` are filled in; shell commands go through the same approvals and sandbox as the `bash` tool. `harness ask "/init"` drafts an `AGENTS.md`.
+- Sessions: every run is saved under `~/.local/share/harness/sessions/`. `harness -c ask "..."` continues the project's most recent session, `harness --resume` lists them, and `harness --resume <id> ask "..."` continues one.
+- Checkpoints: before a turn first changes anything, the workspace is snapshotted into a separate git repository in harness's data directory; your own repository, index and history are never touched. Rewinding to a checkpoint arrives with the terminal UI.
+- Compaction: when a conversation nears the context window, or a provider says a request is too long, older messages are replaced by a summary the model writes, and the summary is shown.
 
 **Sandboxed by default.** In every mode except `full-access`, every shell command runs in an OS sandbox (Seatbelt on macOS, Landlock + seccomp on Linux 6.2+): no network access, and writes only inside the workspace and temp directories (none in `plan`/`read-only`). Git hooks, repository config and `.harness/` stay read-only inside the sandbox on macOS, and on Linux wherever unprivileged user namespaces work (the full tier: read-only mounts in a user namespace). Where they are blocked (stock Ubuntu 24.04 and later, most containers, the basic tier), harness checks them after each command instead, moving anything planted to a quarantine directory and restoring what changed; `harness sandbox doctor` shows how to turn on full protection. Destructive commands (force-push, `reset --hard`, `rm -rf` of the workspace), commands the analyser cannot fully parse, and re-running a command without the sandbox when the sandbox may have blocked it all need approval; headless runs refuse them and exit `3`. `plan` and `read-only` never offer that re-run. If the system has no usable sandbox, harness warns and asks before every command, and `plan`/`read-only` refuse shell commands. A workspace that is your home directory or one of its parents gets no writable sandbox, since it would cover your dotfiles: harness warns, and `ask` and `auto` ask before every command there.
 
@@ -47,7 +52,7 @@ writable_roots = ["~/.cargo"]
 # linux_git_protection = "required"
 ```
 
-Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, `read_dirs`, model, providers, sandbox settings, a `mode` wider than your global or default mode, a `max_steps` above your global limit) only apply after `harness trust`.
+Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, `read_dirs`, model, providers, sandbox settings, a `mode` wider than your global or default mode, a `max_steps` above your global limit) only apply after `harness trust`. The same trust lets a project's command files choose their own `model`.
 
 ## Known limitations
 
@@ -67,12 +72,16 @@ Project-level `.harness/config.toml` settings that widen what the agent may do (
 - **Hard links:** on macOS, files with more than one hard link cannot be modified inside the sandbox. On Linux, hard links that already point outside the workspace stay writable.
 - **Git inside the sandbox** cannot create repositories or worktrees in the workspace (`git init`, `git clone`, `git worktree add`); on Linux they are created and then moved to the quarantine. On macOS a nested repository can still be moved out of the workspace, edited and moved back. `.git/rebase-merge/git-rebase-todo` stays writable, so a sandboxed command could add `exec` lines that run the next time you continue a rebase (`git rebase --continue`). A workspace that is a linked worktree (its `.git` file points into another repository's `.git/worktrees/`) cannot commit inside the sandbox, because that gitdir is outside the workspace. A repository outside the workspace in a writable temp or `writable_roots` directory gets no protection.
 - **Path rules** are matched after resolving symlinks. On macOS, write `/private/tmp/...` rather than `/tmp/...` in `allow` rules.
+- **One context window for every model.** Until model profiles arrive, harness assumes 32,768 tokens: compaction starts at 80% of that, and instruction files over a quarter of it get a warning. A server with a smaller window that rejects a long request gets one compacted retry; one that silently truncates (Ollama's default) does not.
+- **Checkpoints** cover the working directory, not files over 10 MB, git-ignored files, `node_modules`, `target`, or what is inside nested repositories; a rewind leaves those alone. Your global git excludes file does not apply to them.
+- **Command files run with their own settings.** A command file's `allowed-tools` pre-approve the commands it names (never beyond deny rules, destructive-command confirmation or the sandbox). Its `model` answers its invocations if the file is your own (`~/.config/harness/commands`, `~/.claude/commands`); a project's command file chooses the model only once `harness trust` has trusted the project's settings; otherwise a note says the session's model answers instead. Read command files from repositories you did not write before running them.
+- **Instruction files and command files are read when a run starts**; changes apply to the next run.
 
 ## Roadmap
 
 | Milestone | Scope |
 |---|---|
-| M1 Core agent | Phases P1 foundation (done), P2 safety (sandbox, rules, workspace trust), P3 memory (AGENTS.md, slash commands, sessions, rewind), P4 providers (ChatGPT sign-in, Anthropic, model profiles), P5 terminal UI |
+| M1 Core agent | Phases P1 foundation, P2 safety and P3 memory (AGENTS.md, slash commands, sessions, checkpoints, compaction) done; P4 providers (ChatGPT sign-in, Anthropic, model profiles), P5 terminal UI (rewind picker, `/compact`, `/resume`) |
 | M2 Routing | Model roles, boundary-based switching, usage ledger and "$ saved", verification gates |
 | M3 Agents | Subagents, delegation to Claude Code and Codex, parallel agents in worktrees |
 | M4 Ecosystem | Hooks, MCP, Agent Skills, ACP server |

@@ -1,8 +1,8 @@
-//! Slash commands in `harness ask`: custom commands run as the turn's input; built-ins other than
-//! `/init` need the interactive terminal.
+//! Slash commands in `harness ask`: custom commands and `/init` run as the turn's input; the other
+//! built-ins need the interactive terminal.
 
 use harness_context::{
-    commands::{self, Commands, expand::expand, is_builtin, parse_invocation},
+    commands::{self, Commands, expand::expand, init::init_input, is_builtin, parse_invocation},
     project::project_root,
 };
 use harness_core::{
@@ -28,13 +28,15 @@ pub fn discover(setup: &Setup, prompt: &str) -> Option<Commands> {
     Some(found)
 }
 
-/// Whether `prompt` can run headless: ordinary text or a custom command. The message says why
-/// not (exit code 2).
+/// Whether `prompt` can run headless: ordinary text, a custom command, or `/init`. The message
+/// says why not (exit code 2).
 pub fn check(prompt: &str, commands: Option<&Commands>) -> Result<(), String> {
     let (Some(invocation), Some(commands)) = (parse_invocation(prompt), commands) else {
         return Ok(());
     };
-    if is_builtin(invocation.name) {
+    if invocation.name == "init" {
+        Ok(())
+    } else if is_builtin(invocation.name) {
         Err(format!(
             "/{} works only in interactive mode",
             invocation.name
@@ -50,8 +52,8 @@ pub fn check(prompt: &str, commands: Option<&Commands>) -> Result<(), String> {
 }
 
 /// The turn for `prompt` followed by `piped` (the piped-stdin text appended to it, possibly
-/// empty). A custom command is expanded and `piped` added after it; anything else is sent as it
-/// is.
+/// empty). `/init` and custom commands are expanded and `piped` added after them; anything else is
+/// sent as it is.
 pub fn turn_input(
     prompt: &str,
     piped: &str,
@@ -63,6 +65,13 @@ pub fn turn_input(
     let (Some(invocation), Some(commands)) = (parse_invocation(prompt), commands) else {
         return whole();
     };
+    if invocation.name == "init" {
+        let mut input = init_input(&setup.workspace, invocation.args);
+        if !piped.is_empty() {
+            input.parts.push(InputPart::Text(piped.to_string()));
+        }
+        return input;
+    }
     let Some(command) = commands.get(invocation.name) else {
         return whole();
     };

@@ -401,6 +401,9 @@ async fn render(
 ) -> (String, bool) {
     let mut last_text = String::new();
     let mut blocked = false;
+    // The path and content of each `write` call, to show what a blocked one would have written.
+    let mut writes: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
     let mut stdout_broken = false;
     while let Some(event) = rx.recv().await {
         if json && !stdout_broken {
@@ -414,17 +417,33 @@ async fn render(
             AgentEvent::AssistantMessage { content, .. } if !content.is_empty() => {
                 last_text = content.clone()
             }
-            AgentEvent::ActionBlocked { reason, .. } => {
+            AgentEvent::ActionBlocked { id, reason } => {
                 blocked = true;
                 if !json {
                     eprintln!("blocked: {}", terminal_safe(reason));
+                    if let Some((path, content)) = writes.get(id) {
+                        eprintln!(
+                            "proposed content of {}:\n{}",
+                            terminal_safe(path),
+                            terminal_safe_text(content)
+                        );
+                    }
                 }
             }
             AgentEvent::ToolCallRequested {
-                name, arguments, ..
+                id,
+                name,
+                arguments,
             } if !json => {
                 let shown: String = arguments.chars().take(120).collect();
                 eprintln!("-> {} {}", terminal_safe(name), terminal_safe(&shown));
+                if name == "write"
+                    && let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+                    && let (Some(path), Some(content)) =
+                        (args["path"].as_str(), args["content"].as_str())
+                {
+                    writes.insert(id.clone(), (path.to_string(), content.to_string()));
+                }
             }
             AgentEvent::Retrying {
                 attempt,

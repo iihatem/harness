@@ -4,6 +4,7 @@
 
 pub mod expand;
 pub mod frontmatter;
+pub mod init;
 
 use std::{
     io::Read,

@@ -11,17 +11,32 @@ jobs:
       matrix:
         # ubuntu-24.04: kernel 6.8+ with Landlock ABI ≥ 4 (harness needs ≥ 3); pinned so the sandbox suite keeps running on a known kernel.
         os: [ubuntu-24.04, macos-latest]
+        tier: [default]
+        include:
+          # The same Linux runner with unprivileged user namespaces allowed, so the full tier of
+          # Linux git-metadata protection (read-only mounts) is tested too. The default Linux job
+          # tests the basic tier: GitHub's Ubuntu runners restrict user namespaces with AppArmor.
+          - os: ubuntu-24.04
+            tier: full
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.tier }}
+      - name: Allow unprivileged user namespaces
+        if: matrix.tier == 'full'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo fmt --all --check
+        if: matrix.tier != 'full'
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        if: matrix.tier != 'full'
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
         env:
           HARNESS_REQUIRE_LINUX_SANDBOX: ${{ runner.os == 'Linux' && '1' || '0' }}
+          HARNESS_EXPECT_LINUX_TIER: ${{ runner.os == 'Linux' && (matrix.tier == 'full' && 'full' || 'basic') || '' }}
   deny:
     runs-on: ubuntu-latest
     steps:

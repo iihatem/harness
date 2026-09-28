@@ -38,6 +38,10 @@ The system SHALL resume the most recent session for the current project with `ha
 - **WHEN** the user runs `harness -c` in a project with previous sessions
 - **THEN** the most recent session's active branch is loaded and the next turn has access to it
 
+#### Scenario: Session flag in the wrong place
+- **WHEN** the user runs `harness -c models`, or `harness ask --resume "fix it"` without an id
+- **THEN** harness exits with a usage error that says how to run the command instead of ignoring the flag or reporting a missing prompt
+
 #### Scenario: Continue after a run killed during a tool call
 - **WHEN** harness is killed while a tool call runs, and the user continues the session
 - **THEN** the next request carries a result for every tool call, and the unfinished call's result says harness stopped before it finished and its effects are unknown

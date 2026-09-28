@@ -56,3 +56,53 @@ fn resume_without_an_id_before_a_subcommand_is_an_error() {
             .stderr(contains("--resume needs an id"));
     }
 }
+
+// Final review, minor 2: `--resume` takes an id, so in `harness ask --resume "fix it"` the prompt
+// was taken for one. The error says what `--resume` needs rather than that the prompt is missing.
+#[test]
+fn resume_taking_the_prompt_for_its_id_is_explained() {
+    let home = tempfile::tempdir().unwrap();
+    for args in [
+        &["ask", "--resume", "fix it"][..],
+        &["ask", "--json", "--resume", "fix it"],
+    ] {
+        Command::new(env!("CARGO_BIN_EXE_harness"))
+            .args(args)
+            .env("HARNESS_HOME", home.path())
+            .assert()
+            .code(2)
+            .stderr(contains("--resume needs an id, followed by the prompt"));
+    }
+}
+
+// Only `ask` continues a session: with another subcommand `-c` and `--resume <id>` were ignored
+// silently.
+#[test]
+fn session_flags_with_another_subcommand_are_refused() {
+    let home = tempfile::tempdir().unwrap();
+    for (args, flag, command) in [
+        (&["-c", "models"][..], "-c/--continue", "harness models"),
+        (&["models", "--continue"], "-c/--continue", "harness models"),
+        (&["trust", "-c", "--yes"], "-c/--continue", "harness trust"),
+        (
+            &["--resume", "20260927T123456Z-1a2b3c4d", "models"],
+            "--resume",
+            "harness models",
+        ),
+        (&["trust", "--resume", "abc"], "--resume", "harness trust"),
+        (
+            &["sandbox", "doctor", "-c"],
+            "-c/--continue",
+            "harness sandbox doctor",
+        ),
+    ] {
+        Command::new(env!("CARGO_BIN_EXE_harness"))
+            .args(args)
+            .env("HARNESS_HOME", home.path())
+            .assert()
+            .code(2)
+            .stderr(contains(format!(
+                "{flag} continues a session, which only `harness ask` does; run `{command}` without it"
+            )));
+    }
+}

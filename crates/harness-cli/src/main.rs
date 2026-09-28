@@ -94,13 +94,71 @@ fn resume_before_a_subcommand(args: &[std::ffi::OsString]) -> bool {
         .any(|pair| pair[0] == "--resume" && is_subcommand(pair[1]))
 }
 
+/// What `ask --resume <prompt>` says: clap took the prompt for the id, and found no prompt.
+const RESUME_TOOK_THE_PROMPT: &str = "error: --resume needs an id, followed by the prompt: `harness ask --resume <ID> \"<prompt>\"`; run `harness --resume` on its own to list this project's sessions";
+
+/// Whether `--resume` follows `ask` in `args` with a value, which clap takes for the id even when
+/// it was meant as the prompt.
+fn resume_after_ask(args: &[std::ffi::OsString]) -> bool {
+    let args: Vec<_> = args.iter().skip(1).take_while(|a| *a != "--").collect();
+    let Some(ask) = args.iter().position(|a| *a == "ask") else {
+        return false;
+    };
+    let after = &args[ask + 1..];
+    after
+        .iter()
+        .any(|a| a.to_string_lossy().starts_with("--resume="))
+        || after
+            .windows(2)
+            .any(|pair| pair[0] == "--resume" && !pair[1].to_string_lossy().starts_with('-'))
+}
+
+/// How `command` is typed, for messages.
+fn command_line(command: &Command) -> &'static str {
+    match command {
+        Command::Ask { .. } => "harness ask",
+        Command::Models => "harness models",
+        Command::Trust { .. } => "harness trust",
+        Command::Sandbox { .. } => "harness sandbox doctor",
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if resume_before_a_subcommand(&args) {
         eprintln!("{RESUME_NEEDS_AN_ID}");
         return ExitCode::from(2);
     }
-    let cli = Cli::parse_from(args);
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e)
+            if e.kind() == clap::error::ErrorKind::MissingRequiredArgument
+                && resume_after_ask(&args) =>
+        {
+            eprintln!("{RESUME_TOOK_THE_PROMPT}");
+            return ExitCode::from(2);
+        }
+        Err(e) => e.exit(),
+    };
+    // Only `ask` continues a session: with another subcommand the flag would do nothing.
+    if let Some(command) = cli
+        .command
+        .as_ref()
+        .filter(|c| !matches!(c, Command::Ask { .. }))
+    {
+        let flag = match (&cli.resume, cli.continue_session) {
+            (Some(Some(_)), _) => Some("--resume"),
+            (None, true) => Some("-c/--continue"),
+            _ => None,
+        };
+        if let Some(flag) = flag {
+            eprintln!(
+                "error: {flag} continues a session, which only `harness ask` does; run `{}` without it",
+                command_line(command)
+            );
+            return ExitCode::from(2);
+        }
+    }
     let session = match (&cli.resume, cli.continue_session) {
         // Listing is what `--resume` alone does; with a subcommand, the id was forgotten.
         (Some(None), _) if cli.command.is_some() => {

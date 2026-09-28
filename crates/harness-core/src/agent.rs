@@ -31,7 +31,7 @@ use crate::{
 pub const DEFAULT_MAX_STEPS: u32 = 50;
 
 /// What the rewind list says about effects a rewind cannot undo.
-pub const REWIND_LIMITS: &str = "Rewinding restores files in the workspace only: network calls, databases, pushed commits and files outside the workspace stay as they are.";
+pub const REWIND_LIMITS: &str = "Rewinding restores files in the workspace only: network calls, databases, pushed commits, files outside the workspace, and what is inside nested git repositories and submodules stay as they are. Files that checkpoints leave out (git-ignored files, files over 10 MB, node_modules and target) are neither restored nor removed.";
 
 /// A user message the conversation can be rewound to.
 #[derive(Debug, Clone, PartialEq, Eq)]

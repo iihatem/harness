@@ -580,3 +580,23 @@ fn is_root() -> bool {
     // SAFETY: `geteuid` cannot fail.
     unsafe { libc::geteuid() == 0 }
 }
+
+// Review E minor 10: the text the rewind list shows names everything a rewind leaves alone.
+#[test]
+fn the_rewind_limits_name_what_a_rewind_leaves_alone() {
+    for words in [
+        "network calls",
+        "databases",
+        "pushed commits",
+        "outside the workspace",
+        "nested git repositories",
+        "submodules",
+        "git-ignored",
+        "10 MB",
+    ] {
+        assert!(
+            harness_core::agent::REWIND_LIMITS.contains(words),
+            "{words}"
+        );
+    }
+}

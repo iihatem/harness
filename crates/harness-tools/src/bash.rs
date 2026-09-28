@@ -245,9 +245,13 @@ fn kill_group(pgid: Option<i32>) {
 
 /// Waits for the shell itself to be reaped, then polls the process group for up to about 1s,
 /// so no member of it (a background job included) is still mid-syscall when the guard's final
-/// check runs. `kill_group` must already have sent the group SIGKILL.
+/// check runs. `kill_group` must already have sent the group SIGKILL. If waiting for the shell
+/// failed, the shell may not have been reaped, and waiting on its group could take its exit
+/// status: then it does neither.
 async fn reap(child: &mut tokio::process::Child, pgid: Option<i32>) {
-    let _ = child.wait().await;
+    if child.wait().await.is_err() {
+        return;
+    }
     let Some(pgid) = pgid else { return };
     let pgid = nix::unistd::Pid::from_raw(pgid);
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
@@ -284,6 +288,38 @@ fn reap_orphaned_members(pgid: nix::unistd::Pid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// When waiting for the shell fails, the shell may not have been reaped, and a wait on its
+    /// group could take its exit status: `reap` waits for no member of the group then.
+    #[tokio::test]
+    async fn reap_waits_for_no_group_member_once_waiting_for_the_shell_failed() {
+        use std::os::unix::process::CommandExt;
+
+        use nix::sys::wait::{WaitStatus, waitpid};
+        use nix::unistd::Pid;
+        let mut shell = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = shell.id().unwrap() as i32;
+        // A child of this process in the shell's group, which someone else waits for.
+        let mut member = std::process::Command::new("true")
+            .process_group(pgid)
+            .spawn()
+            .unwrap();
+        // Reaped behind tokio's back, so `wait` fails.
+        shell.start_kill().unwrap();
+        assert!(matches!(
+            waitpid(Pid::from_raw(pgid), None),
+            Ok(WaitStatus::Signaled(..))
+        ));
+        reap(&mut shell, Some(pgid)).await;
+        let status = member
+            .wait()
+            .expect("reap took the exit status of a group member it does not wait for");
+        assert!(status.success());
+    }
 
     #[test]
     fn bash_is_looked_for_at_fixed_paths_before_falling_back_to_sh() {

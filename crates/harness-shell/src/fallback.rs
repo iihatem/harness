@@ -21,6 +21,8 @@ const MAX_CANDIDATES: usize = 64;
 /// backtick only ends a command, and here-documents are no longer tracked. Each open one
 /// holds a [`Frame`].
 const MAX_SUBSTITUTIONS: usize = 64;
+/// A `{NAME}` or `{NAME[SUBSCRIPT]}` before a redirection is looked for this far at most.
+const MAX_FD_VARIABLE_CHARS: usize = 256;
 
 const KEYWORDS: &[&str] = &[
     "!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for", "in",
@@ -208,6 +210,9 @@ struct Bare {
     /// The target starts with an unquoted `-` after `>&` or `<&`: bash reads that `-` as a
     /// word of its own, so the rest of the word is not dropped.
     dash: bool,
+    /// Where the `}` of a `{NAME}` before a redirection is: the words up to it are that
+    /// name, which this reading leaves out.
+    name_end: Option<usize>,
 }
 
 /// An open `${…}` or `$[…]`: a `<<` in it is text, and a newline in it does not start
@@ -503,8 +508,16 @@ impl Splitter {
                     self.open('(');
                 }
                 '<' | '>' if self.redirects() => self.redirection_operator(c),
-                '&' if self.peek() == Some('>') && self.redirects() => self.both_outputs(),
+                '&' if self.src.get(self.after_continuations(self.at)) == Some(&'>')
+                    && self.redirects() =>
+                {
+                    self.both_outputs()
+                }
                 '{' => self.open_brace(),
+                '}' if self.bare.name_end == Some(self.at - 1) => {
+                    self.end_written();
+                    self.bare.name_end = None;
+                }
                 ' ' | '\t' | '<' | '>' => self.end_word(),
                 '(' => {
                     if self.peek() == Some('(') {
@@ -549,6 +562,15 @@ impl Splitter {
         }
     }
 
+    /// Where the text from `i` goes on after any backslash-newlines, which bash removes before
+    /// it reads operators and words.
+    fn after_continuations(&self, mut i: usize) -> usize {
+        while self.src.get(i) == Some(&'\\') && self.src.get(i + 1) == Some(&'\n') {
+            i += 2;
+        }
+        i
+    }
+
     /// Whether a `<` or `>` here may be a redirection operator: outside arithmetic, `${…}`
     /// and `$[…]`.
     fn redirects(&self) -> bool {
@@ -579,15 +601,20 @@ impl Splitter {
     /// word starts after a blank or operator, or the backquote opening the substitution
     /// it is in; a closing one goes on with the word, like the `)` of a `$(…)`. When it is
     /// the target of `<&` or `>&` with a leading `-` (see [`Bare::dash`]), the number
-    /// follows that `-`, which bash reads as a word of its own.
+    /// follows that `-`, which bash reads as a word of its own. Backslash-newlines between
+    /// them are skipped, as bash removes them first.
     fn fd_number(&self) -> bool {
-        let op = self.at - 1;
-        let digits = self.src[..op]
-            .iter()
-            .rev()
-            .take_while(|c| c.is_ascii_digit())
-            .count();
-        let start = op - digits;
+        let (mut start, mut digits) = (self.at - 1, 0);
+        loop {
+            if start >= 2 && self.src[start - 1] == '\n' && self.src[start - 2] == '\\' {
+                start -= 2;
+            } else if start >= 1 && self.src[start - 1].is_ascii_digit() {
+                start -= 1;
+                digits += 1;
+            } else {
+                break;
+            }
+        }
         let dash = usize::from(self.bare.dash && self.bare.targets > 0);
         let opened =
             |i: usize| self.src[i] == '`' && self.stack.last().is_some_and(|f| f.start == start);
@@ -605,24 +632,30 @@ impl Splitter {
     /// A redirection operator other than `<<`, `<<-` and `<<<` (see
     /// [`Splitter::redirection`]), whose `<` or `>` was just read: `<`, `<>`, `<&`, `>`,
     /// `>>`, `>|` or `>&`. The word after it is its target, except that bash reads an
-    /// unquoted `-` starting the word after `<&` or `>&` as a word of its own.
+    /// unquoted `-` starting the word after `<&` or `>&` as a word of its own. bash removes
+    /// backslash-newlines before it reads either.
     fn redirection_operator(&mut self, c: char) {
         self.start_redirection();
         self.end_word();
-        match (c, self.peek()) {
-            (_, Some('>')) => self.at += 1,
+        let next = self.after_continuations(self.at);
+        match (c, self.src.get(next)) {
+            // The `>` of a `>(` is left to be read as a process substitution, as before (the
+            // split as the scan was before it followed bash reads none there).
+            (_, Some('>')) if self.legacy || self.src.get(next + 1) != Some(&'(') => {
+                self.at = next + 1;
+            }
             // As written, the `&` or `|` ends the command.
             (_, Some('&')) => {
-                self.at += 1;
+                self.at = next + 1;
                 self.end_written();
-                let blanks = self.src[self.at..]
-                    .iter()
-                    .take_while(|c| matches!(c, ' ' | '\t'))
-                    .count();
-                self.bare.dash = self.src.get(self.at + blanks) == Some(&'-');
+                let mut i = self.after_continuations(self.at);
+                while matches!(self.src.get(i), Some(' ' | '\t')) {
+                    i = self.after_continuations(i + 1);
+                }
+                self.bare.dash = self.src.get(i) == Some(&'-');
             }
             ('>', Some('|')) => {
-                self.at += 1;
+                self.at = next + 1;
                 self.end_written();
             }
             _ => {}
@@ -631,62 +664,86 @@ impl Splitter {
     }
 
     /// `&>` or `&>>`, its `&` just read: both outputs are redirected to the word after it.
-    /// As written, the `&` ends the command. (bash 3.2 reads `&>>` as `&>` and `>`, a
-    /// syntax error.)
+    /// As written, the `&` ends the command. The `>` of a `>(` is left to be read as a
+    /// process substitution, as before: bash 3.2 has no `&>>`, and reads `&>>(…)` as `&>`
+    /// and `>(…)` (and `&>>` before anything else as `&>` and `>`, a syntax error).
     fn both_outputs(&mut self) {
         self.diverge();
         self.end_written();
-        self.at += 1;
-        self.next_if_eq('>');
+        let substitution = |s: &Self, i: usize| !s.legacy && s.src.get(i + 1) == Some(&'(');
+        let first = self.after_continuations(self.at);
+        if !substitution(self, first) {
+            self.at = first + 1;
+            let second = self.after_continuations(self.at);
+            if self.src.get(second) == Some(&'>') && !substitution(self, second) {
+                self.at = second + 1;
+            }
+        }
         self.bare.targets = 1;
     }
 
     /// A `{`: it ends a command, as it always did in this scan. But `{NAME}` starting a word,
     /// followed by a `<` or `>` redirection operator, is to bash 4.1 and later a redirection
     /// that assigns its file descriptor number to NAME: the reading without redirections
-    /// drops it and goes on. As written, `{` and `}` still end commands, with NAME one of its
-    /// own.
+    /// leaves out what is read up to its `}` (see [`Bare::name_end`]) and goes on. As
+    /// written, it is read as before: `{` and `}` end commands.
     fn open_brace(&mut self) {
-        let name = (!self.in_word && self.bare.targets == 0 && self.redirects())
+        let close = (!self.in_word && self.bare.targets == 0 && self.redirects())
             .then(|| self.fd_variable())
             .flatten();
-        let Some(len) = name else {
+        let Some(close) = close else {
             return self.end_command();
         };
         self.diverge();
         self.end_written();
-        let name: String = self.src[self.at..self.at + len].iter().collect();
-        self.words.push(Tok::Lit(name));
-        self.end_written();
-        self.at += len + 1;
+        self.bare.name_end = Some(close);
     }
 
-    /// After a `{`: the length of the NAME or `NAME[SUBSCRIPT]` in `{NAME}` when a `<` or
-    /// `>` redirection operator follows it (not a process substitution).
+    /// After a `{`: where the `}` of `{NAME}` or `{NAME[SUBSCRIPT]}` is when a `<` or `>`
+    /// redirection operator follows it (not a process substitution), backslash-newlines
+    /// skipped. NAME is what bash may take for a name: its letters are the locale's, so any
+    /// non-ASCII character counts, and digits and `_` after the first. The subscript is any
+    /// text with balanced brackets and parentheses, quotes and backquotes skipped.
     fn fd_variable(&self) -> Option<usize> {
-        let rest = &self.src[self.at..];
-        let name = rest
-            .iter()
-            .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
-            .count();
+        let limit = self.src.len().min(self.at + MAX_FD_VARIABLE_CHARS);
+        let rest = &self.src[self.at..limit];
+        let name_char = |c: char| !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_';
+        let name = rest.iter().take_while(|&&c| name_char(c)).count();
         if name == 0 || rest[0].is_ascii_digit() {
             return None;
         }
-        let mut len = name;
-        if rest.get(len) == Some(&'[') {
-            let subscript = rest[len + 1..]
-                .iter()
-                .take_while(|c| c.is_ascii_alphanumeric() || "_@*".contains(**c))
-                .count();
-            if subscript == 0 || rest.get(len + 1 + subscript) != Some(&']') {
-                return None;
+        let mut i = name;
+        if rest.get(i) == Some(&'[') {
+            let (mut brackets, mut parens) = (0usize, 0usize);
+            loop {
+                match *rest.get(i)? {
+                    '[' => brackets += 1,
+                    ']' => {
+                        brackets -= 1;
+                        if brackets == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    '(' => parens += 1,
+                    ')' => parens = parens.checked_sub(1)?,
+                    q @ ('\'' | '"' | '`') => {
+                        i += 1 + rest.get(i + 1..)?.iter().position(|&c| c == q)?;
+                    }
+                    '\\' => i += 1,
+                    ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' if parens == 0 => return None,
+                    _ => {}
+                }
+                i += 1;
             }
-            len += subscript + 2;
         }
-        let redirection = rest.get(len) == Some(&'}')
-            && matches!(rest.get(len + 1), Some('<' | '>'))
-            && rest.get(len + 2) != Some(&'(');
-        redirection.then_some(len)
+        if rest.get(i) != Some(&'}') {
+            return None;
+        }
+        let op = self.after_continuations(self.at + i + 1);
+        let redirection =
+            matches!(self.src.get(op), Some('<' | '>')) && self.src.get(op + 1) != Some(&'(');
+        redirection.then_some(self.at + i)
     }
 
     /// At the start of a line of program text: a restarted split stops where another split
@@ -1040,7 +1097,7 @@ impl Splitter {
             } else {
                 Tok::Lit(word)
             };
-            if self.bare.diverged {
+            if self.bare.diverged && self.bare.name_end.is_none() {
                 if self.bare.targets > 0 {
                     self.bare.targets -= 1;
                     if take(&mut self.bare.dash) {
@@ -1475,6 +1532,56 @@ mod tests {
             let want: Vec<_> = want.iter().map(|w| cmd(w, false)).collect();
             assert_eq!(words(&rough_commands(src)), want, "{src:?}");
         }
+        // bash removes backslash-newlines first. A `{NAME}` is read as written, its
+        // substitutions included, and left out of the reading without redirections; its
+        // letters may be any non-ASCII character, its subscript any text.
+        for (src, want) in [
+            (
+                "2\\\n>/dev/null a b",
+                &[&["2", "/dev/null", "a", "b"][..], &["a", "b"]][..],
+            ),
+            ("3<\\\n&1 a", &[&["3"], &["1", "a"], &["a"]]),
+            ("{fd}\\\n>f a", &[&["fd"], &["f", "a"], &["a"]]),
+            ("x {æ}>o b", &[&["x"], &["æ"], &["o", "b"], &["x", "b"]]),
+            (
+                "git {a[$(b)]}>/dev/null push",
+                &[
+                    &["git"],
+                    &["b"],
+                    &["a[]"],
+                    &["/dev/null", "push"],
+                    &["git", "push"],
+                ],
+            ),
+        ] {
+            let want: Vec<_> = want.iter().map(|w| cmd(w, false)).collect();
+            assert_eq!(words(&rough_commands(src)), want, "{src:?}");
+        }
+        // A `>(` after `>`, `<` or `&>` is still a process substitution (bash 3.2 reads
+        // `&>>(…)` as `&>` and `>(…)`).
+        assert_eq!(
+            words(&split_bash(
+                "a >>(b) c; d &>>(e) f; g <>(h) i; j &>(k) l",
+                Text::Program,
+                0
+            )),
+            [
+                cmd(&["b"], false),
+                cmd(&["a", "", "c"], false),
+                cmd(&["a", "c"], false),
+                cmd(&["d"], false),
+                cmd(&["e"], false),
+                cmd(&["", "f"], false),
+                cmd(&["d", "f"], false),
+                cmd(&["h"], false),
+                cmd(&["g", "", "i"], false),
+                cmd(&["g", "i"], false),
+                cmd(&["j"], false),
+                cmd(&["k"], false),
+                cmd(&["", "l"], false),
+                cmd(&["j", "l"], false),
+            ]
+        );
         // Not redirections to bash: process substitutions, and `<` or `>` in arithmetic or
         // in `${…}`. (The split as the scan was before it followed bash reads `<(` as `<`
         // and `(`, and a `<` in `${…}` as a redirection.)

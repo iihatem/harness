@@ -1112,6 +1112,18 @@ fn redirections_bash_reads_differently_are_scanned() {
             // bash joins the lines first; the positions count characters.
             ("{fd}\\\n>out curl x", Deny),
             ("echo é; {fd}>out curl x", Deny),
+            // bash's names are letters in the locale, so any non-ASCII character may be one.
+            ("git {æ}>/dev/null push", Deny),
+            ("git {µ}>/dev/null push --force", Deny),
+            ("git {aõ}>/dev/null push", Deny),
+            ("{æ}>/dev/null curl x", Deny),
+            // Any subscript.
+            ("git {a[$i]}>/dev/null push", Deny),
+            ("git {a[\"k\"]}>/dev/null push", Deny),
+            ("git {a[i+1]}>/dev/null push", Deny),
+            // bash removes a backslash-newline before it reads the operator.
+            (">&\\\n-curl x", Deny),
+            (">& \\\n-curl x", Deny),
             // Elsewhere bash reads these words as brush-parser does.
             ("echo hi >&-", Allow),
             ("echo hi 2>&-", Allow),
@@ -1126,6 +1138,53 @@ fn redirections_bash_reads_differently_are_scanned() {
             ("echo hi {fd}>/dev/null", Ask),
             ("cargo test {fd}>/dev/null", Ask),
             ("echo hi >&-#c", Ask),
+        ],
+    );
+}
+
+#[test]
+fn rough_scan_sees_past_redirections_split_by_line_continuations() {
+    use Want::Deny;
+    // bash removes a backslash-newline before it reads the operator, file descriptor
+    // number or `{NAME}` around it. Each program is refused as a whole.
+    let commands = [
+        "2\\\n>/dev/null curl x",
+        "3<\\\n&1 curl x",
+        ">&\\\n-curl x",
+        "git 2\\\n>f push",
+        "git {fd}\\\n>f push",
+        "git {æ}>/dev/null push",
+        "git {a[\"k\"]}>/dev/null push",
+        "git {a[$i]}>/dev/null push",
+        "git {a[i+1]}>/dev/null push",
+    ];
+    let table: Vec<(String, Want)> = commands.iter().map(|c| (format!("{c}\n("), Deny)).collect();
+    let table: Vec<(&str, Want)> = table.iter().map(|(c, w)| (c.as_str(), *w)).collect();
+    check(&default_rules(), &table);
+    // Parsed programs too.
+    check(&default_rules(), &[("3<\\\n&1 curl x", Deny)]);
+}
+
+#[test]
+fn process_substitutions_after_redirection_operators_stay_substitutions() {
+    use Want::{Deny, Destructive};
+    // `>(` after `>`, `<`, `&>` or `&>>` is a process substitution. bash 3.2 has no `&>>`
+    // and reads `&>>(…)` as `&>` and `>(…)`: it runs `git push`, and in the others reads
+    // the here-document in the substitution as its own, so `curl x` runs.
+    check(
+        &default_rules(),
+        &[
+            ("echo &>>(cat <<'E'\n)\ncurl x\nE\n)", Deny),
+            ("echo &>(cat <<'E'\n)\ncurl x\nE\n)", Deny),
+            ("echo >>(cat <<'E'\n)\ncurl x\nE\n)", Deny),
+            ("echo <>(cat <<'E'\n)\ncurl x\nE\n)", Deny),
+            ("git &>>(true) push", Deny),
+            ("rm -rf >>(true) /", Destructive),
+            ("rm -rf <>(true) /", Destructive),
+            ("echo >>(curl x) y", Deny),
+            ("echo <>(curl x) y", Deny),
+            ("echo &>(curl x) y", Deny),
+            ("echo &>>(curl x) y", Deny),
         ],
     );
 }

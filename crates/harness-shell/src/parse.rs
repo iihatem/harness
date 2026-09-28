@@ -476,7 +476,7 @@ impl Walker<'_> {
             if matches!(item, Item::IoRedirect(_)) && previous.is_some_and(|w| self.fd_variable(w))
             {
                 self.undecomposable(FD_VARIABLE.into());
-                self.rescan = Some(FD_VARIABLE);
+                self.rescan = self.rescan.or(Some(FD_VARIABLE));
             }
             previous = match item {
                 Item::Word(w) => Some(w),
@@ -486,9 +486,10 @@ impl Walker<'_> {
     }
 
     /// Whether bash may read `word`, just before a redirection, as its file descriptor
-    /// variable: `{NAME}` or `{NAME[SUBSCRIPT]}` with no blank before the redirection. The
-    /// blank is looked for where brush-parser places the word, only if the text there is
-    /// the word.
+    /// variable: `{NAME}` or `{NAME[SUBSCRIPT]}` with no blank before the redirection. NAME
+    /// is what bash may take for a name: its letters are the locale's, so any non-ASCII
+    /// character counts, and digits and `_` after the first. The blank is looked for where
+    /// brush-parser places the word, only if the text there is the word.
     fn fd_variable(&self, word: &ast::Word) -> bool {
         let Some(inner) = word
             .value
@@ -498,8 +499,11 @@ impl Walker<'_> {
             return false;
         };
         let (name, subscript) = inner.split_at(inner.find('[').unwrap_or(inner.len()));
-        let identifier = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let identifier = name.starts_with(|c: char| !c.is_ascii_digit())
+            && !name.is_empty()
+            && name
+                .chars()
+                .all(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_');
         let array = subscript.is_empty() || subscript.len() > 1 && subscript.ends_with(']');
         let blank_after = || {
             let (loc, src) = (word.loc.as_ref()?, self.sources.last()?);
@@ -645,7 +649,7 @@ impl Walker<'_> {
                         // `>&-curl x` runs `curl x`; the rough scan reads it as bash does.
                         if w.value.len() > 1 && w.value.starts_with('-') {
                             self.undecomposable(DUPLICATE_DASH.into());
-                            self.rescan = Some(DUPLICATE_DASH);
+                            self.rescan = self.rescan.or(Some(DUPLICATE_DASH));
                         }
                         let tok = self.word(&w.value, cwd, depth);
                         let fd = tok

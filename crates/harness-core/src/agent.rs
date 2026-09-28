@@ -157,6 +157,8 @@ enum CompactError {
     /// Nothing before the part that is kept but, at most, an earlier summary.
     NothingToCompact,
     Interrupted,
+    /// The summary request was longer than the model's context window; the text says so.
+    Overflow(String),
     /// The summary request failed; the text says why.
     Failed(String),
 }
@@ -166,7 +168,7 @@ impl std::fmt::Display for CompactError {
         match self {
             CompactError::NothingToCompact => f.write_str("there is nothing to compact yet"),
             CompactError::Interrupted => f.write_str("interrupted"),
-            CompactError::Failed(why) => f.write_str(why),
+            CompactError::Overflow(why) | CompactError::Failed(why) => f.write_str(why),
         }
     }
 }
@@ -811,8 +813,17 @@ impl Agent {
             .turn_model
             .as_ref()
             .map_or(self.config.model_name.clone(), |m| m.name.clone());
-        let request = compaction::summary_request(&model, &self.history[..cut], focus, window / 2);
-        let summary = self.summarize(request, events, cancel).await?;
+        // The transcript is sized from an estimate, so the request can still be too long for the
+        // model: then it is tried once more with half as much.
+        let mut max_tokens = window / 2;
+        let summary = loop {
+            let request =
+                compaction::summary_request(&model, &self.history[..cut], focus, max_tokens);
+            match self.summarize(request, events, cancel).await {
+                Err(CompactError::Overflow(_)) if max_tokens == window / 2 => max_tokens /= 2,
+                result => break result?,
+            }
+        };
         let first_kept = self.history_ids.get(cut).cloned();
         self.session.append(EntryKind::Compaction {
             summary: summary.clone(),
@@ -844,25 +855,34 @@ impl Agent {
         loop {
             let collect = async {
                 let mut text = String::new();
+                let mut finish = None;
                 let mut stream = provider.stream(request.clone());
                 while let Some(item) = stream.next().await {
-                    if let ProviderEvent::TextDelta(delta) = item? {
-                        text.push_str(&delta);
+                    match item? {
+                        ProviderEvent::TextDelta(delta) => text.push_str(&delta),
+                        ProviderEvent::Finished(reason) => finish = Some(reason),
+                        _ => {}
                     }
                 }
-                Ok::<String, ProviderError>(text)
+                Ok::<(String, Option<FinishReason>), ProviderError>((text, finish))
             };
             let result = tokio::select! {
                 result = collect => result,
                 _ = cancel.cancelled() => return Err(CompactError::Interrupted),
             };
             match result {
-                Ok(text) if text.trim().is_empty() => {
+                Ok((text, _)) if text.trim().is_empty() => {
                     return Err(CompactError::Failed(
                         "the model returned an empty summary".into(),
                     ));
                 }
-                Ok(text) => return Ok(text.trim().to_string()),
+                // The end of a summary says what remains to be done: a cut-off one is no use.
+                Ok((_, Some(FinishReason::Length))) => {
+                    return Err(CompactError::Failed(
+                        "the summary was cut off at the model's output limit".into(),
+                    ));
+                }
+                Ok((text, _)) => return Ok(text.trim().to_string()),
                 Err(error) if error.is_retryable() && attempt < self.config.retry.max_attempts => {
                     let delay = self.config.retry.delay(attempt, error.retry_after());
                     let _ = events.send(AgentEvent::Retrying {
@@ -875,6 +895,9 @@ impl Agent {
                         _ = cancel.cancelled() => return Err(CompactError::Interrupted),
                     }
                     attempt += 1;
+                }
+                Err(error) if error.is_context_overflow() => {
+                    return Err(CompactError::Overflow(describe(&error)));
                 }
                 Err(error) => return Err(CompactError::Failed(describe(&error))),
             }
@@ -899,6 +922,8 @@ impl Agent {
             .await
         {
             Ok(()) => self.call_model(events, cancel).await,
+            // Ctrl-C while compacting ends the turn as an interruption, not as the overflow.
+            Err(_) if cancel.is_cancelled() => ModelOutcome::Interrupted(ModelReply::default()),
             Err(e) => {
                 let _ = events.send(AgentEvent::Warning {
                     message: format!("could not compact the conversation: {e}"),

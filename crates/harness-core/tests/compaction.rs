@@ -349,6 +349,115 @@ async fn nothing_to_compact_yet_is_skipped_quietly() {
     assert_eq!(compacted(&events).len(), 1, "{events:?}");
 }
 
+// Review F minor 1: Ctrl-C while the overflow compaction runs is an interruption (exit 130),
+// not the provider's overflow error (exit 1).
+#[tokio::test]
+async fn ctrl_c_during_an_overflow_compaction_interrupts_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, _provider) =
+        after_a_long_turn(dir.path(), vec![overflow(), Script::Hang(vec![])]).await;
+    let cancel = CancellationToken::new();
+    let ctrl_c = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        ctrl_c.cancel();
+    });
+    let (reason, events) = run_with(&mut agent, "next", cancel).await;
+    assert_eq!(reason, TurnEndReason::Interrupted, "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { .. } | AgentEvent::Warning { .. })),
+        "{events:?}"
+    );
+}
+
+/// An agent after three turns of 1,500-character messages, with a 2,000-token window.
+async fn after_three_turns(
+    dir: &std::path::Path,
+    script: Vec<Script>,
+) -> (Agent, Arc<MockProvider>) {
+    let mut all = vec![Script::text("ok"), Script::text("ok"), Script::text("ok")];
+    all.extend(script);
+    let provider = MockProvider::new(all);
+    let mut agent = agent(provider.clone(), Mode::Auto, Arc::new(NonInteractive), dir);
+    for letter in ["a", "b", "c"] {
+        run(&mut agent, &letter.repeat(1_500)).await;
+    }
+    agent.config_mut().context_window = 2_000;
+    (agent, provider)
+}
+
+async fn compact_now(agent: &mut Agent) -> (Result<(), String>, Vec<AgentEvent>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = agent.compact(None, &tx, CancellationToken::new()).await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    (result, events)
+}
+
+// Review F minor 6: a summary cut off at the model's output limit lost its end, which says what
+// remains to be done.
+#[tokio::test]
+async fn a_summary_cut_off_at_the_output_limit_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, _provider) = after_three_turns(
+        dir.path(),
+        vec![Script::Reply(vec![
+            Ok(ProviderEvent::TextDelta("The user asked for".into())),
+            Ok(ProviderEvent::Finished(FinishReason::Length)),
+        ])],
+    )
+    .await;
+    let (result, events) = compact_now(&mut agent).await;
+    let error = result.unwrap_err();
+    assert!(error.contains("output limit"), "{error}");
+    assert!(compacted(&events).is_empty());
+    assert_eq!(agent.history().len(), 6);
+}
+
+// Review F minor 7: the summary request is sized from an estimate, so it can itself be too long
+// for the model: it is tried once more with half the transcript.
+#[tokio::test]
+async fn a_summary_request_that_overflows_is_retried_once_with_half_the_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, provider) =
+        after_three_turns(dir.path(), vec![overflow(), Script::text("summary")]).await;
+    let (result, events) = compact_now(&mut agent).await;
+    result.unwrap();
+    assert_eq!(compacted(&events).len(), 1);
+    let summaries: Vec<String> = provider
+        .requests()
+        .iter()
+        .filter(|r| is_summary_request(r))
+        .map(|r| first_user(&r.messages))
+        .collect();
+    assert_eq!(summaries.len(), 2);
+    assert!(summaries[1].len() < summaries[0].len());
+    assert!(summaries[1].contains("earlier messages left out"));
+
+    // Only once.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, provider) = after_three_turns(
+        dir.path(),
+        vec![overflow(), overflow(), Script::text("never")],
+    )
+    .await;
+    let (result, _) = compact_now(&mut agent).await;
+    assert!(result.unwrap_err().contains("maximum context length"));
+    assert_eq!(
+        provider
+            .requests()
+            .iter()
+            .filter(|r| is_summary_request(r))
+            .count(),
+        2
+    );
+}
+
 // Review F I2: compacting again must not cut the end off the earlier summary, where it says
 // what remains to be done.
 #[tokio::test]

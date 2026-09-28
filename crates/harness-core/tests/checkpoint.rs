@@ -1039,6 +1039,145 @@ fn an_index_naming_a_pruned_object_is_started_afresh() {
     );
 }
 
+// Review E probe I: names that look like options, pathspec magic or glob patterns round-trip,
+// whether snapshots hold them, leave them out as large, or ignore them.
+#[test]
+fn hostile_names_round_trip_and_stay_literal() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let f = fixture();
+    let names: [&[u8]; 11] = [
+        b"-rf",
+        b"--force",
+        b"new\nline",
+        b" lead",
+        b"trail ",
+        b"#hash",
+        b"!bang",
+        b":(top)x",
+        b":(exclude)y",
+        b"*",
+        b"[a]",
+    ];
+    for name in names {
+        std::fs::write(f.ws.join(OsStr::from_bytes(name)), b"orig").unwrap();
+    }
+    f.write("a", "matched by the glob [a], were it one\n");
+    let large = vec![b'x'; MAX_FILE_SIZE as usize + 1];
+    std::fs::write(f.ws.join(OsStr::from_bytes(b":(glob)*big")), &large).unwrap();
+    f.write(".gitignore", "*.ign\n");
+    std::fs::write(f.ws.join(OsStr::from_bytes(b"-z\n.ign")), b"ignored").unwrap();
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    let files = checkpoints.files(&first).unwrap();
+    assert_eq!(files.len(), names.len() + 2, "{files:?}");
+    for name in names {
+        std::fs::write(f.ws.join(OsStr::from_bytes(name)), b"changed").unwrap();
+    }
+    std::fs::remove_file(f.ws.join("-rf")).unwrap();
+    std::fs::remove_file(f.ws.join("*")).unwrap();
+    std::fs::write(f.ws.join(OsStr::from_bytes(b":(glob)*big")), b"small").unwrap();
+    std::fs::write(f.ws.join(OsStr::from_bytes(b"-z\n.ign")), b"still ignored").unwrap();
+    checkpoints.restore(&first).unwrap();
+    for name in names {
+        assert_eq!(
+            std::fs::read(f.ws.join(OsStr::from_bytes(name))).unwrap(),
+            b"orig",
+            "{}",
+            String::from_utf8_lossy(name)
+        );
+    }
+    assert_eq!(
+        f.read("a").as_deref(),
+        Some("matched by the glob [a], were it one\n")
+    );
+    assert_eq!(
+        std::fs::read(f.ws.join(OsStr::from_bytes(b":(glob)*big"))).unwrap(),
+        b"small"
+    );
+    assert_eq!(
+        std::fs::read(f.ws.join(OsStr::from_bytes(b"-z\n.ign"))).unwrap(),
+        b"still ignored"
+    );
+}
+
+// Review E probe K: the user's repository configuration and attributes run nothing, now that
+// git's work tree is the repository and its info/exclude is read.
+#[test]
+fn the_users_git_config_and_attributes_run_nothing() {
+    let f = fixture();
+    git(&f.ws, &["init", "-q"]);
+    let base = f.ws.parent().unwrap();
+    let marker = base.join("ran");
+    let script = base.join("evil.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho \"$0 $*\" >> {}\ncat\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let config = f.ws.join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "[filter \"evil\"]\n\tclean = {s}\n\tsmudge = {s}\n\tprocess = {s}\n[core]\n\tfsmonitor = {s}\n\thooksPath = {h}\n\tattributesFile = {a}\n[diff \"evil\"]\n\ttextconv = {s}\n",
+        s = script.display(),
+        h = base.display(),
+        a = base.join("attributes").display()
+    ));
+    std::fs::write(&config, text).unwrap();
+    std::fs::write(base.join("attributes"), "* filter=evil\n").unwrap();
+    std::fs::write(
+        f.ws.join(".git/info/attributes"),
+        "* filter=evil diff=evil\n",
+    )
+    .unwrap();
+    f.write(".gitattributes", "* filter=evil diff=evil\n");
+    f.write("sub/a.txt", "one\n");
+    for workspace in [f.ws.clone(), f.ws.join("sub")] {
+        let checkpoints = Checkpoints::open(&f.gitdir, &workspace, "s1").unwrap();
+        let first = checkpoints.snapshot("turn 1").unwrap();
+        f.write("sub/a.txt", "two\n");
+        checkpoints.restore(&first).unwrap();
+        assert_eq!(f.read("sub/a.txt").as_deref(), Some("one\n"));
+    }
+    assert!(
+        !marker.exists(),
+        "{}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+}
+
+// Review E probe E and minor 10: what is inside a nested repository, with commits or without, is
+// neither snapshotted nor rewound, and a restore removes none of it.
+#[test]
+fn nested_repositories_are_left_alone() {
+    let f = fixture();
+    let inner = f.ws.join("inner");
+    std::fs::create_dir(&inner).unwrap();
+    git(&inner, &["init", "-q"]);
+    std::fs::write(inner.join("f.txt"), "one\n").unwrap();
+    git(&inner, &["add", "f.txt"]);
+    git(&inner, &["commit", "-q", "-m", "c"]);
+    let empty = f.ws.join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    git(&empty, &["init", "-q"]);
+    std::fs::write(empty.join("g.txt"), "g\n").unwrap();
+    f.write("top.txt", "t\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    let files = checkpoints.files(&first).unwrap();
+    assert!(!files.iter().any(|p| p.starts_with("empty")), "{files:?}");
+    std::fs::write(inner.join("f.txt"), "changed\n").unwrap();
+    std::fs::write(inner.join("new.txt"), "new\n").unwrap();
+    std::fs::write(empty.join("g.txt"), "changed\n").unwrap();
+    f.write("top.txt", "changed\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(f.read("top.txt").as_deref(), Some("t\n"));
+    assert_eq!(f.read("inner/f.txt").as_deref(), Some("changed\n"));
+    assert_eq!(f.read("inner/new.txt").as_deref(), Some("new\n"));
+    assert_eq!(f.read("empty/g.txt").as_deref(), Some("changed\n"));
+}
+
 /// Whether the tests run as root, which permissions do not stop.
 fn is_root() -> bool {
     // SAFETY: `geteuid` cannot fail.

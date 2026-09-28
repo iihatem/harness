@@ -35,14 +35,29 @@ impl Env {
 
 const PROJECT: &str = "[permissions]\nallow = [\"bash:make*\"]\n";
 
+// Ruling P3-R1: a workspace without widening settings can still be trusted (for its command
+// files), with the same confirmation.
 #[test]
-fn nothing_to_trust_without_widening_settings() {
-    let env = Env::new(Some("[permissions]\ndeny = [\"bash:curl*\"]\n"));
-    env.cmd()
-        .arg("trust")
-        .assert()
-        .success()
-        .stdout(contains("No project settings"));
+fn a_workspace_without_widening_settings_can_be_trusted() {
+    for project in [None, Some("[permissions]\ndeny = [\"bash:curl*\"]\n")] {
+        let env = Env::new(project);
+        env.cmd()
+            .arg("trust")
+            .assert()
+            .code(2)
+            .stdout(contains("No project settings"))
+            .stderr(contains("--yes"));
+        env.cmd()
+            .args(["trust", "--yes"])
+            .assert()
+            .success()
+            .stdout(contains("Trusted"));
+        env.cmd()
+            .args(["trust", "--revoke"])
+            .assert()
+            .success()
+            .stdout(contains("Revoked"));
+    }
 }
 
 #[test]

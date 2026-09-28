@@ -357,3 +357,36 @@ async fn a_hostile_argument_in_a_quoted_placeholder_runs_nothing() {
         );
     }
 }
+
+// Ruling P3-R1: a repository with command files and no project settings can be trusted, and its
+// command files then choose their model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_workspace_with_only_command_files_can_be_trusted() {
+    let server = MockServer::start().await;
+    answer(&server, "ok").await;
+    let env = Env::new(&server.uri(), "");
+    env.command_file("pick.md", PICKS_A_MODEL);
+    let (untrusted, trust, trusted) = tokio::task::spawn_blocking(move || {
+        let untrusted = env.cmd().args(["ask", "/pick"]).output().unwrap();
+        let trust = env.cmd().args(["trust", "--yes"]).output().unwrap();
+        let trusted = env.cmd().args(["ask", "/pick"]).output().unwrap();
+        (untrusted, trust, trusted)
+    })
+    .await
+    .unwrap();
+    assert!(untrusted.status.success(), "{untrusted:?}");
+    assert!(trust.status.success(), "{trust:?}");
+    assert!(
+        String::from_utf8_lossy(&trust.stdout).contains("Trusted"),
+        "{trust:?}"
+    );
+    assert!(trusted.status.success(), "{trusted:?}");
+    assert!(
+        String::from_utf8_lossy(&trusted.stderr).contains("note: /pick runs on mock/command-model"),
+        "{trusted:?}"
+    );
+    assert_eq!(
+        requested_models(&server).await,
+        ["test-model", "command-model"]
+    );
+}

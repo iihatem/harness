@@ -52,7 +52,7 @@ writable_roots = ["~/.cargo"]
 # linux_git_protection = "required"
 ```
 
-Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, `read_dirs`, model, providers, sandbox settings, a `mode` wider than your global or default mode, a `max_steps` above your global limit) only apply after `harness trust`. The same trust lets a project's command files choose their own `model`.
+Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, `read_dirs`, model, providers, sandbox settings, a `mode` wider than your global or default mode, a `max_steps` above your global limit) only apply after `harness trust`. The same trust lets a project's command files choose their own `model`; a repository with command files and no project settings can be trusted too.
 
 ## Known limitations
 
@@ -74,7 +74,7 @@ Project-level `.harness/config.toml` settings that widen what the agent may do (
 - **Path rules** are matched after resolving symlinks. On macOS, write `/private/tmp/...` rather than `/tmp/...` in `allow` rules.
 - **One context window for every model.** Until model profiles arrive, harness assumes 32,768 tokens: compaction starts at 80% of that, and instruction files over a quarter of it get a warning. A server with a smaller window that rejects a long request gets one compacted retry; one that silently truncates (Ollama's default) does not.
 - **Checkpoints** cover the working directory, not files over 10 MB, git-ignored files, `node_modules`, `target`, or what is inside nested repositories; a rewind leaves those alone. Your global git excludes file does not apply to them.
-- **Command files run with their own settings.** A command file's `allowed-tools` pre-approve the commands it names (never beyond deny rules, destructive-command confirmation or the sandbox). Its `model` answers its invocations if the file is your own (`~/.config/harness/commands`, `~/.claude/commands`); a project's command file chooses the model only once `harness trust` has trusted the project's settings; otherwise a note says the session's model answers instead. Read command files from repositories you did not write before running them.
+- **Command files run with their own settings.** A command file's `allowed-tools` pre-approve the commands it names (never beyond deny rules, destructive-command confirmation or the sandbox). Its `model` answers its invocations if the file is your own (`~/.config/harness/commands`, `~/.claude/commands`); a project's command file chooses the model only once `harness trust` has trusted the workspace; otherwise a note says the session's model answers instead. Read command files from repositories you did not write before running them.
 - **Instruction files and command files are read when a run starts**; changes apply to the next run.
 
 ## Roadmap

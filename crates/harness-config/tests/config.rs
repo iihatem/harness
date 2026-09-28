@@ -11,6 +11,13 @@ fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
     move |k| map.get(k).cloned()
 }
 
+/// The workspace's widening settings, which must not be empty.
+fn widening_of(global: &std::path::Path, ws: &std::path::Path) -> config::Widening {
+    let widening = config::project_widening(global, ws).unwrap();
+    assert!(!widening.items.is_empty(), "no widening settings");
+    widening
+}
+
 #[test]
 fn defaults_follow_xdg_under_home() {
     let p = Paths::from_env(env(&[("HOME", "/home/u")])).unwrap();
@@ -144,9 +151,7 @@ fn trusted_project_widening_settings_apply() {
         "model = \"ollama/b\"\n[permissions]\nallow = [\"bash:make*\"]\nread_dirs = [\"vendor-docs\"]\n[sandbox]\nwritable_roots = [\"cache\"]\nallow_localhost = true\n",
     )
     .unwrap();
-    let widening = config::project_widening(&dir.path().join("none.toml"), &ws)
-        .unwrap()
-        .expect("project has widening settings");
+    let widening = widening_of(&dir.path().join("none.toml"), &ws);
     let mut trust = TrustStore::load(&data).unwrap();
     trust.trust(&ws, &widening.fingerprint).unwrap();
 
@@ -170,10 +175,7 @@ fn changed_project_settings_need_trust_again() {
     trust
         .trust(
             &ws,
-            &config::project_widening(&dir.path().join("none.toml"), &ws)
-                .unwrap()
-                .unwrap()
-                .fingerprint,
+            &widening_of(&dir.path().join("none.toml"), &ws).fingerprint,
         )
         .unwrap();
 
@@ -200,7 +202,7 @@ fn the_workspace_counts_as_trusted_only_while_its_trusted_settings_apply() {
     let project = ws.join(".harness/config.toml");
     std::fs::write(&project, "[permissions]\nallow = [\"bash:make*\"]\n").unwrap();
     assert!(!config::load(&none, &ws, &trust).unwrap().trusted);
-    let widening = config::project_widening(&none, &ws).unwrap().unwrap();
+    let widening = widening_of(&none, &ws);
     trust.trust(&ws, &widening.fingerprint).unwrap();
     assert!(config::load(&none, &ws, &trust).unwrap().trusted);
     // Changed settings need trust again, and until then the workspace is not trusted.
@@ -248,12 +250,8 @@ fn widening_fingerprint_is_not_fooled_by_embedded_newlines() {
     )
     .unwrap();
 
-    let widening_a = config::project_widening(&dir.path().join("none.toml"), &ws_a)
-        .unwrap()
-        .expect("config a has widening");
-    let widening_b = config::project_widening(&dir.path().join("none.toml"), &ws_b)
-        .unwrap()
-        .expect("config b has widening");
+    let widening_a = widening_of(&dir.path().join("none.toml"), &ws_a);
+    let widening_b = widening_of(&dir.path().join("none.toml"), &ws_b);
 
     assert_ne!(
         widening_a.fingerprint, widening_b.fingerprint,
@@ -284,12 +282,8 @@ fn provider_names_cannot_forge_fingerprint_items() {
     )
     .unwrap();
 
-    let widening_a = config::project_widening(&dir.path().join("none.toml"), &ws_a)
-        .unwrap()
-        .expect("config a has widening");
-    let widening_b = config::project_widening(&dir.path().join("none.toml"), &ws_b)
-        .unwrap()
-        .expect("config b has widening");
+    let widening_a = widening_of(&dir.path().join("none.toml"), &ws_a);
+    let widening_b = widening_of(&dir.path().join("none.toml"), &ws_b);
 
     assert_ne!(
         widening_a.fingerprint, widening_b.fingerprint,
@@ -345,7 +339,8 @@ fn load_project(
     }
     std::fs::write(ws.join(".harness/config.toml"), project).unwrap();
     let cfg = config::load(&global_file, &ws, &TrustStore::default()).unwrap();
-    let widening = config::project_widening(&global_file, &ws).unwrap();
+    let widening =
+        Some(config::project_widening(&global_file, &ws).unwrap()).filter(|w| !w.items.is_empty());
     (cfg, widening)
 }
 
@@ -463,9 +458,7 @@ fn trusted_project_mode_and_max_steps_apply_even_when_wider() {
         "mode = \"auto\"\nmax_steps = 80\n",
     )
     .unwrap();
-    let widening = config::project_widening(&global, &ws)
-        .unwrap()
-        .expect("mode and max_steps widen");
+    let widening = widening_of(&global, &ws);
     let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
     trust.trust(&ws, &widening.fingerprint).unwrap();
     let cfg = config::load(&global, &ws, &trust).unwrap();
@@ -556,7 +549,7 @@ fn a_trusted_project_may_relax_required_git_protection() {
         "[sandbox]\nlinux_git_protection = \"best-effort\"\n",
     )
     .unwrap();
-    let widening = config::project_widening(&global, &ws).unwrap().unwrap();
+    let widening = widening_of(&global, &ws);
     let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
     trust.trust(&ws, &widening.fingerprint).unwrap();
     let cfg = config::load(&global, &ws, &trust).unwrap();
@@ -604,4 +597,41 @@ fn impossible_compaction_settings_are_errors_naming_the_file() {
             "{err}"
         );
     }
+}
+
+// Ruling P3-R1: a workspace with no widening settings can be trusted, so that its command files
+// may choose their model. Trust covers the empty set, so a widening setting added later needs
+// trust again.
+#[test]
+fn a_workspace_without_widening_settings_can_be_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let none = dir.path().join("none.toml");
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    assert!(!config::load(&none, &ws, &trust).unwrap().trusted);
+
+    let widening = config::project_widening(&none, &ws).unwrap();
+    assert!(widening.items.is_empty(), "{:?}", widening.items);
+    trust.trust(&ws, &widening.fingerprint).unwrap();
+    let cfg = config::load(&none, &ws, &trust).unwrap();
+    assert!(cfg.trusted);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+
+    // Narrowing settings are not in the set, so the workspace stays trusted.
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    let project = ws.join(".harness/config.toml");
+    std::fs::write(&project, "[permissions]\ndeny = [\"bash:curl*\"]\n").unwrap();
+    assert!(config::load(&none, &ws, &trust).unwrap().trusted);
+
+    std::fs::write(&project, "[permissions]\nallow = [\"bash:make*\"]\n").unwrap();
+    let cfg = config::load(&none, &ws, &trust).unwrap();
+    assert!(!cfg.trusted);
+    assert!(cfg.allow.is_empty());
+    assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
+    assert!(
+        cfg.warnings[0].contains("harness trust"),
+        "{}",
+        cfg.warnings[0]
+    );
 }

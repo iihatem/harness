@@ -46,22 +46,26 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
         };
     }
     let widening = match config::project_widening(&paths.global_config_file(), &workspace) {
-        Ok(Some(widening)) => widening,
-        Ok(None) => {
-            println!("No project settings in {} need trust.", workspace.display());
-            return 0;
-        }
+        Ok(widening) => widening,
         Err(e) => {
             eprintln!("error: {}", terminal_safe(&e.to_string()));
             return 2;
         }
     };
-    println!(
-        "{} contains settings that widen what the agent may do:",
-        config::project_file(&workspace).display()
-    );
-    for item in &widening.items {
-        println!("  - {item}");
+    if widening.items.is_empty() {
+        // Trust still matters: a trusted workspace's command files may choose their model.
+        println!(
+            "No project settings in {} widen what the agent may do. Trusting it lets its command files choose their model, until such settings appear.",
+            workspace.display()
+        );
+    } else {
+        println!(
+            "{} contains settings that widen what the agent may do:",
+            config::project_file(&workspace).display()
+        );
+        for item in &widening.items {
+            println!("  - {}", terminal_safe(item));
+        }
     }
     if !yes {
         if !std::io::stdin().is_terminal() {

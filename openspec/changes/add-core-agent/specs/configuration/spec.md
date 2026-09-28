@@ -48,8 +48,13 @@ The system SHALL apply project-level settings that widen what the agent may do (
 - **THEN** the widening settings are ignored with a warning until the workspace is trusted again
 
 ### Requirement: Trusting a workspace from the command line
-The system SHALL provide `harness trust`, which displays the workspace's widening project settings and records trust after the user confirms interactively or passes `--yes`, and `harness trust --revoke`, which removes it. Without a terminal and without `--yes`, `harness trust` MUST exit with code 2 and explain how to confirm.
+The system SHALL provide `harness trust`, which displays the workspace's widening project settings and records trust after the user confirms interactively or passes `--yes`, and `harness trust --revoke`, which removes it. A workspace with no widening settings MUST be trustable too: its trust is recorded as the fingerprint of the empty set, so it lasts until a widening setting appears. Without a terminal and without `--yes`, `harness trust` MUST exit with code 2 and explain how to confirm.
 
 #### Scenario: Trusting non-interactively
 - **WHEN** the user runs `harness trust --yes` in a workspace whose project config has an `allow` rule
 - **THEN** later runs in that workspace apply the rule without a warning
+
+#### Scenario: Trusting a workspace that has only command files
+- **WHEN** a repository has `.claude/commands/pick.md` with `model: other/model`, no project config, and the user runs `harness trust --yes`
+- **THEN** later runs of `/pick` use `other/model`
+- **AND** once the project config gains an `allow` rule, the workspace is untrusted until trusted again

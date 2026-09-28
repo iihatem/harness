@@ -146,9 +146,9 @@ pub struct Config {
     pub writable_roots: Vec<PathBuf>,
     pub allow_localhost: bool,
     pub linux_git_protection: LinuxGitProtection,
-    /// Whether the user trusted this workspace's project settings as they are now (`harness
-    /// trust`), so that their widening settings apply. A project command file's `model` applies
-    /// only then. False when the project has no settings that need trust.
+    /// Whether the user trusted this workspace with its project settings as they are now
+    /// (`harness trust`), so that their widening settings apply. A workspace with no such
+    /// settings can be trusted too. A project command file's `model` applies only then.
     pub trusted: bool,
     pub warnings: Vec<String>,
 }
@@ -174,9 +174,10 @@ pub fn parse_file(path: &Path) -> Result<Option<ConfigFile>, ConfigError> {
 }
 
 /// Project settings that widen what the agent may do, and a fingerprint of them. Trust is granted to a
-/// fingerprint, so any change to these settings needs trust again.
+/// fingerprint, that of the empty set included, so any change to these settings needs trust again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Widening {
+    /// Empty when the project has no widening settings.
     pub items: Vec<String>,
     pub fingerprint: String,
 }
@@ -216,7 +217,7 @@ pub fn default_mode(workspace: &Path) -> Mode {
     }
 }
 
-fn widening(project: &ConfigFile, baseline: Baseline) -> Option<Widening> {
+fn widening(project: &ConfigFile, baseline: Baseline) -> Widening {
     let mut items = Vec::new();
     if let Some(mode) = project.mode.filter(|m| !m.grants_at_most(baseline.mode)) {
         items.push(format!("mode = \"{mode}\""));
@@ -250,31 +251,27 @@ fn widening(project: &ConfigFile, baseline: Baseline) -> Option<Widening> {
     {
         items.push("sandbox.linux_git_protection = \"best-effort\"".to_string());
     }
-    if items.is_empty() {
-        return None;
-    }
+    // No item is empty, so only the empty set joins to "".
     let fingerprint = hex::encode(Sha256::digest(items.join("\n").as_bytes()));
-    Some(Widening { items, fingerprint })
+    Widening { items, fingerprint }
 }
 
 pub fn project_file(workspace: &Path) -> PathBuf {
     workspace.join(".harness").join("config.toml")
 }
 
-/// The widening settings in the workspace's project config, if any (shown by `harness trust`).
-/// Whether a mode or step limit widens depends on the global config, so it is read too.
-pub fn project_widening(
-    global_file: &Path,
-    workspace: &Path,
-) -> Result<Option<Widening>, ConfigError> {
+/// The widening settings in the workspace's project config, possibly none (shown and trusted by
+/// `harness trust`). Whether a mode or step limit widens depends on the global config, so it is
+/// read too.
+pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening, ConfigError> {
     let baseline = Baseline::new(parse_file(global_file)?.as_ref(), workspace);
-    Ok(parse_file(&project_file(workspace))?
-        .as_ref()
-        .and_then(|project| widening(project, baseline)))
+    let project = parse_file(&project_file(workspace))?.unwrap_or_default();
+    Ok(widening(&project, baseline))
 }
 
 /// Loads the global config, then the workspace's `.harness/config.toml`. Project settings that narrow
-/// what the agent may do always apply; widening ones apply only when `trust` holds their fingerprint.
+/// what the agent may do always apply; widening ones apply only when `trust` holds their fingerprint,
+/// which also makes the workspace trusted (`Config::trusted`) when it has none.
 pub fn load(
     global_file: &Path,
     workspace: &Path,
@@ -307,7 +304,10 @@ pub fn load(
         cfg.linux_git_protection = global.sandbox.linux_git_protection.unwrap_or_default();
     }
     let path = project_file(workspace);
-    if let Some(project) = parse_file(&path)? {
+    let project = parse_file(&path)?;
+    let widening = widening(project.as_ref().unwrap_or(&ConfigFile::default()), baseline);
+    cfg.trusted = trust.is_trusted(workspace, &widening.fingerprint);
+    if let Some(project) = project {
         cfg.deny.extend(project.permissions.deny.iter().cloned());
         cfg.confirm
             .extend(project.permissions.confirm.iter().cloned());
@@ -334,10 +334,8 @@ pub fn load(
         if let Some(LinuxGitProtection::Required) = project.sandbox.linux_git_protection {
             cfg.linux_git_protection = LinuxGitProtection::Required;
         }
-        match widening(&project, baseline) {
-            None => {}
-            Some(w) if trust.is_trusted(workspace, &w.fingerprint) => {
-                cfg.trusted = true;
+        if !widening.items.is_empty() {
+            if cfg.trusted {
                 if project.mode.is_some() {
                     cfg.mode = project.mode;
                 }
@@ -351,21 +349,25 @@ pub fn load(
                 cfg.read_dirs
                     .extend(expand_all(&project.permissions.read_dirs, workspace, home));
                 cfg.providers.extend(project.providers.clone());
-                cfg.writable_roots
-                    .extend(expand_all(&project.sandbox.writable_roots, workspace, home));
+                cfg.writable_roots.extend(expand_all(
+                    &project.sandbox.writable_roots,
+                    workspace,
+                    home,
+                ));
                 if let Some(allow) = project.sandbox.allow_localhost {
                     cfg.allow_localhost = allow;
                 }
                 if let Some(protection) = project.sandbox.linux_git_protection {
                     cfg.linux_git_protection = protection;
                 }
+            } else {
+                cfg.warnings.push(format!(
+                    "{}: ignoring {} setting(s) that widen what the agent may do ({}); run `harness trust` to review and apply them",
+                    path.display(),
+                    widening.items.len(),
+                    widening.items.join("; ")
+                ));
             }
-            Some(w) => cfg.warnings.push(format!(
-                "{}: ignoring {} setting(s) that widen what the agent may do ({}); run `harness trust` to review and apply them",
-                path.display(),
-                w.items.len(),
-                w.items.join("; ")
-            )),
         }
     }
     Ok(cfg)

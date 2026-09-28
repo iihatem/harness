@@ -50,6 +50,11 @@ pub enum RewindError {
     NoCheckpoints,
     #[error("there is no rewind to undo")]
     NothingToUndo,
+    #[error(
+        "the files were checkpointed in {}, not in this directory; rewind them from there",
+        .0.display()
+    )]
+    OtherWorkspace(PathBuf),
     #[error("restoring files failed: {0}")]
     Restore(#[from] CheckpointError),
 }
@@ -387,11 +392,18 @@ impl Agent {
             let checkpoints = self.checkpoints.clone().ok_or(RewindError::NoCheckpoints)?;
             // The workspace before that message is the first snapshot taken at or after it; with
             // none, no change was made since.
-            let commit = branch[position..].iter().find_map(|e| match &e.kind {
-                EntryKind::Checkpoint { commit } => Some(commit.clone()),
+            let checkpoint = branch[position..].iter().find_map(|e| match &e.kind {
+                EntryKind::Checkpoint { commit, workspace } => Some((commit, workspace)),
                 _ => None,
             });
-            if let Some(commit) = commit {
+            if let Some((commit, workspace)) = checkpoint {
+                if let Some(taken) = workspace
+                    .as_ref()
+                    .filter(|w| **w != checkpoints.workspace())
+                {
+                    return Err(RewindError::OtherWorkspace(taken.clone()));
+                }
+                let commit = commit.clone();
                 let restored =
                     tokio::task::spawn_blocking(move || checkpoints.restore(&commit)).await;
                 snapshot = Some(restored.map_err(|e| CheckpointError::Io(e.into()))??);
@@ -479,11 +491,13 @@ impl Agent {
         };
         self.turn_checkpointed = true;
         let message = format!("before a turn of session {}", self.session.id());
+        let workspace = checkpoints.workspace().to_path_buf();
         let result = tokio::task::spawn_blocking(move || checkpoints.snapshot(&message)).await;
         match result {
             Ok(Ok(commit)) => {
                 self.session.append(EntryKind::Checkpoint {
                     commit: commit.clone(),
+                    workspace: Some(workspace),
                 });
                 self.note_save_error();
                 let _ = events.send(AgentEvent::CheckpointCreated { commit });

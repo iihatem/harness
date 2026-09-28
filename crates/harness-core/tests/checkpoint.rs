@@ -851,3 +851,30 @@ fn private_files_come_back_private() {
     assert_eq!(mode(&f.ws.join("id_key")), 0o400);
     assert_eq!(mode(&f.ws.join("run.sh")) & 0o100, 0o100);
 }
+
+// Review E issue 4 (probe C): a session continued from a subdirectory cannot restore a snapshot
+// taken for the directory above: its paths would land in the wrong place.
+#[test]
+fn a_snapshot_is_restored_only_in_the_workspace_it_was_taken_for() {
+    for repository in [false, true] {
+        let f = fixture();
+        if repository {
+            git(&f.ws, &["init", "-q"]);
+        }
+        f.write("a.txt", "a\n");
+        f.write("sub/x.txt", "x\n");
+        let at_root = Checkpoints::open(&f.gitdir, &f.ws, "s1").unwrap();
+        let first = at_root.snapshot("turn 1").unwrap();
+        drop(at_root);
+        f.write("sub/x.txt", "changed\n");
+        let sub = f.ws.join("sub");
+        let in_sub = Checkpoints::open(&f.gitdir, &sub, "s1").unwrap();
+        match in_sub.restore(&first) {
+            Err(CheckpointError::OtherWorkspace { taken }) => assert_eq!(taken, f.ws),
+            other => panic!("repository {repository}: {other:?}"),
+        }
+        assert_eq!(f.read("sub/x.txt").as_deref(), Some("changed\n"));
+        assert!(!sub.join("a.txt").exists());
+        assert!(!sub.join("sub").exists());
+    }
+}

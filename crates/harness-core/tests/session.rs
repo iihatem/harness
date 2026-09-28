@@ -478,3 +478,41 @@ fn a_session_from_a_newer_harness_is_refused_and_left_alone() {
     assert!(error.to_string().contains("newer"), "{error}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
 }
+
+// Review E issue 4: format 2 records each checkpoint's workspace. A version 1 file still opens,
+// and its checkpoints read without one.
+#[test]
+fn checkpoints_name_their_workspace_from_format_two_on() {
+    assert_eq!(session::FORMAT_VERSION, 2);
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::create(dir.path(), Path::new("/work"));
+    session.append(EntryKind::Checkpoint {
+        commit: "a".repeat(40),
+        workspace: Some("/work/sub".into()),
+    });
+    let path = session.path().unwrap().to_path_buf();
+    drop(session);
+    let saved = lines(&path);
+    assert!(saved[0].contains("\"version\":2"), "{}", saved[0]);
+    assert!(
+        saved[1].contains("\"workspace\":\"/work/sub\""),
+        "{}",
+        saved[1]
+    );
+
+    let old = session_file(dir.path(), "20260102T000000Z-0001", "20260102T000000Z-0001");
+    let mut text = std::fs::read_to_string(&old).unwrap();
+    text.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"id": "0000000b", "parent_id": "0000000a", "type": "checkpoint", "commit": "b".repeat(40)})
+    ));
+    std::fs::write(&old, text).unwrap();
+    let (session, _) = Session::open(&old).unwrap();
+    assert!(session.branch().iter().any(|e| matches!(
+        &e.kind,
+        EntryKind::Checkpoint {
+            workspace: None,
+            ..
+        }
+    )));
+}

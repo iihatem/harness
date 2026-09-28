@@ -347,3 +347,41 @@ async fn only_user_messages_are_rewind_points() {
         Err(RewindError::UnknownPoint(_))
     ));
 }
+
+// Review E issue 4 (probe C): a session continued with `-c` from a subdirectory of the project
+// keeps its checkpoints, but restores only those taken for the directory it now runs in.
+#[tokio::test]
+async fn checkpoints_taken_in_another_directory_are_not_restored() {
+    let f = fixture();
+    f.write("a.txt", "original");
+    std::fs::create_dir(f.ws.join("sub")).unwrap();
+    f.write("sub/x.txt", "x");
+    let provider = MockProvider::new(vec![put("c1", "a.txt", "changed"), Script::text("done")]);
+    let mut first = f.agent(provider, Mode::Auto);
+    run(&mut first, "change it").await;
+    let path = first.session().path().unwrap().to_path_buf();
+    drop(first);
+    let (session, _) = Session::open(&path).unwrap();
+    let sub = f.ws.join("sub");
+    let checkpoints =
+        Checkpoints::open(&f.data.join("checkpoints.git"), &sub, session.id()).unwrap();
+    let mut resumed = agent_with_sandbox(
+        MockProvider::new(vec![]),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        &sub,
+    )
+    .with_session(session)
+    .with_checkpoints(Some(Arc::new(checkpoints)));
+    let target = point(&resumed, "change it");
+    match resumed.rewind(&target, RewindScope::Code).await {
+        Err(RewindError::OtherWorkspace(taken)) => assert_eq!(taken, f.ws),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(f.read("a.txt").as_deref(), Some("changed"));
+    assert!(!sub.join("a.txt").exists());
+    resumed
+        .rewind(&target, RewindScope::Conversation)
+        .await
+        .unwrap();
+}

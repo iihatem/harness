@@ -68,6 +68,11 @@ pub enum CheckpointError {
         "snapshot {0} has no record of the files it left out (an older harness took it), so restoring it could delete them"
     )]
     NoRecord(String),
+    #[error(
+        "this snapshot was taken for {}, not for this directory; run harness there to restore it",
+        taken.display()
+    )]
+    OtherWorkspace { taken: PathBuf },
 }
 
 /// One session's checkpoints of a workspace.
@@ -255,7 +260,10 @@ impl Checkpoints {
         let mut large: BTreeSet<&[u8]> = BTreeSet::new();
         // git stores only whether a file is executable, and restores the rest from the umask:
         // the snapshot records the mode of files only their owner may read.
-        let mut record = Record::default();
+        let mut record = Record {
+            workspace: Some(self.workspace.clone()),
+            ..Record::default()
+        };
         for path in &listed {
             if let Some(dir) = excluded_dir(path) {
                 excluded_dirs.insert(dir);
@@ -460,6 +468,15 @@ impl Checkpoints {
 
     fn restore_unchecked(&self, commit: &str) -> Result<String, CheckpointError> {
         let target = self.record_of(commit)?;
+        // Its paths are relative to the root, and cover only the workspace it was taken for.
+        match &target.workspace {
+            Some(taken) if *taken == self.workspace => {}
+            taken => {
+                return Err(CheckpointError::OtherWorkspace {
+                    taken: taken.clone().unwrap_or_default(),
+                });
+            }
+        }
         let before = self.snapshot_within("before a rewind", self.restore_timeout)?;
         self.restore_to(commit, &target, &before)?;
         Ok(before)
@@ -869,21 +886,27 @@ fn read_small_file(path: &Path) -> Option<String> {
     Some(text)
 }
 
-/// What a snapshot knows besides its files, with paths relative to the root: the paths that
-/// existed but were left out (large, ignored or unreadable files, and whole directories, which end
-/// with `/`), and the permissions of its private files.
+/// What a snapshot knows besides its files: the workspace it was taken for and, with paths
+/// relative to the root, the paths that existed but were left out (large, ignored or unreadable
+/// files, and whole directories, which end with `/`), and the permissions of its private files.
 #[derive(Debug, Default)]
 struct Record {
+    workspace: Option<PathBuf>,
     left_out: BTreeSet<Vec<u8>>,
     modes: BTreeMap<Vec<u8>, u32>,
 }
 
 impl Record {
-    /// NUL-terminated items: [`RECORD_MAGIC`], then `left-out <path>` for each path left out,
-    /// and `mode <octal> <path>` for each private file.
+    /// NUL-terminated items: [`RECORD_MAGIC`], `workspace <path>`, then `left-out <path>` for
+    /// each path left out, and `mode <octal> <path>` for each private file.
     fn encode(&self) -> Vec<u8> {
         let mut out = RECORD_MAGIC.to_vec();
         out.push(0);
+        if let Some(workspace) = &self.workspace {
+            out.extend_from_slice(b"workspace ");
+            out.extend_from_slice(workspace.as_os_str().as_bytes());
+            out.push(0);
+        }
         for path in &self.left_out {
             out.extend_from_slice(b"left-out ");
             out.extend_from_slice(path);
@@ -904,7 +927,9 @@ impl Record {
         }
         let mut record = Record::default();
         for item in items {
-            if let Some(path) = item.strip_prefix(b"left-out ") {
+            if let Some(path) = item.strip_prefix(b"workspace ") {
+                record.workspace = Some(PathBuf::from(OsStr::from_bytes(path)));
+            } else if let Some(path) = item.strip_prefix(b"left-out ") {
                 record.left_out.insert(path.to_vec());
             } else if let Some(rest) = item.strip_prefix(b"mode ") {
                 let space = rest.iter().position(|b| *b == b' ')?;
@@ -1032,7 +1057,10 @@ mod tests {
 
     #[test]
     fn a_record_round_trips_and_covers_what_lies_in_its_directories() {
-        let mut record = Record::default();
+        let mut record = Record {
+            workspace: Some(PathBuf::from("/work/a b")),
+            ..Record::default()
+        };
         for path in [&b".env"[..], b"build/", b"odd\nname", b"web/node_modules/"] {
             record.left_out.insert(path.to_vec());
         }
@@ -1040,6 +1068,7 @@ mod tests {
         let decoded = Record::decode(&record.encode()).unwrap();
         assert_eq!(decoded.left_out, record.left_out);
         assert_eq!(decoded.modes, record.modes);
+        assert_eq!(decoded.workspace, record.workspace);
         assert!(decoded.covers(b".env"));
         assert!(decoded.covers(b"build/out.o"));
         assert!(decoded.covers(b"build/deep/er.o"));

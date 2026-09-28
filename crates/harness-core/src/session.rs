@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{compaction, message::Message, time};
 
-/// The session file format written by this version.
-pub const FORMAT_VERSION: u32 = 1;
+/// The session file format written by this version. Version 2 added the workspace of each
+/// checkpoint: a harness that reads version 1 only would restore them in the wrong place.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// One line of a session file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,8 +53,13 @@ pub enum EntryKind {
         summary: String,
         first_kept: Option<String>,
     },
-    /// A snapshot of the workspace taken before the turn's first change.
-    Checkpoint { commit: String },
+    /// A snapshot of `workspace` taken before the turn's first change. (Version 1 did not record
+    /// the workspace; such a checkpoint is restored only where its snapshot says it was taken.)
+    Checkpoint {
+        commit: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<PathBuf>,
+    },
     /// A rewind to just before the user message `target`. The active branch continues from this
     /// entry's parent. `from` is the leaf before the rewind, and `snapshot` the workspace just
     /// before files were restored, so the rewind can be undone.

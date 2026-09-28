@@ -12,7 +12,7 @@ A terminal-first, open-source coding agent written in Rust, built for **hybrid d
 - Approval modes: `plan`, `read-only`, `ask`, `auto`, `full-access`. Default is `auto` inside a git repository and `ask` elsewhere.
 - Exit codes for scripting: `0` success, `1` runtime error, `2` invalid usage or no model, `3` an action was blocked for lack of approval, `130` interrupted.
 - Project instructions: `AGENTS.md` (or `CLAUDE.md` where a directory has no `AGENTS.md`) from `~/.config/harness/`, the repository root, and each directory down to the working directory, with `@path` import lines. They go into a system prompt that stays the same for the whole run, so model servers can reuse their prompt caches.
-- Slash commands in `harness ask`: Markdown commands from `.harness/commands`, `.claude/commands` or `.opencode/commands` in the project, and from `~/.config/harness/commands` and `~/.claude/commands`, so OpenSpec's `/opsx:*` commands work as they are. `$ARGUMENTS`, `$1`…`$9`, `@file` and `` !`command` `` are filled in; shell commands go through the same approvals and sandbox as the `bash` tool. `harness ask "/init"` drafts an `AGENTS.md`.
+- Slash commands in `harness ask`: Markdown commands from `.harness/commands`, `.claude/commands` or `.opencode/commands` in the project, and from `~/.config/harness/commands` and `~/.claude/commands`, so OpenSpec's `/opsx:*` commands work as they are. `$ARGUMENTS`, `$1`…`$9`, `@file` and `` !`command` `` are filled in; an argument reaches a shell command as data however the command file quotes it, and shell commands go through the same approvals and sandbox as the `bash` tool. `harness ask "/init"` drafts an `AGENTS.md`.
 - Sessions: every run is saved under `~/.local/share/harness/sessions/`. `harness -c ask "..."` continues the project's most recent session, `harness --resume` lists them, and `harness --resume <id> ask "..."` continues one.
 - Checkpoints: before a turn first changes anything, the workspace is snapshotted into a separate git repository in harness's data directory; your own repository, index and history are never touched. Rewinding to a checkpoint arrives with the terminal UI.
 - Compaction: when a conversation nears the context window, or a provider says a request is too long, older messages are replaced by a summary the model writes, and the summary is shown.
@@ -50,9 +50,13 @@ confirm = ["bash:terraform apply*"]
 writable_roots = ["~/.cargo"]
 # Linux: ask before every command when git metadata can only be checked after the fact
 # linux_git_protection = "required"
+
+[compaction]
+threshold_percent = 80    # summarize at this share of the context window
+keep_recent_percent = 20  # keep this share of recent messages as they are
 ```
 
-Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, `read_dirs`, model, providers, sandbox settings, a `mode` wider than your global or default mode, a `max_steps` above your global limit) only apply after `harness trust`. The same trust lets a project's command files choose their own `model`; a repository with command files and no project settings can be trusted too.
+Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, `read_dirs`, model, providers, sandbox settings, a `mode` wider than your global or default mode, a `max_steps` above your global limit) only apply after `harness trust`, and so does a `[compaction] threshold_percent` below 50. The same trust lets a project's command files choose their own `model`; a repository with command files and no project settings can be trusted too.
 
 ## Known limitations
 

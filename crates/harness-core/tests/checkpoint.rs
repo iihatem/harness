@@ -648,6 +648,28 @@ fn a_file_unreadable_when_the_snapshot_was_taken_survives_a_restore() {
     assert_eq!(f.read("locked.txt").as_deref(), Some("user data, edited\n"));
 }
 
+// The same for a directory git could not open at the snapshot: what was in it existed then.
+#[test]
+fn a_directory_unreadable_when_the_snapshot_was_taken_survives_a_restore() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return; // root reads the directory anyway
+    }
+    let f = fixture();
+    f.write("a.txt", "a\n");
+    f.write("locked/notes.txt", "user data\n");
+    let locked = f.ws.join("locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let first = first.unwrap();
+    f.write("a.txt", "changed\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(f.read("a.txt").as_deref(), Some("a\n"));
+    assert_eq!(f.read("locked/notes.txt").as_deref(), Some("user data\n"));
+}
+
 // Review E issue 1 (probe N): so did a file that was too large then and has shrunk since.
 #[test]
 fn a_file_too_large_when_the_snapshot_was_taken_survives_a_restore() {

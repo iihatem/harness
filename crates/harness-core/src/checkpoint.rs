@@ -371,9 +371,10 @@ impl Checkpoints {
     }
 
     fn snapshot_until(&self, message: &str, deadline: Instant) -> Result<String, CheckpointError> {
-        // Everything in the index, and every file git would add.
+        // Everything in the index, and every file git would add; and the directories it could not
+        // open, which it only warns about.
         let within = self.within();
-        let listed = self.list(
+        let (listed, unopened) = self.list_noting_unopened(
             &["--cached", "--others", "--exclude-standard", "--"],
             &within,
             deadline,
@@ -464,6 +465,7 @@ impl Checkpoints {
         record
             .left_out
             .extend(large.iter().map(|path| path.to_vec()));
+        record.left_out.extend(unopened);
         record
             .left_out
             .extend(excluded_dirs.iter().map(|dir| [dir, &b"/"[..]].concat()));
@@ -864,13 +866,31 @@ impl Checkpoints {
         pathspec: &[u8],
         deadline: Instant,
     ) -> Result<Vec<Vec<u8>>, CheckpointError> {
+        Ok(self.list_noting_unopened(options, pathspec, deadline)?.0)
+    }
+
+    /// Like [`list`](Self::list), with the directories git warned it could not open (each with a
+    /// trailing `/`). git runs in the C locale, so the warning's wording is fixed.
+    fn list_noting_unopened(
+        &self,
+        options: &[&str],
+        pathspec: &[u8],
+        deadline: Instant,
+    ) -> Result<(Paths, Paths), CheckpointError> {
         let mut cmd = self.command();
         cmd.args(["ls-files", "-z"])
             .args(options)
             .arg(OsStr::from_bytes(pathspec));
         match output_within(&mut cmd, remaining(deadline)?)? {
             None => Err(CheckpointError::TooSlow),
-            Some(out) if out.status.success() => Ok(split_nul(&out.stdout)),
+            Some(out) if out.status.success() => {
+                let unopened = out
+                    .stderr
+                    .split(|b| *b == b'\n')
+                    .filter_map(unopened_directory)
+                    .collect();
+                Ok((split_nul(&out.stdout), unopened))
+            }
             Some(out) => Err(failure("ls-files", &out.stderr)),
         }
     }
@@ -1242,6 +1262,21 @@ fn arg_chunks(args: impl Iterator<Item = OsString>) -> Vec<Vec<OsString>> {
     chunks
 }
 
+/// Paths as git lists them, relative to the root.
+type Paths = Vec<Vec<u8>>;
+
+/// The directory in git's warning `could not open directory '<dir>': <reason>`, with a
+/// trailing `/`.
+fn unopened_directory(line: &[u8]) -> Option<Vec<u8>> {
+    let rest = line.strip_prefix(b"warning: could not open directory '")?;
+    let end = rest.windows(3).rposition(|w| w == b"': ")?;
+    let mut dir = rest[..end].to_vec();
+    if !dir.ends_with(b"/") {
+        dir.push(b'/');
+    }
+    Some(dir)
+}
+
 /// The NUL-separated items of git's `-z` output.
 fn split_nul(bytes: &[u8]) -> Vec<Vec<u8>> {
     bytes
@@ -1300,6 +1335,21 @@ mod tests {
         assert!(!decoded.covers(b"web/x.js"));
         assert!(Record::decode(b"something else\0left-out a\0").is_none());
         assert!(Record::decode(b"").is_none());
+    }
+
+    #[test]
+    fn directories_git_could_not_open_are_read_from_its_warnings() {
+        assert_eq!(
+            unopened_directory(b"warning: could not open directory 'a/b c/': Permission denied"),
+            Some(b"a/b c/".to_vec())
+        );
+        assert_eq!(
+            unopened_directory(
+                b"warning: could not open directory 'x': ': odd': Permission denied"
+            ),
+            Some(b"x': ': odd/".to_vec())
+        );
+        assert_eq!(unopened_directory(b"warning: something else"), None);
     }
 
     #[test]

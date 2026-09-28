@@ -139,16 +139,20 @@ fn reasoning_fields_become_reasoning_deltas() {
 }
 
 #[test]
-fn invalid_json_and_error_payloads_are_protocol_errors() {
+fn invalid_json_is_a_protocol_error_and_an_error_payload_the_providers_own() {
     let mut parser = ChatStreamParser::default();
     assert!(matches!(
         parser.push("{not json"),
         Err(ProviderError::Protocol(_))
     ));
-    assert!(matches!(
-        parser.push(r#"{"error":{"message":"model not found"}}"#),
-        Err(ProviderError::Protocol(_))
-    ));
+    let error = parser
+        .push(r#"{"error":{"message":"model not found"}}"#)
+        .unwrap_err();
+    assert!(matches!(error, ProviderError::InStream(_)), "{error:?}");
+    assert_eq!(
+        error.to_string(),
+        r#"provider error: {"message":"model not found"}"#
+    );
 }
 
 #[test]

@@ -541,8 +541,56 @@ fn overflow_errors_are_recognised_by_their_wording() {
     }
     assert!(!http(400, "invalid tool schema").is_context_overflow());
     assert!(!http(500, "context length").is_context_overflow());
+    // An error the provider reports inside the stream.
     assert!(
-        ProviderError::Protocol("provider error: context_length_exceeded".into())
+        ProviderError::InStream(r#"{"code":"context_length_exceeded"}"#.into())
+            .is_context_overflow()
+    );
+}
+
+// Review F minor 3: other providers' wording.
+#[test]
+fn other_providers_overflow_errors_are_recognised() {
+    let http = |status: u16, body: &str| ProviderError::Http {
+        status,
+        body: body.into(),
+        retry_after: None,
+    };
+    for (status, body) in [
+        // xAI
+        (
+            400,
+            "This model's maximum prompt length is 131072 but the request contains 140000 tokens.",
+        ),
+        // Gemini
+        (
+            400,
+            "The input token count (1234567) exceeds the maximum number of tokens allowed (1048576).",
+        ),
+        // TGI, Together
+        (
+            422,
+            "Input validation error: `inputs` tokens + `max_new_tokens` must be <= 4096. Given: 4000 `inputs` tokens and 200 `max_new_tokens`",
+        ),
+        // Bedrock
+        (400, "Input is too long for requested model."),
+        // Anthropic
+        (
+            400,
+            "input length and `max_tokens` exceed context limit: 188240 + 21333 > 200000, decrease input length or `max_tokens` and try again",
+        ),
+    ] {
+        assert!(http(status, body).is_context_overflow(), "{body}");
+    }
+}
+
+// Review F minor 4: a response harness could not parse quotes the raw chunk, which can hold the
+// model's own text; only error responses and errors the provider reports count.
+#[test]
+fn a_parse_error_quoting_model_text_is_not_an_overflow() {
+    let chunk = r#"{"choices":[{"delta":{"content":"Your context window is 8k"}}]"#;
+    assert!(
+        !ProviderError::Protocol(format!("EOF while parsing an object in chunk: {chunk}"))
             .is_context_overflow()
     );
 }

@@ -70,7 +70,7 @@ impl ChatStreamParser {
         let chunk: Value = serde_json::from_str(data)
             .map_err(|e| ProviderError::Protocol(format!("{e} in chunk: {data}")))?;
         if let Some(error) = chunk.get("error") {
-            return Err(ProviderError::Protocol(format!("provider error: {error}")));
+            return Err(ProviderError::InStream(error.to_string()));
         }
         let mut out = Vec::new();
         if let Some(choice) = chunk["choices"].get(0) {

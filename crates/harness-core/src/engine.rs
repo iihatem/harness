@@ -41,7 +41,7 @@ pub struct EngineConfig {
 }
 
 pub struct PermissionEngine {
-    /// The approval mode; the frontend may change it between turns (`set_mode`).
+    /// The approval mode; `Agent::set_mode` may change it between turns.
     mode: Mutex<Mode>,
     workspace: PathBuf,
     read_dirs: Vec<PathBuf>,
@@ -457,7 +457,7 @@ impl PermissionEngine {
             .contains(&(tool, target.to_path_buf()))
     }
 
-    fn check_read(&self, path: &Path) -> Decision {
+    fn check_read(&self, path: &Path, mode: Mode) -> Decision {
         let target = resolve_path(&self.workspace, path);
         let lexical = lexical_path(&self.workspace, path);
         if let Some(rule) =
@@ -465,13 +465,13 @@ impl PermissionEngine {
         {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
-        if self.mode() != Mode::FullAccess
+        if mode != Mode::FullAccess
             && let Some(rule) =
                 self.deny_confirm_rule(&self.confirm_paths_now(), "read", &target, &lexical)
         {
             return Decision::Ask(format!("read {} (confirm rule `{rule}`)", target.display()));
         }
-        if self.mode() == Mode::FullAccess
+        if mode == Mode::FullAccess
             || target.starts_with(&self.workspace)
             || self.read_dirs.iter().any(|d| target.starts_with(d))
             || self
@@ -484,7 +484,7 @@ impl PermissionEngine {
         Decision::Ask(format!("read outside the workspace: {}", target.display()))
     }
 
-    fn check_write(&self, path: &Path) -> Decision {
+    fn check_write(&self, path: &Path, mode: Mode) -> Decision {
         let target = resolve_path(&self.workspace, path);
         let lexical = lexical_path(&self.workspace, path);
         if let Some(rule) =
@@ -492,14 +492,11 @@ impl PermissionEngine {
         {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
-        if self.mode() == Mode::FullAccess {
+        if mode == Mode::FullAccess {
             return Decision::Allow;
         }
-        if matches!(self.mode(), Mode::Plan | Mode::ReadOnly) {
-            return Decision::Deny(format!(
-                "file writes are not allowed in {} mode",
-                self.mode()
-            ));
+        if matches!(mode, Mode::Plan | Mode::ReadOnly) {
+            return Decision::Deny(format!("file writes are not allowed in {} mode", mode));
         }
         let Ok(inside) = target.strip_prefix(&self.workspace) else {
             return Decision::Ask(format!("write outside the workspace: {}", target.display()));
@@ -515,7 +512,7 @@ impl PermissionEngine {
                 inside.display()
             ));
         }
-        if (self.mode() == Mode::Auto && !self.writes_need_approval)
+        if (mode == Mode::Auto && !self.writes_need_approval)
             || self
                 .allow_rule(&self.allow_paths_now(), "write", &target)
                 .is_some()
@@ -541,7 +538,7 @@ impl PermissionEngine {
         }
     }
 
-    fn check_bash(&self, command: &str) -> Decision {
+    fn check_bash(&self, command: &str, mode: Mode) -> Decision {
         let rules = self.bash_rules();
         match harness_shell::evaluate(command, &rules, &self.workspace) {
             Verdict::Deny { reason } => Decision::Deny(reason),
@@ -552,9 +549,9 @@ impl PermissionEngine {
                 reason,
                 may_deny: true,
                 ..
-            } if self.mode() == Mode::FullAccess => Decision::Ask(reason),
-            _ if self.mode() == Mode::FullAccess => Decision::Allow,
-            _ if !self.sandbox_available && matches!(self.mode(), Mode::Plan | Mode::ReadOnly) => {
+            } if mode == Mode::FullAccess => Decision::Ask(reason),
+            _ if mode == Mode::FullAccess => Decision::Allow,
+            _ if !self.sandbox_available && matches!(mode, Mode::Plan | Mode::ReadOnly) => {
                 Decision::Deny(
                     "shell commands need the OS sandbox in plan and read-only mode".into(),
                 )
@@ -565,7 +562,7 @@ impl PermissionEngine {
             )),
             Verdict::Ask { reason, .. } => Decision::Ask(reason),
             Verdict::Allow => Decision::Allow,
-            Verdict::Unlisted if self.mode() == Mode::Ask => {
+            Verdict::Unlisted if mode == Mode::Ask => {
                 Decision::Ask(format!("run `{}`", short(command)))
             }
             Verdict::Unlisted => Decision::Allow,
@@ -607,8 +604,8 @@ impl PermissionEngine {
     /// write outside the workspace, to a protected path (`protected_write`), or matching a
     /// deny/confirm rule — none of those decisions can be changed by an approval, since they're
     /// checked before the session approvals in `check_write`.
-    fn remember_write(&self, path: &Path) -> bool {
-        if matches!(self.mode(), Mode::Plan | Mode::ReadOnly) {
+    fn remember_write(&self, path: &Path, mode: Mode) -> bool {
+        if matches!(mode, Mode::Plan | Mode::ReadOnly) {
             return false;
         }
         let target = resolve_path(&self.workspace, path);
@@ -657,18 +654,22 @@ impl PermissionEngine {
 }
 
 impl PermissionPolicy for PermissionEngine {
+    // Each check and remember reads the mode once, so a mode switched meanwhile gives the answer
+    // of one mode or the other, never a mix.
     fn check(&self, action: &Action) -> Decision {
+        let mode = self.mode();
         match action {
-            Action::Read(path) => self.check_read(path),
-            Action::Write(path) => self.check_write(path),
-            Action::Bash(command) => self.check_bash(command),
+            Action::Read(path) => self.check_read(path, mode),
+            Action::Write(path) => self.check_write(path, mode),
+            Action::Bash(command) => self.check_bash(command, mode),
         }
     }
 
     fn remember(&self, action: &Action) -> bool {
+        let mode = self.mode();
         match action {
             Action::Bash(command) => self.remember_bash(command),
-            Action::Write(path) => self.remember_write(path),
+            Action::Write(path) => self.remember_write(path, mode),
             Action::Read(path) => self.remember_read(path),
         }
     }

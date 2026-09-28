@@ -177,6 +177,10 @@ pub trait PermissionPolicy: Send + Sync {
     }
 
     /// Switches the approval mode for later checks. Policies without modes ignore it.
+    ///
+    /// Internal to the agent: frontends call `Agent::set_mode`, which also gives shell commands
+    /// the new mode's sandbox access and records the change in the conversation. Calling this
+    /// directly would leave commands running with the old mode's access.
     fn set_mode(&self, _mode: Mode) {}
 
     /// Adds rules for the current turn only, or with `None` removes them. They never override

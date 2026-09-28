@@ -1084,6 +1084,53 @@ fn rough_scan_sees_past_redirections_before_the_command_name() {
 }
 
 #[test]
+fn redirections_bash_reads_differently_are_scanned() {
+    use Want::{Allow, Ask, Deny, Unlisted};
+    // bash reads a `-` right after `>&` or `<&` as a word of its own, and bash 4.1 and
+    // later read `{NAME}` right before a redirection as a variable for its file
+    // descriptor. brush-parser reads one word in both, so these commands run `curl x`
+    // where it sees another command.
+    check(
+        &default_rules(),
+        &[
+            (">&-curl x", Deny),
+            ("<&-curl x", Deny),
+            ("2>&-curl x", Deny),
+            (">& -curl x", Deny),
+            ("2>& -curl x", Deny),
+            (">&-'curl' x", Deny),
+            ("echo a; >&-curl x", Deny),
+            ("{fd}>out curl x", Deny),
+            ("{fd}<file curl x", Deny),
+            ("{fd}>>out curl x", Deny),
+            ("{fd}<<<w curl x", Deny),
+            ("{fd}>&2 curl x", Deny),
+            ("{a[1]}>f curl x", Deny),
+            ("{_x9}>f curl x", Deny),
+            ("A=1 {fd}>f curl x", Deny),
+            ("bash -c '{fd}>f curl x'", Deny),
+            // bash joins the lines first; the positions count characters.
+            ("{fd}\\\n>out curl x", Deny),
+            ("echo é; {fd}>out curl x", Deny),
+            // Elsewhere bash reads these words as brush-parser does.
+            ("echo hi >&-", Allow),
+            ("echo hi 2>&-", Allow),
+            ("echo hi <&-", Allow),
+            ("echo hi >&2", Allow),
+            ("cargo test 2>&1", Allow),
+            ("exec 3>&-", Unlisted),
+            (">&\"-curl\" x", Unlisted),
+            ("echo {fd} >/dev/null", Allow),
+            ("echo é; echo {fd} >/dev/null", Allow),
+            // A command given a `{NAME}` redirection is not fully understood.
+            ("echo hi {fd}>/dev/null", Ask),
+            ("cargo test {fd}>/dev/null", Ask),
+            ("echo hi >&-#c", Ask),
+        ],
+    );
+}
+
+#[test]
 fn unquoted_heredoc_bodies_join_continuation_lines() {
     use Want::Deny;
     // bash joins a body line ending in a backslash with the next before it expands the

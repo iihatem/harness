@@ -319,6 +319,12 @@ pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening
     Ok(widening(&project, baseline))
 }
 
+/// Whether the user trusts `dir`, as `harness trust` run there records it: trust for `dir` holds
+/// the fingerprint of `dir`'s own project settings. Settings that cannot be read are not trusted.
+pub fn is_trusted(global_file: &Path, dir: &Path, trust: &TrustStore) -> bool {
+    project_widening(global_file, dir).is_ok_and(|w| trust.is_trusted(dir, &w.fingerprint))
+}
+
 /// Loads the global config, then the workspace's `.harness/config.toml`. Project settings that narrow
 /// what the agent may do always apply; widening ones apply only when `trust` holds their fingerprint,
 /// which also makes the workspace trusted (`Config::trusted`) when it has none.

@@ -466,3 +466,78 @@ async fn allowed_tools_still_preapprove_a_shell_expansion_that_uses_arguments() 
     assert!(!stderr.contains("blocked"), "{stderr}");
     assert_eq!(user_messages(&server).await, ["<a b>\n"]);
 }
+
+// Final review, minor 1 (probe p4): project command files come from the repository root, so
+// their model applies when the root is trusted, whatever subdirectory harness runs in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trusted_repository_roots_command_files_choose_their_model_in_a_subdirectory() {
+    let server = MockServer::start().await;
+    answer(&server, "ok").await;
+    let env = Env::new(&server.uri(), "");
+    env.command_file("pick.md", PICKS_A_MODEL);
+    std::fs::create_dir(env.ws.path().join("sub")).unwrap();
+    let output = tokio::task::spawn_blocking(move || {
+        env.cmd().args(["trust", "--yes"]).assert().success();
+        env.cmd()
+            .current_dir(env.ws.path().join("sub"))
+            .args(["ask", "/pick"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("note: /pick runs on mock/command-model"),
+        "{stderr}"
+    );
+    assert_eq!(requested_models(&server).await, ["command-model"]);
+}
+
+// The other way round: trusting a subdirectory covers its own settings, not the root's command
+// files, and both `harness trust` and the note say where to run `harness trust` instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn trusting_a_subdirectory_does_not_let_the_roots_command_files_choose_their_model() {
+    let server = MockServer::start().await;
+    answer(&server, "ok").await;
+    let env = Env::new(&server.uri(), "");
+    env.command_file("pick.md", PICKS_A_MODEL);
+    std::fs::create_dir(env.ws.path().join("sub")).unwrap();
+    let root = env.ws.path().canonicalize().unwrap();
+    let (trust, output) = tokio::task::spawn_blocking(move || {
+        let sub = env.ws.path().join("sub");
+        let trust = env
+            .cmd()
+            .current_dir(&sub)
+            .args(["trust", "--yes"])
+            .output()
+            .unwrap();
+        let output = env
+            .cmd()
+            .current_dir(&sub)
+            .args(["ask", "/pick"])
+            .output()
+            .unwrap();
+        (trust, output)
+    })
+    .await
+    .unwrap();
+    assert!(trust.status.success(), "{trust:?}");
+    let said = String::from_utf8_lossy(&trust.stdout);
+    assert!(
+        said.contains(&format!(
+            "command files used there: they come from {}; run `harness trust` there",
+            root.display()
+        )),
+        "{said}"
+    );
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("note: /pick asks for model mock/command-model")
+            && stderr.contains(&format!("run `harness trust` in {}", root.display())),
+        "{stderr}"
+    );
+    assert_eq!(requested_models(&server).await, ["test-model"]);
+}

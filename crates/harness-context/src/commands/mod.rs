@@ -35,7 +35,8 @@ const MAX_FILE_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Scope {
     /// In the project's `.harness/commands`, `.claude/commands` or `.opencode/commands`: it
-    /// comes with the repository, so its `model` applies only in a trusted workspace.
+    /// comes with the repository, so its `model` applies only when the user trusts the
+    /// directory it comes from.
     #[default]
     Project,
     /// In the harness config directory's `commands/` or `~/.claude/commands`: the user's own.

@@ -119,6 +119,15 @@ fn a_referenced_file_swapped_for_a_fifo_is_never_waited_on() {
         writes_need_approval: false,
     });
     never_blocks(&ws.join("notes.md"), move || {
-        expand(&command, "", &ws, &policy, false);
+        expand(
+            &command,
+            "",
+            &ws,
+            &policy,
+            commands::expand::ProjectTrust {
+                dir: &ws,
+                trusted: false,
+            },
+        );
     });
 }

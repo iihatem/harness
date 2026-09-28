@@ -22,11 +22,21 @@ pub struct Expansion {
     /// for that turn. The model is left for the caller to resolve.
     pub input: TurnInput,
     /// The command's `model`, as written, when it may apply: always for a global command file,
-    /// and for a project one only in a trusted workspace.
+    /// and for a project one only when the directory it comes from is trusted.
     pub model: Option<String>,
     pub warnings: Vec<String>,
     /// What harness decided that the user should know, such as an ignored `model`.
     pub notes: Vec<String>,
+}
+
+/// Whether project command files may choose the model: when the user trusts the directory they
+/// come from, as `harness trust` run there records it.
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectTrust<'a> {
+    /// Where the project's command files come from: the repository root, or the working
+    /// directory outside a repository.
+    pub dir: &'a Path,
+    pub trusted: bool,
 }
 
 /// Expands `command` invoked with `args` (the text after its name):
@@ -43,14 +53,15 @@ pub struct Expansion {
 ///
 /// Arguments are inserted as they are and never expanded themselves.
 ///
-/// A project command file's `model` is kept only when `trusted` (the workspace's project settings
-/// are trusted); otherwise a note says it was ignored. A global command file's always is.
+/// A project command file's `model` is kept only when `trust` says the directory it comes from is
+/// trusted; otherwise a note says it was ignored, and where to run `harness trust`. A global
+/// command file's always is.
 pub fn expand(
     command: &CustomCommand,
     args: &str,
     workspace: &Path,
     policy: &dyn PermissionPolicy,
-    trusted: bool,
+    trust: ProjectTrust<'_>,
 ) -> Expansion {
     let words = split_args(args);
     let mut warnings = Vec::new();
@@ -138,10 +149,11 @@ pub fn expand(
     }
     let typed = format!("/{} {}", command.name, args.trim());
     let model = match &command.model {
-        Some(model) if command.scope == Scope::Project && !trusted => {
+        Some(model) if command.scope == Scope::Project && !trust.trusted => {
             notes.push(format!(
-                "/{} asks for model {model}, but a project command file chooses the model only in a trusted workspace; using the session's model",
-                command.name
+                "/{} asks for model {model}, but a project command file chooses the model only in a trusted workspace; using the session's model (run `harness trust` in {}, where the command files come from, to allow it)",
+                command.name,
+                trust.dir.display()
             ));
             None
         }

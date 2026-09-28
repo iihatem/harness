@@ -1,8 +1,14 @@
 //! Slash commands in `harness ask`: custom commands and `/init` run as the turn's input; the other
 //! built-ins need the interactive terminal.
 
+use harness_config::config;
 use harness_context::{
-    commands::{self, Commands, expand::expand, init::init_input, is_builtin, parse_invocation},
+    commands::{
+        self, Commands,
+        expand::{ProjectTrust, expand},
+        init::init_input,
+        is_builtin, parse_invocation,
+    },
     project::project_root,
 };
 use harness_core::{
@@ -75,13 +81,14 @@ pub fn turn_input(
     let Some(command) = commands.get(invocation.name) else {
         return whole();
     };
-    let expansion = expand(
-        command,
-        invocation.args,
-        &setup.workspace,
-        policy,
-        setup.config.trusted,
-    );
+    // Project command files come from the project root, so trust for that directory decides
+    // whether they choose their model, wherever in the project harness runs.
+    let root = project_root(&setup.workspace);
+    let trust = ProjectTrust {
+        dir: &root,
+        trusted: config::is_trusted(&setup.paths.global_config_file(), &root, &setup.trust),
+    };
+    let expansion = expand(command, invocation.args, &setup.workspace, policy, trust);
     for warning in &expansion.warnings {
         eprintln!("warning: {}", terminal_safe(warning));
     }

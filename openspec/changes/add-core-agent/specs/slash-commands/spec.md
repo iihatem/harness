@@ -42,11 +42,15 @@ The system SHALL load Markdown command files from `.harness/commands/`, `.claude
 - **THEN** `/mine` is available
 
 ### Requirement: Supported frontmatter
-The system SHALL honour the frontmatter fields `description`, `argument-hint`, `model`, and `allowed-tools`, and ignore unknown fields. `model` MUST apply only to that invocation, and a project command file's `model` MUST apply only when the workspace is trusted. `allowed-tools` MUST map Claude Code tool names (`Bash`, `Write`, `Edit`) and patterns such as `Bash(openspec:*)` to allow rules for that invocation only, and MUST NOT override deny rules, destructive-command confirmation, or the sandbox. `Read`, `Grep`, and `Glob` MUST NOT widen reads outside the workspace.
+The system SHALL honour the frontmatter fields `description`, `argument-hint`, `model`, and `allowed-tools`, and ignore unknown fields. `model` MUST apply only to that invocation, and a project command file's `model` MUST apply only when the directory the project's command files come from (the repository root, or the working directory outside a repository) is trusted, as `harness trust` run there records it. `allowed-tools` MUST map Claude Code tool names (`Bash`, `Write`, `Edit`) and patterns such as `Bash(openspec:*)` to allow rules for that invocation only, and MUST NOT override deny rules, destructive-command confirmation, or the sandbox. `Read`, `Grep`, and `Glob` MUST NOT widen reads outside the workspace.
 
 #### Scenario: A project command's model in an untrusted workspace
 - **WHEN** a project command file declares `model: other/model` and the workspace is not trusted
-- **THEN** the invocation uses the session's model and a note says the command's model was ignored
+- **THEN** the invocation uses the session's model and a note says the command's model was ignored, naming `harness trust` and the directory to run it in
+
+#### Scenario: A project command's model in a subdirectory
+- **WHEN** the user trusted a repository's root and runs, from a subdirectory, a project command file that declares `model: other/model`
+- **THEN** the invocation uses `other/model`; had the user trusted only the subdirectory, the session's model would answer, and both `harness trust` there and the note would name the repository root
 
 #### Scenario: allowed-tools pre-approves a command
 - **WHEN** a command file declares `allowed-tools: Bash(openspec:*)` and its run executes `openspec status` in `ask` mode

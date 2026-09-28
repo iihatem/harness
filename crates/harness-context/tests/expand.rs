@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use harness_context::commands::{
     CustomCommand, Scope,
-    expand::{allowed_tools_rules, expand},
+    expand::{ProjectTrust, allowed_tools_rules, expand},
     split_args,
 };
 use harness_core::{
@@ -24,6 +24,14 @@ fn command(body: &str) -> CustomCommand {
     }
 }
 
+/// Whether the user trusts `/p`, where [`command`]'s file comes from.
+fn trust(trusted: bool) -> ProjectTrust<'static> {
+    ProjectTrust {
+        dir: Path::new("/p"),
+        trusted,
+    }
+}
+
 fn engine(workspace: &Path, deny: &[&str]) -> PermissionEngine {
     PermissionEngine::new(EngineConfig {
         mode: Mode::Auto,
@@ -41,7 +49,7 @@ fn engine(workspace: &Path, deny: &[&str]) -> PermissionEngine {
 fn parts(body: &str, args: &str) -> Vec<InputPart> {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().canonicalize().unwrap();
-    expand(&command(body), args, &ws, &engine(&ws, &[]), false)
+    expand(&command(body), args, &ws, &engine(&ws, &[]), trust(false))
         .input
         .parts
 }
@@ -153,7 +161,7 @@ fn arguments_are_never_expanded_themselves() {
         "@notes.md !`ls`",
         &ws,
         &engine(&ws, &[]),
-        false,
+        trust(false),
     );
     assert_eq!(got.input.parts, [text("Do: @notes.md !`ls`")]);
 }
@@ -172,7 +180,7 @@ fn file_references_expand_to_workspace_files_the_policy_allows() {
         "",
         &ws,
         &engine(&ws, &["read:secret.md"]),
-        false,
+        trust(false),
     );
     assert_eq!(
         got.input.parts,
@@ -197,7 +205,7 @@ fn an_expansion_carries_what_was_typed_and_the_allowed_tools() {
         " add-login ",
         dir.path(),
         &engine(dir.path(), &[]),
-        true,
+        trust(true),
     );
     assert_eq!(
         got.input.display.as_deref(),
@@ -216,12 +224,13 @@ fn a_project_commands_model_applies_only_in_a_trusted_workspace() {
     let mut cmd = command("Go.");
     cmd.allowed_tools = vec!["Bash(openspec:*)".into()];
     cmd.model = Some("paid/big".into());
-    let untrusted = expand(&cmd, "", dir.path(), &policy, false);
+    let untrusted = expand(&cmd, "", dir.path(), &policy, trust(false));
     assert_eq!(untrusted.model, None);
     assert_eq!(untrusted.notes.len(), 1, "{:?}", untrusted.notes);
     assert!(
         untrusted.notes[0].contains("/review asks for model paid/big")
-            && untrusted.notes[0].contains("trusted workspace"),
+            && untrusted.notes[0].contains("trusted workspace")
+            && untrusted.notes[0].contains("run `harness trust` in /p,"),
         "{}",
         untrusted.notes[0]
     );
@@ -232,11 +241,11 @@ fn a_project_commands_model_applies_only_in_a_trusted_workspace() {
         untrusted.input.rules.allow,
         ["bash:openspec", "bash:openspec *"]
     );
-    let trusted = expand(&cmd, "", dir.path(), &policy, true);
+    let trusted = expand(&cmd, "", dir.path(), &policy, trust(true));
     assert_eq!(trusted.model.as_deref(), Some("paid/big"));
     assert!(trusted.notes.is_empty(), "{:?}", trusted.notes);
     // Without a model there is nothing to note.
-    let plain = expand(&command("Go."), "", dir.path(), &policy, false);
+    let plain = expand(&command("Go."), "", dir.path(), &policy, trust(false));
     assert!(plain.notes.is_empty(), "{:?}", plain.notes);
 }
 
@@ -247,7 +256,13 @@ fn a_global_commands_model_applies_in_any_workspace() {
     cmd.scope = Scope::Global;
     cmd.model = Some("paid/big".into());
     for trusted in [false, true] {
-        let got = expand(&cmd, "", dir.path(), &engine(dir.path(), &[]), trusted);
+        let got = expand(
+            &cmd,
+            "",
+            dir.path(),
+            &engine(dir.path(), &[]),
+            trust(trusted),
+        );
         assert_eq!(got.model.as_deref(), Some("paid/big"), "trusted: {trusted}");
         assert!(got.notes.is_empty(), "{:?}", got.notes);
     }
@@ -293,7 +308,13 @@ fn a_file_reference_through_a_symlink_inside_the_workspace_is_read() {
     std::fs::create_dir(ws.join("docs")).unwrap();
     std::fs::write(ws.join("docs/notes.md"), "NOTES").unwrap();
     std::os::unix::fs::symlink("docs/notes.md", ws.join("notes.md")).unwrap();
-    let got = expand(&command("See @notes.md"), "", &ws, &engine(&ws, &[]), false);
+    let got = expand(
+        &command("See @notes.md"),
+        "",
+        &ws,
+        &engine(&ws, &[]),
+        trust(false),
+    );
     assert_eq!(got.input.parts, [text("See NOTES")]);
 }
 
@@ -493,7 +514,7 @@ fn a_shell_expansion_using_arguments_where_bash_evaluates_them_is_never_run() {
         let body = format!("Before !`{shell}` after");
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().canonicalize().unwrap();
-        let got = expand(&command(&body), "x y", &ws, &engine(&ws, &[]), false);
+        let got = expand(&command(&body), "x y", &ws, &engine(&ws, &[]), trust(false));
         assert_eq!(
             got.input.parts,
             [text(&format!("Before [not expanded: `{shell}`] after"))],
@@ -582,7 +603,7 @@ fn allowed_tools_cover_the_prelude() {
     let ws = dir.path().canonicalize().unwrap();
     let mut cmd = command("!`git log --grep \"$1\"`");
     cmd.allowed_tools = vec!["Bash(git log:*)".into()];
-    let got = expand(&cmd, "\"a b\" c", &ws, &engine(&ws, &[]), false);
+    let got = expand(&cmd, "\"a b\" c", &ws, &engine(&ws, &[]), trust(false));
     let [Shell(shell)] = got.input.parts.as_slice() else {
         panic!("{:?}", got.input.parts)
     };
@@ -606,7 +627,7 @@ fn allowed_tools_cover_the_prelude() {
         "x",
         &ws,
         &engine(&ws, &[]),
-        false,
+        trust(false),
     );
     assert!(
         plain.input.rules.allow.is_empty(),

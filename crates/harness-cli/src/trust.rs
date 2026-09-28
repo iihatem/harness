@@ -1,6 +1,7 @@
 use std::io::{BufRead, IsTerminal, Write};
 
 use harness_config::{config, paths::Paths, trust::TrustStore};
+use harness_context::project::project_root;
 
 use crate::term::terminal_safe;
 
@@ -52,10 +53,17 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
             return 2;
         }
     };
-    if widening.items.is_empty() {
+    // Command files come from the project root: trust given here covers them only there.
+    let root = project_root(&workspace);
+    if widening.items.is_empty() && root == workspace {
         // Trust still matters: a trusted workspace's command files may choose their model.
         println!(
             "No project settings in {} widen what the agent may do. Trusting it lets its command files choose their model, until such settings appear.",
+            workspace.display()
+        );
+    } else if widening.items.is_empty() {
+        println!(
+            "No project settings in {} widen what the agent may do.",
             workspace.display()
         );
     } else {
@@ -66,6 +74,13 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
         for item in &widening.items {
             println!("  - {}", terminal_safe(item));
         }
+    }
+    if root != workspace {
+        println!(
+            "Trusting {} does not cover the command files used there: they come from {}; run `harness trust` there to let them choose their model.",
+            workspace.display(),
+            root.display()
+        );
     }
     if !yes {
         if !std::io::stdin().is_terminal() {

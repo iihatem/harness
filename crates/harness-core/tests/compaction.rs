@@ -229,6 +229,126 @@ async fn reported_usage_counts_toward_the_threshold() {
     assert_eq!(compacted(&events).len(), 1, "{events:?}");
 }
 
+fn echo(id: &str, text: &str) -> Script {
+    Script::tool_call(id, "echo", serde_json::json!({ "text": text }))
+}
+
+/// Whether `request` asks to summarize nothing but an earlier summary.
+fn summarizes_only_a_summary(request: &harness_core::message::ChatRequest) -> bool {
+    let text = first_user(&request.messages);
+    let conversation = text.split("<conversation>\n").nth(1).unwrap_or_default();
+    conversation.starts_with(&format!("User: {SUMMARY_PREFIX}"))
+        && conversation.matches("\n\n").count() == 1
+}
+
+// Review F I1: in a long turn whose last step alone is over the keep budget, compaction must
+// still make the next request fit, and must never summarize just the earlier summary.
+#[tokio::test]
+async fn a_long_turn_is_compacted_to_its_last_step_and_the_next_request_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::text("ok"),
+        echo("c1", &"a".repeat(4_000)),
+        echo("c2", &"b".repeat(4_000)),
+        Script::text("first summary"),
+        echo("c3", &"c".repeat(4_000)),
+        Script::text("second summary"),
+        Script::text("done"),
+    ]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let window = 4_000;
+    agent.config_mut().context_window = window;
+    run(&mut agent, "first").await;
+    let (reason, events) = run(&mut agent, "do the work").await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    let done = compacted(&events);
+    assert_eq!(done.len(), 2, "{events:?}");
+    for (_, before, after) in &done {
+        assert!(after < before, "{done:?}");
+    }
+    let requests = provider.requests();
+    assert!(!requests.iter().any(summarizes_only_a_summary));
+    for (i, request) in requests.iter().enumerate() {
+        if i > 0 && is_summary_request(&requests[i - 1]) {
+            let tokens = request_tokens(&request.system, &request.tools, &request.messages);
+            assert!(tokens < window, "request {i} has {tokens} tokens");
+        }
+    }
+    // The step that did not fit the budget is kept as it was, with its result.
+    let last = &requests.last().unwrap().messages;
+    assert!(first_user(last).starts_with(SUMMARY_PREFIX));
+    assert!(matches!(&last[1], Message::Assistant { tool_calls, .. } if tool_calls[0].id == "c3"));
+    assert!(matches!(&last[2], Message::Tool { call_id, .. } if call_id == "c3"));
+}
+
+// Review F I1: a compaction that could not bring the estimate below the threshold is not
+// repeated at every step; automatic compaction waits until the estimate drops below it.
+#[tokio::test]
+async fn automatic_compaction_waits_until_the_estimate_drops_below_the_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::text("ok"),
+        // One step alone over the threshold.
+        echo("c1", &"z".repeat(14_000)),
+        Script::text("summary"),
+        echo("c2", "small"),
+        echo("c3", "small"),
+        Script::text("done"),
+    ]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    agent.config_mut().context_window = 4_000;
+    run(&mut agent, "first").await;
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    assert_eq!(compacted(&events).len(), 1, "{events:?}");
+    assert_eq!(
+        provider
+            .requests()
+            .iter()
+            .filter(|r| is_summary_request(r))
+            .count(),
+        1
+    );
+}
+
+// Review F minor 2: with nothing to compact yet (one large message), automatic compaction skips
+// quietly, and still happens once there is something to compact.
+#[tokio::test]
+async fn nothing_to_compact_yet_is_skipped_quietly() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        echo("c1", "small"),
+        Script::text("summary"),
+        Script::text("done"),
+    ]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    agent.config_mut().context_window = 4_000;
+    let (reason, events) = run(&mut agent, &"x".repeat(14_000)).await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Warning { .. })),
+        "{events:?}"
+    );
+    assert_eq!(compacted(&events).len(), 1, "{events:?}");
+}
+
 // Review F I2: compacting again must not cut the end off the earlier summary, where it says
 // what remains to be done.
 #[tokio::test]

@@ -85,6 +85,16 @@ pub fn cut(messages: &[Message], budget: u64) -> Option<usize> {
     first_kept.filter(|&i| i > 0)
 }
 
+/// Whether summarizing `messages` would summarize anything: they are more than, at most, an
+/// earlier summary.
+pub fn summarizes(messages: &[Message]) -> bool {
+    match messages {
+        [] => false,
+        [Message::User { content }] => !content.starts_with(SUMMARY_PREFIX),
+        _ => true,
+    }
+}
+
 /// The message that stands for the summarized part of the conversation.
 pub fn summary_message(summary: &str) -> Message {
     Message::User {

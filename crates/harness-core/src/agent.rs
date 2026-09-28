@@ -151,6 +151,26 @@ enum Trigger {
     Overflow,
 }
 
+/// Why the conversation was not compacted.
+#[derive(Debug)]
+enum CompactError {
+    /// Nothing before the part that is kept but, at most, an earlier summary.
+    NothingToCompact,
+    Interrupted,
+    /// The summary request failed; the text says why.
+    Failed(String),
+}
+
+impl std::fmt::Display for CompactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompactError::NothingToCompact => f.write_str("there is nothing to compact yet"),
+            CompactError::Interrupted => f.write_str("interrupted"),
+            CompactError::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
 /// How one model call (including its retries) ended.
 enum ModelOutcome {
     Reply(ModelReply),
@@ -187,6 +207,10 @@ pub struct Agent {
     next_call_id: u64,
     /// The model answering the current turn, when it is not the session's.
     turn_model: Option<TurnModel>,
+    /// Set when an automatic compaction left the estimate at or over the threshold: automatic
+    /// compaction then waits until the estimate drops below it, rather than repeat at every step
+    /// without shrinking anything.
+    auto_compaction_paused: bool,
 }
 
 impl Agent {
@@ -226,6 +250,7 @@ impl Agent {
             used_call_ids: HashSet::new(),
             next_call_id: 0,
             turn_model: None,
+            auto_compaction_paused: false,
         }
     }
 
@@ -554,18 +579,8 @@ impl Agent {
 
         let mut auto_compaction_failed = false;
         for _ in 0..self.config.max_steps {
-            if !auto_compaction_failed
-                && self.near_the_window()
-                && let Err(e) = self
-                    .compact_history(None, Trigger::Auto, events, &cancel)
-                    .await
-            {
-                auto_compaction_failed = true;
-                if !cancel.is_cancelled() {
-                    let _ = events.send(AgentEvent::Warning {
-                        message: format!("could not compact the conversation: {e}"),
-                    });
-                }
+            if !auto_compaction_failed {
+                auto_compaction_failed = !self.compact_automatically(events, &cancel).await;
             }
             let reply = match self.call_model_compacting(events, &cancel).await {
                 ModelOutcome::Reply(mut reply) => {
@@ -658,7 +673,43 @@ impl Agent {
         for message in self.warnings.drain(..) {
             let _ = events.send(AgentEvent::Warning { message });
         }
-        result
+        result.map_err(|e| e.to_string())
+    }
+
+    /// Compacts the conversation before a model call when the request would reach the threshold,
+    /// unless an earlier automatic compaction could not bring it below. Returns `false` when the
+    /// compaction failed (after a warning), so the turn stops trying.
+    async fn compact_automatically(
+        &mut self,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> bool {
+        if !self.near_the_window() {
+            self.auto_compaction_paused = false;
+            return true;
+        }
+        if self.auto_compaction_paused {
+            return true;
+        }
+        match self
+            .compact_history(None, Trigger::Auto, events, cancel)
+            .await
+        {
+            Ok(()) => {
+                self.auto_compaction_paused = self.near_the_window();
+                true
+            }
+            // One large message, say: nothing is wrong, and the next step may have more to
+            // compact.
+            Err(CompactError::NothingToCompact) => true,
+            Err(CompactError::Interrupted) => false,
+            Err(e) => {
+                let _ = events.send(AgentEvent::Warning {
+                    message: format!("could not compact the conversation: {e}"),
+                });
+                false
+            }
+        }
     }
 
     /// Estimated tokens of the next request: what the provider last reported plus an estimate
@@ -682,37 +733,79 @@ impl Agent {
 
     /// Whether the next request would reach the compaction threshold.
     fn near_the_window(&self) -> bool {
-        let threshold = self.config.context_window as f64 * self.config.compaction.threshold;
-        self.estimated_tokens() as f64 >= threshold
+        self.estimated_tokens() as f64 >= self.threshold_tokens()
+    }
+
+    /// The compaction threshold, in tokens.
+    fn threshold_tokens(&self) -> f64 {
+        self.config.context_window as f64 * self.config.compaction.threshold
+    }
+
+    /// Where the current turn starts: its user message (or the summary standing for it).
+    fn turn_start(&self) -> usize {
+        self.history
+            .iter()
+            .rposition(|m| matches!(m, Message::User { .. }))
+            .unwrap_or(0)
+    }
+
+    /// Where the last step starts: the last message that is not a tool result, so a model reply
+    /// and the results of its tool calls stay together.
+    fn last_step_start(&self) -> usize {
+        self.history
+            .iter()
+            .rposition(|m| !matches!(m, Message::Tool { .. }))
+            .unwrap_or(0)
+    }
+
+    /// Where the kept part starts when no recent part fits the keep budget: the current turn,
+    /// unless the turn itself reaches the threshold (or is only an earlier summary's), and then
+    /// its last step, so that what is kept fits.
+    fn fallback_cut(&self) -> usize {
+        let turn_start = self.turn_start();
+        let turn = compaction::request_tokens(
+            &self.config.system_prompt,
+            &self.tools.specs(),
+            &self.history[turn_start..],
+        );
+        if (turn as f64) < self.threshold_tokens()
+            && compaction::summarizes(&self.history[..turn_start])
+        {
+            turn_start
+        } else {
+            self.last_step_start()
+        }
     }
 
     /// Replaces the older part of the conversation by a summary. The kept part fits the
-    /// configured share of the window; failing that, automatic and overflow compaction keep the
-    /// current turn, and `/compact` summarizes everything. The summary is saved as a compaction
-    /// entry, so the summarized messages stay in the session and can be rewound to.
+    /// configured share of the window. Failing that, automatic compaction keeps the current
+    /// turn, or only its last step when the turn itself reaches the threshold; overflow
+    /// compaction keeps only the last step; and `/compact` summarizes everything. A part to
+    /// summarize that is only an earlier summary is nothing to compact. The summary is saved as a
+    /// compaction entry, so the summarized messages stay in the session and can be rewound to.
     async fn compact_history(
         &mut self,
         focus: Option<&str>,
         trigger: Trigger,
         events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
-    ) -> Result<(), String> {
+    ) -> Result<(), CompactError> {
         let window = self.config.context_window;
         let budget = (window as f64 * self.config.compaction.keep_recent) as u64;
         let fits = compaction::cut(&self.history, budget);
-        let turn_start = self
-            .history
-            .iter()
-            .rposition(|m| matches!(m, Message::User { .. }))
-            .unwrap_or(0);
         let cut = match trigger {
-            Trigger::Auto => fits.or(Some(turn_start)),
-            // The provider's window is smaller than assumed: keep no more than the current turn.
-            Trigger::Overflow => Some(fits.unwrap_or(0).max(turn_start)),
-            Trigger::Manual => fits.or(Some(self.history.len())),
+            Trigger::Auto => fits.unwrap_or_else(|| self.fallback_cut()),
+            // The provider's window is smaller than assumed: keep no more than the current turn,
+            // and only the last step when even that is over the budget.
+            Trigger::Overflow => match fits {
+                Some(fits) => fits.max(self.turn_start()),
+                None => self.last_step_start(),
+            },
+            Trigger::Manual => fits.unwrap_or(self.history.len()),
+        };
+        if !compaction::summarizes(&self.history[..cut]) {
+            return Err(CompactError::NothingToCompact);
         }
-        .filter(|&cut| cut > 0)
-        .ok_or("there is nothing to compact yet")?;
         let before = self.estimated_tokens();
         let model = self
             .turn_model
@@ -741,7 +834,7 @@ impl Agent {
         request: ChatRequest,
         events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
-    ) -> Result<String, String> {
+    ) -> Result<String, CompactError> {
         let provider = self
             .turn_model
             .as_ref()
@@ -761,11 +854,13 @@ impl Agent {
             };
             let result = tokio::select! {
                 result = collect => result,
-                _ = cancel.cancelled() => return Err("interrupted".into()),
+                _ = cancel.cancelled() => return Err(CompactError::Interrupted),
             };
             match result {
                 Ok(text) if text.trim().is_empty() => {
-                    return Err("the model returned an empty summary".into());
+                    return Err(CompactError::Failed(
+                        "the model returned an empty summary".into(),
+                    ));
                 }
                 Ok(text) => return Ok(text.trim().to_string()),
                 Err(error) if error.is_retryable() && attempt < self.config.retry.max_attempts => {
@@ -777,11 +872,11 @@ impl Agent {
                     });
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
-                        _ = cancel.cancelled() => return Err("interrupted".into()),
+                        _ = cancel.cancelled() => return Err(CompactError::Interrupted),
                     }
                     attempt += 1;
                 }
-                Err(error) => return Err(describe(&error)),
+                Err(error) => return Err(CompactError::Failed(describe(&error))),
             }
         }
     }

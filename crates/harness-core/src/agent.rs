@@ -55,6 +55,10 @@ pub enum RewindError {
         .0.display()
     )]
     OtherWorkspace(PathBuf),
+    #[error(
+        "files were changed after this message while checkpoints were off, so they cannot be restored to before it; rewind the conversation only, or pick a later message"
+    )]
+    Unrecorded,
     #[error("restoring files failed: {0}")]
     Restore(#[from] CheckpointError),
 }
@@ -398,12 +402,17 @@ impl Agent {
         if scope != RewindScope::Conversation {
             let checkpoints = self.checkpoints.clone().ok_or(RewindError::NoCheckpoints)?;
             // The workspace before that message is the first snapshot taken at or after it; with
-            // none, no change was made since.
+            // none, no change was made since. A turn before it that changed files without one
+            // leaves a gap that no snapshot covers.
             let checkpoint = branch[position..].iter().find_map(|e| match &e.kind {
-                EntryKind::Checkpoint { commit, workspace } => Some((commit, workspace)),
+                EntryKind::Checkpoint { commit, workspace } => Some(Some((commit, workspace))),
+                EntryKind::NoCheckpoint => Some(None),
                 _ => None,
             });
-            if let Some((commit, workspace)) = checkpoint {
+            if checkpoint == Some(None) {
+                return Err(RewindError::Unrecorded);
+            }
+            if let Some((commit, workspace)) = checkpoint.flatten() {
                 if let Some(taken) = workspace
                     .as_ref()
                     .filter(|w| **w != checkpoints.workspace())
@@ -493,10 +502,13 @@ impl Agent {
         if self.turn_checkpointed {
             return;
         }
+        self.turn_checkpointed = true;
+        // Without a snapshot, the session notes that files may have changed here, so no rewind
+        // restores code across this turn as if they had not.
         let Some(checkpoints) = self.checkpoints.clone() else {
+            self.append_turn_entry(EntryKind::NoCheckpoint);
             return;
         };
-        self.turn_checkpointed = true;
         let message = format!("before a turn of session {}", self.session.id());
         let workspace = checkpoints.workspace().to_path_buf();
         let result = tokio::task::spawn_blocking(move || checkpoints.snapshot(&message)).await;
@@ -526,6 +538,7 @@ impl Agent {
 
     fn disable_checkpoints(&mut self, why: &str, events: &UnboundedSender<AgentEvent>) {
         self.checkpoints = None;
+        self.append_turn_entry(EntryKind::NoCheckpoint);
         let _ = events.send(AgentEvent::Warning {
             message: format!("checkpoints are disabled for this session: {why}"),
         });

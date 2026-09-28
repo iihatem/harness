@@ -499,6 +499,15 @@ fn checkpoints_name_their_workspace_from_format_two_on() {
         "{}",
         saved[1]
     );
+    // Review E minor 6: a turn that changed files without a checkpoint is noted.
+    let (mut session, _) = Session::open(&path).unwrap();
+    session.append(EntryKind::NoCheckpoint);
+    drop(session);
+    let (session, _) = Session::open(&path).unwrap();
+    assert!(matches!(
+        session.branch().last().unwrap().kind,
+        EntryKind::NoCheckpoint
+    ));
 
     let old = session_file(dir.path(), "20260102T000000Z-0001", "20260102T000000Z-0001");
     let mut text = std::fs::read_to_string(&old).unwrap();

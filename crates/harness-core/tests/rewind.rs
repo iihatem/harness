@@ -468,3 +468,39 @@ async fn a_slash_commands_shell_part_is_rewound_with_its_turn() {
         .unwrap();
     assert_eq!(f.read("a.txt").as_deref(), Some("original\n"));
 }
+
+// Review E minor 6 (probe O): a turn that changed files while checkpoints were off leaves a gap no
+// snapshot covers, so code is not restored across it; later turns can still be rewound.
+#[tokio::test]
+async fn code_is_not_restored_across_a_turn_without_a_checkpoint() {
+    let f = fixture();
+    f.write("a.txt", "original");
+    f.write("b.txt", "original");
+    let session = Session::create(&f.data.join("sessions"), &f.ws);
+    let path = session.path().unwrap().to_path_buf();
+    let provider = MockProvider::new(vec![put("c1", "a.txt", "one"), Script::text("done")]);
+    let mut first = agent_with_sandbox(provider, Mode::Auto, Arc::new(NonInteractive), &f.ws)
+        .with_session(session)
+        .with_checkpoints(None);
+    run(&mut first, "turn one").await;
+    drop(first);
+    let (session, _) = Session::open(&path).unwrap();
+    let checkpoints =
+        Checkpoints::open(&f.data.join("checkpoints.git"), &f.ws, session.id()).unwrap();
+    let provider = MockProvider::new(vec![put("c2", "b.txt", "two"), Script::text("done")]);
+    let mut second = agent_with_sandbox(provider, Mode::Auto, Arc::new(NonInteractive), &f.ws)
+        .with_session(session)
+        .with_checkpoints(Some(Arc::new(checkpoints)));
+    run(&mut second, "turn two").await;
+    let one = point(&second, "turn one");
+    assert!(matches!(
+        second.rewind(&one, RewindScope::CodeAndConversation).await,
+        Err(RewindError::Unrecorded)
+    ));
+    assert_eq!(f.read("a.txt").as_deref(), Some("one"));
+    assert_eq!(f.read("b.txt").as_deref(), Some("two"));
+    let two = point(&second, "turn two");
+    second.rewind(&two, RewindScope::Code).await.unwrap();
+    assert_eq!(f.read("a.txt").as_deref(), Some("one"));
+    assert_eq!(f.read("b.txt").as_deref(), Some("original"));
+}

@@ -60,6 +60,9 @@ pub enum EntryKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace: Option<PathBuf>,
     },
+    /// The turn went on to change files, or may have, while checkpoints were off: no snapshot
+    /// holds the workspace before it, so code is never rewound past it.
+    NoCheckpoint,
     /// A rewind to just before the user message `target`. The active branch continues from this
     /// entry's parent. `from` is the leaf before the rewind, and `snapshot` the workspace just
     /// before files were restored, so the rewind can be undone.

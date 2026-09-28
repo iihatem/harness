@@ -5,7 +5,7 @@
 //! hook or file-system monitor runs.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     ffi::{OsStr, OsString},
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
@@ -21,8 +21,12 @@ pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long restoring files may take.
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
-/// Always left out of snapshots, besides what `.gitignore` files exclude.
+/// Always left out of snapshots, besides what `.gitignore` files exclude. git never walks past
+/// these directories, which keeps snapshots fast; [`EXCLUDED_DIRS`] keeps them out even where a
+/// `.gitignore` brings them back.
 const BUILTIN_EXCLUDES: &str = ".git\nnode_modules/\ntarget/\n";
+/// Directories left out of snapshots wherever they are.
+const EXCLUDED_DIRS: [&[u8]; 2] = [b"node_modules", b"target"];
 /// Attributes that outrank the workspace's `.gitattributes`, so every file is stored and restored
 /// byte for byte: no end-of-line conversion, keyword expansion, filter or re-encoding.
 const ATTRIBUTES: &str = "* -text -ident -filter !eol !working-tree-encoding\n";
@@ -57,8 +61,8 @@ pub struct Checkpoints {
     index: PathBuf,
     /// The index a restore builds its target in.
     scratch: PathBuf,
-    /// This session's large files, excluded from its next snapshot.
-    excludes: PathBuf,
+    /// Where this session writes the pathspecs it gives git, one per NUL-terminated line.
+    pathspecs: PathBuf,
     /// The ref that keeps this session's snapshots reachable.
     reference: String,
     timeout: Duration,
@@ -109,7 +113,7 @@ impl Checkpoints {
             workspace: workspace.to_path_buf(),
             index: gitdir.join("indexes").join(session_id),
             scratch: gitdir.join("indexes").join(format!("restore-{session_id}")),
-            excludes: gitdir.join("excludes").join(session_id),
+            pathspecs: gitdir.join("pathspecs").join(session_id),
             reference: format!("refs/harness/{session_id}"),
             timeout: SNAPSHOT_TIMEOUT,
             restore_timeout: RESTORE_TIMEOUT,
@@ -128,7 +132,7 @@ impl Checkpoints {
         std::fs::write(gitdir.join("info/exclude"), BUILTIN_EXCLUDES)?;
         std::fs::write(gitdir.join("info/attributes"), ATTRIBUTES)?;
         std::fs::create_dir_all(gitdir.join("indexes"))?;
-        std::fs::create_dir_all(gitdir.join("excludes"))?;
+        std::fs::create_dir_all(gitdir.join("pathspecs"))?;
         // Start from the last index any session wrote, so unchanged files are not hashed again.
         let shared = gitdir.join("index");
         if !checkpoints.index.exists() && shared.is_file() {
@@ -175,63 +179,46 @@ impl Checkpoints {
 
     fn snapshot_within(&self, message: &str, timeout: Duration) -> Result<String, CheckpointError> {
         let deadline = Instant::now() + timeout;
-        let listed = self.git_bytes(
-            &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ],
-            deadline,
-        )?;
-        let large: Vec<OsString> = listed
-            .split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .map(|p| OsStr::from_bytes(p).to_os_string())
-            .filter(|p| {
-                std::fs::symlink_metadata(self.workspace.join(p))
-                    .is_ok_and(|m| m.is_file() && m.len() > MAX_FILE_SIZE)
-            })
-            .collect();
-        let mut patterns = Vec::new();
-        for path in &large {
-            if let Some(pattern) = exclude_pattern(path.as_bytes()) {
-                patterns.extend_from_slice(&pattern);
-                patterns.push(b'\n');
+        // Everything in the index, and every file git would add.
+        let listed = self.list(&["--cached", "--others", "--exclude-standard"], deadline)?;
+        // What is left out whatever `.gitignore` files say: large files, and the directories
+        // always left out. They are given to git as literal pathspecs, which outrank ignore rules
+        // and match any name, a newline in it included.
+        let mut excluded: BTreeSet<&[u8]> = BTreeSet::new();
+        for path in &listed {
+            if let Some(dir) = excluded_dir(path) {
+                excluded.insert(dir);
+            } else if std::fs::symlink_metadata(self.workspace.join(OsStr::from_bytes(path)))
+                .is_ok_and(|m| m.is_file() && m.len() > MAX_FILE_SIZE)
+            {
+                excluded.insert(path);
             }
         }
-        std::fs::write(&self.excludes, patterns)?;
-        // Files an earlier snapshot holds that are now git-ignored leave the snapshots too.
-        let ignored = self.git_bytes(
-            &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--ignored",
-                "--exclude-standard",
-            ],
-            deadline,
-        )?;
-        let untrack: Vec<OsString> = ignored
-            .split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .map(|p| OsStr::from_bytes(p).to_os_string())
-            .chain(large)
+        // Files an earlier snapshot holds that are now git-ignored or excluded leave the snapshots.
+        let ignored = self.list(&["--cached", "--ignored", "--exclude-standard"], deadline)?;
+        let leaving: Vec<Vec<u8>> = ignored
+            .iter()
+            .map(Vec::as_slice)
+            .chain(excluded.iter().copied())
+            .map(|path| pathspec("top,literal", path))
             .collect();
-        for chunk in untrack.chunks(500) {
-            let mut args = vec![
-                OsString::from("update-index"),
-                "--force-remove".into(),
-                "--".into(),
-            ];
-            args.extend(chunk.iter().cloned());
-            self.git_os(&args, deadline)?;
+        if !leaving.is_empty() {
+            self.write_pathspecs(&leaving)?;
+            self.git_with_pathspecs(
+                &["rm", "--cached", "-r", "-f", "-q", "--ignore-unmatch"],
+                deadline,
+            )?;
         }
+        let mut adding = vec![b":(top)".to_vec()];
+        adding.extend(
+            excluded
+                .iter()
+                .map(|path| pathspec("top,exclude,literal", path)),
+        );
+        self.write_pathspecs(&adding)?;
         let mut add = self.command();
-        add.arg("-c")
-            .arg(format!("core.excludesFile={}", self.excludes.display()))
-            .args(["add", "-A", "--ignore-errors"]);
+        add.args(["add", "-A", "--ignore-errors"]);
+        add.arg(self.pathspec_file_arg()).arg("--pathspec-file-nul");
         // Exit code 1 means some files could not be read; everything else was added.
         match output_within(&mut add, remaining(deadline)?)? {
             None => return Err(CheckpointError::TooSlow),
@@ -328,6 +315,43 @@ impl Checkpoints {
             .collect())
     }
 
+    /// The paths `ls-files -z` lists with `options`.
+    fn list(&self, options: &[&str], deadline: Instant) -> Result<Vec<Vec<u8>>, CheckpointError> {
+        let mut args = vec!["ls-files", "-z"];
+        args.extend_from_slice(options);
+        Ok(split_nul(&self.git_bytes(&args, deadline)?))
+    }
+
+    /// Writes `pathspecs` where [`pathspec_file_arg`](Self::pathspec_file_arg) points git.
+    fn write_pathspecs(&self, pathspecs: &[Vec<u8>]) -> Result<(), CheckpointError> {
+        let mut bytes = Vec::new();
+        for pathspec in pathspecs {
+            bytes.extend_from_slice(pathspec);
+            bytes.push(0);
+        }
+        std::fs::write(&self.pathspecs, bytes)?;
+        Ok(())
+    }
+
+    fn pathspec_file_arg(&self) -> OsString {
+        let mut arg = OsString::from("--pathspec-from-file=");
+        arg.push(&self.pathspecs);
+        arg
+    }
+
+    /// Runs git with `args` and the pathspecs last written.
+    fn git_with_pathspecs(
+        &self,
+        args: &[&str],
+        deadline: Instant,
+    ) -> Result<String, CheckpointError> {
+        let mut cmd = self.command();
+        cmd.args(args)
+            .arg(self.pathspec_file_arg())
+            .arg("--pathspec-file-nul");
+        self.run(cmd, args[0], deadline)
+    }
+
     /// `git` with a clean environment: the shadow repository, the workspace as its work tree, this
     /// session's index, and no user or system configuration.
     fn command(&self) -> Command {
@@ -420,20 +444,33 @@ fn failure(command: &str, stderr: &[u8]) -> CheckpointError {
     }
 }
 
-/// A gitignore pattern matching exactly the workspace path `path`, or `None` for a path no
-/// pattern can express (one with a newline).
-fn exclude_pattern(path: &[u8]) -> Option<Vec<u8>> {
-    if path.contains(&b'\n') {
-        return None;
-    }
-    let mut out = vec![b'/'];
-    for &b in path {
-        if matches!(b, b'\\' | b'*' | b'?' | b'[' | b' ' | b'!' | b'#') {
-            out.push(b'\\');
+/// The NUL-separated items of git's `-z` output.
+fn split_nul(bytes: &[u8]) -> Vec<Vec<u8>> {
+    bytes
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// The pathspec `:(<magic>)<path>`.
+fn pathspec(magic: &str, path: &[u8]) -> Vec<u8> {
+    let mut out = format!(":({magic})").into_bytes();
+    out.extend_from_slice(path);
+    out
+}
+
+/// The directory always left out (see [`EXCLUDED_DIRS`]) that `path` lies in, if any.
+fn excluded_dir(path: &[u8]) -> Option<&[u8]> {
+    let mut start = 0;
+    while let Some(slash) = path[start..].iter().position(|b| *b == b'/') {
+        let end = start + slash;
+        if EXCLUDED_DIRS.contains(&&path[start..end]) {
+            return Some(&path[..end]);
         }
-        out.push(b);
+        start = end + 1;
     }
-    Some(out)
+    None
 }
 
 #[cfg(test)]
@@ -441,12 +478,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exclude_patterns_match_one_path_literally() {
-        assert_eq!(exclude_pattern(b"a/b.bin").unwrap(), b"/a/b.bin");
+    fn paths_in_always_excluded_directories_are_found() {
         assert_eq!(
-            exclude_pattern(b"#x/[y] *z?!").unwrap(),
-            br"/\#x/\[y]\ \*z\?\!".to_vec()
+            excluded_dir(b"node_modules/m.js"),
+            Some(&b"node_modules"[..])
         );
-        assert_eq!(exclude_pattern(b"new\nline"), None);
+        assert_eq!(
+            excluded_dir(b"web/node_modules/p/i.js"),
+            Some(&b"web/node_modules"[..])
+        );
+        assert_eq!(excluded_dir(b"a/target/debug/t"), Some(&b"a/target"[..]));
+        assert_eq!(excluded_dir(b"src/target"), None);
+        assert_eq!(excluded_dir(b"my-node_modules/x"), None);
+        assert_eq!(excluded_dir(b"x"), None);
     }
 }

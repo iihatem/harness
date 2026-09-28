@@ -412,3 +412,55 @@ fn a_git_that_does_not_answer_is_given_up_on() {
         start.elapsed()
     );
 }
+
+// Review E minor 8 (probe H): a large file whose name no ignore pattern can express is left out.
+#[test]
+fn a_large_file_with_a_newline_in_its_name_is_left_out() {
+    let f = fixture();
+    f.write("a.txt", "a\n");
+    let large = vec![b'x'; MAX_FILE_SIZE as usize + 1];
+    std::fs::write(f.ws.join("big\nname"), &large).unwrap();
+    let checkpoints = f.checkpoints();
+    let snapshot = checkpoints.snapshot("turn 1").unwrap();
+    assert_eq!(
+        checkpoints.files(&snapshot).unwrap(),
+        [PathBuf::from("a.txt")]
+    );
+}
+
+// Review E minor 8 (probe T): a .gitignore negation cannot bring back what snapshots always
+// leave out.
+#[test]
+fn gitignore_negations_do_not_outrank_the_size_limit_or_the_builtin_excludes() {
+    let f = fixture();
+    f.write(".gitignore", "*.tmp\n!big.bin\n!node_modules/\n!target/\n");
+    let large = vec![b'x'; MAX_FILE_SIZE as usize + 1];
+    std::fs::write(f.ws.join("big.bin"), &large).unwrap();
+    f.write("node_modules/m.js", "x\n");
+    f.write("web/node_modules/pkg/i.js", "x\n");
+    f.write("target/debug/t", "x\n");
+    f.write("src/target", "a file named target is kept\n");
+    let checkpoints = f.checkpoints();
+    let snapshot = checkpoints.snapshot("turn 1").unwrap();
+    assert_eq!(
+        checkpoints.files(&snapshot).unwrap(),
+        [PathBuf::from(".gitignore"), PathBuf::from("src/target")]
+    );
+    // What an earlier snapshot holds leaves later ones once it is excluded.
+    std::fs::write(f.ws.join("big.bin"), b"small").unwrap();
+    let small = checkpoints.snapshot("turn 2").unwrap();
+    assert!(
+        checkpoints
+            .files(&small)
+            .unwrap()
+            .contains(&PathBuf::from("big.bin"))
+    );
+    std::fs::write(f.ws.join("big.bin"), &large).unwrap();
+    let again = checkpoints.snapshot("turn 3").unwrap();
+    assert!(
+        !checkpoints
+            .files(&again)
+            .unwrap()
+            .contains(&PathBuf::from("big.bin"))
+    );
+}

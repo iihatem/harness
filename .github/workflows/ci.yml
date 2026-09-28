@@ -42,3 +42,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+  overlayfs:
+    # Docker on ubuntu-24.04 runners stores container layers on overlay2. The guard's own git
+    # repos are still made fresh inside the container (nothing new to copy up there), but this
+    # bakes the checkout into an image layer and runs the guard's Linux tests with the container's
+    # whole root filesystem, .git included, on overlay2, and with Docker's default seccomp profile
+    # blocking user namespaces, so the basic tier is what runs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: overlayfs
+      - name: Build the guard's test binaries
+        run: |
+          mkdir -p docker/tests
+          for t in git_guard linux_git_guard; do
+            bin=$(cargo test -p harness-sandbox --test "$t" --no-run --message-format=json \
+              | jq -r 'select(.executable != null) | .executable' | tail -n1)
+            cp "$bin" "docker/tests/$t"
+          done
+      - name: Run them in a container whose root filesystem is overlay2
+        run: |
+          printf 'target\n' > .dockerignore
+          cat > Dockerfile.overlayfs <<'EOF'
+          FROM ubuntu:24.04
+          RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+              && rm -rf /var/lib/apt/lists/*
+          COPY . /workspace
+          WORKDIR /workspace
+          EOF
+          docker build -f Dockerfile.overlayfs -t harness-overlayfs-test .
+          docker run --rm \
+            -e HARNESS_REQUIRE_LINUX_SANDBOX=1 \
+            -e HARNESS_EXPECT_LINUX_TIER=basic \
+            harness-overlayfs-test \
+            sh -c 'chmod +x docker/tests/git_guard docker/tests/linux_git_guard \
+              && ./docker/tests/git_guard --test-threads=1 \
+              && ./docker/tests/linux_git_guard --test-threads=1'

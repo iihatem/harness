@@ -251,3 +251,50 @@ fn sessions_of_one_project_keep_their_own_snapshots() {
     first.restore(&one).unwrap();
     assert_eq!(f.read("a.txt").as_deref(), Some("one\n"));
 }
+
+// Review E minor 9: the session id becomes paths in the shadow repository, and commit ids come
+// from the session file; neither may name anything else.
+#[test]
+fn session_ids_and_commit_ids_are_checked() {
+    let f = fixture();
+    for id in ["../escape", "a/b", "", "s 1"] {
+        assert!(
+            matches!(
+                Checkpoints::open(&f.gitdir, &f.ws, id),
+                Err(CheckpointError::InvalidSession(_))
+            ),
+            "{id:?}"
+        );
+    }
+    assert!(!f.gitdir.join("escape").exists());
+    f.write("a.txt", "one\n");
+    let checkpoints = f.checkpoints();
+    let snapshot = checkpoints.snapshot("turn 1").unwrap();
+    f.write("a.txt", "two\n");
+    let short = &snapshot[..12];
+    let upper = snapshot.to_uppercase();
+    for commit in [
+        "refs/harness/s1",
+        "HEAD",
+        "--help",
+        short,
+        upper.as_str(),
+        "",
+    ] {
+        assert!(
+            matches!(
+                checkpoints.restore(commit),
+                Err(CheckpointError::InvalidCommit(_))
+            ),
+            "{commit:?}"
+        );
+        assert!(
+            matches!(
+                checkpoints.files(commit),
+                Err(CheckpointError::InvalidCommit(_))
+            ),
+            "{commit:?}"
+        );
+    }
+    assert_eq!(f.read("a.txt").as_deref(), Some("two\n"));
+}

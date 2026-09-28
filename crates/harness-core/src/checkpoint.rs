@@ -34,6 +34,10 @@ pub enum CheckpointError {
     Git { command: String, message: String },
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    #[error("{0:?} is not a session id")]
+    InvalidSession(String),
+    #[error("{0:?} is not a snapshot id")]
+    InvalidCommit(String),
 }
 
 /// One session's checkpoints of a workspace.
@@ -69,6 +73,10 @@ impl Checkpoints {
         workspace: &Path,
         session_id: &str,
     ) -> Result<Checkpoints, CheckpointError> {
+        // The id names this session's index and ref.
+        if !crate::session::is_valid_id(session_id) {
+            return Err(CheckpointError::InvalidSession(session_id.to_string()));
+        }
         let found = Command::new(git)
             .arg("--version")
             .env_clear()
@@ -217,6 +225,7 @@ impl Checkpoints {
     /// left alone. Returns a snapshot of the workspace as it was just before, which restores it
     /// again.
     pub fn restore(&self, commit: &str) -> Result<String, CheckpointError> {
+        check_commit(commit)?;
         let before = self.snapshot_within("before a rewind", RESTORE_TIMEOUT)?;
         // Paths `commit` has that exist now but are not in `before` are files snapshots leave
         // out; restoring them would overwrite something no snapshot holds.
@@ -260,6 +269,7 @@ impl Checkpoints {
 
     /// The files a snapshot holds, relative to the workspace.
     pub fn files(&self, commit: &str) -> Result<Vec<PathBuf>, CheckpointError> {
+        check_commit(commit)?;
         Ok(self
             .tree_paths(commit)?
             .into_iter()
@@ -346,6 +356,19 @@ fn remaining(deadline: Instant) -> Result<Duration, CheckpointError> {
         return Err(CheckpointError::TooSlow);
     }
     Ok(deadline - now)
+}
+
+/// Fails unless `commit` is a full commit id as git prints it, so a session file can name only a
+/// snapshot, never a ref, a revision expression or an option.
+fn check_commit(commit: &str) -> Result<(), CheckpointError> {
+    let hex = commit
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if hex && matches!(commit.len(), 40 | 64) {
+        Ok(())
+    } else {
+        Err(CheckpointError::InvalidCommit(commit.to_string()))
+    }
 }
 
 fn failure(command: &str, stderr: &[u8]) -> CheckpointError {

@@ -637,6 +637,7 @@ impl Agent {
 
     /// The turn's user message: text parts as they are, and each shell part replaced by the output
     /// of running it as a `bash` tool call, with the same permission check, approval and sandbox.
+    /// Once the turn is interrupted, later shell parts are neither run nor asked about.
     async fn user_message(
         &mut self,
         parts: Vec<InputPart>,
@@ -646,6 +647,9 @@ impl Agent {
         for part in parts {
             match part {
                 InputPart::Text(text) => message.push_str(&text),
+                InputPart::Shell(command) if self.ctx.cancel.is_cancelled() => {
+                    message.push_str(&format!("[`{command}` not run: interrupted]"));
+                }
                 InputPart::Shell(command) => {
                     let mut call = [ToolCall {
                         id: String::new(),

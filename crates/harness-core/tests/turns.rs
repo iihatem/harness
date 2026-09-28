@@ -200,3 +200,60 @@ async fn a_read_only_shell_turn_runs_commands_read_only() {
             .contains("WorkspaceWrite access")
     );
 }
+
+/// Approves, and cancels `token` as it does: the user pressed Ctrl+C at the prompt.
+struct ApproveThenInterrupt {
+    token: tokio_util::sync::CancellationToken,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+#[async_trait::async_trait]
+impl harness_core::agent::Approver for ApproveThenInterrupt {
+    async fn decide(
+        &self,
+        request: &harness_core::agent::ApprovalRequest,
+    ) -> harness_core::agent::ApprovalDecision {
+        self.asked.lock().unwrap().push(request.reason.clone());
+        self.token.cancel();
+        harness_core::agent::ApprovalDecision::Approve
+    }
+}
+
+// Review C, minor 5: after an interrupt, later shell parts are neither run nor asked about.
+#[tokio::test]
+async fn shell_parts_after_an_interrupt_are_not_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::text("never")]);
+    let token = tokio_util::sync::CancellationToken::new();
+    let approver = Arc::new(ApproveThenInterrupt {
+        token: token.clone(),
+        asked: Default::default(),
+    });
+    let mut agent = agent_with_sandbox(provider.clone(), Mode::Ask, approver.clone(), dir.path());
+    let parts = vec![
+        InputPart::Shell("git diff".into()),
+        InputPart::Text("\n".into()),
+        InputPart::Shell("git status".into()),
+    ];
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let reason = agent.run_turn(input(parts), &tx, token).await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    assert_eq!(reason, TurnEndReason::Interrupted);
+    assert_eq!(*approver.asked.lock().unwrap(), ["run `git diff`"]);
+    let requested = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolCallRequested { .. }))
+        .count();
+    assert_eq!(requested, 1, "{events:?}");
+    assert!(provider.requests().is_empty());
+    match agent.history().last() {
+        Some(Message::User { content }) => assert_eq!(
+            content,
+            "ran `git diff` with WorkspaceWrite access\n[`git status` not run: interrupted]"
+        ),
+        other => panic!("{other:?}"),
+    }
+}

@@ -16,7 +16,7 @@ The system SHALL load the global `AGENTS.md` from the harness configuration dire
 - **THEN** `CLAUDE.md` from that directory is loaded
 
 ### Requirement: File imports are resolved safely
-The system SHALL expand `@<path>` import lines (lines holding only the import, outside code fences) in instruction files relative to the importing file, to a maximum depth of 5. Imports MUST be confined to the discovery root and the harness configuration directory; outside a repository they MUST be confined to the importing file's own directory and the harness configuration directory. Each file MUST be included at most once, and a missing or disallowed import MUST produce a warning rather than a failure. An instruction file found in the project that resolves, through symlinks, outside the discovery root and the harness configuration directory MUST be skipped with a warning.
+The system SHALL expand `@<path>` import lines (lines holding only the import, outside code fences) in instruction files relative to the importing file, to a maximum depth of 5. Imports MUST be confined to the discovery root and the harness configuration directory; outside a repository they MUST be confined to the importing file's own directory and the harness configuration directory. Each file MUST be included at most once, and a missing or disallowed import MUST produce a warning rather than a failure. An instruction file found in the project that resolves, through symlinks, outside the repository and the harness configuration directory MUST be skipped with a warning; outside a repository, one that resolves outside the directory it was found in and the harness configuration directory MUST be skipped with a warning.
 
 #### Scenario: CLAUDE.md importing AGENTS.md
 - **WHEN** a subdirectory has only a `CLAUDE.md` containing `@../AGENTS.md`, and the parent's `AGENTS.md` is already loaded
@@ -29,6 +29,10 @@ The system SHALL expand `@<path>` import lines (lines holding only the import, o
 #### Scenario: Instruction file linked to a secret
 - **WHEN** a repository's `AGENTS.md` is a symlink to `~/.aws/credentials`
 - **THEN** it is skipped with a warning and its target is not sent to the model
+
+#### Scenario: Instruction file outside a repository linked to a secret
+- **WHEN** a folder in the home directory that is not a repository, such as an extracted archive, has an `AGENTS.md` that is a symlink to `~/.aws/credentials`
+- **THEN** it is skipped with a warning and its target is not sent to the model, while a symlink to a file inside that folder is loaded
 
 ### Requirement: Environment information is captured at session start
 The system SHALL include the working directory, operating system, date, and, inside a git repository, the current branch and whether the work tree has uncommitted changes, all captured once when the session starts.

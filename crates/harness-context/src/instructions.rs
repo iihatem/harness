@@ -115,14 +115,21 @@ enum Import {
 }
 
 impl Loader {
-    /// Loads one discovered file. Project files must resolve inside the discovery root or the
-    /// config directory; the global file is the user's own and may link anywhere.
+    /// Loads one discovered file. The global file is the user's own and may link anywhere. A
+    /// project file must resolve inside the repository or the config directory; outside a
+    /// repository, where the discovery root can be the home directory, inside the directory it
+    /// was found in or the config directory, as its imports must.
     fn top_level(&mut self, path: &Path, global: bool) -> Option<InstructionFile> {
         if !path.exists() {
             return None;
         }
         let real = canonical(path);
-        if !global && !real.starts_with(&self.root) && !real.starts_with(&self.config_dir) {
+        let within = if self.in_repository {
+            self.root.clone()
+        } else {
+            canonical(path.parent().unwrap_or(Path::new("/")))
+        };
+        if !global && !real.starts_with(&within) && !real.starts_with(&self.config_dir) {
             self.warnings.push(format!(
                 "skipped {}: it links to {}, outside the project",
                 path.display(),

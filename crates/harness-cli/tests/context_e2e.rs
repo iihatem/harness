@@ -157,3 +157,43 @@ async fn large_instruction_files_and_bad_imports_are_reported() {
     .await
     .unwrap();
 }
+
+// Final review, critical 1 (probe p6): a folder under the home directory that is not a
+// repository, such as an extracted archive, whose `AGENTS.md` links to a secret elsewhere in the
+// home directory. The link is skipped with a warning and the secret never reaches the model.
+#[tokio::test(flavor = "multi_thread")]
+async fn outside_a_repository_an_instruction_file_linked_to_a_secret_is_not_sent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(stream(&[text_chunk("ok")]))
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri());
+    let base = tempfile::tempdir().unwrap();
+    let home = base.path().canonicalize().unwrap().join("home");
+    std::fs::create_dir_all(home.join(".aws")).unwrap();
+    std::fs::write(home.join(".aws/credentials"), "SECRET_SENTINEL\n").unwrap();
+    let evil = home.join("Downloads/evil");
+    std::fs::create_dir_all(&evil).unwrap();
+    std::os::unix::fs::symlink("../../.aws/credentials", evil.join("AGENTS.md")).unwrap();
+    let output = tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .current_dir(&evil)
+            .env("HOME", &home)
+            .args(["--mode", "plan", "ask", "hi"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("AGENTS.md: it links to") && stderr.contains("outside the project"),
+        "{stderr}"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body = String::from_utf8_lossy(&requests[0].body);
+    assert!(!body.contains("SECRET_SENTINEL"), "{body}");
+}

@@ -243,3 +243,41 @@ fn a_directory_named_agents_md_is_skipped_with_a_warning() {
     assert!(loaded.files.is_empty());
     assert!(loaded.warnings[0].contains("not a regular file"));
 }
+
+// Final review, critical 1: outside a repository the discovery root can be the home directory,
+// so a downloaded folder's instruction file that links elsewhere in the home directory (to
+// `~/.aws/credentials`, say) must be skipped, as its imports would be.
+#[test]
+fn outside_a_repository_an_instruction_file_linking_out_of_its_directory_is_skipped() {
+    let (_dir, base) = setup();
+    write(&base.join("home/.aws/credentials"), "SECRET=abc\n");
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let pkg = base.join(format!("home/dl/{name}-pkg"));
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::os::unix::fs::symlink("../../.aws/credentials", pkg.join(name)).unwrap();
+        let loaded = load(&base, &format!("home/dl/{name}-pkg"));
+        assert!(
+            !contents(&loaded).concat().contains("SECRET"),
+            "{name}: {:?}",
+            loaded.files
+        );
+        assert!(loaded.files.is_empty(), "{name}: {:?}", loaded.files);
+        assert_eq!(loaded.warnings.len(), 1, "{name}: {:?}", loaded.warnings);
+        assert!(
+            loaded.warnings[0].contains(&format!("skipped {}", pkg.join(name).display()))
+                && loaded.warnings[0].contains("outside the project"),
+            "{name}: {}",
+            loaded.warnings[0]
+        );
+    }
+}
+
+#[test]
+fn outside_a_repository_an_instruction_file_may_link_within_its_directory() {
+    let (_dir, base) = setup();
+    write(&base.join("home/dl/pkg/docs/agents.md"), "rules\n");
+    std::os::unix::fs::symlink("docs/agents.md", base.join("home/dl/pkg/AGENTS.md")).unwrap();
+    let loaded = load(&base, "home/dl/pkg");
+    assert_eq!(contents(&loaded), ["rules\n"]);
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+}

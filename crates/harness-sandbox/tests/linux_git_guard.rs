@@ -772,6 +772,13 @@ async fn the_watcher_quarantines_a_hook_while_the_command_runs() {
     let mut child = cmd.spawn().expect("spawn the sandboxed command");
     guard.started(child.id().expect("a pid"));
     env.wait_for_quarantine(".git/hooks/post-checkout").await;
+    // The hook can be moved between the shell's open and its write; the
+    // write still lands in the moved file, so wait for it before the kill.
+    wait_until("the hook's text reaches the quarantine", || {
+        std::fs::read_to_string(env.quarantined(".git/hooks/post-checkout"))
+            .is_ok_and(|text| text == "echo pwned\n")
+    })
+    .await;
     assert!(
         child.try_wait().unwrap().is_none(),
         "the command should still be running"

@@ -43,7 +43,7 @@ pub fn check(prompt: &str, commands: Option<&Commands>) -> Result<(), String> {
         ))
     } else if commands.get(invocation.name).is_none() {
         Err(format!(
-            "unknown command /{}; custom commands are Markdown files in .harness/commands, .claude/commands or .opencode/commands",
+            "unknown command /{}; custom commands are Markdown files in .harness/commands, .claude/commands or .opencode/commands; to send text that starts with / as a prompt, put a word before it (for example \"Note: /tmp is full\")",
             invocation.name
         ))
     } else {
@@ -95,24 +95,52 @@ pub fn turn_input(
     if let Some(model) = expansion.model {
         match registry::resolve(&model, &setup.config.providers, setup::env) {
             Ok(resolved) => {
-                eprintln!(
-                    "note: /{} runs on {}, as its command file asks",
-                    command.name,
-                    terminal_safe(&resolved.id)
-                );
+                eprintln!("{}", runs_on(&command.name, &resolved.id));
                 input.model = Some(TurnModel {
                     provider: resolved.provider,
                     id: resolved.id,
                     name: resolved.model,
                 });
             }
-            Err(e) => eprintln!(
-                "warning: /{} asks for model {}, which cannot be used ({}); using the session's model",
-                command.name,
-                terminal_safe(&model),
-                terminal_safe(&e.to_string())
-            ),
+            Err(e) => eprintln!("{}", cannot_use(&command.name, &model, &e.to_string())),
         }
     }
     input
+}
+
+/// The note that command `name` runs on `model`.
+fn runs_on(name: &str, model: &str) -> String {
+    format!(
+        "note: /{} runs on {}, as its command file asks",
+        terminal_safe(name),
+        terminal_safe(model)
+    )
+}
+
+/// The warning that command `name` asks for `model`, which `error` keeps from being used.
+fn cannot_use(name: &str, model: &str, error: &str) -> String {
+    format!(
+        "warning: /{} asks for model {}, which cannot be used ({}); using the session's model",
+        terminal_safe(name),
+        terminal_safe(model),
+        terminal_safe(error)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Review C, minor 7: a command's name is printed like any other text from a file.
+    #[test]
+    fn model_messages_print_the_command_name_safely() {
+        let name = "x\u{1b}[2J";
+        for message in [
+            runs_on(name, "mock/m"),
+            cannot_use(name, "mock/m", "unknown provider"),
+        ] {
+            assert!(!message.contains('\u{1b}'), "{message:?}");
+            assert!(message.contains("/x\\u{1b}[2J"), "{message:?}");
+        }
+    }
 }

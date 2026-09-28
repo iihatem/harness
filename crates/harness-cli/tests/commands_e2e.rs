@@ -242,7 +242,8 @@ async fn an_unknown_command_is_rejected_but_a_path_is_ordinary_text() {
             .args(["ask", "/nope", "x"])
             .assert()
             .code(2)
-            .stderr(contains("unknown command /nope"));
+            .stderr(contains("unknown command /nope"))
+            .stderr(contains("to send text that starts with /"));
         env.cmd()
             .args(["ask", "/usr/bin/env is missing"])
             .assert()

@@ -136,6 +136,41 @@ async fn init_shows_but_does_not_write_a_replacement_without_confirmation() {
     .unwrap();
 }
 
+// Review A: the model may improve an existing AGENTS.md with `edit` rather than `write`; a
+// headless run shows that change too.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_shows_but_does_not_make_an_edit_without_confirmation() {
+    let server = MockServer::start().await;
+    script(
+        &server,
+        call("c1", "read", json!({"path": "AGENTS.md"})),
+        call(
+            "c2",
+            "edit",
+            json!({"path": "AGENTS.md", "old_string": "old rules", "new_string": "new rules\nmore"}),
+        ),
+    )
+    .await;
+    let (home, ws) = env(&server.uri());
+    std::fs::write(ws.path().join("AGENTS.md"), "# Rules\nold rules\n").unwrap();
+    tokio::task::spawn_blocking(move || {
+        cmd(&home, &ws)
+            .args(["ask", "/init"])
+            .assert()
+            .code(3)
+            .stderr(contains("confirm rule `write:AGENTS.md`"))
+            .stderr(contains(
+                "proposed edit of AGENTS.md, replacing:\nold rules\nwith:\nnew rules\nmore",
+            ));
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("AGENTS.md")).unwrap(),
+            "# Rules\nold rules\n"
+        );
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn init_runs_shell_commands_read_only() {
     let server = MockServer::start().await;

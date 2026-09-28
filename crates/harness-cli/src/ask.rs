@@ -196,6 +196,7 @@ pub async fn run(
         &setup,
         &*policy,
     );
+    let checkpoints = crate::sessions::checkpoints(&setup, &session);
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin(),
@@ -204,7 +205,8 @@ pub async fn run(
         config,
         ctx,
     )
-    .with_session(session);
+    .with_session(session)
+    .with_checkpoints(checkpoints);
 
     let (tx, rx) = mpsc::unbounded_channel();
     let renderer = tokio::spawn(render(rx, json, cancel.clone()));

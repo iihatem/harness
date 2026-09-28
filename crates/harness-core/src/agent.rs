@@ -13,19 +13,44 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    checkpoint::{CheckpointError, Checkpoints},
     event::{AgentEvent, ErrorKind, TurnEndReason},
     message::{ChatRequest, Message, ToolCall},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
     permission::{Action, Decision, FsAccess, Mode, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
     retry::RetryPolicy,
-    session::{EntryKind, Session},
+    session::{Entry, EntryKind, RewindScope, Session},
     tool::{Tool, ToolContext, ToolOutput, ToolRegistry},
     turn::{InputPart, TurnInput, TurnModel},
 };
 
 /// Model calls allowed per turn unless configured otherwise.
 pub const DEFAULT_MAX_STEPS: u32 = 50;
+
+/// What the rewind list says about effects a rewind cannot undo.
+pub const REWIND_LIMITS: &str = "Rewinding restores files in the workspace only: network calls, databases, pushed commits and files outside the workspace stay as they are.";
+
+/// A user message the conversation can be rewound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewindPoint {
+    /// The session entry of the message.
+    pub entry: String,
+    /// What the user typed.
+    pub text: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RewindError {
+    #[error("there is no user message {0} in this conversation")]
+    UnknownPoint(String),
+    #[error("checkpoints are disabled for this session, so files cannot be restored")]
+    NoCheckpoints,
+    #[error("there is no rewind to undo")]
+    NothingToUndo,
+    #[error("restoring files failed: {0}")]
+    Restore(#[from] CheckpointError),
+}
 
 /// Settings for one agent session.
 #[derive(Debug, Clone)]
@@ -127,6 +152,10 @@ pub struct Agent {
     history_ids: Vec<String>,
     /// Warnings to report at the end of the current (or next) turn.
     warnings: Vec<String>,
+    /// Snapshots of the workspace; `None` when checkpoints are disabled.
+    checkpoints: Option<Arc<Checkpoints>>,
+    /// Whether the current turn already took its snapshot.
+    turn_checkpointed: bool,
     validators: HashMap<String, jsonschema::Validator>,
     invalid_calls: u32,
     /// Tool-call ids already used in this session, so a missing or repeated id (from a model or
@@ -166,6 +195,8 @@ impl Agent {
             history: Vec::new(),
             history_ids: Vec::new(),
             warnings: Vec::new(),
+            checkpoints: None,
+            turn_checkpointed: false,
             validators,
             invalid_calls: 0,
             used_call_ids: HashSet::new(),
@@ -214,8 +245,170 @@ impl Agent {
         self.history_ids = ids;
     }
 
+    /// Snapshots the workspace before each turn's first change, so it can be rewound.
+    pub fn with_checkpoints(mut self, checkpoints: Option<Arc<Checkpoints>>) -> Self {
+        self.checkpoints = checkpoints;
+        self
+    }
+
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// The user messages on the active branch, oldest first, for the rewind list. Notes from
+    /// harness are left out.
+    pub fn rewind_points(&self) -> Vec<RewindPoint> {
+        self.session
+            .branch()
+            .into_iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Message {
+                    message: Message::User { content },
+                    display,
+                    note: false,
+                } => Some(RewindPoint {
+                    entry: entry.id.clone(),
+                    text: display.clone().unwrap_or_else(|| content.clone()),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether the rewind list offers "undo last rewind": nothing has happened since the last
+    /// rewind.
+    pub fn can_undo_rewind(&self) -> bool {
+        self.session
+            .get(self.session.leaf())
+            .is_some_and(|e| matches!(e.kind, EntryKind::Rewind { .. }))
+    }
+
+    /// Rewinds to just before the user message `entry`: restores the workspace files, the
+    /// conversation, or both, as they were then. Restoring files first snapshots the workspace,
+    /// and rewinding the conversation starts a new branch, so the rewind can be undone.
+    pub async fn rewind(&mut self, entry: &str, scope: RewindScope) -> Result<(), RewindError> {
+        let branch: Vec<Entry> = self.session.branch().into_iter().cloned().collect();
+        let position = self
+            .rewind_points()
+            .iter()
+            .any(|p| p.entry == entry)
+            .then(|| branch.iter().position(|e| e.id == entry))
+            .flatten()
+            .ok_or_else(|| RewindError::UnknownPoint(entry.to_string()))?;
+        let mut snapshot = None;
+        if scope != RewindScope::Conversation {
+            let checkpoints = self.checkpoints.clone().ok_or(RewindError::NoCheckpoints)?;
+            // The workspace before that message is the first snapshot taken at or after it; with
+            // none, no change was made since.
+            let commit = branch[position..].iter().find_map(|e| match &e.kind {
+                EntryKind::Checkpoint { commit } => Some(commit.clone()),
+                _ => None,
+            });
+            if let Some(commit) = commit {
+                let restored =
+                    tokio::task::spawn_blocking(move || checkpoints.restore(&commit)).await;
+                snapshot = Some(restored.map_err(|e| CheckpointError::Io(e.into()))??);
+            }
+        }
+        let from = self.session.leaf().to_string();
+        let parent = match scope {
+            RewindScope::Code => from.clone(),
+            _ => branch[position]
+                .parent_id
+                .clone()
+                .expect("a user message has a parent"),
+        };
+        self.session.append_under(
+            &parent,
+            EntryKind::Rewind {
+                from,
+                target: entry.to_string(),
+                scope,
+                snapshot,
+            },
+        );
+        self.after_session_change();
+        Ok(())
+    }
+
+    /// Undoes the last rewind, when nothing has happened since: restores the files and the
+    /// conversation as they were just before it.
+    pub async fn undo_rewind(&mut self) -> Result<(), RewindError> {
+        let Some(Entry {
+            id,
+            kind: EntryKind::Rewind { from, snapshot, .. },
+            ..
+        }) = self.session.get(self.session.leaf()).cloned()
+        else {
+            return Err(RewindError::NothingToUndo);
+        };
+        if let Some(snapshot) = snapshot {
+            let checkpoints = self.checkpoints.clone().ok_or(RewindError::NoCheckpoints)?;
+            tokio::task::spawn_blocking(move || checkpoints.restore(&snapshot))
+                .await
+                .map_err(|e| CheckpointError::Io(e.into()))??;
+        }
+        self.session
+            .append_under(&from, EntryKind::UndoRewind { rewind: id });
+        self.after_session_change();
+        Ok(())
+    }
+
+    /// Reloads the history after the active branch moved, and notes a failure to save.
+    fn after_session_change(&mut self) {
+        self.load_history();
+        self.note_save_error();
+    }
+
+    /// Queues a warning, once, when the session file could not be written.
+    fn note_save_error(&mut self) {
+        if let Some(e) = self.session.take_save_error() {
+            self.warnings.push(format!(
+                "cannot save the session: {e}; the conversation continues but is no longer saved"
+            ));
+        }
+    }
+
+    /// Whether running `action` may change the workspace: a file write, or a shell command in a
+    /// mode that lets commands write.
+    fn is_mutating(&self, action: &Action) -> bool {
+        match action {
+            Action::Write(_) => true,
+            Action::Bash(_) => self.ctx.access == FsAccess::WorkspaceWrite,
+            Action::Read(_) => false,
+        }
+    }
+
+    /// Snapshots the workspace before the turn's first change. A snapshot that fails or takes
+    /// too long disables checkpoints for the rest of the session, with a warning; the turn goes on.
+    async fn checkpoint(&mut self, events: &UnboundedSender<AgentEvent>) {
+        if self.turn_checkpointed {
+            return;
+        }
+        let Some(checkpoints) = self.checkpoints.clone() else {
+            return;
+        };
+        self.turn_checkpointed = true;
+        let message = format!("before a turn of session {}", self.session.id());
+        let result = tokio::task::spawn_blocking(move || checkpoints.snapshot(&message)).await;
+        match result {
+            Ok(Ok(commit)) => {
+                self.session.append(EntryKind::Checkpoint {
+                    commit: commit.clone(),
+                });
+                self.note_save_error();
+                let _ = events.send(AgentEvent::CheckpointCreated { commit });
+            }
+            Ok(Err(e)) => self.disable_checkpoints(&e.to_string(), events),
+            Err(e) => self.disable_checkpoints(&e.to_string(), events),
+        }
+    }
+
+    fn disable_checkpoints(&mut self, why: &str, events: &UnboundedSender<AgentEvent>) {
+        self.checkpoints = None;
+        let _ = events.send(AgentEvent::Warning {
+            message: format!("checkpoints are disabled for this session: {why}"),
+        });
     }
 
     pub fn history(&self) -> &[Message] {
@@ -232,11 +425,7 @@ impl Agent {
         });
         self.history.push(message);
         self.history_ids.push(id);
-        if let Some(e) = self.session.take_save_error() {
-            self.warnings.push(format!(
-                "cannot save the session: {e}; the conversation continues but is no longer saved"
-            ));
-        }
+        self.note_save_error();
     }
 
     pub fn config_mut(&mut self) -> &mut AgentConfig {
@@ -273,6 +462,7 @@ impl Agent {
         let input = input.into();
         self.ctx.cancel = cancel.clone();
         self.invalid_calls = 0;
+        self.turn_checkpointed = false;
         // Settings that apply to this turn only.
         self.turn_model = input.model.clone();
         self.policy.set_turn_rules(Some(input.rules.clone()));
@@ -582,6 +772,7 @@ impl Agent {
         }
 
         let action = tool.action(&args, &self.ctx);
+        let mutating = self.is_mutating(&action);
         match self.policy.check(&action) {
             Decision::Allow => {}
             Decision::Deny(reason) => return ToolOutput::error(format!("denied: {reason}")),
@@ -620,6 +811,9 @@ impl Agent {
                     }
                 }
             }
+        }
+        if mutating {
+            self.checkpoint(events).await;
         }
         let output = tool.run(args.clone(), &self.ctx).await;
         if output.guard_blocked {

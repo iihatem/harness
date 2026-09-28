@@ -174,6 +174,50 @@ impl Tool for FakeBash {
     }
 }
 
+/// Writes `content` to `path`.
+pub struct Put;
+#[async_trait]
+impl Tool for Put {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "put",
+            json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}),
+        )
+    }
+    fn action(&self, args: &Value, ctx: &ToolContext) -> Action {
+        Action::Write(ctx.resolve(args["path"].as_str().unwrap_or_default()))
+    }
+    async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
+        let path = ctx.resolve(args["path"].as_str().unwrap_or_default());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, args["content"].as_str().unwrap_or_default()).unwrap();
+        ToolOutput::ok("written")
+    }
+}
+
+/// Runs `command` with `/bin/sh` in the workspace, unsandboxed.
+pub struct Sh;
+#[async_trait]
+impl Tool for Sh {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "sh",
+            json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
+        )
+    }
+    fn action(&self, args: &Value, _ctx: &ToolContext) -> Action {
+        Action::Bash(args["command"].as_str().unwrap_or_default().to_string())
+    }
+    async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", args["command"].as_str().unwrap_or_default()])
+            .current_dir(&ctx.workspace)
+            .status()
+            .unwrap();
+        ToolOutput::ok(format!("exit code {}\n", status.code().unwrap_or(-1)))
+    }
+}
+
 /// Approves everything, and records the reason of every approval it was asked for.
 #[derive(Default)]
 pub struct Recorder {
@@ -228,6 +272,8 @@ fn build(
         Arc::new(Boxed),
         Arc::new(GuardBlocked),
         Arc::new(FakeBash),
+        Arc::new(Put),
+        Arc::new(Sh),
     ]);
     let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode,

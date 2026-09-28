@@ -1,10 +1,13 @@
 //! Which session a run continues: a new one, the project's most recent (`-c`), or one by id
 //! (`--resume <id>`). `harness --resume` without an id lists the project's sessions.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use harness_context::project::{project_key, project_root};
-use harness_core::session::{self, Session};
+use harness_core::{
+    checkpoint::Checkpoints,
+    session::{self, Session},
+};
 
 use crate::{setup, setup::Setup, term::terminal_safe};
 
@@ -25,6 +28,27 @@ pub fn dir(setup: &Setup) -> PathBuf {
         .data_dir
         .join("sessions")
         .join(project_key(&project_root(&setup.workspace)))
+}
+
+/// The checkpoints of `session`, in the project's shadow repository. `None`, after a warning,
+/// when they cannot work (no `git` on `PATH`, or the repository cannot be created).
+pub fn checkpoints(setup: &Setup, session: &Session) -> Option<Arc<Checkpoints>> {
+    let key = project_key(&project_root(&setup.workspace));
+    let gitdir = setup
+        .paths
+        .data_dir
+        .join("checkpoints")
+        .join(format!("{key}.git"));
+    match Checkpoints::open(&gitdir, &setup.workspace, session.id()) {
+        Ok(checkpoints) => Some(Arc::new(checkpoints)),
+        Err(e) => {
+            eprintln!(
+                "warning: checkpoints are disabled: {}; turns run normally but cannot be rewound",
+                terminal_safe(&e.to_string())
+            );
+            None
+        }
+    }
 }
 
 /// Opens the session to run in, printing any warnings about its file. Errors are user-facing

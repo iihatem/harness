@@ -64,6 +64,10 @@ pub enum AgentEvent {
     Warning {
         message: String,
     },
+    /// The workspace was snapshotted before the turn's first change.
+    CheckpointCreated {
+        commit: String,
+    },
     TurnFinished {
         reason: TurnEndReason,
     },

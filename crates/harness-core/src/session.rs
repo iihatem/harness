@@ -45,6 +45,28 @@ pub enum EntryKind {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         note: bool,
     },
+    /// A snapshot of the workspace taken before the turn's first change.
+    Checkpoint { commit: String },
+    /// A rewind to just before the user message `target`. The active branch continues from this
+    /// entry's parent. `from` is the leaf before the rewind, and `snapshot` the workspace just
+    /// before files were restored, so the rewind can be undone.
+    Rewind {
+        from: String,
+        target: String,
+        scope: RewindScope,
+        snapshot: Option<String>,
+    },
+    /// Undoes the rewind `rewind`: the active branch continues from where that rewind started.
+    UndoRewind { rewind: String },
+}
+
+/// What a rewind restores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewindScope {
+    CodeAndConversation,
+    Code,
+    Conversation,
 }
 
 #[derive(Debug, thiserror::Error)]

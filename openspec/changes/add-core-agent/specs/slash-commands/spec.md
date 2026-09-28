@@ -23,7 +23,7 @@ The `/context` command SHALL show the active model's effective context window an
 - **THEN** the breakdown lists `AGENTS.md` with approximately 2,000 tokens and the remaining free space
 
 ### Requirement: Custom commands are discovered from compatible locations
-The system SHALL load Markdown command files from `.harness/commands/`, `.claude/commands/`, and `.opencode/commands/` in the project and from the `commands/` directory in the harness configuration directory and `~/.claude/commands/` globally, in that precedence order, with the first definition of a name winning. Subdirectories MUST become colon-separated namespaces. A custom command with the same name as a built-in MUST be ignored with a warning.
+The system SHALL load Markdown command files from `.harness/commands/`, `.claude/commands/`, and `.opencode/commands/` in the project and from the `commands/` directory in the harness configuration directory and `~/.claude/commands/` globally, in that precedence order, with the first definition of a name winning. Subdirectories MUST become colon-separated namespaces. A custom command with the same name as a built-in MUST be ignored with a warning. A project command file or commands directory that resolves, through symlinks, outside the project MUST be skipped with a warning; global command files MAY link anywhere.
 
 #### Scenario: Namespaced OpenSpec command
 - **WHEN** the project contains `.claude/commands/opsx/propose.md`
@@ -32,6 +32,14 @@ The system SHALL load Markdown command files from `.harness/commands/`, `.claude
 #### Scenario: Name collision with a built-in
 - **WHEN** the project contains `.claude/commands/help.md`
 - **THEN** `/help` remains the built-in and a warning is shown
+
+#### Scenario: A project command file linking to a secret
+- **WHEN** a cloned repository's `.claude/commands/x.md` is a symlink to `~/.ssh/id_rsa`
+- **THEN** `/x` is not available, a warning names the file, and nothing from it reaches the model
+
+#### Scenario: A global command file kept in a dotfiles repository
+- **WHEN** `~/.claude/commands/mine.md` is a symlink to `~/dotfiles/mine.md`
+- **THEN** `/mine` is available
 
 ### Requirement: Supported frontmatter
 The system SHALL honour the frontmatter fields `description`, `argument-hint`, `model`, and `allowed-tools`, and ignore unknown fields. `model` MUST apply only to that invocation, and a project command file's `model` MUST apply only when the workspace is trusted. `allowed-tools` MUST map Claude Code tool names (`Bash`, `Write`, `Edit`) and patterns such as `Bash(openspec:*)` to allow rules for that invocation only, and MUST NOT override deny rules, destructive-command confirmation, or the sandbox. `Read`, `Grep`, and `Glob` MUST NOT widen reads outside the workspace.

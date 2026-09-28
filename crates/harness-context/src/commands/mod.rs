@@ -95,32 +95,46 @@ pub fn is_builtin(name: &str) -> bool {
 }
 
 /// Finds the custom commands for a project rooted at `project_root` (the repository root, or the
-/// working directory outside a repository). Project command files must resolve inside the project;
-/// global ones inside their own commands directory.
+/// working directory outside a repository). Project command files must resolve inside the
+/// project, and a project commands directory that links outside it is skipped with a warning;
+/// global ones, the user's own, may link anywhere. A project commands directory that is also a
+/// global one (in the home directory) is read as global.
 pub fn discover(project_root: &Path, config_dir: &Path, home: Option<&Path>) -> Commands {
     let project = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
-    let mut dirs: Vec<(PathBuf, PathBuf, Scope)> = [".harness", ".claude", ".opencode"]
-        .iter()
-        .map(|d| {
-            let dir = project_root.join(d).join("commands");
-            (dir, project.clone(), Scope::Project)
-        })
-        .collect();
     let mut global = vec![config_dir.join("commands")];
     if let Some(home) = home {
         global.push(home.join(".claude/commands"));
     }
-    for dir in global {
-        let confine = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-        dirs.push((dir, confine, Scope::Global));
-    }
+    let global_real: Vec<PathBuf> = global
+        .iter()
+        .filter_map(|dir| dir.canonicalize().ok())
+        .collect();
     let mut found = Finder::default();
-    for (dir, confine, scope) in &dirs {
+    for sub in [".harness", ".claude", ".opencode"] {
+        let dir = project_root.join(sub).join("commands");
+        let Ok(real) = dir.canonicalize() else {
+            continue;
+        };
+        if !real.is_dir() || global_real.contains(&real) {
+            continue;
+        }
+        if !real.starts_with(&project) {
+            found.commands.warnings.push(format!(
+                "skipped {}: it links to {}, outside the project",
+                dir.display(),
+                real.display()
+            ));
+            continue;
+        }
+        found.scope = Scope::Project;
+        found.walk(&dir, Some(&project), &mut Vec::new());
+    }
+    for dir in &global {
         if dir.is_dir() {
-            found.scope = *scope;
-            found.walk(dir, confine, &mut Vec::new());
+            found.scope = Scope::Global;
+            found.walk(dir, None, &mut Vec::new());
         }
     }
     found.commands.custom.sort_by(|a, b| a.name.cmp(&b.name));
@@ -135,7 +149,8 @@ struct Finder {
 }
 
 impl Finder {
-    fn walk(&mut self, dir: &Path, confine: &Path, namespace: &mut Vec<String>) {
+    /// Reads the command files below `dir`. With `confine`, each must resolve inside it.
+    fn walk(&mut self, dir: &Path, confine: Option<&Path>, namespace: &mut Vec<String>) {
         if namespace.len() > MAX_DEPTH {
             return;
         }
@@ -163,7 +178,7 @@ impl Finder {
         }
     }
 
-    fn file(&mut self, path: &Path, confine: &Path, namespace: &[String], stem: &str) {
+    fn file(&mut self, path: &Path, confine: Option<&Path>, namespace: &[String], stem: &str) {
         let segments: Vec<&str> = namespace.iter().map(String::as_str).chain([stem]).collect();
         if segments
             .iter()
@@ -187,7 +202,9 @@ impl Finder {
             return;
         }
         let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if !real.starts_with(confine) {
+        if let Some(confine) = confine
+            && !real.starts_with(confine)
+        {
             self.commands.warnings.push(format!(
                 "ignored {}: it links to {}, outside {}",
                 path.display(),

@@ -238,3 +238,84 @@ fn arguments_split_on_whitespace_and_respect_quotes() {
     assert_eq!(split_args("\"\""), [""]);
     assert!(split_args("   ").is_empty());
 }
+
+// Decision 6: the user's own command files may link anywhere, as dotfiles managers do.
+#[test]
+fn a_global_command_may_link_anywhere() {
+    let (_dir, base) = setup();
+    write(&base.join("dotfiles/mine.md"), "mine");
+    write(&base.join("dotfiles/tool.md"), "tool");
+    std::fs::create_dir_all(base.join("home/.claude/commands")).unwrap();
+    std::fs::create_dir_all(base.join("config/commands")).unwrap();
+    std::os::unix::fs::symlink(
+        base.join("dotfiles/mine.md"),
+        base.join("home/.claude/commands/mine.md"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        base.join("dotfiles/tool.md"),
+        base.join("config/commands/tool.md"),
+    )
+    .unwrap();
+    let found = discover(&base);
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+    assert_eq!(found.get("mine").unwrap().body, "mine");
+    assert_eq!(found.get("mine").unwrap().scope, Scope::Global);
+    assert_eq!(found.get("tool").unwrap().body, "tool");
+}
+
+// Review B, minor 4: a project's commands directory that links elsewhere is not walked.
+#[test]
+fn a_project_commands_directory_linking_outside_the_project_is_skipped() {
+    let (_dir, base) = setup();
+    write(&base.join("elsewhere/x.md"), "x");
+    write(&base.join("other/commands/z.md"), "z");
+    std::fs::create_dir_all(base.join("project/.claude")).unwrap();
+    std::os::unix::fs::symlink(
+        base.join("elsewhere"),
+        base.join("project/.claude/commands"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(base.join("other"), base.join("project/.opencode")).unwrap();
+    let found = discover(&base);
+    assert!(found.get("x").is_none() && found.get("z").is_none());
+    assert_eq!(found.warnings.len(), 2, "{:?}", found.warnings);
+    assert!(
+        found
+            .warnings
+            .iter()
+            .all(|w| w.contains("outside the project")),
+        "{:?}",
+        found.warnings
+    );
+}
+
+// One inside the project is read: its files are inside the project too.
+#[test]
+fn a_project_commands_directory_linking_inside_the_project_is_read() {
+    let (_dir, base) = setup();
+    write(&base.join("project/tools/commands/y.md"), "y");
+    std::fs::create_dir_all(base.join("project/.opencode")).unwrap();
+    std::os::unix::fs::symlink("../tools/commands", base.join("project/.opencode/commands"))
+        .unwrap();
+    let found = discover(&base);
+    assert_eq!(found.get("y").unwrap().body, "y");
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}
+
+// Review C, minor 6: run from the home directory, the user's own commands stay global.
+#[test]
+fn commands_in_the_home_directory_stay_global_when_it_is_the_project() {
+    let (_dir, base) = setup();
+    write(
+        &base.join("home/.claude/commands/h.md"),
+        "---\nmodel: m/x\n---\nmine",
+    );
+    let found = commands::discover(
+        &base.join("home"),
+        &base.join("config"),
+        Some(&base.join("home")),
+    );
+    assert_eq!(found.get("h").unwrap().scope, Scope::Global);
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}

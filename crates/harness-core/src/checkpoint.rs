@@ -23,6 +23,13 @@ pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Always left out of snapshots, besides what `.gitignore` files exclude.
 const BUILTIN_EXCLUDES: &str = ".git\nnode_modules/\ntarget/\n";
+/// Attributes that outrank the workspace's `.gitattributes`, so every file is stored and restored
+/// byte for byte: no end-of-line conversion, keyword expansion, filter or re-encoding.
+const ATTRIBUTES: &str = "* -text -ident -filter !eol !working-tree-encoding\n";
+/// Settings given on every git command line, where they outrank the shadow repository's own
+/// configuration: whatever that file says, git runs no file-system monitor or hook. (Commits are
+/// made with `--no-gpg-sign`, so no signing program runs either.)
+const OVERRIDES: [&str; 2] = ["core.fsmonitor=false", "core.hooksPath=/dev/null"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointError {
@@ -106,6 +113,7 @@ impl Checkpoints {
         }
         std::fs::create_dir_all(gitdir.join("info"))?;
         std::fs::write(gitdir.join("info/exclude"), BUILTIN_EXCLUDES)?;
+        std::fs::write(gitdir.join("info/attributes"), ATTRIBUTES)?;
         std::fs::create_dir_all(gitdir.join("indexes"))?;
         std::fs::create_dir_all(gitdir.join("excludes"))?;
         // Start from the last index any session wrote, so unchanged files are not hashed again.
@@ -207,7 +215,7 @@ impl Checkpoints {
                 remaining(deadline)?,
             )
             .ok();
-        let mut commit_args = vec!["commit-tree", tree.as_str(), "-m", message];
+        let mut commit_args = vec!["commit-tree", "--no-gpg-sign", tree.as_str(), "-m", message];
         if let Some(parent) = &parent {
             commit_args.extend(["-p", parent.as_str()]);
         }
@@ -293,6 +301,9 @@ impl Checkpoints {
     /// session's index, and no user or system configuration.
     fn command(&self) -> Command {
         let mut cmd = Command::new(&self.git);
+        for setting in OVERRIDES {
+            cmd.args(["-c", setting]);
+        }
         cmd.env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.gitdir)

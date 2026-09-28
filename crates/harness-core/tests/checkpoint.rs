@@ -298,3 +298,67 @@ fn session_ids_and_commit_ids_are_checked() {
     }
     assert_eq!(f.read("a.txt").as_deref(), Some("two\n"));
 }
+
+// Review E minor 7: the workspace's .gitattributes cannot change the bytes a restore writes.
+#[test]
+fn a_restore_is_byte_exact_whatever_gitattributes_say() {
+    let f = fixture();
+    f.write(".gitattributes", "* text=auto eol=lf\n*.id ident\n");
+    std::fs::write(f.ws.join("win.txt"), b"a\r\nb\r\n").unwrap();
+    std::fs::write(f.ws.join("x.id"), b"$Id$\n").unwrap();
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    std::fs::write(f.ws.join("win.txt"), b"agent\n").unwrap();
+    std::fs::remove_file(f.ws.join("x.id")).unwrap();
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(std::fs::read(f.ws.join("win.txt")).unwrap(), b"a\r\nb\r\n");
+    assert_eq!(std::fs::read(f.ws.join("x.id")).unwrap(), b"$Id$\n");
+}
+
+// Review E minor 9: the shadow repository's own configuration cannot make git run a program.
+#[test]
+fn programs_named_in_the_shadow_config_do_not_run() {
+    let f = fixture();
+    f.write("a.txt", "one\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    let marker = f.ws.parent().unwrap().join("ran");
+    let script = f.ws.parent().unwrap().join("evil.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$0 $*\" >> {}\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let hooks = f.ws.parent().unwrap().join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    for hook in [
+        "pre-commit",
+        "post-commit",
+        "reference-transaction",
+        "post-index-change",
+    ] {
+        std::fs::copy(&script, hooks.join(hook)).unwrap();
+    }
+    let config = f.gitdir.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "[core]\n\tfsmonitor = {s}\n\thooksPath = {h}\n[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = {s}\n",
+        s = script.display(),
+        h = hooks.display()
+    ));
+    std::fs::write(&config, text).unwrap();
+    f.write("a.txt", "two\n");
+    let second = checkpoints.snapshot("turn 2").unwrap();
+    checkpoints.restore(&first).unwrap();
+    checkpoints.restore(&second).unwrap();
+    assert_eq!(f.read("a.txt").as_deref(), Some("two\n"));
+    assert!(
+        !marker.exists(),
+        "{}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+}

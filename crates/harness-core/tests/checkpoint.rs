@@ -822,3 +822,32 @@ fn a_directory_holding_an_empty_nested_repository_is_never_removed() {
         Some("the user's work\n")
     );
 }
+
+// Review E minor 13: a private file comes back private, not with the default mode git gives it.
+#[test]
+fn private_files_come_back_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let set = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let f = fixture();
+    f.write(".env", "SECRET=1\n");
+    set(&f.ws.join(".env"), 0o600);
+    f.write("id_key", "key\n");
+    set(&f.ws.join("id_key"), 0o400);
+    f.write("run.sh", "#!/bin/sh\n");
+    set(&f.ws.join("run.sh"), 0o755);
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    std::fs::remove_file(f.ws.join(".env")).unwrap();
+    std::fs::remove_file(f.ws.join("id_key")).unwrap();
+    f.write("id_key", "replaced by the agent\n");
+    f.write("run.sh", "#!/bin/sh\necho changed\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(f.read(".env").as_deref(), Some("SECRET=1\n"));
+    assert_eq!(mode(&f.ws.join(".env")), 0o600);
+    assert_eq!(f.read("id_key").as_deref(), Some("key\n"));
+    assert_eq!(mode(&f.ws.join("id_key")), 0o400);
+    assert_eq!(mode(&f.ws.join("run.sh")) & 0o100, 0o100);
+}

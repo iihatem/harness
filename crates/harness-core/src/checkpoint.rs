@@ -5,10 +5,13 @@
 //! hook or file-system monitor runs.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     ffi::{OsStr, OsString},
     io::Read,
-    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -30,6 +33,9 @@ const BUILTIN_EXCLUDES: &str = ".git\nnode_modules/\ntarget/\n/.harness/\n/HEAD\
 const EXCLUDED_DIRS: [&[u8]; 2] = [b"node_modules", b"target"];
 /// The first item of a snapshot's record, which says how to read the rest.
 const RECORD_MAGIC: &[u8] = b"harness snapshot record 1";
+/// How many private files a snapshot records the mode of at most. (Past that many, the user's
+/// umask most likely makes every new file private anyway.)
+const MAX_PRIVATE_MODES: usize = 10_000;
 /// How many paths, and how many bytes of them, one git command line carries at most.
 const ARGS_PER_COMMAND: (usize, usize) = (500, 64 * 1024);
 /// Names left out at the top of the workspace, in any case: harness's project settings, and a
@@ -247,13 +253,26 @@ impl Checkpoints {
         // and match any name, a newline in it included.
         let mut excluded_dirs: BTreeSet<&[u8]> = BTreeSet::new();
         let mut large: BTreeSet<&[u8]> = BTreeSet::new();
+        // git stores only whether a file is executable, and restores the rest from the umask:
+        // the snapshot records the mode of files only their owner may read.
+        let mut record = Record::default();
         for path in &listed {
             if let Some(dir) = excluded_dir(path) {
                 excluded_dirs.insert(dir);
-            } else if std::fs::symlink_metadata(self.root.join(OsStr::from_bytes(path)))
-                .is_ok_and(|m| m.is_file() && m.len() > MAX_FILE_SIZE)
-            {
+                continue;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(self.root.join(OsStr::from_bytes(path)))
+            else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let mode = meta.permissions().mode() & 0o7777;
+            if meta.len() > MAX_FILE_SIZE {
                 large.insert(path);
+            } else if mode & 0o077 == 0 && record.modes.len() < MAX_PRIVATE_MODES {
+                record.modes.insert(path.clone(), mode);
             }
         }
         let excluded: Vec<&[u8]> = excluded_dirs.iter().chain(&large).copied().collect();
@@ -307,7 +326,6 @@ impl Checkpoints {
         // What exists but the snapshot leaves out, so that a restore to it never removes that:
         // large files, the directories always left out, what git ignores, and what it could not
         // read.
-        let mut record = Record::default();
         record
             .left_out
             .extend(large.iter().map(|path| path.to_vec()));
@@ -471,7 +489,7 @@ impl Checkpoints {
         };
         // Paths `commit` holds that `before` does not are written only where that removes
         // nothing that no snapshot holds.
-        let skipped: Vec<&[u8]> = then
+        let skipped: HashSet<&[u8]> = then
             .iter()
             .map(|e| e.path.as_slice())
             .filter(|p| !now_paths.contains(p) && self.blocked(p, &current))
@@ -485,10 +503,33 @@ impl Checkpoints {
         let tree = if skipped.is_empty() && kept.is_empty() {
             format!("{commit}^{{tree}}")
         } else {
+            let skipped: Vec<&[u8]> = skipped.iter().copied().collect();
             self.build_tree(commit, &skipped, &kept, deadline)?
         };
         self.git(&["read-tree", "--reset", "-u", &tree], remaining(deadline)?)?;
+        for (path, mode) in &target.modes {
+            if then_paths.contains(path.as_slice()) && !skipped.contains(path.as_slice()) {
+                self.set_mode(path, *mode);
+            }
+        }
         Ok(())
+    }
+
+    /// Gives the regular file at `path` the permissions `mode`; never follows a symlink there.
+    fn set_mode(&self, path: &[u8], mode: u32) {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(self.root.join(OsStr::from_bytes(path)))
+        else {
+            return;
+        };
+        if file
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o7777 != mode)
+        {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
+        }
     }
 
     /// Whether writing the target's file at `path`, which `before` does not hold, would remove
@@ -828,20 +869,28 @@ fn read_small_file(path: &Path) -> Option<String> {
     Some(text)
 }
 
-/// What a snapshot knows besides its files: the paths that existed but were left out (large,
-/// ignored or unreadable files, and whole directories, which end with `/`), relative to the root.
+/// What a snapshot knows besides its files, with paths relative to the root: the paths that
+/// existed but were left out (large, ignored or unreadable files, and whole directories, which end
+/// with `/`), and the permissions of its private files.
 #[derive(Debug, Default)]
 struct Record {
     left_out: BTreeSet<Vec<u8>>,
+    modes: BTreeMap<Vec<u8>, u32>,
 }
 
 impl Record {
-    /// NUL-terminated items: [`RECORD_MAGIC`], then `left-out <path>` for each path.
+    /// NUL-terminated items: [`RECORD_MAGIC`], then `left-out <path>` for each path left out,
+    /// and `mode <octal> <path>` for each private file.
     fn encode(&self) -> Vec<u8> {
         let mut out = RECORD_MAGIC.to_vec();
         out.push(0);
         for path in &self.left_out {
             out.extend_from_slice(b"left-out ");
+            out.extend_from_slice(path);
+            out.push(0);
+        }
+        for (path, mode) in &self.modes {
+            out.extend_from_slice(format!("mode {mode:o} ").as_bytes());
             out.extend_from_slice(path);
             out.push(0);
         }
@@ -857,6 +906,13 @@ impl Record {
         for item in items {
             if let Some(path) = item.strip_prefix(b"left-out ") {
                 record.left_out.insert(path.to_vec());
+            } else if let Some(rest) = item.strip_prefix(b"mode ") {
+                let space = rest.iter().position(|b| *b == b' ')?;
+                let mode = std::str::from_utf8(&rest[..space]).ok()?;
+                let mode = u32::from_str_radix(mode, 8).ok()?;
+                record
+                    .modes
+                    .insert(rest[space + 1..].to_vec(), mode & 0o7777);
             }
         }
         Some(record)
@@ -980,8 +1036,10 @@ mod tests {
         for path in [&b".env"[..], b"build/", b"odd\nname", b"web/node_modules/"] {
             record.left_out.insert(path.to_vec());
         }
+        record.modes.insert(b"id key".to_vec(), 0o600);
         let decoded = Record::decode(&record.encode()).unwrap();
         assert_eq!(decoded.left_out, record.left_out);
+        assert_eq!(decoded.modes, record.modes);
         assert!(decoded.covers(b".env"));
         assert!(decoded.covers(b"build/out.o"));
         assert!(decoded.covers(b"build/deep/er.o"));

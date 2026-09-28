@@ -533,7 +533,7 @@ impl Agent {
         self.ctx.access = mode.fs_access();
         self.record(
             Message::User {
-                content: mode_note(mode),
+                content: mode_note(mode, self.ctx.sandbox.is_some()),
             },
             None,
             true,
@@ -1044,7 +1044,7 @@ impl Agent {
         let request = ChatRequest {
             model,
             system: self.config.system_prompt.clone(),
-            messages: self.history.clone(),
+            messages: request_messages(&self.history),
             tools: self.tools.specs(),
         };
         let mut stream = provider.stream(request);
@@ -1285,21 +1285,54 @@ fn stopped_result(call_id: String) -> Message {
     }
 }
 
-/// The note appended to the conversation when the approval mode changes.
-fn mode_note(mode: Mode) -> String {
+/// The note appended to the conversation when the approval mode changes to `mode`, saying what it
+/// allows with or without an OS sandbox for shell commands (`sandboxed`), as the base system
+/// prompt does.
+fn mode_note(mode: Mode, sandboxed: bool) -> String {
     let rules = match mode {
-        Mode::Plan | Mode::ReadOnly => "file edits are refused and shell commands can only read",
-        Mode::Ask => {
-            "file edits and shell commands need the user's approval unless a rule allows them"
+        Mode::Plan | Mode::ReadOnly if sandboxed => {
+            "file edits are refused, and shell commands run in a read-only sandbox"
         }
-        Mode::Auto => {
+        Mode::Plan | Mode::ReadOnly => {
+            "file edits and shell commands are refused, since no OS sandbox is active; use the read, grep and glob tools"
+        }
+        Mode::Ask if sandboxed => {
+            "file edits and sandboxed shell commands need the user's approval unless a rule allows them"
+        }
+        Mode::Ask => {
+            "file edits need the user's approval unless a rule allows them, and every shell command needs approval, since no OS sandbox is active"
+        }
+        Mode::Auto if sandboxed => {
             "file edits in the workspace and sandboxed shell commands run without approval"
         }
+        Mode::Auto => {
+            "every shell command needs approval, since no OS sandbox is active; use the file tools instead"
+        }
+        Mode::FullAccess if sandboxed => {
+            "actions run without approval, except those a deny rule forbids or may match; shell commands still run in the sandbox"
+        }
         Mode::FullAccess => {
-            "actions run without approval or sandbox, except those a deny rule forbids"
+            "actions run without approval or sandbox, except those a deny rule forbids or may match"
         }
     };
     format!("[harness] The approval mode is now {mode}: {rules}.")
+}
+
+/// `history` as sent to a provider. Consecutive user messages, such as a mode-change note and the
+/// next prompt, become one: some chat templates reject two user messages in a row. The session
+/// keeps them apart.
+fn request_messages(history: &[Message]) -> Vec<Message> {
+    let mut messages: Vec<Message> = Vec::with_capacity(history.len());
+    for message in history {
+        match (messages.last_mut(), message) {
+            (Some(Message::User { content: joined }), Message::User { content }) => {
+                joined.push_str("\n\n");
+                joined.push_str(content);
+            }
+            _ => messages.push(message.clone()),
+        }
+    }
+    messages
 }
 
 /// A human-readable error message for the user.

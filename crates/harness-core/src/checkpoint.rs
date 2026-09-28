@@ -15,7 +15,7 @@ use std::{
     io::Read,
     os::unix::{
         ffi::OsStrExt,
-        fs::{OpenOptionsExt, PermissionsExt},
+        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     process::Command,
@@ -791,10 +791,29 @@ impl Checkpoints {
     /// Makes again, with their permissions, the directories of `dirs` a restore removed. The
     /// process's working directory, `cwd` before the restore, is set again if it was one of them.
     fn recreate(&self, dirs: &[(PathBuf, u32)], cwd: Option<&Path>) {
+        // Outermost first, and never through a symlink: whatever else now stands where a
+        // directory was (a symlink planted by a process racing the restore, say) stops it.
         for (dir, mode) in dirs {
-            if std::fs::symlink_metadata(dir).is_err() && std::fs::create_dir(dir).is_ok() {
-                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(*mode));
+            match std::fs::symlink_metadata(dir) {
+                Ok(meta) if meta.is_dir() => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                _ => break,
             }
+            if std::fs::DirBuilder::new().mode(*mode).create(dir).is_err() {
+                break;
+            }
+            // Its permissions exactly, whatever the umask, on the directory just made.
+            let Ok(made) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(dir)
+            else {
+                break;
+            };
+            if !made.metadata().is_ok_and(|m| m.is_dir()) {
+                break;
+            }
+            let _ = made.set_permissions(std::fs::Permissions::from_mode(*mode));
         }
         if let Some(cwd) = cwd
             && std::env::current_dir().is_err()
@@ -1478,6 +1497,32 @@ mod tests {
             Some(b"x': ': odd/".to_vec())
         );
         assert_eq!(unopened_directory(b"warning: something else"), None);
+    }
+
+    // Re-review E: making the removed directories again never follows a symlink: one planted
+    // where a directory was (by a process racing the restore) stops it.
+    #[test]
+    fn removed_directories_are_made_again_without_following_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let checkpoints = Checkpoints::open(&base.join("data/p.git"), &ws, "s1").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("a")).unwrap();
+        checkpoints.recreate(&[(ws.join("a"), 0o755), (ws.join("a/b"), 0o750)], None);
+        assert!(!outside.join("b").exists());
+        assert!(
+            std::fs::symlink_metadata(ws.join("a"))
+                .unwrap()
+                .is_symlink()
+        );
+        // A directory made again gets exactly its permissions back, whatever the umask.
+        checkpoints.recreate(&[(ws.join("c"), 0o777), (ws.join("c/d"), 0o700)], None);
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&ws.join("c")), 0o777);
+        assert_eq!(mode(&ws.join("c/d")), 0o700);
     }
 
     #[test]

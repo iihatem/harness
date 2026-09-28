@@ -179,7 +179,7 @@ impl Checkpoints {
             .as_os_str()
             .as_bytes()
             .to_vec();
-        let checkpoints = Checkpoints {
+        let mut checkpoints = Checkpoints {
             git: git.to_path_buf(),
             gitdir: gitdir.to_path_buf(),
             workspace: workspace.to_path_buf(),
@@ -213,6 +213,13 @@ impl Checkpoints {
         std::fs::create_dir_all(gitdir.join("indexes"))?;
         std::fs::create_dir_all(gitdir.join("pathspecs"))?;
         std::fs::create_dir_all(gitdir.join("records"))?;
+        // A workspace its repository ignores would get empty snapshots, and a rewind would
+        // restore nothing: it is snapshotted as a directory of its own, by its own ignore files.
+        if !checkpoints.scope.is_empty() && checkpoints.repository_ignores_workspace()? {
+            checkpoints.root = workspace.to_path_buf();
+            checkpoints.scope.clear();
+            checkpoints.repository_excludes = None;
+        }
         // Start from the last index any session wrote, so unchanged files are not hashed again.
         let shared = gitdir.join("index");
         if !checkpoints.index.exists() && shared.is_file() {
@@ -233,6 +240,26 @@ impl Checkpoints {
             )?;
         }
         Ok(checkpoints)
+    }
+
+    /// Whether the repository's ignore rules (its `.gitignore` files, its `info/exclude`, and the
+    /// built-in excludes) ignore the workspace, by itself or as part of an ignored directory.
+    fn repository_ignores_workspace(&self) -> Result<bool, CheckpointError> {
+        // `./` so that no name reads as pathspec magic; no trailing slash, so that git looks the
+        // directory up and a rule that re-includes it applies.
+        let mut path = OsString::from("./");
+        path.push(OsStr::from_bytes(&self.scope));
+        let mut cmd = self.command();
+        cmd.args(["check-ignore", "-q", "--no-index", "--"])
+            .arg(path);
+        match output_within(&mut cmd, SNAPSHOT_TIMEOUT)? {
+            None => Err(CheckpointError::TooSlow),
+            Some(out) => match out.status.code() {
+                Some(0) => Ok(true),
+                Some(1) => Ok(false),
+                _ => Err(failure("check-ignore", &out.stderr)),
+            },
+        }
     }
 
     /// The directory these checkpoints are of.

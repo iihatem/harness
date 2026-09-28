@@ -1246,6 +1246,80 @@ fn a_restore_that_empties_a_root_workspace_keeps_it() {
     assert!(!f.ws.join("new").exists());
 }
 
+// Re-review E, V3: a workspace in a directory its repository ignores would get empty snapshots,
+// and a rewind would restore nothing while claiming success. It is treated as a directory outside
+// any repository instead: its own ignore files apply, not the repository's.
+#[test]
+fn a_workspace_its_repository_ignores_is_snapshotted_as_a_directory_of_its_own() {
+    let f = fixture();
+    git(&f.ws, &["init", "-q"]);
+    f.write(".gitignore", "scratch/\n*.tmp\n");
+    f.write("scratch/notes.txt", "one\n");
+    f.write(
+        "scratch/draft.tmp",
+        "kept: only the workspace's own rules apply\n",
+    );
+    f.write("scratch/.gitignore", "*.log\n");
+    f.write("scratch/debug.log", "log\n");
+    let ws = f.ws.join("scratch");
+    let checkpoints = Checkpoints::open(&f.gitdir, &ws, "s1").unwrap();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    assert_eq!(
+        checkpoints.files(&first).unwrap(),
+        [
+            PathBuf::from(".gitignore"),
+            PathBuf::from("draft.tmp"),
+            PathBuf::from("notes.txt")
+        ]
+    );
+    f.write("scratch/notes.txt", "changed by the agent\n");
+    f.write("scratch/new.txt", "agent\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(f.read("scratch/notes.txt").as_deref(), Some("one\n"));
+    assert_eq!(f.read("scratch/new.txt"), None);
+    assert_eq!(f.read("scratch/debug.log").as_deref(), Some("log\n"));
+}
+
+// Re-review E, V3: the same for a directory under a home directory that is a repository ignoring
+// everything, as dotfiles repositories do.
+#[test]
+fn a_workspace_under_a_home_repository_that_ignores_everything_is_snapshotted() {
+    let f = fixture();
+    git(&f.ws, &["init", "-q"]);
+    f.write(".gitignore", "*\n");
+    f.write("projects/foo/main.rs", "fn main() {}\n");
+    let ws = f.ws.join("projects/foo");
+    let checkpoints = Checkpoints::open(&f.gitdir, &ws, "s1").unwrap();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    assert_eq!(
+        checkpoints.files(&first).unwrap(),
+        [PathBuf::from("main.rs")]
+    );
+    f.write("projects/foo/main.rs", "broken\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(
+        f.read("projects/foo/main.rs").as_deref(),
+        Some("fn main() {}\n")
+    );
+}
+
+// A workspace the repository does not ignore keeps the repository's rules (as in probe F), also
+// when a rule re-includes it.
+#[test]
+fn a_workspace_a_negation_re_includes_keeps_the_repositorys_rules() {
+    let f = fixture();
+    git(&f.ws, &["init", "-q"]);
+    f.write(".gitignore", "*\n!sub/\n!sub/**\nsub/*.log\n");
+    f.write("sub/code.rs", "x\n");
+    f.write("sub/debug.log", "x\n");
+    let checkpoints = Checkpoints::open(&f.gitdir, &f.ws.join("sub"), "s1").unwrap();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    assert_eq!(
+        checkpoints.files(&first).unwrap(),
+        [PathBuf::from("code.rs")]
+    );
+}
+
 /// Whether the tests run as root, which permissions do not stop.
 fn is_root() -> bool {
     // SAFETY: `geteuid` cannot fail.

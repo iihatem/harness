@@ -604,3 +604,74 @@ fn harness_settings_in_a_subdirectory_workspace_are_left_out() {
     let first = checkpoints.snapshot("turn 1").unwrap();
     assert_eq!(checkpoints.files(&first).unwrap(), [PathBuf::from("a.txt")]);
 }
+
+// Review E issue 1 (probe A): a file the target snapshot left out because it was ignored then
+// existed then, so a restore does not delete it, even though it is no longer ignored.
+#[test]
+fn a_file_ignored_when_the_snapshot_was_taken_survives_a_restore() {
+    let f = fixture();
+    f.write(".gitignore", ".env\nbuild/\n");
+    f.write(".env", "SECRET=1\n");
+    f.write("build/out.o", "object\n");
+    f.write("a.txt", "a\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    // The agent drops the ignore rules and changes a file.
+    f.write(".gitignore", "node_modules/\n");
+    f.write("a.txt", "changed\n");
+    f.write("created.txt", "new\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(f.read(".gitignore").as_deref(), Some(".env\nbuild/\n"));
+    assert_eq!(f.read("a.txt").as_deref(), Some("a\n"));
+    assert_eq!(f.read(".env").as_deref(), Some("SECRET=1\n"));
+    assert_eq!(f.read("build/out.o").as_deref(), Some("object\n"));
+    assert_eq!(f.read("created.txt"), None);
+}
+
+// Review E issue 1 (probe M): a file git could not read at the snapshot existed then too.
+#[test]
+fn a_file_unreadable_when_the_snapshot_was_taken_survives_a_restore() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    f.write("a.txt", "a\n");
+    f.write("locked.txt", "user data\n");
+    let locked = f.ws.join("locked.txt");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    f.write("locked.txt", "user data, edited\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(f.read("locked.txt").as_deref(), Some("user data, edited\n"));
+}
+
+// Review E issue 1 (probe N): so did a file that was too large then and has shrunk since.
+#[test]
+fn a_file_too_large_when_the_snapshot_was_taken_survives_a_restore() {
+    let f = fixture();
+    let large = vec![b'x'; MAX_FILE_SIZE as usize + 1];
+    std::fs::write(f.ws.join("data.bin"), &large).unwrap();
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    std::fs::write(f.ws.join("data.bin"), b"small now").unwrap();
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(std::fs::read(f.ws.join("data.bin")).unwrap(), b"small now");
+}
+
+// A snapshot without a record (as an older harness took them) cannot be restored safely, so it is
+// refused rather than restored.
+#[test]
+fn a_snapshot_without_a_record_is_refused() {
+    let f = fixture();
+    f.write("a.txt", "one\n");
+    let checkpoints = f.checkpoints();
+    let snapshot = checkpoints.snapshot("turn 1").unwrap();
+    let tree = git(&f.gitdir, &["rev-parse", &format!("{snapshot}^{{tree}}")]);
+    let old = git(&f.gitdir, &["commit-tree", tree.trim(), "-m", "old"]);
+    f.write("a.txt", "two\n");
+    assert!(matches!(
+        checkpoints.restore(old.trim()),
+        Err(CheckpointError::NoRecord(_))
+    ));
+    assert_eq!(f.read("a.txt").as_deref(), Some("two\n"));
+}

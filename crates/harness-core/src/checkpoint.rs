@@ -8,10 +8,7 @@ use std::{
     collections::{BTreeSet, HashSet},
     ffi::{OsStr, OsString},
     io::Read,
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        fs::OpenOptionsExt,
-    },
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -31,6 +28,10 @@ const RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
 const BUILTIN_EXCLUDES: &str = ".git\nnode_modules/\ntarget/\n/.harness/\n/HEAD\n";
 /// Directories left out of snapshots wherever they are.
 const EXCLUDED_DIRS: [&[u8]; 2] = [b"node_modules", b"target"];
+/// The first item of a snapshot's record, which says how to read the rest.
+const RECORD_MAGIC: &[u8] = b"harness snapshot record 1";
+/// How many paths, and how many bytes of them, one git command line carries at most.
+const ARGS_PER_COMMAND: (usize, usize) = (500, 64 * 1024);
 /// Names left out at the top of the workspace, in any case: harness's project settings, and a
 /// `HEAD` that would make git take the workspace for a repository. The permission engine and the
 /// sandbox protect them, so a rewind must neither recreate nor remove them.
@@ -57,6 +58,10 @@ pub enum CheckpointError {
     InvalidSession(String),
     #[error("{0:?} is not a snapshot id")]
     InvalidCommit(String),
+    #[error(
+        "snapshot {0} has no record of the files it left out (an older harness took it), so restoring it could delete them"
+    )]
+    NoRecord(String),
 }
 
 /// One session's checkpoints of a workspace.
@@ -81,6 +86,8 @@ pub struct Checkpoints {
     scratch: PathBuf,
     /// Where this session writes the pathspecs it gives git, one per NUL-terminated line.
     pathspecs: PathBuf,
+    /// Where this session writes a snapshot's record before git stores it.
+    record: PathBuf,
     /// The ref that keeps this session's snapshots reachable.
     reference: String,
     timeout: Duration,
@@ -142,6 +149,7 @@ impl Checkpoints {
             index: gitdir.join("indexes").join(session_id),
             scratch: gitdir.join("indexes").join(format!("restore-{session_id}")),
             pathspecs: gitdir.join("pathspecs").join(session_id),
+            record: gitdir.join("records").join(session_id),
             reference: format!("refs/harness/{session_id}"),
             timeout: SNAPSHOT_TIMEOUT,
             restore_timeout: RESTORE_TIMEOUT,
@@ -161,6 +169,7 @@ impl Checkpoints {
         std::fs::write(gitdir.join("info/attributes"), ATTRIBUTES)?;
         std::fs::create_dir_all(gitdir.join("indexes"))?;
         std::fs::create_dir_all(gitdir.join("pathspecs"))?;
+        std::fs::create_dir_all(gitdir.join("records"))?;
         // Start from the last index any session wrote, so unchanged files are not hashed again.
         let shared = gitdir.join("index");
         if !checkpoints.index.exists() && shared.is_file() {
@@ -236,16 +245,18 @@ impl Checkpoints {
         // What is left out whatever `.gitignore` files say: large files, and the directories
         // always left out. They are given to git as literal pathspecs, which outrank ignore rules
         // and match any name, a newline in it included.
-        let mut excluded: BTreeSet<&[u8]> = BTreeSet::new();
+        let mut excluded_dirs: BTreeSet<&[u8]> = BTreeSet::new();
+        let mut large: BTreeSet<&[u8]> = BTreeSet::new();
         for path in &listed {
             if let Some(dir) = excluded_dir(path) {
-                excluded.insert(dir);
+                excluded_dirs.insert(dir);
             } else if std::fs::symlink_metadata(self.root.join(OsStr::from_bytes(path)))
                 .is_ok_and(|m| m.is_file() && m.len() > MAX_FILE_SIZE)
             {
-                excluded.insert(path);
+                large.insert(path);
             }
         }
+        let excluded: Vec<&[u8]> = excluded_dirs.iter().chain(&large).copied().collect();
         // Files an earlier snapshot holds that are now git-ignored or excluded leave the snapshots.
         let ignored = self.list(
             &["--cached", "--ignored", "--exclude-standard", "--"],
@@ -271,7 +282,7 @@ impl Checkpoints {
                 deadline,
             )?;
         }
-        let mut adding = vec![within];
+        let mut adding = vec![within.clone()];
         adding.extend(
             excluded
                 .iter()
@@ -287,23 +298,73 @@ impl Checkpoints {
         add.args(["add", "-A", "--ignore-errors"]);
         add.arg(self.pathspec_file_arg()).arg("--pathspec-file-nul");
         // Exit code 1 means some files could not be read; everything else was added.
-        match output_within(&mut add, remaining(deadline)?)? {
+        let unreadable = match output_within(&mut add, remaining(deadline)?)? {
             None => return Err(CheckpointError::TooSlow),
-            Some(out) if out.status.code().is_some_and(|c| c <= 1) => {}
+            Some(out) if out.status.success() => false,
+            Some(out) if out.status.code() == Some(1) => true,
             Some(out) => return Err(failure("add", &out.stderr)),
+        };
+        // What exists but the snapshot leaves out, so that a restore to it never removes that:
+        // large files, the directories always left out, what git ignores, and what it could not
+        // read.
+        let mut record = Record::default();
+        record
+            .left_out
+            .extend(large.iter().map(|path| path.to_vec()));
+        record
+            .left_out
+            .extend(excluded_dirs.iter().map(|dir| [dir, &b"/"[..]].concat()));
+        record.left_out.extend(self.list(
+            &[
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "--",
+            ],
+            &within,
+            deadline,
+        )?);
+        if unreadable {
+            let added: HashSet<Vec<u8>> = self
+                .list(&["--cached", "--"], &within, deadline)?
+                .into_iter()
+                .collect();
+            for path in &listed {
+                // A nested repository is listed as a directory, with a slash.
+                let name = path.strip_suffix(b"/").unwrap_or(path);
+                let gone = std::fs::symlink_metadata(self.root.join(OsStr::from_bytes(name)))
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+                if !added.contains(name)
+                    && !gone
+                    && !large.contains(name)
+                    && excluded_dir(name).is_none()
+                    && !self.is_protected(name)
+                {
+                    record.left_out.insert(path.clone());
+                }
+            }
         }
         let tree = self.git(&["write-tree"], remaining(deadline)?)?;
-        let parent = self
+        let previous = self
             .git(
                 &["rev-parse", "-q", "--verify", &self.reference],
                 remaining(deadline)?,
             )
             .ok();
-        let mut commit_args = vec!["commit-tree", "--no-gpg-sign", tree.as_str(), "-m", message];
-        if let Some(parent) = &parent {
-            commit_args.extend(["-p", parent.as_str()]);
-        }
-        let commit = self.git(&commit_args, remaining(deadline)?)?;
+        let record = self.write_record(&record, previous.as_deref(), deadline)?;
+        let commit = self.git(
+            &[
+                "commit-tree",
+                "--no-gpg-sign",
+                &tree,
+                "-p",
+                &record,
+                "-m",
+                message,
+            ],
+            remaining(deadline)?,
+        )?;
         self.git(
             &["update-ref", &self.reference, &commit],
             remaining(deadline)?,
@@ -312,52 +373,167 @@ impl Checkpoints {
         Ok(commit)
     }
 
+    /// Stores `record` as the file `record` of a commit of its own, whose parent is `previous`
+    /// (the session's last snapshot), and returns that commit. The snapshot's commit has it as its
+    /// only parent, so its ref keeps every snapshot of the session, and each one's record,
+    /// reachable.
+    fn write_record(
+        &self,
+        record: &Record,
+        previous: Option<&str>,
+        deadline: Instant,
+    ) -> Result<String, CheckpointError> {
+        std::fs::write(&self.record, record.encode())?;
+        let blob = self.hash_object("blob", &self.record, deadline)?;
+        let blob = hex::decode(&blob).map_err(|_| failure("hash-object", blob.as_bytes()))?;
+        let mut tree = b"100644 record\0".to_vec();
+        tree.extend_from_slice(&blob);
+        let mut tree_file = self.record.clone().into_os_string();
+        tree_file.push(".tree");
+        std::fs::write(&tree_file, tree)?;
+        let tree = self.hash_object("tree", Path::new(&tree_file), deadline)?;
+        let mut args = vec![
+            "commit-tree",
+            "--no-gpg-sign",
+            &tree,
+            "-m",
+            "what the next snapshot left out",
+        ];
+        if let Some(previous) = previous {
+            args.extend(["-p", previous]);
+        }
+        self.git(&args, remaining(deadline)?)
+    }
+
+    /// Stores the file at `path` as an object of `kind`, byte for byte, and returns its id.
+    fn hash_object(
+        &self,
+        kind: &str,
+        path: &Path,
+        deadline: Instant,
+    ) -> Result<String, CheckpointError> {
+        let mut cmd = self.command();
+        cmd.args(["hash-object", "-w", "--no-filters", "-t", kind, "--"])
+            .arg(path);
+        self.run(cmd, "hash-object", deadline)
+    }
+
+    /// The record of the snapshot `commit`.
+    fn record_of(&self, commit: &str) -> Result<Record, CheckpointError> {
+        let blob = format!("{commit}^:record");
+        let deadline = Instant::now() + self.restore_timeout;
+        match self.git_bytes(&["cat-file", "blob", &blob], deadline) {
+            Ok(bytes) => Record::decode(&bytes),
+            Err(CheckpointError::TooSlow) => return Err(CheckpointError::TooSlow),
+            Err(_) => None,
+        }
+        .ok_or_else(|| CheckpointError::NoRecord(commit.to_string()))
+    }
+
     /// Restores the workspace to `commit`: modified files are reverted, deleted files recreated,
-    /// and files created since removed. Files that snapshots leave out (large or git-ignored) are
-    /// left alone. Returns a snapshot of the workspace as it was just before, which restores it
-    /// again.
+    /// and files created since removed. What snapshots leave out is left alone: a file the
+    /// snapshot taken just before leaves out is never overwritten, and one `commit` left out
+    /// (because it was too large, ignored or unreadable then) is never removed. Returns a snapshot
+    /// of the workspace as it was just before, which restores it again.
     pub fn restore(&self, commit: &str) -> Result<String, CheckpointError> {
         check_commit(commit)?;
         self.unlock_after(self.restore_unchecked(commit))
     }
 
     fn restore_unchecked(&self, commit: &str) -> Result<String, CheckpointError> {
+        let target = self.record_of(commit)?;
         let before = self.snapshot_within("before a rewind", self.restore_timeout)?;
-        // Paths `commit` has that exist now but are not in `before` are files snapshots leave
-        // out; restoring them would overwrite something no snapshot holds.
-        let now: HashSet<Vec<u8>> = self.tree_paths(&before)?.into_iter().collect();
-        let keep: Vec<OsString> = self
-            .tree_paths(commit)?
-            .into_iter()
-            .filter(|p| !now.contains(p))
-            .map(OsString::from_vec)
-            .filter(|p| std::fs::symlink_metadata(self.root.join(p)).is_ok())
+        self.restore_to(commit, &target, &before)?;
+        Ok(before)
+    }
+
+    /// Makes the workspace match the snapshot `commit`, whose record is `target`, from the
+    /// snapshot `before` just taken.
+    fn restore_to(
+        &self,
+        commit: &str,
+        target: &Record,
+        before: &str,
+    ) -> Result<(), CheckpointError> {
+        let deadline = Instant::now() + self.restore_timeout;
+        let now = self.tree_entries(before, deadline)?;
+        let then = self.tree_entries(commit, deadline)?;
+        let now_paths: HashSet<&[u8]> = now.iter().map(|e| e.path.as_slice()).collect();
+        let then_paths: HashSet<&[u8]> = then.iter().map(|e| e.path.as_slice()).collect();
+        // Paths `commit` holds that exist now but are not in `before` are what snapshots leave
+        // out now: restoring them would overwrite something no snapshot holds.
+        let skipped: Vec<&[u8]> = then
+            .iter()
+            .map(|e| e.path.as_slice())
+            .filter(|p| !now_paths.contains(p))
+            .filter(|p| std::fs::symlink_metadata(self.root.join(OsStr::from_bytes(p))).is_ok())
             .collect();
-        let tree = if keep.is_empty() {
+        // Paths `before` holds that `commit` does not would be removed as created since. Those
+        // `commit` left out existed then, though: they stay as they are.
+        let kept: Vec<&TreeEntry> = now
+            .iter()
+            .filter(|e| !then_paths.contains(e.path.as_slice()) && target.covers(&e.path))
+            .collect();
+        let tree = if skipped.is_empty() && kept.is_empty() {
             format!("{commit}^{{tree}}")
         } else {
-            let scratch = &self.scratch;
-            let with_index = |args: &[OsString]| -> Result<String, CheckpointError> {
-                let mut cmd = self.command();
-                cmd.env("GIT_INDEX_FILE", scratch).args(args);
-                self.run(cmd, "update-index", Instant::now() + self.restore_timeout)
-            };
-            with_index(&["read-tree".into(), commit.into()])?;
-            for chunk in keep.chunks(500) {
-                let mut args = vec![
-                    OsString::from("update-index"),
-                    "--force-remove".into(),
-                    "--".into(),
-                ];
-                args.extend(chunk.iter().cloned());
-                with_index(&args)?;
-            }
-            let tree = with_index(&["write-tree".into()])?;
-            let _ = std::fs::remove_file(scratch);
-            tree
+            self.build_tree(commit, &skipped, &kept, deadline)?
         };
-        self.git(&["read-tree", "--reset", "-u", &tree], self.restore_timeout)?;
-        Ok(before)
+        self.git(&["read-tree", "--reset", "-u", &tree], remaining(deadline)?)?;
+        Ok(())
+    }
+
+    /// The tree of `commit` without the paths `skipped` and with the entries `kept`, built in the
+    /// restore index.
+    fn build_tree(
+        &self,
+        commit: &str,
+        skipped: &[&[u8]],
+        kept: &[&TreeEntry],
+        deadline: Instant,
+    ) -> Result<String, CheckpointError> {
+        let in_scratch = |args: Vec<OsString>| -> Result<String, CheckpointError> {
+            let mut cmd = self.command();
+            cmd.env("GIT_INDEX_FILE", &self.scratch).args(&args);
+            self.run(cmd, &args[0].to_string_lossy(), deadline)
+        };
+        in_scratch(vec!["read-tree".into(), commit.into()])?;
+        let removals = skipped.iter().map(|p| OsStr::from_bytes(p).to_os_string());
+        for chunk in arg_chunks(removals) {
+            let mut args = vec!["update-index".into(), "--force-remove".into(), "--".into()];
+            args.extend(chunk);
+            in_scratch(args)?;
+        }
+        let additions = kept.iter().map(|e| {
+            let mut info = OsString::from(format!("{},{},", e.mode, e.oid));
+            info.push(OsStr::from_bytes(&e.path));
+            info
+        });
+        for chunk in arg_chunks(additions) {
+            let mut args = vec![OsString::from("update-index"), "--add".into()];
+            for info in chunk {
+                args.push("--cacheinfo".into());
+                args.push(info);
+            }
+            in_scratch(args)?;
+        }
+        let tree = in_scratch(vec!["write-tree".into()])?;
+        let _ = std::fs::remove_file(&self.scratch);
+        Ok(tree)
+    }
+
+    /// The entries of the snapshot `commit`, with paths relative to the root.
+    fn tree_entries(
+        &self,
+        commit: &str,
+        deadline: Instant,
+    ) -> Result<Vec<TreeEntry>, CheckpointError> {
+        let listed = self.git_bytes(&["ls-tree", "-r", "-z", "--full-tree", commit], deadline)?;
+        split_nul(&listed)
+            .into_iter()
+            .map(|item| TreeEntry::parse(&item))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| failure("ls-tree", b"unexpected output"))
     }
 
     /// The files a snapshot holds, relative to the workspace.
@@ -405,6 +581,15 @@ impl Checkpoints {
                 path
             })
             .collect()
+    }
+
+    /// Whether `path` is a [`PROTECTED`] name at the top of the workspace, or inside one.
+    fn is_protected(&self, path: &[u8]) -> bool {
+        self.protected().iter().any(|name| {
+            path.len() >= name.len()
+                && path[..name.len()].eq_ignore_ascii_case(name)
+                && matches!(path.get(name.len()), None | Some(b'/'))
+        })
     }
 
     /// The paths `ls-files -z` lists with `options` and then `pathspec`, relative to the root.
@@ -602,6 +787,94 @@ fn read_small_file(path: &Path) -> Option<String> {
     Some(text)
 }
 
+/// What a snapshot knows besides its files: the paths that existed but were left out (large,
+/// ignored or unreadable files, and whole directories, which end with `/`), relative to the root.
+#[derive(Debug, Default)]
+struct Record {
+    left_out: BTreeSet<Vec<u8>>,
+}
+
+impl Record {
+    /// NUL-terminated items: [`RECORD_MAGIC`], then `left-out <path>` for each path.
+    fn encode(&self) -> Vec<u8> {
+        let mut out = RECORD_MAGIC.to_vec();
+        out.push(0);
+        for path in &self.left_out {
+            out.extend_from_slice(b"left-out ");
+            out.extend_from_slice(path);
+            out.push(0);
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Record> {
+        let mut items = bytes.split(|b| *b == 0);
+        if items.next()? != RECORD_MAGIC {
+            return None;
+        }
+        let mut record = Record::default();
+        for item in items {
+            if let Some(path) = item.strip_prefix(b"left-out ") {
+                record.left_out.insert(path.to_vec());
+            }
+        }
+        Some(record)
+    }
+
+    /// Whether the snapshot left `path` out, by itself or in a directory it left out.
+    fn covers(&self, path: &[u8]) -> bool {
+        self.left_out.contains(path)
+            || path
+                .iter()
+                .enumerate()
+                .any(|(i, b)| *b == b'/' && self.left_out.contains(&path[..=i]))
+    }
+}
+
+/// One file of a snapshot, as `ls-tree` lists it.
+#[derive(Debug)]
+struct TreeEntry {
+    mode: String,
+    oid: String,
+    path: Vec<u8>,
+}
+
+impl TreeEntry {
+    /// Parses `<mode> <type> <oid>\t<path>`.
+    fn parse(item: &[u8]) -> Option<TreeEntry> {
+        let tab = item.iter().position(|b| *b == b'\t')?;
+        let meta = std::str::from_utf8(&item[..tab]).ok()?;
+        let mut fields = meta.split(' ');
+        let (mode, _kind, oid) = (fields.next()?, fields.next()?, fields.next()?);
+        Some(TreeEntry {
+            mode: mode.to_string(),
+            oid: oid.to_string(),
+            path: item[tab + 1..].to_vec(),
+        })
+    }
+}
+
+/// `args` in groups small enough for one command line each.
+fn arg_chunks(args: impl Iterator<Item = OsString>) -> Vec<Vec<OsString>> {
+    let (most, most_bytes) = ARGS_PER_COMMAND;
+    let mut chunks: Vec<Vec<OsString>> = Vec::new();
+    let mut bytes = 0;
+    for arg in args {
+        let len = arg.len() + 1;
+        match chunks.last_mut() {
+            Some(chunk) if chunk.len() < most && bytes + len <= most_bytes => {
+                bytes += len;
+                chunk.push(arg);
+            }
+            _ => {
+                bytes = len;
+                chunks.push(vec![arg]);
+            }
+        }
+    }
+    chunks
+}
+
 /// The NUL-separated items of git's `-z` output.
 fn split_nul(bytes: &[u8]) -> Vec<Vec<u8>> {
     bytes
@@ -634,6 +907,43 @@ fn excluded_dir(path: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_round_trips_and_covers_what_lies_in_its_directories() {
+        let mut record = Record::default();
+        for path in [&b".env"[..], b"build/", b"odd\nname", b"web/node_modules/"] {
+            record.left_out.insert(path.to_vec());
+        }
+        let decoded = Record::decode(&record.encode()).unwrap();
+        assert_eq!(decoded.left_out, record.left_out);
+        assert!(decoded.covers(b".env"));
+        assert!(decoded.covers(b"build/out.o"));
+        assert!(decoded.covers(b"build/deep/er.o"));
+        assert!(decoded.covers(b"odd\nname"));
+        assert!(decoded.covers(b"web/node_modules/p/i.js"));
+        assert!(!decoded.covers(b"build"));
+        assert!(!decoded.covers(b"buildx/a"));
+        assert!(!decoded.covers(b"src/.env"));
+        assert!(!decoded.covers(b"web/x.js"));
+        assert!(Record::decode(b"something else\0left-out a\0").is_none());
+        assert!(Record::decode(b"").is_none());
+    }
+
+    #[test]
+    fn arguments_are_split_by_count_and_size() {
+        let many = (0..1200).map(|i| OsString::from(format!("f{i}")));
+        let sizes: Vec<usize> = arg_chunks(many).iter().map(Vec::len).collect();
+        assert_eq!(sizes, [500, 500, 200]);
+        let long = (0..40).map(|_| OsString::from("x".repeat(4000)));
+        let chunks = arg_chunks(long);
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.iter().map(|a| a.len() + 1).sum::<usize>() <= ARGS_PER_COMMAND.1)
+        );
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 40);
+    }
 
     #[test]
     fn paths_in_always_excluded_directories_are_found() {

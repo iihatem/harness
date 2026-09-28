@@ -15,6 +15,10 @@ Before the first mutating action of each turn (`write`, `edit`, or `bash` in a m
 - **WHEN** a turn edits a file in a directory that is not a git repository
 - **THEN** a checkpoint is created for that turn
 
+#### Scenario: Files left out of snapshots
+- **WHEN** the user rewinds code while the workspace holds a 50 MB file or a git-ignored file
+- **THEN** that file is neither overwritten nor deleted
+
 ### Requirement: Rewind restores code, conversation, or both
 The system SHALL provide `/rewind` (and Esc pressed twice on empty input) listing the session's previous user messages. After the user selects one, the system MUST offer to restore code and conversation, code only, or conversation only, to the state before that message. Restoring code MUST revert modified files, recreate deleted files, and remove files created since that point, including changes made by `bash`.
 

@@ -37,7 +37,7 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 - [x] 2.15 Shell-analysis follow-ups: on macOS, make `harness-shell` read a here-document inside `$(…)` the way `/bin/bash` 3.2 does without making the common `git commit -m "$(cat <<'EOF' …)"` idiom ask; bound the rough scan's memory on very large commands (1 MB of input can take about 500 MB)
 - [ ] 2.16 Rough-scan follow-up from the 2.15 review: when a redirection comes before the command name (`>/dev/null curl x`) in text that cannot be fully decomposed, also check a reading with redirection operators and their targets removed, so deny rules see the real command name (verdicts can only get stricter); verify with a differential against master
 
-## 3. P3 Memory (plan written after P2)
+## 3. P3 Memory (`docs/superpowers/plans/2026-09-27-m1-p3-memory.md`)
 
 - [ ] 3.1 `AGENTS.md`/`CLAUDE.md` discovery with confined `@` imports; verify the project-context discovery and import scenarios as tests
 - [ ] 3.2 Cache-stable prompt assembly with session-start environment capture and oversize warning; verify byte-identical prefixes across turns in a test

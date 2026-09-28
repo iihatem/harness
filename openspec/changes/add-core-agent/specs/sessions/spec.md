@@ -11,6 +11,10 @@ The system SHALL persist each session as an append-only JSON Lines file in the `
 - **WHEN** the harness process is killed after two completed turns
 - **THEN** the session file contains both turns
 
+#### Scenario: Session in use
+- **WHEN** a second harness process tries to continue a session that another process is using
+- **THEN** it refuses with an error instead of writing to the file
+
 ### Requirement: Sessions branch instead of losing history
 The system SHALL treat the session as a tree of entries whose active branch runs from the root to the current leaf. Rewinding the conversation MUST move the current leaf to an earlier entry, and new entries MUST be appended as children of that entry, leaving the previous branch intact in the file.
 

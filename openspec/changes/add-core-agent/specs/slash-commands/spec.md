@@ -34,7 +34,11 @@ The system SHALL load Markdown command files from `.harness/commands/`, `.claude
 - **THEN** `/help` remains the built-in and a warning is shown
 
 ### Requirement: Supported frontmatter
-The system SHALL honour the frontmatter fields `description`, `argument-hint`, `model`, and `allowed-tools`, and ignore unknown fields. `model` MUST apply only to that invocation. `allowed-tools` MUST map Claude Code tool names (`Bash`, `Read`, `Write`, `Edit`, `Grep`, `Glob`) and patterns such as `Bash(openspec:*)` to allow rules for that invocation only, and MUST NOT override deny rules, destructive-command confirmation, or the sandbox.
+The system SHALL honour the frontmatter fields `description`, `argument-hint`, `model`, and `allowed-tools`, and ignore unknown fields. `model` MUST apply only to that invocation, and a project command file's `model` MUST apply only when the workspace is trusted. `allowed-tools` MUST map Claude Code tool names (`Bash`, `Write`, `Edit`) and patterns such as `Bash(openspec:*)` to allow rules for that invocation only, and MUST NOT override deny rules, destructive-command confirmation, or the sandbox. `Read`, `Grep`, and `Glob` MUST NOT widen reads outside the workspace.
+
+#### Scenario: A project command's model in an untrusted workspace
+- **WHEN** a project command file declares `model: other/model` and the workspace is not trusted
+- **THEN** the invocation uses the session's model and a note says the command's model was ignored
 
 #### Scenario: allowed-tools pre-approves a command
 - **WHEN** a command file declares `allowed-tools: Bash(openspec:*)` and its run executes `openspec status` in `ask` mode
@@ -45,18 +49,22 @@ The system SHALL honour the frontmatter fields `description`, `argument-hint`, `
 - **THEN** `rm -rf build` during that command is blocked
 
 ### Requirement: Placeholders are expanded
-The system SHALL expand `$ARGUMENTS` to the full argument string, `$1` through `$9` to positional arguments (whitespace-separated, respecting quotes), `@<path>` to the content of a workspace file, and `` !`<command>` `` to the output of a shell command. Shell expansions MUST go through the same permission rules and sandbox as the `bash` tool.
+The system SHALL expand `$ARGUMENTS` to the full argument string, `$1` through `$9` to positional arguments (whitespace-separated, respecting quotes), `@<path>` to the content of a workspace file, and `` !`<command>` `` to the output of a shell command. When the body uses none of the argument placeholders, non-empty arguments MUST be appended as `ARGUMENTS: <arguments>`. File references and shell commands MUST be expanded only in the command body, never in the arguments. Shell expansions MUST go through the same permission rules and sandbox as the `bash` tool.
 
 #### Scenario: Positional arguments
 - **WHEN** the user runs `/review "src/lib.rs" strict` for a command whose body contains `Review $1 in $2 mode`
 - **THEN** the prompt sent is `Review src/lib.rs in strict mode`
+
+#### Scenario: Arguments without a placeholder
+- **WHEN** a command body contains no argument placeholder and the user runs `/opsx:propose add-login`
+- **THEN** the prompt sent is the body followed by `ARGUMENTS: add-login`
 
 #### Scenario: Shell expansion in ask mode
 - **WHEN** a command body contains `` !`git diff` `` and the session is in `ask` mode
 - **THEN** the user is asked to approve `git diff` before the command's prompt is sent
 
 ### Requirement: Commands are available headless and with completion
-Custom commands and `/init` SHALL work in `harness ask`; other built-in commands MUST be rejected with exit code 2. In interactive mode, typing `/` at the start of input MUST show matching commands with their descriptions.
+Custom commands and `/init` SHALL work in `harness ask`; other built-in commands and unknown commands MUST be rejected with exit code 2. In interactive mode, typing `/` at the start of input MUST show matching commands with their descriptions.
 
 #### Scenario: Headless custom command
 - **WHEN** the user runs `harness ask "/opsx:propose add-login"`

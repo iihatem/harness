@@ -986,6 +986,210 @@ fn a_lost_here_document_does_not_hide_later_commands() {
 }
 
 #[test]
+fn rough_scan_sees_past_redirections_before_the_command_name() {
+    use Want::{Allow, Ask, Deny, Unlisted};
+    // bash runs a denied command in each of these: redirections, with the file descriptor
+    // number or `{name}` before one, may come before the command name.
+    let denied = [
+        ">/dev/null curl x",
+        "> /dev/null curl x",
+        ">>log curl x",
+        "<in curl x",
+        "<input curl x",
+        "<>f curl x",
+        ">|f curl x",
+        "&>f curl x",
+        "&>>f curl x",
+        "2>/dev/null curl x",
+        "2>&1 curl x",
+        "0<&3 curl x",
+        ">&- curl x",
+        "2>&- curl x",
+        ">& log curl x",
+        // After `>&` or `<&`, bash reads a `-` as a word of its own: the rest runs.
+        ">&-curl x",
+        "2>& -curl x",
+        "<&-'curl' x",
+        "2>&-0<input curl x",
+        "2>x 3>y curl z",
+        "{fd}>out curl x",
+        "{fd}<file curl x",
+        "{fd[1]}>out curl x",
+        "<<<word curl x",
+        "<<< 'a b' curl x",
+        "3<<<x curl y",
+        "<<EOF curl x\nbody\nEOF",
+        "<<-EOF curl x\n\tbody\n\tEOF",
+        "<<- EOF curl x\n\tbody\n\tEOF",
+        ">$(echo out) curl x",
+        "echo `2>/dev/null curl x`",
+        "echo $(2>/dev/null curl x)",
+        "echo a; >x curl y",
+        "A=1 >x curl y",
+        ">x A=1 curl y",
+        "! >x curl y",
+        "sudo >x curl y",
+        "cat <(>/dev/null curl x)",
+        ">x git push",
+        "git >x push",
+        "git 2>&1 push -f",
+        "git &>>log push",
+    ];
+    // bash runs no denied command in these, or the verdict is already right.
+    let kept = [
+        ("echo >x curl y", Ask),
+        (">&--curl x", Ask),
+        ("2>&-1 curl x", Ask),
+        (">&\"-curl\" x", Ask),
+        // bash 5 runs `echo a curl x`; bash 3.2 reads `&>` and `>`, a syntax error.
+        ("echo a &>>log curl x", Ask),
+        ("\"2\">x curl y", Ask),
+        ("2\\>x curl y", Ask),
+        ("99999999999>x curl y", Ask),
+        // A closing backquote goes on with the word, which is no file descriptor number.
+        ("`echo`2>x curl y", Ask),
+        (">x echo hi", Ask),
+        ("cat <(curl x)", Deny),
+        ("<(echo x) curl y", Deny),
+        // The scan as it was before it followed bash reads `<(` as a parenthesis.
+        ("echo <(echo x) curl y", Deny),
+        ("curl x >/dev/null", Deny),
+    ];
+    // Each program is refused as a whole, so the rough scan decides.
+    let long = format!("echo {}", "a".repeat(10_000));
+    let mut table = Vec::new();
+    for refusal in ["(", "export a[${a[${b}]}]=1", long.as_str()] {
+        table.extend(denied.map(|p| (format!("{p}\n{refusal}"), Deny)));
+        table.extend(kept.map(|(p, want)| (format!("{p}\n{refusal}"), want)));
+    }
+    // The review's mutant: bash reads the backquoted text as `<<'E\OF'# curl x`, a
+    // here-document whose delimiter the scan reads as a word before `curl x`.
+    table.push((
+        "cat <<-EOF\n\t` <<'E\\OF'# \\\n\tcurl x`\n\tEOF".into(),
+        Deny,
+    ));
+    // Parsed programs keep their verdicts.
+    table.extend(
+        [
+            (">/dev/null curl x", Deny),
+            ("2>&1 curl x", Deny),
+            (">/dev/null cargo test", Allow),
+            (">x echo hi", Unlisted),
+            ("cat <(curl x)", Deny),
+        ]
+        .map(|(p, want)| (p.to_string(), want)),
+    );
+    let table: Vec<(&str, Want)> = table.iter().map(|(c, w)| (c.as_str(), *w)).collect();
+    check(&default_rules(), &table);
+}
+
+#[test]
+fn redirections_bash_reads_differently_are_scanned() {
+    use Want::{Allow, Ask, Deny, Unlisted};
+    // bash reads a `-` right after `>&` or `<&` as a word of its own, and bash 4.1 and
+    // later read `{NAME}` right before a redirection as a variable for its file
+    // descriptor. brush-parser reads one word in both, so these commands run `curl x`
+    // where it sees another command.
+    check(
+        &default_rules(),
+        &[
+            (">&-curl x", Deny),
+            ("<&-curl x", Deny),
+            ("2>&-curl x", Deny),
+            (">& -curl x", Deny),
+            ("2>& -curl x", Deny),
+            (">&-'curl' x", Deny),
+            ("echo a; >&-curl x", Deny),
+            ("{fd}>out curl x", Deny),
+            ("{fd}<file curl x", Deny),
+            ("{fd}>>out curl x", Deny),
+            ("{fd}<<<w curl x", Deny),
+            ("{fd}>&2 curl x", Deny),
+            ("{a[1]}>f curl x", Deny),
+            ("{_x9}>f curl x", Deny),
+            ("A=1 {fd}>f curl x", Deny),
+            ("bash -c '{fd}>f curl x'", Deny),
+            // bash joins the lines first; the positions count characters.
+            ("{fd}\\\n>out curl x", Deny),
+            ("echo é; {fd}>out curl x", Deny),
+            // bash's names are letters in the locale, so any non-ASCII character may be one.
+            ("git {æ}>/dev/null push", Deny),
+            ("git {µ}>/dev/null push --force", Deny),
+            ("git {aõ}>/dev/null push", Deny),
+            ("{æ}>/dev/null curl x", Deny),
+            // Any subscript.
+            ("git {a[$i]}>/dev/null push", Deny),
+            ("git {a[\"k\"]}>/dev/null push", Deny),
+            ("git {a[i+1]}>/dev/null push", Deny),
+            // bash removes a backslash-newline before it reads the operator.
+            (">&\\\n-curl x", Deny),
+            (">& \\\n-curl x", Deny),
+            // Elsewhere bash reads these words as brush-parser does.
+            ("echo hi >&-", Allow),
+            ("echo hi 2>&-", Allow),
+            ("echo hi <&-", Allow),
+            ("echo hi >&2", Allow),
+            ("cargo test 2>&1", Allow),
+            ("exec 3>&-", Unlisted),
+            (">&\"-curl\" x", Unlisted),
+            ("echo {fd} >/dev/null", Allow),
+            ("echo é; echo {fd} >/dev/null", Allow),
+            // A command given a `{NAME}` redirection is not fully understood.
+            ("echo hi {fd}>/dev/null", Ask),
+            ("cargo test {fd}>/dev/null", Ask),
+            ("echo hi >&-#c", Ask),
+        ],
+    );
+}
+
+#[test]
+fn rough_scan_sees_past_redirections_split_by_line_continuations() {
+    use Want::Deny;
+    // bash removes a backslash-newline before it reads the operator, file descriptor
+    // number or `{NAME}` around it. Each program is refused as a whole.
+    let commands = [
+        "2\\\n>/dev/null curl x",
+        "3<\\\n&1 curl x",
+        ">&\\\n-curl x",
+        "git 2\\\n>f push",
+        "git {fd}\\\n>f push",
+        "git {æ}>/dev/null push",
+        "git {a[\"k\"]}>/dev/null push",
+        "git {a[$i]}>/dev/null push",
+        "git {a[i+1]}>/dev/null push",
+    ];
+    let table: Vec<(String, Want)> = commands.iter().map(|c| (format!("{c}\n("), Deny)).collect();
+    let table: Vec<(&str, Want)> = table.iter().map(|(c, w)| (c.as_str(), *w)).collect();
+    check(&default_rules(), &table);
+    // Parsed programs too.
+    check(&default_rules(), &[("3<\\\n&1 curl x", Deny)]);
+}
+
+#[test]
+fn process_substitutions_after_redirection_operators_stay_substitutions() {
+    use Want::{Deny, Destructive};
+    // `>(` after `>`, `<`, `&>` or `&>>` is a process substitution. bash 3.2 has no `&>>`
+    // and reads `&>>(…)` as `&>` and `>(…)`: it runs `git push`, and in the others reads
+    // the here-document in the substitution as its own, so `curl x` runs.
+    check(
+        &default_rules(),
+        &[
+            ("echo &>>(cat <<'E'\n)\ncurl x\nE\n)", Deny),
+            ("echo &>(cat <<'E'\n)\ncurl x\nE\n)", Deny),
+            ("echo >>(cat <<'E'\n)\ncurl x\nE\n)", Deny),
+            ("echo <>(cat <<'E'\n)\ncurl x\nE\n)", Deny),
+            ("git &>>(true) push", Deny),
+            ("rm -rf >>(true) /", Destructive),
+            ("rm -rf <>(true) /", Destructive),
+            ("echo >>(curl x) y", Deny),
+            ("echo <>(curl x) y", Deny),
+            ("echo &>(curl x) y", Deny),
+            ("echo &>>(curl x) y", Deny),
+        ],
+    );
+}
+
+#[test]
 fn unquoted_heredoc_bodies_join_continuation_lines() {
     use Want::Deny;
     // bash joins a body line ending in a backslash with the next before it expands the

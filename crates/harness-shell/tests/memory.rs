@@ -96,6 +96,11 @@ fn rough_scan_memory_is_bounded() {
         (untracked, "a\n"),
         ("", "a\n"),
         ("", ";"),
+        // Commands are also read without their redirections.
+        (untracked, "2>&1 a\n"),
+        ("", "a 2>&1 "),
+        ("", "a &>>b "),
+        ("", "{a}>b "),
     ]
     .iter()
     .map(|&(prefix, unit)| {

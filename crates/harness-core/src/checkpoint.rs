@@ -44,6 +44,8 @@ const PRUNE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// How many sessions one prune removes at most, and how long it may take.
 const PRUNE_AT_MOST: usize = 20;
 const PRUNE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The message of the commit that holds a snapshot's record, which marks it as one.
+const RECORD_MESSAGE: &str = "what the next snapshot left out";
 /// The first item of a snapshot's record, which says how to read the rest.
 const RECORD_MAGIC: &[u8] = b"harness snapshot record 1";
 /// How many private files a snapshot records the mode of at most. (Past that many, the user's
@@ -590,13 +592,7 @@ impl Checkpoints {
         tree_file.push(".tree");
         std::fs::write(&tree_file, tree)?;
         let tree = self.hash_object("tree", Path::new(&tree_file), deadline)?;
-        let mut args = vec![
-            "commit-tree",
-            "--no-gpg-sign",
-            &tree,
-            "-m",
-            "what the next snapshot left out",
-        ];
+        let mut args = vec!["commit-tree", "--no-gpg-sign", &tree, "-m", RECORD_MESSAGE];
         if let Some(previous) = previous {
             args.extend(["-p", previous]);
         }
@@ -616,16 +612,34 @@ impl Checkpoints {
         self.run(cmd, "hash-object", deadline)
     }
 
-    /// The record of the snapshot `commit`, in its first parent.
+    /// The record of the snapshot `commit`, in its first parent, which must be a record commit:
+    /// a snapshot an older harness took has another snapshot there, whose top-level file named
+    /// `record` is the user's.
     fn record_of(&self, commit: &str) -> Result<Record, CheckpointError> {
-        let blob = format!("{commit}^1:record");
         let deadline = Instant::now() + self.restore_timeout;
-        match self.git_bytes(&["cat-file", "blob", &blob], deadline) {
-            Ok(bytes) => Record::decode(&bytes),
+        let no_record = || CheckpointError::NoRecord(commit.to_string());
+        let parent = format!("{commit}^1");
+        let object = match self.git_bytes(&["cat-file", "commit", &parent], deadline) {
+            Ok(object) => object,
             Err(CheckpointError::TooSlow) => return Err(CheckpointError::TooSlow),
-            Err(_) => None,
+            Err(_) => return Err(no_record()),
+        };
+        let text = String::from_utf8_lossy(&object);
+        let (header, message) = text.split_once("\n\n").ok_or_else(no_record)?;
+        let tree = header
+            .lines()
+            .find_map(|line| line.strip_prefix("tree "))
+            .filter(|tree| check_commit(tree).is_ok())
+            .ok_or_else(no_record)?;
+        if message.trim_end() != RECORD_MESSAGE {
+            return Err(no_record());
         }
-        .ok_or_else(|| CheckpointError::NoRecord(commit.to_string()))
+        let blob = format!("{tree}:record");
+        match self.git_bytes(&["cat-file", "blob", &blob], deadline) {
+            Ok(bytes) => Record::decode(&bytes).ok_or_else(no_record),
+            Err(CheckpointError::TooSlow) => Err(CheckpointError::TooSlow),
+            Err(_) => Err(no_record()),
+        }
     }
 
     /// Restores the workspace to `commit`: modified files are reverted, deleted files recreated,

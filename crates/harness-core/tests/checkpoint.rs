@@ -1333,6 +1333,67 @@ fn a_workspace_a_negation_re_includes_keeps_the_repositorys_rules() {
     );
 }
 
+// Re-review E, nit d: a record is read only from a record commit. An older snapshot's parent is
+// another snapshot, whose top-level file named `record` is the user's, whatever it holds.
+#[test]
+fn a_users_file_named_record_is_never_read_as_a_record() {
+    use std::io::Write;
+    let f = fixture();
+    f.write("a.txt", "one\n");
+    let checkpoints = f.checkpoints();
+    let snapshot = checkpoints.snapshot("turn 1").unwrap();
+    let tree = git(&f.gitdir, &["rev-parse", &format!("{snapshot}^{{tree}}")]);
+    // An older snapshot whose workspace held a file `record` that looks like one.
+    let forged = f.ws.parent().unwrap().join("forged");
+    let mut bytes = b"harness snapshot record 1\0workspace ".to_vec();
+    bytes.extend_from_slice(f.ws.as_os_str().as_encoded_bytes());
+    bytes.push(0);
+    std::fs::write(&forged, bytes).unwrap();
+    let blob = git(&f.gitdir, &["hash-object", "-w", forged.to_str().unwrap()]);
+    let mut mktree = Command::new("git")
+        .arg("--git-dir")
+        .arg(&f.gitdir)
+        .arg("mktree")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        mktree.stdin.take().unwrap(),
+        "100644 blob {}\trecord",
+        blob.trim()
+    )
+    .unwrap();
+    let old_tree = String::from_utf8(mktree.wait_with_output().unwrap().stdout).unwrap();
+    let older = git(
+        &f.gitdir,
+        &[
+            "commit-tree",
+            old_tree.trim(),
+            "-m",
+            "before a turn of session s0",
+        ],
+    );
+    let old = git(
+        &f.gitdir,
+        &[
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            older.trim(),
+            "-m",
+            "before a turn of session s0",
+        ],
+    );
+    f.write("a.txt", "two\n");
+    assert!(matches!(
+        checkpoints.restore(old.trim()),
+        Err(CheckpointError::NoRecord(_))
+    ));
+    assert_eq!(f.read("a.txt").as_deref(), Some("two\n"));
+}
+
 /// Whether the tests run as root, which permissions do not stop.
 fn is_root() -> bool {
     // SAFETY: `geteuid` cannot fail.

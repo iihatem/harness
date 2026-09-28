@@ -1,5 +1,5 @@
 //! Linux git-metadata protection end to end: `LinuxSandbox::prepare` runs real commands with
-//! the guard, in the basic tier, and tracks the processes they leave running.
+//! the guard and its watcher, in the basic tier, and tracks the processes they leave running.
 //!
 //! Like `linux_sandbox.rs`, a test skips when the sandbox or a tool it needs is missing, unless
 //! `HARNESS_REQUIRE_LINUX_SANDBOX=1`.
@@ -114,17 +114,9 @@ impl Env {
         sandbox
     }
 
-    /// The one entry the quarantine holds for `rel` (relative to the workspace), where every
-    /// `.git` in the path is stored as `dot-git` and every `HEAD` as `HEAD.quarantined`.
+    /// The one entry the quarantine holds for `rel` (relative to the workspace): see [`stored`].
     fn quarantined(&self, rel: &str) -> PathBuf {
-        let stored: PathBuf = Path::new(rel)
-            .iter()
-            .map(|name| match name.to_str() {
-                Some(".git") => OsStr::new("dot-git"),
-                Some("HEAD") => OsStr::new("HEAD.quarantined"),
-                _ => name,
-            })
-            .collect();
+        let stored = stored(rel);
         let found: Vec<PathBuf> = std::fs::read_dir(&self.quarantine)
             .unwrap_or_else(|e| panic!("no quarantine at {:?}: {e}", self.quarantine))
             .map(|e| e.unwrap().path().join(&stored))
@@ -134,12 +126,38 @@ impl Env {
         found.into_iter().next().unwrap()
     }
 
+    /// Whether the quarantine holds anything for `rel` yet.
+    fn in_quarantine(&self, rel: &str) -> bool {
+        let stored = stored(rel);
+        std::fs::read_dir(&self.quarantine).is_ok_and(|dirs| {
+            dirs.filter_map(Result::ok)
+                .any(|dir| std::fs::symlink_metadata(dir.path().join(&stored)).is_ok())
+        })
+    }
+
+    /// Waits up to four seconds for the watcher to quarantine `rel`.
+    async fn wait_for_quarantine(&self, rel: &str) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !self.in_quarantine(rel) {
+            assert!(
+                Instant::now() < deadline,
+                "{rel} was not moved while the command ran"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     fn exists(&self, rel: &str) -> bool {
         std::fs::symlink_metadata(self.ws.join(rel)).is_ok()
     }
 
     fn read(&self, rel: &str) -> String {
         std::fs::read_to_string(self.ws.join(rel)).unwrap()
+    }
+
+    /// What `rel` holds, if it is there: the guard may be moving it right now.
+    fn read_now(&self, rel: &str) -> Option<String> {
+        std::fs::read_to_string(self.ws.join(rel)).ok()
     }
 
     fn append(&self, rel: &str, text: &str) {
@@ -157,6 +175,19 @@ impl Drop for Env {
         let _ = std::fs::remove_dir_all(&self.ws);
         let _ = std::fs::remove_dir_all(&self.quarantine);
     }
+}
+
+/// `rel` as the quarantine stores it: every `.git` in the path as `dot-git`, and every `HEAD` as
+/// `HEAD.quarantined`.
+fn stored(rel: &str) -> PathBuf {
+    Path::new(rel)
+        .iter()
+        .map(|name| match name.to_str() {
+            Some(".git") => OsStr::new("dot-git"),
+            Some("HEAD") => OsStr::new("HEAD.quarantined"),
+            _ => name,
+        })
+        .collect()
 }
 
 /// Runs `script` with `/bin/sh -c` through `sandbox.prepare`, in `cwd`, as the bash tool does:
@@ -309,6 +340,44 @@ fn state_of(pid: u32) -> Option<u8> {
         .map(|process| process.state)
 }
 
+/// How many threads of this process are named `name`.
+fn threads_named(name: &str) -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .flatten()
+        .filter(|task| {
+            std::fs::read_to_string(task.path().join("comm"))
+                .is_ok_and(|comm| comm.trim_end() == name)
+        })
+        .count()
+}
+
+/// A process a command left running, which wrote its pid to a file: killed when dropped.
+struct Job(i32);
+
+impl Job {
+    async fn from_pid_file(env: &Env, rel: &str) -> Job {
+        wait_until("the job wrote its pid", || {
+            env.read_now(rel).is_some_and(|pid| pid.ends_with('\n'))
+        })
+        .await;
+        Job(env.read(rel).trim().parse().expect("a pid"))
+    }
+
+    fn alive(&self) -> bool {
+        state_of(u32::try_from(self.0).unwrap()).is_some_and(|state| !matches!(state, b'Z' | b'X'))
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        // SAFETY: sends a signal to the job's pid; it has not been reaped, since the job is a
+        // descendant of this process in another session, which only the guard reaps, and the
+        // tests run one at a time.
+        unsafe { libc::kill(self.0, libc::SIGKILL) };
+    }
+}
+
 /// A child process killed and waited for when dropped.
 struct Killed(std::process::Child);
 
@@ -423,8 +492,9 @@ async fn names_a_background_process_plants_later_are_caught_before_the_next_comm
     )
     .await;
     assert_eq!(report, None);
+    // The watcher between commands may have moved it already.
     wait_until("the background process planted commondir", || {
-        env.exists(".git/commondir")
+        env.exists(".git/commondir") || env.in_quarantine(".git/commondir")
     })
     .await;
     let (_, report) = run(&sandbox, &env, "true").await;
@@ -461,11 +531,184 @@ async fn the_session_reports_a_workspace_it_cannot_scan_whole_without_blocking()
 }
 
 // ---------------------------------------------------------------------------
+// The watcher
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_watcher_quarantines_a_hook_while_the_command_runs() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let sandbox = env.basic();
+    let prepared = sandbox
+        .prepare(
+            FsAccess::WorkspaceWrite,
+            &env.ws,
+            "/bin/sh",
+            &[
+                "-c",
+                "echo 'echo pwned' > .git/hooks/post-checkout; exec sleep 30",
+            ],
+        )
+        .expect("prepare the sandboxed command");
+    let mut guard = prepared.guard.expect("a workspace-write guard");
+    let mut cmd = prepared.command;
+    cmd.current_dir(&env.ws)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn the sandboxed command");
+    guard.started(child.id().expect("a pid"));
+    env.wait_for_quarantine(".git/hooks/post-checkout").await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the command should still be running"
+    );
+    assert!(!env.exists(".git/hooks/post-checkout"));
+    child.kill().await.unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(report.blocked, "{}", report.message);
+    assert!(
+        report.message.contains("- .git/hooks/post-checkout: "),
+        "{}",
+        report.message
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.quarantined(".git/hooks/post-checkout")).unwrap(),
+        "echo pwned\n"
+    );
+}
+
+#[tokio::test]
+async fn a_hook_planted_again_and_again_gets_a_bounded_report() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let started = Instant::now();
+    let (output, report) = run(
+        &env.basic(),
+        &env,
+        "i=0; while [ $i -lt 100 ]; do echo 'echo pwned' > .git/hooks/post-checkout; \
+         i=$((i + 1)); sleep 0.02; done",
+    )
+    .await;
+    let took = started.elapsed();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = report.expect("a report");
+    assert!(report.blocked, "{}", report.message);
+    // Each check moves the hook planted last: one as the command starts planting, then one at
+    // most every 50 ms, and the final one after it ends.
+    let listed = report
+        .message
+        .matches("\n- .git/hooks/post-checkout: ")
+        .count();
+    let more: usize = report
+        .message
+        .split("\n- and ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .map_or(0, |count| count.parse().unwrap());
+    let found = listed + more;
+    let most = usize::try_from(took.as_millis() / 50).unwrap() + 3;
+    assert!(
+        (2..=most).contains(&found),
+        "{found} found in {took:?}, at most {most}: {}",
+        report.message
+    );
+    assert!(listed <= 50, "{}", report.message);
+    assert!(report.message.len() < 16 * 1024, "{}", report.message);
+}
+
+// ---------------------------------------------------------------------------
 // Processes a command leaves running (the basic tier)
 // ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn a_job_left_running_is_undone_between_commands_and_reported_with_the_next() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let sandbox = env.basic();
+    let before = env.read(".git/config");
+    let (output, report) = run(
+        &sandbox,
+        &env,
+        r##"sh -c 'echo $$ > job.pid; sleep 1; echo "echo pwned" > .git/hooks/post-checkout; echo "# evil" >> .git/config; exec sleep 30' > /dev/null 2>&1 &"##,
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(report, None);
+    let job = Job::from_pid_file(&env, "job.pid").await;
+    // No command runs meanwhile.
+    wait_until(
+        "the watcher between commands undid what the job did",
+        || {
+            env.in_quarantine(".git/hooks/post-checkout")
+                && env.in_quarantine(".git/config")
+                && !env.exists(".git/hooks/post-checkout")
+                && env.read_now(".git/config").as_ref() == Some(&before)
+        },
+    )
+    .await;
+    assert!(job.alive(), "undone while the job still ran");
+    drop(job);
+    let (output, report) = run(&sandbox, &env, "true").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = report.expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report.message.starts_with("[before this command ran"),
+        "{}",
+        report.message
+    );
+    assert!(
+        report
+            .message
+            .contains("- .git/hooks/post-checkout: new in a protected directory; moved to "),
+        "{}",
+        report.message
+    );
+    assert!(
+        report
+            .message
+            .contains("- .git/config: changed; restored the earlier version"),
+        "{}",
+        report.message
+    );
+    assert_eq!(env.read(".git/config"), before);
+    let changed = std::fs::read_to_string(env.quarantined(".git/config")).unwrap();
+    assert!(changed.contains("# evil"), "{changed}");
+}
+
+#[tokio::test]
+async fn the_watcher_between_commands_ends_once_the_processes_left_are_gone() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let sandbox = env.basic();
+    let (output, report) = run(&sandbox, &env, "(sleep 1) > /dev/null 2>&1 &").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(report, None);
+    assert_eq!(
+        threads_named("harness-watch"),
+        0,
+        "the command's watcher stopped"
+    );
+    wait_until(
+        "a watcher runs between commands while the job lives",
+        || threads_named("harness-between") == 1,
+    )
+    .await;
+    wait_until("the watcher between commands ended with the job", || {
+        threads_named("harness-between") == 0
+    })
+    .await;
+    assert_eq!(
+        orphaned_zombies(),
+        Vec::<i32>::new(),
+        "its last look reaped the job"
+    );
+}
+
 /// Runs `script`, which leaves a process running that appends `# evil` to `.git/config` a
-/// second after the command ends, and checks the next command puts the config back.
+/// second after the command ends, and checks the config is put back, by the watcher between
+/// commands or before the next command at the latest, and that the next command reports it.
 async fn a_config_rewrite_after_the_command_is_undone_before_the_next(env: &Env, script: &str) {
     let sandbox = env.basic();
     let before = env.read(".git/config");
@@ -473,7 +716,9 @@ async fn a_config_rewrite_after_the_command_is_undone_before_the_next(env: &Env,
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(report, None);
     wait_until("the process left running rewrote the config", || {
-        env.read(".git/config").contains("# evil")
+        env.read_now(".git/config")
+            .is_some_and(|config| config.contains("# evil"))
+            || env.in_quarantine(".git/config")
     })
     .await;
     let (output, report) = run(&sandbox, env, "true").await;
@@ -645,16 +890,17 @@ async fn no_zombies_remain_after_a_detached_job_exits_and_the_next_command_runs(
     )
     .await;
     assert!(output.status.success(), "{}", stderr(&output));
+    // Its parent exited at once: it was reparented to this process.
+    wait_until("the detached job is a descendant of this process", || {
+        !live_descendants_elsewhere().is_empty()
+    })
+    .await;
     wait_until("the detached job ran", || env.exists("done")).await;
     wait_until("nothing the command left is still running", || {
         live_descendants_elsewhere().is_empty()
     })
     .await;
-    // It was reparented to this process, which has not reaped it yet.
-    assert!(
-        !orphaned_zombies().is_empty(),
-        "the detached job is not a zombie child of this process"
-    );
+    // The watcher between commands may have reaped it already; the next command does if not.
     let (output, _) = run(&sandbox, &env, "true").await;
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(orphaned_zombies(), Vec::<i32>::new());

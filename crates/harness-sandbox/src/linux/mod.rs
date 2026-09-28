@@ -1,7 +1,8 @@
 //! Linux sandbox backend: a Landlock ruleset (filesystem) plus seccomp-BPF
 //! programs (network, mounts, namespaces) installed from `pre_exec`, in the
 //! forked child, before `execve`; and around every workspace-write
-//! command, the git-metadata guard (`crate::guard`).
+//! command, the git-metadata guard (`crate::guard`) with an inotify watcher
+//! (`crate::watch`, `inotify.rs`).
 //!
 //! ## Split between parent and child
 //!
@@ -42,16 +43,28 @@
 //! whose docs state the invariant every other child of harness must keep).
 //! Each command's pid is registered with [`CommandGuard::started`] until its
 //! guard finishes, so harness never reaps the process tokio waits for.
+//!
+//! ## The watcher
+//!
+//! While a workspace-write command runs, a watcher runs the guard's checks as
+//! soon as a protected name in the workspace changes; it is stopped before
+//! the guard's final checks. When the guard finishes while processes the
+//! command left are running, a watcher between commands takes over for that
+//! workspace, until they are gone or the next workspace-write command there
+//! begins; what it does is reported with that command. A watcher that cannot
+//! start is skipped: the checks around each command still run.
 
 mod detect;
 mod fdcleanup;
 mod fs;
+mod inotify;
 mod preexec;
 mod seccomp;
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use harness_core::tool::{
     CommandGuard, CommandSandbox, GitProtection, GuardReport, SandboxedCommand,
@@ -60,7 +73,9 @@ use tokio::process::Command;
 
 use crate::guard::{GitGuard, GuardSession};
 use crate::procs::{self, Registration};
+use crate::watch::Lifetime;
 use crate::{FsAccess, SandboxPolicy, SandboxSettings};
+use inotify::Watcher;
 use preexec::PreparedSandbox;
 
 pub use detect::{landlock_abi, linux_sandbox_available};
@@ -136,6 +151,7 @@ pub struct LinuxSandbox {
     settings: SandboxSettings,
     guards: Arc<GuardSession>,
     tier: GitProtection,
+    between: Between,
 }
 
 impl LinuxSandbox {
@@ -167,6 +183,7 @@ impl LinuxSandbox {
             settings,
             guards,
             tier,
+            between: Between::default(),
         }
     }
 }
@@ -218,11 +235,13 @@ impl CommandSandbox for LinuxSandbox {
         self.guards.prime(&canonical(workspace));
     }
 
-    /// Reaps what commands left behind, starts the guard for a
-    /// workspace-write command, saving every protected file so it can be
-    /// restored, registers the command as about to be spawned, then builds
-    /// it. A read-only command has no git metadata to guard, but it runs in
-    /// a session of its own all the same, so it is registered too.
+    /// Stops the workspace's watcher between commands, reaps what commands
+    /// left behind, starts the guard for a workspace-write command, saving
+    /// every protected file so it can be restored, registers the command as
+    /// about to be spawned, builds it, and starts its watcher. A read-only
+    /// command has no git metadata to guard, but it runs in a session of its
+    /// own all the same, so it is registered too; it cannot write to the
+    /// workspace, so the watcher between commands goes on meanwhile.
     fn prepare(
         &self,
         access: FsAccess,
@@ -238,6 +257,9 @@ impl CommandSandbox for LinuxSandbox {
             });
         }
         let workspace = canonical(workspace);
+        // What it would check, `begin` checks, and their checks must not
+        // overlap.
+        self.between.stop(&workspace);
         // `begin` asks the probe only when an earlier command left something
         // to check, so orphans are reaped here as well.
         procs::look_and_reap();
@@ -253,7 +275,9 @@ impl CommandSandbox for LinuxSandbox {
                 // Nothing ran; finishing records where things stand for the
                 // next command, and what the checks before this one found is
                 // said with the error.
-                return Err(match guard.finish() {
+                let report = guard.finish();
+                self.between.start(&self.guards, &workspace);
+                return Err(match report {
                     Some(report) => {
                         io::Error::new(err.kind(), format!("{err}\n{}", report.message))
                     }
@@ -261,11 +285,19 @@ impl CommandSandbox for LinuxSandbox {
                 });
             }
         };
+        // One that cannot start is skipped: the final checks still run.
+        let watcher = Watcher::start(guard.watch_handle(), Lifetime::Command).ok();
         Ok(SandboxedCommand {
             command,
             guard: Some(Box::new(LinuxGuard {
                 guard,
                 registration,
+                watcher,
+                after: After {
+                    guards: Arc::clone(&self.guards),
+                    workspace,
+                    between: self.between.clone(),
+                },
             })),
         })
     }
@@ -277,6 +309,64 @@ impl CommandSandbox for LinuxSandbox {
 
 fn canonical(workspace: &Path) -> PathBuf {
     std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The watchers between commands, while processes the last command in their
+/// workspace left are running: at most one per workspace.
+#[derive(Debug, Clone, Default)]
+struct Between(Arc<Mutex<BTreeMap<PathBuf, Watcher>>>);
+
+impl Between {
+    /// Stops the watcher between commands in `workspace`, if there is one,
+    /// and waits for it.
+    fn stop(&self, workspace: &Path) {
+        let watcher = lock(&self.0).remove(workspace);
+        if let Some(watcher) = watcher {
+            watcher.stop();
+        }
+    }
+
+    /// Watches `workspace` until its next command while processes the last
+    /// one left are running, if the guard says any are. One that cannot start
+    /// is skipped: the checks before the next command still run.
+    fn start(&self, guards: &Arc<GuardSession>, workspace: &Path) {
+        let Some(handle) = guards.between_commands(workspace) else {
+            return;
+        };
+        let lifetime = Lifetime::Between {
+            alive: Box::new(procs::look_and_reap),
+        };
+        let Ok(watcher) = Watcher::start(handle, lifetime) else {
+            return;
+        };
+        let done: Vec<Watcher> = {
+            let mut watchers = lock(&self.0);
+            let ended: Vec<PathBuf> = watchers
+                .iter()
+                .filter(|(_, watcher)| watcher.ended())
+                .map(|(path, _)| path.clone())
+                .collect();
+            let mut done: Vec<Watcher> = ended
+                .iter()
+                .filter_map(|path| watchers.remove(path))
+                .collect();
+            done.extend(watchers.insert(workspace.to_path_buf(), watcher));
+            done
+        };
+        // Joined once the lock is released.
+        drop(done);
+    }
+}
+
+/// What a command's guard does once it has finished.
+struct After {
+    guards: Arc<GuardSession>,
+    workspace: PathBuf,
+    between: Between,
 }
 
 /// A read-only command's place in the registry of the processes harness
@@ -293,11 +383,13 @@ impl CommandGuard for Registered {
     }
 }
 
-/// The guard for one command, and its place in the registry of the
-/// processes harness waits for.
+/// The guard for one command, its place in the registry of the processes
+/// harness waits for, and its watcher.
 struct LinuxGuard {
     guard: GitGuard,
     registration: Registration,
+    watcher: Option<Watcher>,
+    after: After,
 }
 
 impl CommandGuard for LinuxGuard {
@@ -305,20 +397,29 @@ impl CommandGuard for LinuxGuard {
         self.registration.started(pid);
     }
 
-    /// The command has been waited for: it is no longer registered, and the
-    /// guard's checks, which ask the survivor probe, reap what it left.
+    /// The command has been waited for: its watcher stops, so none of its
+    /// checks runs once the final ones start; it is no longer registered; and
+    /// the guard's checks, which ask the survivor probe, reap what it left.
     ///
     /// While the probe says processes it left are alive,
-    /// [`GuardSession::between_commands`] hands a file watcher the checks to
-    /// run until the next command begins; each asks the probe again, which
-    /// reaps on the same tick.
+    /// [`GuardSession::between_commands`] hands a watcher between commands
+    /// the checks to run until the next command begins; each asks the probe
+    /// again, which reaps on the same tick, and so does the watcher every
+    /// couple of seconds, until none is left.
     fn finish(self: Box<Self>) -> Option<GuardReport> {
         let LinuxGuard {
             guard,
             registration,
+            watcher,
+            after,
         } = *self;
+        if let Some(watcher) = watcher {
+            watcher.stop();
+        }
         drop(registration);
-        guard.finish()
+        let report = guard.finish();
+        after.between.start(&after.guards, &after.workspace);
+        report
     }
 }
 

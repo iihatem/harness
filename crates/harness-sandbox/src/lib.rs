@@ -27,6 +27,16 @@ mod policy;
 ))]
 mod procs;
 mod roots;
+// The watcher that runs the git-metadata guard's checks as protected names change. Its
+// platform-neutral parts are unit-tested on every host; its kernel side is in `linux`.
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+mod watch;
 
 use std::{
     path::{Path, PathBuf},

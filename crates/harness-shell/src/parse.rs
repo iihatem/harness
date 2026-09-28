@@ -7,6 +7,7 @@ use brush_parser::ast::{
 };
 
 use crate::argv::{self, Hidden, MAX_DEPTH, Scan, Tok, basename, command_name};
+use crate::bash32;
 use crate::destructive;
 use crate::fallback;
 use crate::git;
@@ -15,6 +16,10 @@ use crate::wrappers::{self, Next, assigned_name, runs_programs};
 
 /// Longer input is not parsed (it is only roughly scanned for deny matches).
 const MAX_INPUT_CHARS: usize = 10_000;
+/// Longer input, in bytes, is not even roughly scanned, which bounds the scan's time and
+/// memory: it is undecomposable, so it prompts, and whenever a deny rule exists it counts as
+/// possibly hiding a denied command (see [`crate::Verdict::Ask`]'s `may_deny`).
+const MAX_SCAN_BYTES: usize = 262_144;
 /// Builtins whose `NAME=value` operands set shell variables.
 const DECLARATION_BUILTINS: &[&str] = &["export", "declare", "typeset", "local", "readonly"];
 /// Builtins that evaluate their operands' text as arithmetic, subscripts or variable
@@ -85,6 +90,7 @@ pub(crate) fn analyze(src: &str, ws: &Workspace) -> Analysis {
         data: 0,
         rescan: None,
         sources: Vec::new(),
+        comsub: 0,
     };
     walker.program(src, &mut Cwd::at(ws.root()), 0);
     walker.out
@@ -116,6 +122,9 @@ struct Walker<'a> {
     rescan: Option<&'static str>,
     /// The text of the programs being walked, innermost last.
     sources: Vec<String>,
+    /// Command substitutions being walked, since the last program bash parses from its
+    /// start (the command itself, or `bash -c` or `eval` text).
+    comsub: usize,
 }
 
 impl Walker<'_> {
@@ -134,6 +143,11 @@ impl Walker<'_> {
     fn program(&mut self, src: &str, cwd: &mut Cwd, depth: usize) {
         if depth > MAX_DEPTH {
             return self.undecomposable("nested too deeply".into());
+        }
+        if src.len() > MAX_SCAN_BYTES {
+            return self.undecomposable(format!(
+                "longer than {MAX_SCAN_BYTES} bytes; not checked against deny rules"
+            ));
         }
         if src.chars().count() > MAX_INPUT_CHARS {
             self.undecomposable(format!("longer than {MAX_INPUT_CHARS} characters"));
@@ -173,7 +187,17 @@ impl Walker<'_> {
                 let rescan = self.rescan;
                 self.rescan = outer.or(rescan);
                 let panicked = argv::parser_panics() > panics;
-                if let Some(why) = rescan.or(panicked.then_some(argv::PARSER_PANICKED)) {
+                // bash 3.2 reads the command substitutions of a program it parses from the
+                // start its own way; the text of each is checked with that program.
+                let bash32 = if self.comsub == 0 {
+                    bash32::divergence(src)
+                } else {
+                    None
+                };
+                let why = rescan
+                    .or(panicked.then_some(argv::PARSER_PANICKED))
+                    .or(bash32);
+                if let Some(why) = why {
                     self.undecomposable(why.into());
                     self.rough_scan(src, depth);
                 }
@@ -536,7 +560,17 @@ impl Walker<'_> {
             self.undecomposable(why);
         }
         for sub in scan.subs {
-            self.program(&sub, &mut cwd.clone(), depth + 1);
+            // Where bash may end a `$(…)` at another `)`, it runs text this analysis did not
+            // read as a command, in this program or an enclosing one.
+            if !sub.backquoted
+                && let Some(why) = bash32::substitution_misread(&sub.text)
+            {
+                self.undecomposable(why.into());
+                self.rescan = Some(why);
+            }
+            self.comsub += 1;
+            self.program(&sub.text, &mut cwd.clone(), depth + 1);
+            self.comsub -= 1;
         }
     }
 
@@ -587,8 +621,27 @@ impl Walker<'_> {
                             .collect::<String>(),
                     )
                 };
-                let continued = doc.requires_expansion && body.lines().any(|l| l.ends_with('\\'));
+                // bash 3.2 removes backslash-newlines while it reads a `$(…)`, and every bash
+                // while it reads a backquoted command, before it reads the here-documents in
+                // it: so it joins the lines of a body with a quoted delimiter there too.
+                let joins = doc.requires_expansion || self.comsub > 0;
+                let continued = joins && body.lines().any(|l| l.ends_with('\\'));
                 let raw = if continued { raw() } else { None };
+                if continued && !doc.requires_expansion {
+                    // bash compares the lines with the delimiter after quote removal. How it
+                    // reads a backslash left in it, next to the joined lines, is not modelled:
+                    // such a body counts as ending early.
+                    let unquoted = bash32::delimiter(delimiter);
+                    let early = unquoted.contains('\\')
+                        || raw.as_deref().is_none_or(|raw| {
+                            argv::joined_ends_earlier(raw, &unquoted, doc.remove_tabs)
+                        });
+                    if early {
+                        self.rescan = Some(
+                            "bash joins the lines of this here-document inside a command substitution and may end it earlier",
+                        );
+                    }
+                }
                 if let Some(why) = argv::heredoc_misread(
                     delimiter,
                     body,
@@ -598,13 +651,17 @@ impl Walker<'_> {
                 ) {
                     self.rescan = Some(why);
                 }
-                // A quoted delimiter (`<<'EOF'`) makes the body literal.
-                if doc.requires_expansion && !self.too_nested(&doc.doc.value, true, depth) {
-                    let mut scan = Scan::default();
-                    if let Err(why) = argv::heredoc_substitutions(&doc.doc.value, &mut scan) {
-                        self.undecomposable(why);
+                // A quoted delimiter (`<<'EOF'`) makes the body literal. bash joins the
+                // continuation lines of any other body before it expands it.
+                if doc.requires_expansion {
+                    let body = argv::join_continuations(body);
+                    if !self.too_nested(&body, true, depth) {
+                        let mut scan = Scan::default();
+                        if let Err(why) = argv::heredoc_substitutions(&body, &mut scan) {
+                            self.undecomposable(why);
+                        }
+                        self.scanned(scan, cwd, depth);
                     }
-                    self.scanned(scan, cwd, depth);
                 }
             }
             IoRedirect::HereString(_, w) => {
@@ -691,7 +748,12 @@ impl Walker<'_> {
                 Next::Argv(inner) => {
                     self.exec(inner, &inner_operands, target, depth, layer + 1, same_shell)
                 }
-                Next::Script(src) => self.program(&src, target, depth + 1),
+                Next::Script(src) => {
+                    // bash parses this text from its start.
+                    let comsub = std::mem::take(&mut self.comsub);
+                    self.program(&src, target, depth + 1);
+                    self.comsub = comsub;
+                }
             }
         }
     }
@@ -728,6 +790,14 @@ impl Walker<'_> {
         }
         if name == "alias" {
             self.alias_operands(&argv);
+        }
+        if name == "shopt" && shopt_sets(&argv[1..]) {
+            // extglob changes how bash parses later words (the analysis parses with it off),
+            // and expand_aliases what they run.
+            self.undecomposable(
+                "`shopt` changes a shell option, which can change how bash reads later commands"
+                    .into(),
+            );
         }
         if same_shell {
             match word {
@@ -845,6 +915,25 @@ fn evaluates_operands(name: &str, argv: &[Tok]) -> bool {
             && argv
                 .get(1)
                 .is_some_and(|t| t.lit().is_none_or(|s| s.starts_with("-v"))))
+}
+
+/// Whether `shopt ARGS` may set or unset an option: `-s`, `-u` or `-o` is among its
+/// options, or a word that may be an option is only known at run time. Its options end at
+/// the first word that is not one.
+fn shopt_sets(args: &[Tok]) -> bool {
+    for arg in args {
+        match arg.lit() {
+            None => return true,
+            Some("--") => return false,
+            Some(s) if s.len() > 1 && s.starts_with('-') => {
+                if s[1..].contains(['s', 'u', 'o']) {
+                    return true;
+                }
+            }
+            Some(_) => return false,
+        }
+    }
+    false
 }
 
 /// Whether the NAME of a `NAME=value` operand (or a bare NAME) has a subscript or glob

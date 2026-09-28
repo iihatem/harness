@@ -40,6 +40,11 @@ pub async fn run(
             return 2;
         }
     };
+    let commands = crate::slash::discover(&setup, &prompt_text);
+    if let Err(message) = crate::slash::check(&prompt_text, commands.as_ref()) {
+        eprintln!("error: {}", terminal_safe(&message));
+        return 2;
+    }
     let Some(model_id) = model_flag.or_else(|| setup.config.model.clone()) else {
         eprintln!("error: no model configured.");
         let found = models::available(&setup).await;
@@ -81,6 +86,7 @@ pub async fn run(
 
     // Only read (and potentially block on) stdin once we know we're actually going to run: a
     // missing model must exit 2 promptly even if a pipe into stdin is still open.
+    let typed = prompt_text.clone();
     let input = match with_piped_stdin(prompt_text, cancel.clone()).await {
         StdinOutcome::Ready(input) => input,
         // Cancelled while waiting on stdin: exit immediately, before any model call.
@@ -174,6 +180,14 @@ pub async fn run(
     if let Some(steps) = setup.config.max_steps {
         config.max_steps = steps;
     }
+    // `with_piped_stdin` returns the prompt with any piped text appended.
+    let turn = crate::slash::turn_input(
+        &typed,
+        &input[typed.len()..],
+        commands.as_ref(),
+        &setup,
+        &*policy,
+    );
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin(),
@@ -185,7 +199,7 @@ pub async fn run(
 
     let (tx, rx) = mpsc::unbounded_channel();
     let renderer = tokio::spawn(render(rx, json, cancel.clone()));
-    let reason = agent.run_turn(input, &tx, cancel).await;
+    let reason = agent.run_turn(turn, &tx, cancel).await;
     drop(tx);
     let (final_text, blocked) = renderer.await.unwrap_or_default();
     if !json && !final_text.is_empty() {

@@ -189,6 +189,30 @@ fn changed_project_settings_need_trust_again() {
 }
 
 #[test]
+fn the_workspace_counts_as_trusted_only_while_its_trusted_settings_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let none = dir.path().join("none.toml");
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    // No project settings, so nothing was trusted.
+    assert!(!config::load(&none, &ws, &trust).unwrap().trusted);
+    let project = ws.join(".harness/config.toml");
+    std::fs::write(&project, "[permissions]\nallow = [\"bash:make*\"]\n").unwrap();
+    assert!(!config::load(&none, &ws, &trust).unwrap().trusted);
+    let widening = config::project_widening(&none, &ws).unwrap().unwrap();
+    trust.trust(&ws, &widening.fingerprint).unwrap();
+    assert!(config::load(&none, &ws, &trust).unwrap().trusted);
+    // Changed settings need trust again, and until then the workspace is not trusted.
+    std::fs::write(
+        &project,
+        "[permissions]\nallow = [\"bash:make*\", \"bash:npm*\"]\n",
+    )
+    .unwrap();
+    assert!(!config::load(&none, &ws, &trust).unwrap().trusted);
+}
+
+#[test]
 fn a_typo_in_permissions_reports_file_and_line() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("config.toml");

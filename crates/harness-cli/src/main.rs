@@ -5,6 +5,7 @@ mod models;
 mod prompt;
 mod sandbox;
 mod setup;
+mod slash;
 mod term;
 mod trust;
 

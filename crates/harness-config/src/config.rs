@@ -101,6 +101,10 @@ pub struct Config {
     pub writable_roots: Vec<PathBuf>,
     pub allow_localhost: bool,
     pub linux_git_protection: LinuxGitProtection,
+    /// Whether the user trusted this workspace's project settings as they are now (`harness
+    /// trust`), so that their widening settings apply. A project command file's `model` applies
+    /// only then. False when the project has no settings that need trust.
+    pub trusted: bool,
     pub warnings: Vec<String>,
 }
 
@@ -270,6 +274,7 @@ pub fn load(
         match widening(&project, baseline) {
             None => {}
             Some(w) if trust.is_trusted(workspace, &w.fingerprint) => {
+                cfg.trusted = true;
                 if project.mode.is_some() {
                     cfg.mode = project.mode;
                 }

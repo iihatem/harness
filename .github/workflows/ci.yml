@@ -68,7 +68,10 @@ jobs:
           printf 'target\n' > .dockerignore
           cat > Dockerfile.overlayfs <<'EOF'
           FROM ubuntu:24.04
+          # gcc and libc6-dev: a test builds a small C helper (a process whose main thread exits
+          # first), and HARNESS_REQUIRE_LINUX_SANDBOX makes it fail rather than skip without one.
           RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+              gcc libc6-dev \
               && rm -rf /var/lib/apt/lists/*
           # A repository committed here, in a RUN step, sits in a lower, read-only image layer.
           # The first write under its .git from a running container forces overlayfs to copy it

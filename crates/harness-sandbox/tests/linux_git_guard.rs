@@ -2036,29 +2036,24 @@ async fn a_commit_in_a_repository_from_an_image_layer_gets_no_report() {
 // When harness exits
 // ---------------------------------------------------------------------------
 
-/// A job that rewrites `.git/config` a second after its command ends, then runs on, is ended
-/// when the session ends, and what it did is undone and said.
-async fn a_job_left_running_is_ended_at_exit_and_its_change_undone(
+/// Runs `script`, which must leave a job running that writes its pid to `job.pid`, then waits
+/// until `wrote` holds: the job's change, as it is or once a watcher undid it.
+async fn a_job_that_changes(
     sandbox: &LinuxSandbox,
     env: &Env,
-) {
-    let before = env.read(".git/config");
-    let (output, report) = run(
-        sandbox,
-        env,
-        r##"sh -c 'echo $$ > job.pid; sleep 1; echo "# evil" >> .git/config; exec sleep 30' > /dev/null 2>&1 &"##,
-    )
-    .await;
+    script: &str,
+    wrote: impl Fn() -> bool,
+) -> Job {
+    let (output, report) = run(sandbox, env, script).await;
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(report, None);
     let job = Job::from_pid_file(env, "job.pid").await;
-    wait_until("the job wrote the config", || {
-        env.in_quarantine(".git/config")
-            || env
-                .read_now(".git/config")
-                .is_some_and(|c| c.contains("# evil"))
-    })
-    .await;
+    wait_until("the job made its change", wrote).await;
+    job
+}
+
+/// Ends the session, which must end `job` within the bound and say so; what it said.
+fn end_session_ending(sandbox: &LinuxSandbox, job: &Job) -> String {
     let started = Instant::now();
     let said = sandbox.end_session().expect("something to say");
     assert!(
@@ -2071,14 +2066,8 @@ async fn a_job_left_running_is_ended_at_exit_and_its_change_undone(
         said.contains("harness ended 1 process that sandboxed commands left running"),
         "{said}"
     );
-    assert!(
-        said.contains("\n- .git/config: changed; restored the earlier version"),
-        "{said}"
-    );
-    assert_eq!(env.read(".git/config"), before);
-    let changed = std::fs::read_to_string(env.quarantined(".git/config")).unwrap();
-    assert!(changed.contains("# evil"), "{changed}");
     assert_eq!(orphaned_zombies(), Vec::<i32>::new(), "{said}");
+    said
 }
 
 #[tokio::test]
@@ -2086,7 +2075,28 @@ async fn at_exit_a_job_left_running_is_ended_and_its_change_undone_in_the_basic_
     let _serial = SERIAL.lock().await;
     let Some(env) = Env::new() else { return };
     let sandbox = env.basic();
-    a_job_left_running_is_ended_at_exit_and_its_change_undone(&sandbox, &env).await;
+    let before = env.read(".git/config");
+    // A job that rewrites `.git/config` a second after its command ends, then runs on.
+    let job = a_job_that_changes(
+        &sandbox,
+        &env,
+        r##"sh -c 'echo $$ > job.pid; sleep 1; echo "# evil" >> .git/config; exec sleep 30' > /dev/null 2>&1 &"##,
+        || {
+            env.in_quarantine(".git/config")
+                || env
+                    .read_now(".git/config")
+                    .is_some_and(|c| c.contains("# evil"))
+        },
+    )
+    .await;
+    let said = end_session_ending(&sandbox, &job);
+    assert!(
+        said.contains("\n- .git/config: changed; restored the earlier version"),
+        "{said}"
+    );
+    assert_eq!(env.read(".git/config"), before);
+    let changed = std::fs::read_to_string(env.quarantined(".git/config")).unwrap();
+    assert!(changed.contains("# evil"), "{changed}");
 }
 
 #[tokio::test]
@@ -2094,7 +2104,27 @@ async fn at_exit_a_job_left_running_is_ended_and_its_change_undone_in_the_full_t
     let _serial = SERIAL.lock().await;
     let Some(env) = Env::new() else { return };
     let Some(sandbox) = env.full() else { return };
-    a_job_left_running_is_ended_at_exit_and_its_change_undone(&sandbox, &env).await;
+    // In the full tier the job keeps its command's read-only mounts, so it cannot rewrite
+    // `.git/config`; it can plant a protected name that did not exist, which no mount covers, in
+    // the pinned, writable `.git`.
+    let job = a_job_that_changes(
+        &sandbox,
+        &env,
+        "sh -c 'echo $$ > job.pid; sleep 1; echo /tmp/evil > .git/commondir; exec sleep 30' \
+         > /dev/null 2>&1 &",
+        || env.in_quarantine(".git/commondir") || env.exists(".git/commondir"),
+    )
+    .await;
+    let said = end_session_ending(&sandbox, &job);
+    assert!(
+        said.contains("\n- .git/commondir: new; moved to "),
+        "{said}"
+    );
+    assert!(!env.exists(".git/commondir"));
+    assert_eq!(
+        std::fs::read_to_string(env.quarantined(".git/commondir")).unwrap(),
+        "/tmp/evil\n"
+    );
 }
 
 #[tokio::test]

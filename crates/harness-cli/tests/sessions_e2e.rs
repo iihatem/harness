@@ -301,3 +301,77 @@ async fn the_session_list_shows_file_names_and_escapes_what_the_files_say() {
     );
     assert!(listing.starts_with(&format!("{id}  ")), "{listing}");
 }
+
+// Review D I1, end to end: harness killed while a tool runs, then continued. Strict providers
+// reject a tool call without a result, so the next request must carry one for every call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_killed_during_a_tool_call_can_be_continued() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("start the long job"))
+        .respond_with(stream(&[json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+            "function": {"name": "bash", "arguments": "{\"command\":\"sleep 20\"}"}}]}, "finish_reason": "tool_calls"}]})]))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    answers(&server, "what happened", "it was stopped").await;
+    let env = Env::new(&server.uri());
+    // Full access, so the command runs without approval or sandbox on every platform.
+    let mut child = std::process::Command::new(BIN)
+        .current_dir(env.ws.path())
+        .env("HARNESS_HOME", env.home.path())
+        .args(["--mode", "full-access", "ask", "start the long job"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    loop {
+        let saved = env
+            .session_files()
+            .first()
+            .map(|f| std::fs::read_to_string(f).unwrap_or_default())
+            .unwrap_or_default();
+        if saved.contains("call_1") {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the tool call was never saved"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let env = tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .args(["-c", "ask", "what happened?"])
+            .assert()
+            .success()
+            .stdout(contains("it was stopped"));
+        env
+    })
+    .await
+    .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    let result = messages
+        .iter()
+        .position(|m| m["role"] == "tool" && m["tool_call_id"] == "call_1")
+        .expect("a result for the call");
+    assert_eq!(messages[result - 1]["tool_calls"][0]["id"], "call_1");
+    assert!(
+        messages[result]["content"]
+            .as_str()
+            .unwrap()
+            .contains("harness stopped before this tool call finished"),
+        "{messages:?}"
+    );
+    assert_eq!(messages[result + 1]["role"], "user");
+    drop(env);
+}

@@ -248,26 +248,61 @@ impl Agent {
         }
     }
 
-    /// Saves the conversation in `session` from now on, continuing its active branch.
+    /// Saves the conversation in `session` from now on, continuing its active branch. Tool calls
+    /// a stopped run left without results at the end of it get results, saved in the session.
     pub fn with_session(mut self, session: Session) -> Self {
         self.session = session;
-        self.load_history();
+        self.load_history(true);
         self
     }
 
-    /// Rebuilds the history from the session's active branch.
-    fn load_history(&mut self) {
-        let (ids, history): (Vec<String>, Vec<Message>) =
-            self.session.messages().into_iter().unzip();
-        for message in &history {
-            if let Message::Assistant { tool_calls, .. } = message {
+    /// Rebuilds the history from the session's active branch. Every tool call needs a result, or
+    /// providers reject the request, but a run that was killed while a tool ran left none: such
+    /// a call gets one saying its effects are unknown. At the end of the branch that result is
+    /// saved when `save` is set; elsewhere, and otherwise, it exists only in the history, where
+    /// it shares its call's entry id.
+    fn load_history(&mut self, save: bool) {
+        let mut history = Vec::new();
+        let mut ids = Vec::new();
+        // The calls of the last assistant message still waiting for a result.
+        let mut waiting: Vec<String> = Vec::new();
+        let mut answered = 0;
+        for (id, message) in self.session.messages() {
+            if let Message::Tool { call_id, .. } = &message {
+                waiting.retain(|c| c != call_id);
+            } else {
+                for call_id in waiting.drain(..) {
+                    history.push(stopped_result(call_id));
+                    ids.push(ids.last().cloned().unwrap_or_default());
+                    answered += 1;
+                }
+            }
+            if let Message::Assistant { tool_calls, .. } = &message {
                 self.used_call_ids
                     .extend(tool_calls.iter().map(|c| c.id.clone()));
+                waiting = tool_calls.iter().map(|c| c.id.clone()).collect();
             }
+            history.push(message);
+            ids.push(id);
         }
         self.history = history;
         self.history_ids = ids;
         self.reported_usage = None;
+        for call_id in waiting {
+            if save {
+                self.record(stopped_result(call_id), None, false);
+            } else {
+                self.history.push(stopped_result(call_id));
+                let id = self.history_ids.last().cloned().unwrap_or_default();
+                self.history_ids.push(id);
+            }
+            answered += 1;
+        }
+        if answered > 0 && save {
+            self.warnings.push(format!(
+                "harness stopped before {answered} tool call(s) in this conversation finished; the model is told their effects are unknown"
+            ));
+        }
     }
 
     /// Snapshots the workspace before each turn's first change, so it can be rewound.
@@ -381,7 +416,7 @@ impl Agent {
 
     /// Reloads the history after the active branch moved, and notes a failure to save.
     fn after_session_change(&mut self) {
-        self.load_history();
+        self.load_history(false);
         self.note_save_error();
     }
 
@@ -1115,6 +1150,15 @@ fn shell_part_text(command: &str, output: &ToolOutput) -> String {
             "[`{command}` did not run successfully]\n{}",
             output.content.trim_end_matches('\n')
         ),
+    }
+}
+
+/// The result given to a tool call that a stopped run left without one.
+fn stopped_result(call_id: String) -> Message {
+    Message::Tool {
+        call_id,
+        content: "harness stopped before this tool call finished; its effects are unknown".into(),
+        is_error: true,
     }
 }
 

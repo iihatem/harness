@@ -12,7 +12,7 @@ mod trust;
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use harness_core::permission::Mode;
 
 #[derive(Parser)]
@@ -79,9 +79,34 @@ enum SandboxCommand {
     Doctor,
 }
 
+/// What `--resume` without an id says when a subcommand follows it.
+const RESUME_NEEDS_AN_ID: &str = "error: --resume needs an id when a command follows it; run `harness --resume` on its own to list this project's sessions";
+
+/// Whether a bare `--resume` in `args` is followed directly by a subcommand, which clap would
+/// take for its id.
+fn resume_before_a_subcommand(args: &[std::ffi::OsString]) -> bool {
+    let command = Cli::command();
+    let is_subcommand = |arg: &std::ffi::OsString| {
+        arg == "help" || command.get_subcommands().any(|c| arg == c.get_name())
+    };
+    let args: Vec<_> = args.iter().skip(1).take_while(|a| *a != "--").collect();
+    args.windows(2)
+        .any(|pair| pair[0] == "--resume" && is_subcommand(pair[1]))
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if resume_before_a_subcommand(&args) {
+        eprintln!("{RESUME_NEEDS_AN_ID}");
+        return ExitCode::from(2);
+    }
+    let cli = Cli::parse_from(args);
     let session = match (&cli.resume, cli.continue_session) {
+        // Listing is what `--resume` alone does; with a subcommand, the id was forgotten.
+        (Some(None), _) if cli.command.is_some() => {
+            eprintln!("{RESUME_NEEDS_AN_ID}");
+            return ExitCode::from(2);
+        }
         (Some(None), _) => return ExitCode::from(sessions::print_list()),
         (Some(Some(id)), _) => sessions::Choice::Resume(id.clone()),
         (None, true) => sessions::Choice::Continue,

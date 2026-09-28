@@ -1,6 +1,8 @@
 mod ask;
+mod doctor;
 mod models;
 mod prompt;
+mod sandbox;
 mod setup;
 mod term;
 mod trust;
@@ -49,6 +51,17 @@ enum Command {
         #[arg(long, conflicts_with = "yes")]
         revoke: bool,
     },
+    /// Inspect the OS sandbox
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SandboxCommand {
+    /// Show which sandbox this system gets, how git metadata is protected, and how to improve it
+    Doctor,
 }
 
 fn main() -> ExitCode {
@@ -61,6 +74,9 @@ fn main() -> ExitCode {
             }
             Some(Command::Models) => models::run().await,
             Some(Command::Trust { yes, revoke }) => trust::run(yes, revoke),
+            Some(Command::Sandbox {
+                command: SandboxCommand::Doctor,
+            }) => doctor::run(),
             None => {
                 eprintln!("Interactive mode is not available yet; use `harness ask \"...\"`.");
                 2

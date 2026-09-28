@@ -1293,6 +1293,38 @@ async fn a_read_only_command_harness_waits_for_is_never_reaped_either() {
     the_command_harness_waits_for_is_never_reaped(FsAccess::ReadOnly).await;
 }
 
+#[tokio::test]
+async fn required_protection_refuses_to_run_in_the_basic_tier() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let settings = SandboxSettings {
+        require_full_git_protection: true,
+        ..env.settings()
+    };
+    let sandbox = LinuxSandbox::with_git_protection(
+        settings,
+        GitProtection::Basic {
+            reason: "forced by the test".into(),
+        },
+    );
+    let err = sandbox
+        .prepare(
+            FsAccess::WorkspaceWrite,
+            &env.ws,
+            "/bin/sh",
+            &["-c", "touch ran"],
+        )
+        .err()
+        .expect("the basic tier is refused");
+    assert!(err.to_string().contains("linux_git_protection"), "{err}");
+    // A read-only sandbox protects git metadata completely, so it still runs.
+    assert!(
+        sandbox
+            .prepare(FsAccess::ReadOnly, &env.ws, "/bin/sh", &["-c", "true"])
+            .is_ok()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The full tier: writes fail
 // ---------------------------------------------------------------------------

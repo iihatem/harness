@@ -85,6 +85,9 @@ pub struct SandboxSettings {
     /// Where the Linux git-metadata guard moves what it takes out of the workspace. The CLI
     /// passes `<data dir>/quarantine`; `None` means `harness-quarantine` in the temp directory.
     pub quarantine_dir: Option<PathBuf>,
+    /// `sandbox.linux_git_protection = "required"`: on Linux, refuse to run a workspace-write
+    /// command in the basic tier (the CLI then treats the session as having no sandbox).
+    pub require_full_git_protection: bool,
 }
 
 impl SandboxSettings {
@@ -104,6 +107,40 @@ impl SandboxSettings {
 /// canonicalized counts as too broad. The same check the sandboxes apply to temp and cache roots.
 pub fn workspace_is_too_broad(workspace: &Path) -> bool {
     roots::safe_root(workspace, roots::home_dir().as_deref()).is_none()
+}
+
+/// Why [`detect`] finds no sandbox on this host, for `harness sandbox doctor`.
+pub fn unavailable_reason() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        format!(
+            "{} is missing or cannot apply a profile",
+            macos::SANDBOX_EXEC_PATH
+        )
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        match landlock_abi() {
+            None => "Landlock is not enabled in this kernel".to_string(),
+            Some(abi) if abi < 3 => format!(
+                "this kernel has Landlock ABI {abi}; harness needs ABI 3 or later (Linux 6.2+)"
+            ),
+            Some(_) => "the seccomp filter could not be built for this system".to_string(),
+        }
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )))]
+    {
+        "harness has no sandbox for this system".to_string()
+    }
 }
 
 /// The OS sandbox this host supports, or `None` when none is usable (the caller must then ask before
@@ -140,5 +177,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(!workspace_is_too_broad(dir.path()));
         assert!(workspace_is_too_broad(&dir.path().join("missing")));
+    }
+
+    #[test]
+    fn there_is_always_a_reason_to_give_for_having_no_sandbox() {
+        let reason = unavailable_reason();
+        assert!(!reason.is_empty());
+        if cfg!(target_os = "macos") {
+            assert!(reason.starts_with("/usr/bin/sandbox-exec "), "{reason}");
+        }
     }
 }

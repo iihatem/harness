@@ -359,7 +359,15 @@ impl CommandSandbox for LinuxSandbox {
                 })),
             });
         }
-        let full = self.git_protection() == GitProtection::Full;
+        let tier = self.git_protection();
+        if let GitProtection::Basic { reason } = &tier
+            && self.settings.require_full_git_protection
+        {
+            return Err(io::Error::other(format!(
+                "git metadata protection is required (sandbox.linux_git_protection = \"required\"), but the full tier is unavailable: {reason}; restart harness to have every command ask first"
+            )));
+        }
+        let full = tier == GitProtection::Full;
         let workspace = canonical(workspace);
         // What it would check, `begin` checks, and their checks must not
         // overlap.

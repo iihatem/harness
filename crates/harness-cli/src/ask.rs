@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use harness_config::config;
+use harness_config::config::{self, LinuxGitProtection};
 use harness_core::{
     agent::{Agent, AgentConfig, NonInteractive},
     engine::{EngineConfig, PermissionEngine, RuleSet},
@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    models, prompt, setup,
+    models, prompt, sandbox, setup,
     term::{terminal_safe, terminal_safe_text},
 };
 
@@ -108,17 +108,24 @@ pub async fn run(
     // read-only modes keep their read-only sandbox.
     let workspace_too_broad = mode.fs_access() == FsAccess::WorkspaceWrite
         && harness_sandbox::workspace_is_too_broad(&setup.workspace);
-    let sandbox = if mode == Mode::FullAccess || sandbox_disabled_by_env || workspace_too_broad {
+    let required = setup.config.linux_git_protection == LinuxGitProtection::Required;
+    let detected = if mode == Mode::FullAccess || sandbox_disabled_by_env || workspace_too_broad {
         None
     } else {
         harness_sandbox::detect(harness_sandbox::SandboxSettings {
             extra_writable: setup.config.writable_roots.clone(),
             allow_localhost: setup.config.allow_localhost,
             quarantine_dir: Some(setup.paths.data_dir.join("quarantine")),
+            require_full_git_protection: required,
         })
     };
+    let choice = sandbox::choose(detected, mode.fs_access(), required);
+    if let Some(warning) = &choice.warning {
+        eprintln!("warning: {}", terminal_safe(warning));
+    }
+    let sandbox = choice.sandbox;
     let sandboxed = sandbox.is_some();
-    if mode != Mode::FullAccess && !sandboxed {
+    if mode != Mode::FullAccess && !sandboxed && choice.warning.is_none() {
         if sandbox_disabled_by_env {
             eprintln!(
                 "warning: the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval"

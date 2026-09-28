@@ -1,6 +1,7 @@
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
+use harness_core::tool::GitProtection;
 use predicates::str::contains;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -23,6 +24,24 @@ fn host_has_sandbox() -> bool {
         eprintln!("skipping: no OS sandbox on this host");
     }
     ok
+}
+
+/// On Linux with a sandbox, whether this host gets the basic git-protection tier (`Some(true)`)
+/// or the full one (`Some(false)`); `None` elsewhere. With `HARNESS_EXPECT_LINUX_TIER` set (CI
+/// sets `basic` or `full`), any other tier fails the test.
+fn linux_basic_tier() -> Option<bool> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let protection =
+        harness_sandbox::detect(harness_sandbox::SandboxSettings::default())?.git_protection();
+    let basic = matches!(protection, GitProtection::Basic { .. });
+    let expected = std::env::var("HARNESS_EXPECT_LINUX_TIER").unwrap_or_default();
+    if !expected.is_empty() {
+        let tier = if basic { "basic" } else { "full" };
+        assert_eq!(tier, expected, "{protection:?}");
+    }
+    Some(basic)
 }
 
 fn sse(chunks: &[Value]) -> String {
@@ -265,23 +284,140 @@ async fn git_commit_works_in_the_sandbox() {
     assert!(String::from_utf8_lossy(&log.stdout).contains("sandboxed"));
 }
 
+/// Macos and the Linux full tier refuse the write; the Linux basic tier moves the hook to
+/// quarantine after the command. Either way the command counts as blocked.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "Landlock cannot protect .git/hooks inside a writable workspace; see README Known limitations"
-)]
 async fn planting_a_git_hook_fails_in_the_sandbox() {
     if !host_has_sandbox() {
         return;
     }
+    let basic = linux_basic_tier() == Some(true);
     let (env, out) = run_bash("echo 'echo pwned' > .git/hooks/pre-commit", "", |_| {}).await;
     assert!(!env.ws.path().join(".git/hooks/pre-commit").exists());
     assert_eq!(out.status.code(), Some(3), "{}", tool_output(&out));
+    let expected = if basic {
+        "- .git/hooks/pre-commit: new in a protected directory; moved to "
+    } else {
+        "[the sandbox may have blocked"
+    };
     assert!(
-        tool_output(&out).contains("[the sandbox may have blocked"),
+        tool_output(&out).contains(expected),
         "{}",
         tool_output(&out)
     );
+    if basic {
+        let quarantine = env.home.path().join("data/quarantine");
+        let moved = std::fs::read_dir(&quarantine)
+            .unwrap()
+            .map(|d| d.unwrap().path().join(".git/hooks/pre-commit"))
+            .find(|p| p.exists())
+            .expect("the hook is in the quarantine");
+        assert_eq!(std::fs::read_to_string(moved).unwrap(), "echo pwned\n");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn git_init_of_a_nested_repository_is_undone() {
+    if !host_has_sandbox() {
+        return;
+    }
+    let (env, out) = run_bash("git init -q sub", "", |_| {}).await;
+    assert!(!env.ws.path().join("sub/.git").exists());
+    assert_eq!(out.status.code(), Some(3), "{}", tool_output(&out));
+    if cfg!(target_os = "linux") {
+        assert!(
+            tool_output(&out).contains("- sub/.git: a new repository; moved to "),
+            "{}",
+            tool_output(&out)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_linux_basic_tier_warns_at_startup() {
+    let Some(basic) = linux_basic_tier() else {
+        return;
+    };
+    let (_env, out) = run_bash("true", "", |_| {}).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.contains("run `harness sandbox doctor`"),
+        basic,
+        "{stderr}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn required_git_protection_asks_before_every_command_in_the_basic_tier() {
+    let Some(basic) = linux_basic_tier() else {
+        return;
+    };
+    let (env, out) = run_bash(
+        "touch made.txt",
+        "[sandbox]\nlinux_git_protection = \"required\"\n",
+        |_| {},
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if basic {
+        assert_eq!(out.status.code(), Some(3), "{stderr}");
+        assert!(
+            stderr.contains("every shell command will need approval"),
+            "{stderr}"
+        );
+        assert!(!env.ws.path().join("made.txt").exists());
+    } else {
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+        assert!(env.ws.path().join("made.txt").exists());
+    }
+}
+
+#[test]
+fn sandbox_doctor_reports_the_mechanism_and_tier() {
+    let home = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let out = Command::new(BIN)
+        .args(["sandbox", "doctor"])
+        .current_dir(ws.path())
+        .env("HARNESS_HOME", home.path())
+        .env_remove("HARNESS_SANDBOX")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("Sandbox: "), "{stdout}");
+    match linux_basic_tier() {
+        Some(true) => {
+            assert!(
+                stdout.contains("Git metadata protection: basic tier\n  Why: "),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains("harness does not change any of these settings itself."),
+                "{stdout}"
+            );
+            let apparmor =
+                std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                    .is_ok_and(|v| v.trim() == "1");
+            if apparmor {
+                assert!(
+                    stdout.contains("sudo apparmor_parser -r /etc/apparmor.d/harness"),
+                    "{stdout}"
+                );
+                assert!(
+                    stdout
+                        .contains("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"),
+                    "{stdout}"
+                );
+            }
+        }
+        Some(false) => assert!(stdout.contains("full tier"), "{stdout}"),
+        None if cfg!(target_os = "macos") => {
+            assert!(stdout.starts_with("Sandbox: seatbelt\n"), "{stdout}")
+        }
+        None => {}
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

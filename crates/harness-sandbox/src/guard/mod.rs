@@ -30,7 +30,7 @@
 //! directory for one at any moment. When a directory's owner lost the
 //! permissions the guard needs, the guard gives them back and says so.
 
-mod nofollow;
+pub(crate) mod nofollow;
 mod quarantine;
 mod report;
 mod snapshot;
@@ -52,7 +52,7 @@ use crate::gitmeta::{
     nested_gitdirs, read_ignore_rules,
 };
 use nofollow::{Dir, Kind, Stat, Tree, absent, same_birth};
-use quarantine::Quarantine;
+use quarantine::{Quarantine, renamed_in_place};
 use report::{Finding, Findings, List, Outcome, What};
 use snapshot::{Difference, Next, Snapshot};
 
@@ -344,6 +344,37 @@ impl GuardSession {
         })
     }
 
+    /// What the checks between commands have found in `workspace` since the
+    /// last command, taken for the result of a command that has no checks
+    /// of its own (a read-only one): said once, without blocking.
+    pub fn found_between(&self, workspace: &Path) -> Option<GuardReport> {
+        let found = {
+            let mut workspaces = lock(&self.workspaces);
+            let kept = workspaces.get_mut(workspace)?.kept.as_mut()?;
+            std::mem::take(&mut kept.found)
+        };
+        let findings = Findings {
+            before: found,
+            ..Findings::default()
+        };
+        findings.report(workspace).map(|report| GuardReport {
+            blocked: false,
+            ..report
+        })
+    }
+
+    /// Between the command of `generation` and the next, no process it left
+    /// is running any more: see [`WatchHandle::survivors_gone`].
+    fn clear_survivors(&self, workspace: &Path, generation: u64) {
+        let mut workspaces = lock(&self.workspaces);
+        if let Some(entry) = workspaces.get_mut(workspace)
+            && entry.generation == generation
+            && let Some(kept) = entry.kept.as_mut()
+        {
+            kept.survivors = false;
+        }
+    }
+
     /// Takes where things stood after the previous command, as the next
     /// one begins.
     fn take_kept(&self, workspace: &Path) -> Option<Kept> {
@@ -559,6 +590,21 @@ impl WatchHandle {
                     relevant(workspace, &kept.gitdirs, Some(&kept.snapshot), dir, name)
                 })
                 .unwrap_or(false),
+        }
+    }
+
+    /// Between commands, says that no process the last command left is
+    /// running any more, once a last check has run: from then on, changes
+    /// to protected files are the user's, and the next command leaves them.
+    /// Does nothing for a command's handle.
+    pub fn survivors_gone(&self) {
+        if let Watched::Between {
+            session,
+            workspace,
+            generation,
+        } = &self.0
+        {
+            session.clear_survivors(workspace, *generation);
         }
     }
 
@@ -1173,6 +1219,10 @@ impl<'a> Pass<'a> {
                         outcome: self.unreachable(path),
                     })
                 }
+                // Renamed in place by an earlier check, when the quarantine
+                // could not be used: git no longer uses it, and that check
+                // said so.
+                Difference::Added if path.file_name().is_some_and(renamed_in_place) => None,
                 Difference::Added => self.take(path, What::Added),
                 Difference::Changed => match self.move_out(path, What::Changed, &Todo::Restore) {
                     None | Some(Moved::Failed { known: true, .. }) => None,

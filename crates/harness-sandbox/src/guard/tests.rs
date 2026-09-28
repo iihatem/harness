@@ -303,15 +303,27 @@ fn the_same_name_planted_again_and_again_is_not_searched_for_a_free_name() {
     let probes = lock(&guard.state).quarantine.probes();
     assert!(probes <= 2 * 500, "{probes} names tried for 500 moves");
     let report = guard.finish().expect("a report");
+    // One line, however often it was planted: a count, and where the first
+    // and the last went.
     assert_eq!(
-        report.message.matches("\n- HEAD: new; moved to ").count(),
-        50
-    );
-    assert!(
-        report.message.contains("\n- and 450 more]"),
+        report.message.matches("\n- ").count(),
+        1,
         "{}",
         report.message
     );
+    assert!(
+        report.message.contains("\n- HEAD: new; moved to "),
+        "{}",
+        report.message
+    );
+    assert!(
+        report
+            .message
+            .contains(", and 499 more times since, the last: moved to "),
+        "{}",
+        report.message
+    );
+    assert!(report.message.len() < 1024, "{}", report.message);
 }
 
 /// Sets the most changes one check makes.
@@ -741,4 +753,125 @@ fn a_directory_is_known_by_its_inode_alone() {
         birth,
     };
     assert_ne!(file(Some((10, 0))), file(Some((20, 5))));
+}
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn what_was_renamed_in_place_is_left_as_it_is_by_later_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let ws = base.join("ws");
+    std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+    std::fs::write(ws.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(ws.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+    // A quarantine that cannot be used: a file where its directory would be.
+    std::fs::write(base.join("quarantine"), "not a directory\n").unwrap();
+    let session = GuardSession::new(&base.join("quarantine"));
+    session.set_survivor_probe(Arc::new(|| true));
+    let guard = session.begin(&ws, true, |_| {});
+    let handle = guard.watch_handle();
+    std::fs::write(ws.join(".git/hooks/post-checkout"), "echo pwned\n").unwrap();
+    for _ in 0..5 {
+        handle.check();
+    }
+    let renamed = ["post-checkout.harness-quarantine-0"];
+    assert_eq!(names_in(&ws.join(".git/hooks")), renamed);
+    let report = guard.finish().expect("a report");
+    assert_eq!(
+        report.message.matches("\n- ").count(),
+        1,
+        "{}",
+        report.message
+    );
+    assert!(
+        report
+            .message
+            .contains("- .git/hooks/post-checkout: new in a protected directory; moved to "),
+        "{}",
+        report.message
+    );
+    // Nor between commands, nor before the next one.
+    let between = session.between_commands(&ws).expect("survivors");
+    for _ in 0..3 {
+        between.check();
+    }
+    assert_eq!(names_in(&ws.join(".git/hooks")), renamed);
+    assert_eq!(session.begin(&ws, true, |_| {}).finish(), None);
+    assert_eq!(names_in(&ws.join(".git/hooks")), renamed);
+}
+
+#[test]
+fn once_survivors_are_gone_changes_between_commands_are_the_users() {
+    let env = env();
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let probe = Arc::clone(&alive);
+    env.session.set_survivor_probe(Arc::new(move || {
+        probe.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    let original = read(&env.ws.join(".git/config"));
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    let between = env.session.between_commands(&env.ws).expect("survivors");
+    // A survivor changes the config, then exits: the last check puts it back.
+    std::fs::write(env.ws.join(".git/config"), EVIL).unwrap();
+    alive.store(false, std::sync::atomic::Ordering::SeqCst);
+    between.check();
+    between.survivors_gone();
+    assert_eq!(read(&env.ws.join(".git/config")), original);
+    // What the user changes after that is theirs.
+    let mine = "[user]\n\tname = me\n";
+    std::fs::write(env.ws.join(".git/config"), mine).unwrap();
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("what the last check did");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report
+            .message
+            .contains("- .git/config: changed; restored the earlier version"),
+        "{}",
+        report.message
+    );
+    assert_eq!(read(&env.ws.join(".git/config")), mine);
+}
+
+#[test]
+fn what_the_checks_between_commands_found_is_said_once_with_the_next_result() {
+    let env = env();
+    env.session.set_survivor_probe(Arc::new(|| true));
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    let between = env.session.between_commands(&env.ws).expect("survivors");
+    std::fs::write(env.ws.join(".git/commondir"), "/tmp/evil\n").unwrap();
+    between.check();
+    let report = env
+        .session
+        .found_between(&env.ws)
+        .expect("what the check found");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report.message.starts_with("[before this command ran"),
+        "{}",
+        report.message
+    );
+    assert!(
+        report.message.contains("- .git/commondir: new; moved to "),
+        "{}",
+        report.message
+    );
+    assert_eq!(env.session.found_between(&env.ws), None, "said once");
+    assert_eq!(
+        env.session.begin(&env.ws, true, |_| {}).finish(),
+        None,
+        "not said again"
+    );
 }

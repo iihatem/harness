@@ -1,7 +1,7 @@
 //! What the guard found and did around one command, and how the tool result
 //! reports it.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +13,9 @@ const MAX_LISTED: usize = 10;
 
 /// How many lines one section of the report lists; the rest are counted.
 const MAX_LINES: usize = 50;
+
+/// How many paths one list of findings keeps; past it, only a count.
+const MAX_KEPT: usize = 1_000;
 
 pub(super) const BEFORE: &str = "[before this command ran, harness found protected git metadata created or changed after the previous command ended, probably by a process it left running:";
 
@@ -115,25 +118,98 @@ impl Outcome {
     }
 }
 
-/// Findings in the order found, each once: a check that runs again while a
-/// failure lasts finds it again.
+/// Findings in the order found, one line per path and kind. A check that
+/// runs again finds the same thing again, and a name planted again and again
+/// is moved to a new place in quarantine each time: a finding for a path and
+/// kind already listed is counted on its line, which keeps the first and the
+/// last of them, so the list grows with the paths, not with the checks. Past
+/// [`MAX_KEPT`] paths only a count is kept, and whether any failed.
 #[derive(Debug, Default)]
 pub(super) struct List {
-    items: Vec<Finding>,
-    seen: HashSet<Finding>,
+    items: Vec<Entry>,
+    index: HashMap<(PathBuf, What), usize>,
+    /// Findings past [`MAX_KEPT`] paths.
+    beyond: usize,
+    beyond_failed: bool,
+}
+
+/// One line of a [`List`].
+#[derive(Debug)]
+struct Entry {
+    first: Finding,
+    /// How many findings for the same path and kind came after the first,
+    /// and the last of them.
+    again: usize,
+    last: Option<Finding>,
+    /// Whether any of them failed.
+    failed: bool,
 }
 
 impl List {
     pub(super) fn push(&mut self, finding: Option<Finding>) {
-        if let Some(finding) = finding
-            && self.seen.insert(finding.clone())
-        {
-            self.items.push(finding);
+        let Some(finding) = finding else {
+            return;
+        };
+        let key = (finding.path.clone(), finding.what);
+        if let Some(&at) = self.index.get(&key) {
+            let entry = &mut self.items[at];
+            if entry.first == finding || entry.last.as_ref() == Some(&finding) {
+                return;
+            }
+            entry.failed |= finding.failed();
+            entry.again += 1;
+            entry.last = Some(finding);
+            return;
         }
+        if self.items.len() == MAX_KEPT {
+            self.beyond += 1;
+            self.beyond_failed |= finding.failed();
+            return;
+        }
+        self.index.insert(key, self.items.len());
+        self.items.push(Entry {
+            failed: finding.failed(),
+            first: finding,
+            again: 0,
+            last: None,
+        });
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.items.is_empty() && self.beyond == 0
+    }
+
+    /// Whether anything listed failed.
+    fn failed(&self) -> bool {
+        self.beyond_failed || self.items.iter().any(|entry| entry.failed)
+    }
+
+    /// How many lines the list has.
+    fn count(&self) -> usize {
+        self.items.len() + self.beyond
+    }
+
+    /// Its lines, with paths spelled by `rel`.
+    fn lines<'a>(&'a self, rel: &'a dyn Fn(&Path) -> String) -> impl Iterator<Item = String> + 'a {
+        self.items.iter().map(move |entry| {
+            let first = &entry.first;
+            let mut line = format!(
+                "{}: {}; {}",
+                rel(&first.path),
+                first.what.describe(),
+                first.outcome.describe()
+            );
+            if let Some(last) = &entry.last {
+                let times = if entry.again == 1 { "time" } else { "times" };
+                let _ = write!(
+                    line,
+                    ", and {} more {times} since, the last: {}",
+                    entry.again,
+                    last.outcome.describe()
+                );
+            }
+            line
+        })
     }
 
     #[cfg(test)]
@@ -178,7 +254,7 @@ impl Findings {
         !self.after.is_empty()
             || self.uncheckable
             || !self.undone.is_empty()
-            || self.before.items.iter().any(Finding::failed)
+            || self.before.failed()
     }
 
     /// The report for the tool result, with paths relative to `workspace`.
@@ -191,15 +267,8 @@ impl Findings {
         let mut message = String::new();
         for (header, findings) in [(BEFORE, &self.before), (AFTER, &self.after)] {
             if !findings.is_empty() {
-                let lines = findings.items.iter().map(|finding| {
-                    format!(
-                        "{}: {}; {}",
-                        rel(&finding.path),
-                        finding.what.describe(),
-                        finding.outcome.describe()
-                    )
-                });
-                section(&mut message, header, lines, findings.items.len(), MAX_LINES);
+                let lines = findings.lines(&rel);
+                section(&mut message, header, lines, findings.count(), MAX_LINES);
             }
         }
         if !self.undone.is_empty() {
@@ -341,6 +410,78 @@ mod tests {
                 .push(Some(finding(".git/config", What::Deleted, failed())));
         }
         assert_eq!(findings.after.len(), 1);
+    }
+
+    #[test]
+    fn a_name_moved_again_and_again_is_one_line_with_a_count() {
+        let mut findings = Findings::default();
+        for i in 0..500 {
+            let moved = Outcome::Moved(PathBuf::from(format!("/q/1/post-checkout.{i}")));
+            findings.after.push(Some(finding(
+                ".git/hooks/post-checkout",
+                What::Added,
+                moved,
+            )));
+        }
+        assert_eq!(findings.after.len(), 1);
+        let report = findings.report(Path::new("/ws")).unwrap();
+        assert_eq!(
+            report.message,
+            format!(
+                "{AFTER}\n- .git/hooks/post-checkout: new in a protected directory; moved to \
+                 /q/1/post-checkout.0, and 499 more times since, the last: moved to \
+                 /q/1/post-checkout.499]\n"
+            )
+        );
+        assert!(report.blocked);
+    }
+
+    #[test]
+    fn a_repeat_that_failed_counts_even_after_one_that_did_not() {
+        let mut findings = Findings::default();
+        for outcome in [
+            Outcome::Moved(PathBuf::from("/q/1/commondir")),
+            Outcome::Failed("could not move it: busy".into()),
+            Outcome::Moved(PathBuf::from("/q/1/commondir.1")),
+        ] {
+            findings
+                .before
+                .push(Some(finding(".git/commondir", What::New, outcome)));
+        }
+        let report = findings.report(Path::new("/ws")).unwrap();
+        assert!(report.blocked, "{}", report.message);
+        assert!(
+            report
+                .message
+                .contains("and 2 more times since, the last: moved to /q/1/commondir.1"),
+            "{}",
+            report.message
+        );
+    }
+
+    #[test]
+    fn past_a_thousand_paths_only_a_count_is_kept() {
+        let mut findings = Findings::default();
+        for i in 0..1200 {
+            let moved = Outcome::Moved(PathBuf::from(format!("/q/1/h{i}")));
+            findings
+                .before
+                .push(Some(finding(&format!("h{i}"), What::Added, moved)));
+        }
+        assert!(!findings.report(Path::new("/ws")).unwrap().blocked);
+        findings.before.push(Some(finding(
+            "late",
+            What::New,
+            Outcome::Failed("could not move it: busy".into()),
+        )));
+        assert_eq!(findings.before.len(), MAX_KEPT);
+        let report = findings.report(Path::new("/ws")).unwrap();
+        assert!(report.blocked, "a failure past the limit still counts");
+        assert!(
+            report.message.ends_with("\n- and 1151 more]\n"),
+            "{}",
+            report.message
+        );
     }
 
     #[test]

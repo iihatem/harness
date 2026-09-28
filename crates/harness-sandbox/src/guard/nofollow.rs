@@ -564,7 +564,8 @@ impl Dir {
         cvt(unsafe { libc::fchmod(self.raw(), mode as libc::mode_t) }).map(drop)
     }
 
-    fn raw(&self) -> RawFd {
+    /// The descriptor, for a call that needs it as a number.
+    pub(crate) fn raw(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 

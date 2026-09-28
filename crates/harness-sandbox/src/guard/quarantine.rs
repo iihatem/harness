@@ -595,6 +595,18 @@ fn in_place(parent: &Dir, name: &OsStr, path: &Path) -> io::Result<Stored> {
     })
 }
 
+/// Whether `name` is one [`rename_in_place`] gives: it ends in
+/// `.harness-quarantine-<n>`.
+pub(crate) fn renamed_in_place(name: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    const SUFFIX: &[u8] = b".harness-quarantine-";
+    let name = name.as_bytes();
+    name.windows(SUFFIX.len())
+        .rposition(|part| part == SUFFIX)
+        .map(|at| &name[at + SUFFIX.len()..])
+        .is_some_and(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit))
+}
+
 /// Renames `name` in `parent`, at `path`, to `<name>.harness-quarantine-<n>`
 /// next to it, never replacing an entry.
 fn rename_in_place(parent: &Dir, name: &OsStr, path: &Path) -> io::Result<PathBuf> {
@@ -752,6 +764,26 @@ mod tests {
         );
         assert!(!exists(&ws.join("sub/.git")));
         assert!(ws.join("sub").is_dir());
+    }
+
+    #[test]
+    fn only_names_renamed_in_place_end_in_the_suffix_and_a_number() {
+        for name in [
+            "post-checkout.harness-quarantine-0",
+            ".git.harness-quarantine-12",
+            "x.harness-quarantine-0.harness-quarantine-3",
+        ] {
+            assert!(renamed_in_place(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "post-checkout",
+            "post-checkout.harness-quarantine-",
+            "post-checkout.harness-quarantine-1x",
+            ".harness-quarantine-x",
+            "harness-quarantine-0",
+        ] {
+            assert!(!renamed_in_place(OsStr::new(name)), "{name}");
+        }
     }
 
     #[test]

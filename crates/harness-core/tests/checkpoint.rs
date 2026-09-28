@@ -560,3 +560,47 @@ fn a_linked_worktree_follows_its_repositorys_info_exclude() {
         [PathBuf::from("a.txt")]
     );
 }
+
+// Review E minor 15: `.harness/` and a `HEAD` at the top of the workspace are left out, as the
+// permission engine and the sandbox protect them, whatever .gitignore says; a rewind neither
+// recreates nor removes them.
+#[test]
+fn harness_settings_and_a_top_level_head_are_left_out() {
+    let f = fixture();
+    f.write(".gitignore", "!/HEAD\n!.harness/\n");
+    f.write(".harness/config.toml", "x\n");
+    f.write("HEAD", "ref: refs/heads/main\n");
+    f.write("src/HEAD", "only the top level is protected\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    assert_eq!(
+        checkpoints.files(&first).unwrap(),
+        [PathBuf::from(".gitignore"), PathBuf::from("src/HEAD")]
+    );
+    std::fs::remove_dir_all(f.ws.join(".harness")).unwrap();
+    std::fs::remove_file(f.ws.join("HEAD")).unwrap();
+    checkpoints.restore(&first).unwrap();
+    assert!(!f.ws.join(".harness").exists());
+    assert!(!f.ws.join("HEAD").exists());
+    f.write(".HARNESS/config.toml", "made since\n");
+    f.write("Head", "made since\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(
+        f.read(".HARNESS/config.toml").as_deref(),
+        Some("made since\n")
+    );
+    assert_eq!(f.read("Head").as_deref(), Some("made since\n"));
+}
+
+// The same at the top of a workspace in a repository's subdirectory.
+#[test]
+fn harness_settings_in_a_subdirectory_workspace_are_left_out() {
+    let f = fixture();
+    git(&f.ws, &["init", "-q"]);
+    f.write("sub/.harness/config.toml", "x\n");
+    f.write("sub/HEAD", "x\n");
+    f.write("sub/a.txt", "a\n");
+    let checkpoints = Checkpoints::open(&f.gitdir, &f.ws.join("sub"), "s1").unwrap();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    assert_eq!(checkpoints.files(&first).unwrap(), [PathBuf::from("a.txt")]);
+}

@@ -28,9 +28,13 @@ const RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Always left out of snapshots, besides what `.gitignore` files exclude. git never walks past
 /// these directories, which keeps snapshots fast; [`EXCLUDED_DIRS`] keeps them out even where a
 /// `.gitignore` brings them back.
-const BUILTIN_EXCLUDES: &str = ".git\nnode_modules/\ntarget/\n";
+const BUILTIN_EXCLUDES: &str = ".git\nnode_modules/\ntarget/\n/.harness/\n/HEAD\n";
 /// Directories left out of snapshots wherever they are.
 const EXCLUDED_DIRS: [&[u8]; 2] = [b"node_modules", b"target"];
+/// Names left out at the top of the workspace, in any case: harness's project settings, and a
+/// `HEAD` that would make git take the workspace for a repository. The permission engine and the
+/// sandbox protect them, so a rewind must neither recreate nor remove them.
+const PROTECTED: [&[u8]; 2] = [b".harness", b"HEAD"];
 /// Attributes that outrank the workspace's `.gitattributes`, so every file is stored and restored
 /// byte for byte: no end-of-line conversion, keyword expansion, filter or re-encoding.
 const ATTRIBUTES: &str = "* -text -ident -filter !eol !working-tree-encoding\n";
@@ -248,11 +252,17 @@ impl Checkpoints {
             &within,
             deadline,
         )?;
+        let protected = self.protected();
         let leaving: Vec<Vec<u8>> = ignored
             .iter()
             .map(Vec::as_slice)
             .chain(excluded.iter().copied())
             .map(|path| pathspec("top,literal", path))
+            .chain(
+                protected
+                    .iter()
+                    .map(|path| pathspec("top,literal,icase", path)),
+            )
             .collect();
         if !leaving.is_empty() {
             self.write_pathspecs(&leaving)?;
@@ -266,6 +276,11 @@ impl Checkpoints {
             excluded
                 .iter()
                 .map(|path| pathspec("top,exclude,literal", path)),
+        );
+        adding.extend(
+            protected
+                .iter()
+                .map(|path| pathspec("top,exclude,literal,icase", path)),
         );
         self.write_pathspecs(&adding)?;
         let mut add = self.command();
@@ -375,6 +390,21 @@ impl Checkpoints {
         } else {
             pathspec("top,literal", &self.scope)
         }
+    }
+
+    /// The [`PROTECTED`] names at the top of the workspace, relative to the root.
+    fn protected(&self) -> Vec<Vec<u8>> {
+        PROTECTED
+            .iter()
+            .map(|name| {
+                let mut path = self.scope.clone();
+                if !path.is_empty() {
+                    path.push(b'/');
+                }
+                path.extend_from_slice(name);
+                path
+            })
+            .collect()
     }
 
     /// The paths `ls-files -z` lists with `options` and then `pathspec`, relative to the root.

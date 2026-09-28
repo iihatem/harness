@@ -464,3 +464,99 @@ fn gitignore_negations_do_not_outrank_the_size_limit_or_the_builtin_excludes() {
             .contains(&PathBuf::from("big.bin"))
     );
 }
+
+// Review E issue 3 (probe F): in a subdirectory of a repository, the repository's ignore rules
+// apply: its root .gitignore and its own info/exclude.
+#[test]
+fn a_subdirectory_of_a_repository_follows_the_repositorys_ignore_rules() {
+    let f = fixture();
+    git(&f.ws, &["init", "-q"]);
+    f.write(".gitignore", "*.log\n.env\n");
+    std::fs::write(f.ws.join(".git/info/exclude"), "local-only/\n").unwrap();
+    f.write("sub/code.rs", "x\n");
+    f.write("sub/debug.log", "x\n");
+    f.write("sub/.env", "SECRET\n");
+    f.write("sub/local-only/notes.txt", "x\n");
+    f.write("sub/deeper/lib.rs", "y\n");
+    let checkpoints = Checkpoints::open(&f.gitdir, &f.ws.join("sub"), "s1").unwrap();
+    let snapshot = checkpoints.snapshot("turn 1").unwrap();
+    assert_eq!(
+        checkpoints.files(&snapshot).unwrap(),
+        [PathBuf::from("code.rs"), PathBuf::from("deeper/lib.rs")]
+    );
+}
+
+// Review E issue 3 (probe F2): so a rewind there leaves the files the repository ignores alone,
+// and never touches anything outside the workspace.
+#[test]
+fn a_restore_in_a_subdirectory_leaves_ignored_files_and_the_rest_of_the_repository_alone() {
+    let f = fixture();
+    git(&f.ws, &["init", "-q"]);
+    f.write(".gitignore", "*.log\n.env\n");
+    f.write("top.txt", "top\n");
+    f.write("sub/code.rs", "x\n");
+    f.write("sub/.env", "OLD\n");
+    let sub = f.ws.join("sub");
+    let checkpoints = Checkpoints::open(&f.gitdir, &sub, "s1").unwrap();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    f.write("sub/.env", "NEW (edited by the user)\n");
+    f.write("sub/server.log", "log\n");
+    f.write("sub/code.rs", "changed\n");
+    f.write("top.txt", "changed outside the workspace\n");
+    f.write("new-at-top.txt", "new\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(f.read("sub/code.rs").as_deref(), Some("x\n"));
+    assert_eq!(
+        f.read("sub/.env").as_deref(),
+        Some("NEW (edited by the user)\n")
+    );
+    assert_eq!(f.read("sub/server.log").as_deref(), Some("log\n"));
+    assert_eq!(
+        f.read("top.txt").as_deref(),
+        Some("changed outside the workspace\n")
+    );
+    assert_eq!(f.read("new-at-top.txt").as_deref(), Some("new\n"));
+}
+
+// A new session starts from the index another session left, which may cover a different part of
+// the repository: none of it may enter this workspace's snapshots or be removed by its restores.
+#[test]
+fn an_index_left_by_a_session_elsewhere_in_the_repository_stays_out() {
+    let f = fixture();
+    git(&f.ws, &["init", "-q"]);
+    f.write("top.txt", "top\n");
+    f.write("other/o.txt", "o\n");
+    f.write("sub/s.txt", "s\n");
+    let at_root = Checkpoints::open(&f.gitdir, &f.ws, "s1").unwrap();
+    at_root.snapshot("turn 1").unwrap();
+    let in_sub = Checkpoints::open(&f.gitdir, &f.ws.join("sub"), "s2").unwrap();
+    let first = in_sub.snapshot("turn 1").unwrap();
+    assert_eq!(in_sub.files(&first).unwrap(), [PathBuf::from("s.txt")]);
+    f.write("sub/s.txt", "changed\n");
+    in_sub.restore(&first).unwrap();
+    assert_eq!(f.read("sub/s.txt").as_deref(), Some("s\n"));
+    assert_eq!(f.read("top.txt").as_deref(), Some("top\n"));
+    assert_eq!(f.read("other/o.txt").as_deref(), Some("o\n"));
+}
+
+// A linked worktree's .git is a file; the ignore rules of the repository it belongs to still apply.
+#[test]
+fn a_linked_worktree_follows_its_repositorys_info_exclude() {
+    let f = fixture();
+    let main = f.ws.join("main");
+    std::fs::create_dir(&main).unwrap();
+    git(&main, &["init", "-q", "-b", "main"]);
+    std::fs::write(main.join("a.txt"), "a\n").unwrap();
+    git(&main, &["add", "a.txt"]);
+    git(&main, &["commit", "-q", "-m", "first"]);
+    std::fs::write(main.join(".git/info/exclude"), "*.secret\n").unwrap();
+    let linked = f.ws.join("linked");
+    git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+    std::fs::write(linked.join("key.secret"), "x\n").unwrap();
+    let checkpoints = Checkpoints::open(&f.gitdir, &linked, "s1").unwrap();
+    let snapshot = checkpoints.snapshot("turn 1").unwrap();
+    assert_eq!(
+        checkpoints.files(&snapshot).unwrap(),
+        [PathBuf::from("a.txt")]
+    );
+}

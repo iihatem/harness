@@ -7,7 +7,11 @@
 use std::{
     collections::{BTreeSet, HashSet},
     ffi::{OsStr, OsString},
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    io::Read,
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::OpenOptionsExt,
+    },
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -52,11 +56,21 @@ pub enum CheckpointError {
 }
 
 /// One session's checkpoints of a workspace.
+///
+/// In a repository, git's work tree is the repository's root, so the repository's own ignore rules
+/// apply, and every command is limited to the workspace; paths in snapshots are relative to that
+/// root.
 #[derive(Debug)]
 pub struct Checkpoints {
     git: PathBuf,
     gitdir: PathBuf,
     workspace: PathBuf,
+    /// The repository the workspace is in, or the workspace outside one.
+    root: PathBuf,
+    /// The workspace relative to `root`; empty when they are the same.
+    scope: Vec<u8>,
+    /// The repository's own `info/exclude`, read as one more excludes file.
+    repository_excludes: Option<PathBuf>,
     /// This session's index, so sessions in one project never share one.
     index: PathBuf,
     /// The index a restore builds its target in.
@@ -107,10 +121,20 @@ impl Checkpoints {
             }
             _ => return Err(CheckpointError::GitMissing),
         }
+        let root = work_tree(workspace);
+        let scope = workspace
+            .strip_prefix(&root)
+            .unwrap_or(Path::new(""))
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
         let checkpoints = Checkpoints {
             git: git.to_path_buf(),
             gitdir: gitdir.to_path_buf(),
             workspace: workspace.to_path_buf(),
+            repository_excludes: repository_excludes(&root),
+            root,
+            scope,
             index: gitdir.join("indexes").join(session_id),
             scratch: gitdir.join("indexes").join(format!("restore-{session_id}")),
             pathspecs: gitdir.join("pathspecs").join(session_id),
@@ -138,7 +162,26 @@ impl Checkpoints {
         if !checkpoints.index.exists() && shared.is_file() {
             let _ = std::fs::copy(&shared, &checkpoints.index);
         }
+        // That index, or this session's own from a run elsewhere in the repository, may hold
+        // paths outside the workspace: they must never enter its snapshots, and a restore would
+        // delete them.
+        if !checkpoints.scope.is_empty() && checkpoints.index.exists() {
+            let outside = [
+                b":(top)".to_vec(),
+                pathspec("top,exclude,literal", &checkpoints.scope),
+            ];
+            checkpoints.write_pathspecs(&outside)?;
+            checkpoints.git_with_pathspecs(
+                &["rm", "--cached", "-r", "-f", "-q", "--ignore-unmatch"],
+                Instant::now() + RESTORE_TIMEOUT,
+            )?;
+        }
         Ok(checkpoints)
+    }
+
+    /// The directory these checkpoints are of.
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
     }
 
     /// Replaces the time a snapshot may take (for tests).
@@ -180,7 +223,12 @@ impl Checkpoints {
     fn snapshot_within(&self, message: &str, timeout: Duration) -> Result<String, CheckpointError> {
         let deadline = Instant::now() + timeout;
         // Everything in the index, and every file git would add.
-        let listed = self.list(&["--cached", "--others", "--exclude-standard"], deadline)?;
+        let within = self.within();
+        let listed = self.list(
+            &["--cached", "--others", "--exclude-standard", "--"],
+            &within,
+            deadline,
+        )?;
         // What is left out whatever `.gitignore` files say: large files, and the directories
         // always left out. They are given to git as literal pathspecs, which outrank ignore rules
         // and match any name, a newline in it included.
@@ -188,14 +236,18 @@ impl Checkpoints {
         for path in &listed {
             if let Some(dir) = excluded_dir(path) {
                 excluded.insert(dir);
-            } else if std::fs::symlink_metadata(self.workspace.join(OsStr::from_bytes(path)))
+            } else if std::fs::symlink_metadata(self.root.join(OsStr::from_bytes(path)))
                 .is_ok_and(|m| m.is_file() && m.len() > MAX_FILE_SIZE)
             {
                 excluded.insert(path);
             }
         }
         // Files an earlier snapshot holds that are now git-ignored or excluded leave the snapshots.
-        let ignored = self.list(&["--cached", "--ignored", "--exclude-standard"], deadline)?;
+        let ignored = self.list(
+            &["--cached", "--ignored", "--exclude-standard", "--"],
+            &within,
+            deadline,
+        )?;
         let leaving: Vec<Vec<u8>> = ignored
             .iter()
             .map(Vec::as_slice)
@@ -209,7 +261,7 @@ impl Checkpoints {
                 deadline,
             )?;
         }
-        let mut adding = vec![b":(top)".to_vec()];
+        let mut adding = vec![within];
         adding.extend(
             excluded
                 .iter()
@@ -264,7 +316,7 @@ impl Checkpoints {
             .into_iter()
             .filter(|p| !now.contains(p))
             .map(OsString::from_vec)
-            .filter(|p| std::fs::symlink_metadata(self.workspace.join(p)).is_ok())
+            .filter(|p| std::fs::symlink_metadata(self.root.join(p)).is_ok())
             .collect();
         let tree = if keep.is_empty() {
             format!("{commit}^{{tree}}")
@@ -298,14 +350,15 @@ impl Checkpoints {
         check_commit(commit)?;
         Ok(self
             .tree_paths(commit)?
-            .into_iter()
-            .map(|p| PathBuf::from(OsString::from_vec(p)))
+            .iter()
+            .filter_map(|p| self.in_workspace(p))
+            .map(|p| PathBuf::from(OsStr::from_bytes(p)))
             .collect())
     }
 
     fn tree_paths(&self, commit: &str) -> Result<Vec<Vec<u8>>, CheckpointError> {
         let listed = self.git_bytes(
-            &["ls-tree", "-r", "-z", "--name-only", commit],
+            &["ls-tree", "-r", "-z", "--name-only", "--full-tree", commit],
             Instant::now() + self.restore_timeout,
         )?;
         Ok(listed
@@ -315,11 +368,39 @@ impl Checkpoints {
             .collect())
     }
 
-    /// The paths `ls-files -z` lists with `options`.
-    fn list(&self, options: &[&str], deadline: Instant) -> Result<Vec<Vec<u8>>, CheckpointError> {
-        let mut args = vec!["ls-files", "-z"];
-        args.extend_from_slice(options);
-        Ok(split_nul(&self.git_bytes(&args, deadline)?))
+    /// The pathspec that limits git to the workspace.
+    fn within(&self) -> Vec<u8> {
+        if self.scope.is_empty() {
+            b":(top)".to_vec()
+        } else {
+            pathspec("top,literal", &self.scope)
+        }
+    }
+
+    /// The paths `ls-files -z` lists with `options` and then `pathspec`, relative to the root.
+    fn list(
+        &self,
+        options: &[&str],
+        pathspec: &[u8],
+        deadline: Instant,
+    ) -> Result<Vec<Vec<u8>>, CheckpointError> {
+        let mut cmd = self.command();
+        cmd.args(["ls-files", "-z"])
+            .args(options)
+            .arg(OsStr::from_bytes(pathspec));
+        match output_within(&mut cmd, remaining(deadline)?)? {
+            None => Err(CheckpointError::TooSlow),
+            Some(out) if out.status.success() => Ok(split_nul(&out.stdout)),
+            Some(out) => Err(failure("ls-files", &out.stderr)),
+        }
+    }
+
+    /// `path`, relative to the root, as a path relative to the workspace; `None` outside it.
+    fn in_workspace<'a>(&self, path: &'a [u8]) -> Option<&'a [u8]> {
+        if self.scope.is_empty() {
+            return Some(path);
+        }
+        path.strip_prefix(self.scope.as_slice())?.strip_prefix(b"/")
     }
 
     /// Writes `pathspecs` where [`pathspec_file_arg`](Self::pathspec_file_arg) points git.
@@ -352,12 +433,17 @@ impl Checkpoints {
         self.run(cmd, args[0], deadline)
     }
 
-    /// `git` with a clean environment: the shadow repository, the workspace as its work tree, this
+    /// `git` with a clean environment: the shadow repository, the root as its work tree, this
     /// session's index, and no user or system configuration.
     fn command(&self) -> Command {
         let mut cmd = Command::new(&self.git);
         for setting in OVERRIDES {
             cmd.args(["-c", setting]);
+        }
+        if let Some(excludes) = &self.repository_excludes {
+            let mut setting = OsString::from("core.excludesFile=");
+            setting.push(excludes);
+            cmd.arg("-c").arg(setting);
         }
         cmd.env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -365,14 +451,14 @@ impl Checkpoints {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_DIR", &self.gitdir)
-            .env("GIT_WORK_TREE", &self.workspace)
+            .env("GIT_WORK_TREE", &self.root)
             .env("GIT_INDEX_FILE", &self.index)
             .env("GIT_AUTHOR_NAME", "harness")
             .env("GIT_AUTHOR_EMAIL", "harness@localhost")
             .env("GIT_COMMITTER_NAME", "harness")
             .env("GIT_COMMITTER_EMAIL", "harness@localhost")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .current_dir(&self.workspace);
+            .current_dir(&self.root);
         cmd
     }
 
@@ -380,12 +466,6 @@ impl Checkpoints {
         let mut cmd = self.command();
         cmd.args(args);
         self.run(cmd, args[0], Instant::now() + timeout)
-    }
-
-    fn git_os(&self, args: &[OsString], deadline: Instant) -> Result<String, CheckpointError> {
-        let mut cmd = self.command();
-        cmd.args(args);
-        self.run(cmd, &args[0].to_string_lossy(), deadline)
     }
 
     fn git_bytes(&self, args: &[&str], deadline: Instant) -> Result<Vec<u8>, CheckpointError> {
@@ -442,6 +522,54 @@ fn failure(command: &str, stderr: &[u8]) -> CheckpointError {
         command: command.to_string(),
         message: String::from_utf8_lossy(stderr).trim().to_string(),
     }
+}
+
+/// The work tree snapshots of `workspace` are taken in: the repository it is in, found as
+/// `harness_context::project::repo_root` finds it (the nearest directory at or above it holding a
+/// `.git`), so that sessions and snapshots belong to the same project; or the workspace itself.
+fn work_tree(workspace: &Path) -> PathBuf {
+    workspace
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(workspace)
+        .to_path_buf()
+}
+
+/// The `info/exclude` of the repository at `root`, when it has one: from its `.git` directory, or,
+/// for a `.git` file (a linked worktree or a submodule), from the repository that file names.
+/// Only that file is read, as more ignore rules; nothing else of the repository's is used.
+fn repository_excludes(root: &Path) -> Option<PathBuf> {
+    let dotgit = root.join(".git");
+    let gitdir = if dotgit.is_dir() {
+        dotgit
+    } else {
+        let text = read_small_file(&dotgit)?;
+        let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+        root.join(target)
+    };
+    // A linked worktree's gitdir names the repository's common directory, which holds `info`.
+    let common = match read_small_file(&gitdir.join("commondir")) {
+        Some(text) => gitdir.join(text.trim()),
+        None => gitdir,
+    };
+    let excludes = common.join("info").join("exclude");
+    excludes.is_file().then_some(excludes)
+}
+
+/// The text of the regular file at `path`, when it is one of at most 4 KiB; never waits on a FIFO.
+fn read_small_file(path: &Path) -> Option<String> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > 4096 {
+        return None;
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
 }
 
 /// The NUL-separated items of git's `-z` output.

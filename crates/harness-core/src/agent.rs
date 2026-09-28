@@ -203,6 +203,11 @@ pub struct Agent {
     checkpoints: Option<Arc<Checkpoints>>,
     /// Whether the current turn already took its snapshot.
     turn_checkpointed: bool,
+    /// Whether the current turn's user message is saved yet. A slash command's shell parts run
+    /// before it is, and entries about the turn they make wait in `held_entries`, to be saved
+    /// just after it: rewinding to the message looks for them after it.
+    message_recorded: bool,
+    held_entries: Vec<EntryKind>,
     /// Input tokens the provider reported for the last request, and how many messages it had;
     /// `None` until a provider reports usage, and after the history changes.
     reported_usage: Option<(u64, usize)>,
@@ -251,6 +256,8 @@ impl Agent {
             warnings: Vec::new(),
             checkpoints: None,
             turn_checkpointed: false,
+            message_recorded: true,
+            held_entries: Vec::new(),
             reported_usage: None,
             validators,
             invalid_calls: 0,
@@ -495,15 +502,25 @@ impl Agent {
         let result = tokio::task::spawn_blocking(move || checkpoints.snapshot(&message)).await;
         match result {
             Ok(Ok(commit)) => {
-                self.session.append(EntryKind::Checkpoint {
+                self.append_turn_entry(EntryKind::Checkpoint {
                     commit: commit.clone(),
                     workspace: Some(workspace),
                 });
-                self.note_save_error();
                 let _ = events.send(AgentEvent::CheckpointCreated { commit });
             }
             Ok(Err(e)) => self.disable_checkpoints(&e.to_string(), events),
             Err(e) => self.disable_checkpoints(&e.to_string(), events),
+        }
+    }
+
+    /// Saves `kind`, an entry about the current turn, after the turn's user message; until that
+    /// is saved, it waits.
+    fn append_turn_entry(&mut self, kind: EntryKind) {
+        if self.message_recorded {
+            self.session.append(kind);
+            self.note_save_error();
+        } else {
+            self.held_entries.push(kind);
         }
     }
 
@@ -587,8 +604,13 @@ impl Agent {
         cancel: CancellationToken,
     ) -> TurnEndReason {
         let _ = events.send(AgentEvent::TurnStarted);
+        self.message_recorded = false;
         let content = self.user_message(input.parts, events).await;
         self.record(Message::User { content }, input.display, false);
+        self.message_recorded = true;
+        for kind in std::mem::take(&mut self.held_entries) {
+            self.append_turn_entry(kind);
+        }
         if cancel.is_cancelled() {
             return self.finish(TurnEndReason::Interrupted, events);
         }

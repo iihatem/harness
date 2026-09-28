@@ -385,3 +385,86 @@ async fn checkpoints_taken_in_another_directory_are_not_restored() {
         .await
         .unwrap();
 }
+
+/// The `bash` a slash command's shell part runs: `/bin/sh` in the workspace, for real.
+struct WritingBash;
+#[async_trait::async_trait]
+impl harness_core::tool::Tool for WritingBash {
+    fn spec(&self) -> harness_core::message::ToolSpec {
+        harness_core::message::ToolSpec {
+            name: "bash".into(),
+            description: "runs a command".into(),
+            parameters: json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
+        }
+    }
+    fn action(
+        &self,
+        args: &serde_json::Value,
+        _ctx: &harness_core::tool::ToolContext,
+    ) -> harness_core::permission::Action {
+        harness_core::permission::Action::Bash(args["command"].as_str().unwrap_or_default().into())
+    }
+    async fn run(
+        &self,
+        args: serde_json::Value,
+        ctx: &harness_core::tool::ToolContext,
+    ) -> harness_core::tool::ToolOutput {
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", args["command"].as_str().unwrap_or_default()])
+            .current_dir(&ctx.workspace)
+            .status()
+            .unwrap();
+        harness_core::tool::ToolOutput::ok(format!("exit code {}\n", status.code().unwrap_or(-1)))
+    }
+}
+
+// Review E issue 5 (probe B): a slash command whose `!` shell part changes files takes the turn's
+// checkpoint before its user message is recorded. Rewinding to that message restores it.
+#[tokio::test]
+async fn a_slash_commands_shell_part_is_rewound_with_its_turn() {
+    use harness_core::turn::{InputPart, TurnInput};
+    let f = fixture();
+    f.write("a.txt", "original\n");
+    let session = Session::create(&f.data.join("sessions"), &f.ws);
+    let checkpoints =
+        Checkpoints::open(&f.data.join("checkpoints.git"), &f.ws, session.id()).unwrap();
+    let policy = Arc::new(harness_core::engine::PermissionEngine::new(
+        harness_core::engine::EngineConfig {
+            mode: Mode::Auto,
+            workspace: f.ws.clone(),
+            read_dirs: vec![],
+            rules: Default::default(),
+            sandbox_available: true,
+            writes_need_approval: false,
+        },
+    ));
+    let mut agent = Agent::new(
+        MockProvider::new(vec![Script::text("formatted it")]),
+        harness_core::tool::ToolRegistry::new(vec![Arc::new(WritingBash)]),
+        policy,
+        Arc::new(NonInteractive),
+        harness_core::agent::AgentConfig::new("mock/m1", "m1", "system", f.ws.join(".spill")),
+        harness_core::tool::ToolContext::new(&f.ws).with_sandbox(None, Mode::Auto.fs_access()),
+    )
+    .with_session(session)
+    .with_checkpoints(Some(Arc::new(checkpoints)));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let input = TurnInput {
+        parts: vec![
+            InputPart::Shell("echo formatted > a.txt".into()),
+            InputPart::Text("Say what changed.".into()),
+        ],
+        display: Some("/fmt".into()),
+        ..TurnInput::default()
+    };
+    agent
+        .run_turn(input, &tx, tokio_util::sync::CancellationToken::new())
+        .await;
+    assert_eq!(f.read("a.txt").as_deref(), Some("formatted\n"));
+    let target = point(&agent, "/fmt");
+    agent
+        .rewind(&target, RewindScope::CodeAndConversation)
+        .await
+        .unwrap();
+    assert_eq!(f.read("a.txt").as_deref(), Some("original\n"));
+}

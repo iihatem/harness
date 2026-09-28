@@ -1,23 +1,24 @@
 use std::{
     io::{IsTerminal, Read, Write},
+    path::Path,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use harness_config::config;
+use harness_config::config::{self, LinuxGitProtection};
 use harness_core::{
     agent::{Agent, AgentConfig, NonInteractive},
     engine::{EngineConfig, PermissionEngine, RuleSet},
     event::{AgentEvent, TurnEndReason},
     permission::{FsAccess, Mode},
-    tool::ToolContext,
+    tool::{CommandSandbox, ToolContext},
 };
 use harness_providers::registry;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    models, prompt, setup,
+    models, prompt, sandbox, setup,
     term::{terminal_safe, terminal_safe_text},
 };
 
@@ -107,16 +108,27 @@ pub async fn run(
     // read-only modes keep their read-only sandbox.
     let workspace_too_broad = mode.fs_access() == FsAccess::WorkspaceWrite
         && harness_sandbox::workspace_is_too_broad(&setup.workspace);
-    let sandbox = if mode == Mode::FullAccess || sandbox_disabled_by_env || workspace_too_broad {
+    let required = setup.config.linux_git_protection == LinuxGitProtection::Required;
+    let detected = if mode == Mode::FullAccess || sandbox_disabled_by_env || workspace_too_broad {
         None
     } else {
         harness_sandbox::detect(harness_sandbox::SandboxSettings {
             extra_writable: setup.config.writable_roots.clone(),
             allow_localhost: setup.config.allow_localhost,
+            quarantine_dir: Some(setup.paths.data_dir.join("quarantine")),
+            require_full_git_protection: required,
         })
     };
+    let choice = sandbox::choose(detected, mode.fs_access(), required);
+    if let Some(warning) = &choice.warning {
+        eprintln!("warning: {}", terminal_safe(warning));
+    }
+    let sandbox = choice.sandbox;
+    // From here on, however `run` is left, the sandbox's session ends: on Linux that ends what
+    // sandboxed commands left running, and checks git metadata once more.
+    let session = SessionEnd::new(sandbox.clone());
     let sandboxed = sandbox.is_some();
-    if mode != Mode::FullAccess && !sandboxed {
+    if mode != Mode::FullAccess && !sandboxed && choice.warning.is_none() {
         if sandbox_disabled_by_env {
             eprintln!(
                 "warning: the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval"
@@ -152,7 +164,7 @@ pub async fn run(
             terminal_safe(&rule)
         );
     }
-    let ctx = ToolContext::new(&setup.workspace).with_sandbox(sandbox, mode.fs_access());
+    let ctx = tool_context(&setup.workspace, sandbox, mode.fs_access()).await;
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),
@@ -187,7 +199,56 @@ pub async fn run(
             terminal_safe_text(&final_text)
         );
     }
+    session.end();
     exit_code(reason, blocked)
+}
+
+/// Ends the sandbox's session ([`CommandSandbox::end_session`]) once: when [`end`](Self::end) is
+/// called, or when dropped, so that an early return or a panic ends it too. What that says goes
+/// to stderr, escaped; the exit code does not depend on it. It takes a few seconds at most.
+struct SessionEnd(Option<Arc<dyn CommandSandbox>>);
+
+impl SessionEnd {
+    fn new(sandbox: Option<Arc<dyn CommandSandbox>>) -> SessionEnd {
+        SessionEnd(sandbox)
+    }
+
+    /// Ends the session now.
+    fn end(mut self) {
+        self.run();
+    }
+
+    fn run(&mut self) {
+        let Some(sandbox) = self.0.take() else {
+            return;
+        };
+        if let Some(text) = sandbox.end_session() {
+            let _ = write!(std::io::stderr().lock(), "{}", terminal_safe_text(&text));
+        }
+    }
+}
+
+impl Drop for SessionEnd {
+    fn drop(&mut self) {
+        self.run();
+    }
+}
+
+/// The tools' context, with the sandbox's session started first: before the agent runs, so what
+/// the sandbox reads from the workspace (on Linux, the ignore rules the git-metadata guard scans
+/// with) is what was there before any tool could change it.
+async fn tool_context(
+    workspace: &Path,
+    sandbox: Option<Arc<dyn CommandSandbox>>,
+    access: FsAccess,
+) -> ToolContext {
+    let ctx = ToolContext::new(workspace).with_sandbox(sandbox, access);
+    if let Some(sandbox) = ctx.sandbox.clone() {
+        let workspace = ctx.workspace.clone();
+        // It may walk the whole workspace. Should it fail, the first command reads what it needs.
+        let _ = tokio::task::spawn_blocking(move || sandbox.start_session(&workspace)).await;
+    }
+    ctx
 }
 
 /// Maps how the turn ended to the documented exit codes.
@@ -363,6 +424,115 @@ async fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Mutex;
+
+    use harness_core::tool::Tool;
+
+    /// Runs commands directly, and records what harness asks of it.
+    #[derive(Debug, Default)]
+    struct Recording {
+        log: Mutex<Vec<String>>,
+    }
+
+    impl Recording {
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandSandbox for Recording {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn command(
+            &self,
+            _access: FsAccess,
+            _workspace: &Path,
+            program: &str,
+            args: &[&str],
+        ) -> std::io::Result<tokio::process::Command> {
+            self.log.lock().unwrap().push("command".into());
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(args).process_group(0);
+            Ok(cmd)
+        }
+
+        fn is_denial(&self, _exit_code: Option<i32>, _output: &str) -> bool {
+            false
+        }
+
+        fn start_session(&self, workspace: &Path) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("start_session {}", workspace.display()));
+        }
+
+        fn end_session(&self) -> Option<String> {
+            self.log.lock().unwrap().push("end_session".into());
+            Some("ended\n".into())
+        }
+    }
+
+    fn ended(sandbox: &Recording) -> usize {
+        sandbox
+            .log()
+            .iter()
+            .filter(|entry| *entry == "end_session")
+            .count()
+    }
+
+    #[test]
+    fn the_sandbox_session_ends_once_when_the_turn_ends() {
+        let sandbox = Arc::new(Recording::default());
+        let shared: Arc<dyn CommandSandbox> = sandbox.clone();
+        let session = SessionEnd::new(Some(shared));
+        assert_eq!(ended(&sandbox), 0);
+        session.end();
+        assert_eq!(ended(&sandbox), 1);
+    }
+
+    #[test]
+    fn the_sandbox_session_ends_however_run_is_left() {
+        // An early return drops the guard; so does a panic.
+        let sandbox = Arc::new(Recording::default());
+        let shared: Arc<dyn CommandSandbox> = sandbox.clone();
+        drop(SessionEnd::new(Some(shared)));
+        assert_eq!(ended(&sandbox), 1);
+        let shared: Arc<dyn CommandSandbox> = sandbox.clone();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _session = SessionEnd::new(Some(shared));
+            panic!("the turn failed");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(ended(&sandbox), 2);
+        // Without a sandbox there is nothing to end.
+        SessionEnd::new(None).end();
+    }
+
+    #[tokio::test]
+    async fn the_sandbox_session_starts_before_the_first_tool_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(Recording::default());
+        let shared: Arc<dyn CommandSandbox> = sandbox.clone();
+        let ctx = tool_context(dir.path(), Some(shared), FsAccess::WorkspaceWrite).await;
+        let started = format!("start_session {}", ctx.workspace.display());
+        assert_eq!(sandbox.log(), [started.as_str()]);
+        let out = harness_tools::BashTool
+            .run(serde_json::json!({"command": "echo hi"}), &ctx)
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(sandbox.log(), [started.as_str(), "command"]);
+    }
+
+    #[tokio::test]
+    async fn without_a_sandbox_there_is_no_session_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = tool_context(dir.path(), None, FsAccess::WorkspaceWrite).await;
+        assert!(ctx.sandbox.is_none());
+    }
 
     #[test]
     fn exit_codes_match_the_spec() {

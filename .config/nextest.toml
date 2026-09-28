@@ -1,0 +1,3 @@
+# Run every test even after one fails, so a CI run shows all failures at once.
+[profile.default]
+fail-fast = false

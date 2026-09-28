@@ -3,8 +3,10 @@ use std::{path::Path, process::Stdio, sync::Arc, sync::Mutex, time::Duration};
 use async_trait::async_trait;
 use harness_core::{
     message::ToolSpec,
-    permission::Action,
-    tool::{Tool, ToolContext, ToolOutput},
+    permission::{Action, FsAccess},
+    tool::{
+        CommandGuard, CommandSandbox, GuardReport, SandboxedCommand, Tool, ToolContext, ToolOutput,
+    },
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -64,96 +66,169 @@ impl Tool for BashTool {
         let (shell, mut args) = shell(Path::is_file);
         args.push(&script);
 
-        let sandbox = ctx.sandbox.as_ref().filter(|_| !ctx.unsandboxed);
-        let mut cmd = match sandbox {
-            Some(sandbox) => match sandbox.command(ctx.access, &ctx.workspace, shell, &args) {
-                Ok(cmd) => cmd,
-                Err(e) => return ToolOutput::error(format!("failed to prepare the sandbox: {e}")),
-            },
+        let sandbox = ctx.sandbox.clone().filter(|_| !ctx.unsandboxed);
+        let (cmd, mut guard) = match &sandbox {
+            Some(sandbox) => {
+                match prepare(sandbox.clone(), ctx.access, &ctx.workspace, shell, &args).await {
+                    Ok(prepared) => (prepared.command, prepared.guard),
+                    Err(e) => {
+                        return ToolOutput::error(format!("failed to prepare the sandbox: {e}"));
+                    }
+                }
+            }
             None => {
                 let mut cmd = tokio::process::Command::new(shell);
                 cmd.args(&args).process_group(0);
-                cmd
+                (cmd, None)
             }
         };
-        let mut child = match cmd
-            .current_dir(&ctx.workspace)
-            .env_remove("BASH_ENV")
-            .env_remove("ENV")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
+        let mut output =
+            run_command(cmd, ctx, shell, secs, sandbox.as_deref(), guard.as_mut()).await;
+        // The guard is finished however the command ended: exited, timed out, interrupted, or
+        // never started.
+        if let Some(guard) = guard
+            && let Some(report) = finish(guard).await
         {
-            Ok(child) => child,
-            Err(e) => return ToolOutput::error(format!("failed to start {shell}: {e}")),
-        };
-        let pgid = child.id().map(|id| id as i32);
-        let mut stdout = child.stdout.take().expect("stdout is piped");
-
-        // Read stdout on a separate task into a buffer that outlives the `select!` below: if a
-        // branch other than `finished` wins (timeout/interrupt), `finished` (and any buffer local
-        // to it) is dropped, but this task keeps draining into `output`, so whatever the command
-        // already printed is not lost.
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let reader_output = output.clone();
-        let mut reader = tokio::spawn(async move {
-            let mut chunk = [0u8; 8192];
-            loop {
-                match stdout.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => reader_output
-                        .lock()
-                        .expect("bash output lock")
-                        .extend_from_slice(&chunk[..n]),
-                }
+            output.content.push('\n');
+            output.content.push_str(&report.message);
+            if report.blocked {
+                output.is_error = true;
+                output.guard_blocked = true;
+                // A guard-blocked result is never offered a re-run: it would redo exactly what
+                // the guard just undid.
+                output.sandbox_denied = false;
             }
-        });
-        let partial_text = |output: &Arc<Mutex<Vec<u8>>>| {
-            let buf = output.lock().expect("bash output lock");
-            String::from_utf8_lossy(&buf).into_owned()
-        };
+        }
+        output
+    }
+}
 
-        let finished = async {
-            let status = child.wait().await;
-            // Drain whatever is left so a fast-exiting command's full output is captured.
-            let _ = (&mut reader).await;
-            status
-        };
+/// The sandboxed command and its guard, prepared off the async runtime: the guard walks the
+/// workspace, which takes a while in a large one.
+async fn prepare(
+    sandbox: Arc<dyn CommandSandbox>,
+    access: FsAccess,
+    workspace: &Path,
+    shell: &str,
+    args: &[&str],
+) -> std::io::Result<SandboxedCommand> {
+    let workspace = workspace.to_path_buf();
+    let shell = shell.to_string();
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        sandbox.prepare(access, &workspace, &shell, &args)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
 
-        tokio::select! {
-            status = finished => {
-                let text = partial_text(&output);
-                match status {
-                    Ok(status) => {
-                        let code = status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
-                        let body = format!("exit code {code}\n{text}");
-                        if status.success() {
-                            ToolOutput::ok(body)
-                        } else if sandbox.is_some_and(|s| s.is_denial(status.code(), &text)) {
-                            let mut out = ToolOutput::error(format!("{body}\n[the sandbox may have blocked part of this command]"));
-                            out.sandbox_denied = true;
-                            out
-                        } else {
-                            ToolOutput::error(body)
-                        }
+/// Finishes the guard off the async runtime. A guard that panics leaves the command's effect on
+/// git metadata unchecked, so the command counts as blocked.
+async fn finish(guard: Box<dyn CommandGuard>) -> Option<GuardReport> {
+    match tokio::task::spawn_blocking(move || guard.finish()).await {
+        Ok(report) => report,
+        Err(e) => Some(GuardReport {
+            message: format!("[harness could not check git metadata after this command: {e}]\n"),
+            blocked: true,
+        }),
+    }
+}
+
+/// Runs `cmd` until it exits, times out after `secs`, or the user interrupts it, and reports its
+/// exit code and output. `guard` is told the pid of the process spawned.
+async fn run_command(
+    mut cmd: tokio::process::Command,
+    ctx: &ToolContext,
+    shell: &str,
+    secs: u64,
+    sandbox: Option<&dyn CommandSandbox>,
+    guard: Option<&mut Box<dyn CommandGuard>>,
+) -> ToolOutput {
+    let mut child = match cmd
+        .current_dir(&ctx.workspace)
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return ToolOutput::error(format!("failed to start {shell}: {e}")),
+    };
+    // Before anything else: the guard must know which process this task waits for, so it never
+    // reaps it itself.
+    if let (Some(guard), Some(pid)) = (guard, child.id()) {
+        guard.started(pid);
+    }
+    let pgid = child.id().map(|id| id as i32);
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+
+    // Read stdout on a separate task into a buffer that outlives the `select!` below: if a
+    // branch other than `finished` wins (timeout/interrupt), `finished` (and any buffer local
+    // to it) is dropped, but this task keeps draining into `output`, so whatever the command
+    // already printed is not lost.
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let reader_output = output.clone();
+    let mut reader = tokio::spawn(async move {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stdout.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => reader_output
+                    .lock()
+                    .expect("bash output lock")
+                    .extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+    let partial_text = |output: &Arc<Mutex<Vec<u8>>>| {
+        let buf = output.lock().expect("bash output lock");
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    let finished = async {
+        let status = child.wait().await;
+        // Drain whatever is left so a fast-exiting command's full output is captured.
+        let _ = (&mut reader).await;
+        status
+    };
+
+    tokio::select! {
+        status = finished => {
+            let text = partial_text(&output);
+            match status {
+                Ok(status) => {
+                    let code = status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
+                    let body = format!("exit code {code}\n{text}");
+                    if status.success() {
+                        ToolOutput::ok(body)
+                    } else if sandbox.is_some_and(|s| s.is_denial(status.code(), &text)) {
+                        let mut out = ToolOutput::error(format!("{body}\n[the sandbox may have blocked part of this command]"));
+                        out.sandbox_denied = true;
+                        out
+                    } else {
+                        ToolOutput::error(body)
                     }
-                    Err(e) => ToolOutput::error(format!("failed to wait for command: {e}\n{text}")),
                 }
+                Err(e) => ToolOutput::error(format!("failed to wait for command: {e}\n{text}")),
             }
-            _ = tokio::time::sleep(Duration::from_secs(secs)) => {
-                kill_group(pgid);
-                reader.abort();
-                let text = partial_text(&output);
-                ToolOutput::error(format!("command timed out after {secs}s and was terminated\n{text}"))
-            }
-            _ = ctx.cancel.cancelled() => {
-                kill_group(pgid);
-                reader.abort();
-                let text = partial_text(&output);
-                ToolOutput::error(format!("command interrupted by the user\n{text}"))
-            }
+        }
+        _ = tokio::time::sleep(Duration::from_secs(secs)) => {
+            kill_group(pgid);
+            reap(&mut child, pgid).await;
+            reader.abort();
+            let text = partial_text(&output);
+            ToolOutput::error(format!("command timed out after {secs}s and was terminated\n{text}"))
+        }
+        _ = ctx.cancel.cancelled() => {
+            kill_group(pgid);
+            reap(&mut child, pgid).await;
+            reader.abort();
+            let text = partial_text(&output);
+            ToolOutput::error(format!("command interrupted by the user\n{text}"))
         }
     }
 }
@@ -168,9 +243,83 @@ fn kill_group(pgid: Option<i32>) {
     }
 }
 
+/// Waits for the shell itself to be reaped, then polls the process group for up to about 1s,
+/// so no member of it (a background job included) is still mid-syscall when the guard's final
+/// check runs. `kill_group` must already have sent the group SIGKILL. If waiting for the shell
+/// failed, the shell may not have been reaped, and waiting on its group could take its exit
+/// status: then it does neither.
+async fn reap(child: &mut tokio::process::Child, pgid: Option<i32>) {
+    if child.wait().await.is_err() {
+        return;
+    }
+    let Some(pgid) = pgid else { return };
+    let pgid = nix::unistd::Pid::from_raw(pgid);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
+    loop {
+        reap_orphaned_members(pgid);
+        if nix::sys::signal::killpg(pgid, None).is_err() || tokio::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Reaps the members of the process group `pgid` that are harness's own children. On Linux,
+/// harness is a child subreaper in the basic tier of git-metadata protection, so once the shell
+/// dies the rest of its group reparents to harness, and each member stays a zombie, still in the
+/// group, until harness reaps it. Only this group is waited for, never `-1`: its one member
+/// harness spawned, and tokio waits for, is the shell, which `reap` has reaped already.
+fn reap_orphaned_members(pgid: nix::unistd::Pid) {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    // A group id of 1 would make this `waitpid(-1)`.
+    if pgid.as_raw() <= 1 {
+        return;
+    }
+    let group = nix::unistd::Pid::from_raw(-pgid.as_raw());
+    // Each round reaps one zombie; the group, killed, makes no new ones.
+    while let Ok(status) = waitpid(group, Some(WaitPidFlag::WNOHANG)) {
+        if status == WaitStatus::StillAlive {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// When waiting for the shell fails, the shell may not have been reaped, and a wait on its
+    /// group could take its exit status: `reap` waits for no member of the group then.
+    #[tokio::test]
+    async fn reap_waits_for_no_group_member_once_waiting_for_the_shell_failed() {
+        use std::os::unix::process::CommandExt;
+
+        use nix::sys::wait::{WaitStatus, waitpid};
+        use nix::unistd::Pid;
+        let mut shell = tokio::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = shell.id().unwrap() as i32;
+        // A child of this process in the shell's group, which someone else waits for.
+        let mut member = std::process::Command::new("true")
+            .process_group(pgid)
+            .spawn()
+            .unwrap();
+        // Reaped behind tokio's back, so `wait` fails.
+        shell.start_kill().unwrap();
+        assert!(matches!(
+            waitpid(Pid::from_raw(pgid), None),
+            Ok(WaitStatus::Signaled(..))
+        ));
+        reap(&mut shell, Some(pgid)).await;
+        let status = member
+            .wait()
+            .expect("reap took the exit status of a group member it does not wait for");
+        assert!(status.success());
+    }
 
     #[test]
     fn bash_is_looked_for_at_fixed_paths_before_falling_back_to_sh() {

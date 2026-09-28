@@ -449,3 +449,93 @@ fn trusted_project_mode_and_max_steps_apply_even_when_wider() {
     assert_eq!(cfg.max_steps, Some(80));
     assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
 }
+
+#[test]
+fn linux_git_protection_defaults_to_best_effort_and_reads_both_values() {
+    use config::LinuxGitProtection;
+    let (cfg, _) = load_project(None, "", false);
+    assert_eq!(cfg.linux_git_protection, LinuxGitProtection::BestEffort);
+    let (cfg, _) = load_project(
+        Some("[sandbox]\nlinux_git_protection = \"required\"\n"),
+        "",
+        false,
+    );
+    assert_eq!(cfg.linux_git_protection, LinuxGitProtection::Required);
+    let (cfg, _) = load_project(
+        Some("[sandbox]\nlinux_git_protection = \"best-effort\"\n"),
+        "",
+        false,
+    );
+    assert_eq!(cfg.linux_git_protection, LinuxGitProtection::BestEffort);
+}
+
+#[test]
+fn an_unknown_linux_git_protection_value_reports_file_and_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(&file, "[sandbox]\nlinux_git_protection = \"strict\"\n").unwrap();
+    let err = config::load(&file, dir.path(), &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("config.toml") && err.contains("line 2"),
+        "{err}"
+    );
+    assert!(
+        err.contains("best-effort") && err.contains("required"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_project_may_require_linux_git_protection_without_trust() {
+    use config::LinuxGitProtection;
+    let (cfg, widening) = load_project(
+        None,
+        "[sandbox]\nlinux_git_protection = \"required\"\n",
+        false,
+    );
+    assert_eq!(cfg.linux_git_protection, LinuxGitProtection::Required);
+    assert!(widening.is_none());
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+}
+
+#[test]
+fn a_project_relaxing_required_git_protection_needs_trust() {
+    use config::LinuxGitProtection;
+    let global = "[sandbox]\nlinux_git_protection = \"required\"\n";
+    let project = "[sandbox]\nlinux_git_protection = \"best-effort\"\n";
+    let (cfg, widening) = load_project(Some(global), project, false);
+    assert_eq!(cfg.linux_git_protection, LinuxGitProtection::Required);
+    let widening = widening.expect("relaxing the global setting widens");
+    assert_eq!(
+        widening.items,
+        ["sandbox.linux_git_protection = \"best-effort\""]
+    );
+    assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
+
+    // The same value as the global one changes nothing, so it needs no trust.
+    let (_, widening) = load_project(None, project, false);
+    assert!(widening.is_none());
+}
+
+#[test]
+fn a_trusted_project_may_relax_required_git_protection() {
+    use config::LinuxGitProtection;
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    std::fs::write(&global, "[sandbox]\nlinux_git_protection = \"required\"\n").unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    std::fs::write(
+        ws.join(".harness/config.toml"),
+        "[sandbox]\nlinux_git_protection = \"best-effort\"\n",
+    )
+    .unwrap();
+    let widening = config::project_widening(&global, &ws).unwrap().unwrap();
+    let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    trust.trust(&ws, &widening.fingerprint).unwrap();
+    let cfg = config::load(&global, &ws, &trust).unwrap();
+    assert_eq!(cfg.linux_git_protection, LinuxGitProtection::BestEffort);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+}

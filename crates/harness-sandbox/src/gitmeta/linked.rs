@@ -1,5 +1,6 @@
-//! Finds the gitdir a workspace's `.git` leads to when `.git` is a symlink or
-//! a gitfile, so the Seatbelt profile can protect it like `.git` itself.
+//! Finds the gitdir a `.git` leads to when it is a symlink or a gitfile, so
+//! the Seatbelt profile (for the workspace's own `.git`) and the Linux guard
+//! (for every `.git`) can protect it like a `.git` directory.
 //!
 //! Git follows a `.git` symlink, and reads a `.git` file (a gitfile, also
 //! when reached through a symlink) as `gitdir: <path>`, relative to the
@@ -8,12 +9,17 @@
 //! hooks from the dir it names (`get_common_dir_noenv`). Seatbelt matches
 //! resolved paths, so none of these gitdirs has a `.git` component the
 //! profile's `.git` rules would see.
+//!
+//! Symlinks are resolved with `readlink` alone, and gitfiles and `commondir`
+//! files are read with [`read_regular`]: whatever the workspace holds, looking
+//! never blocks.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+
+use super::read::{missing, read_regular};
 
 /// Symlinks followed on one path before giving up, as the kernel does for a
 /// loop.
@@ -22,9 +28,9 @@ const MAX_SYMLINKS: usize = 40;
 /// The most of a gitfile or `commondir` file read. A path is shorter.
 const MAX_POINTER_BYTES: u64 = 4096;
 
-/// What the profile protects for a workspace whose `.git` is a symlink or a
-/// gitfile. Only paths inside the workspace are listed; nothing outside it is
-/// writable from the workspace-write sandbox except the temp and cache roots.
+/// What to protect for a `.git` that is a symlink or a gitfile. Only paths
+/// inside the workspace are listed; nothing outside it is writable from the
+/// workspace-write sandbox except the temp and cache roots.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct LinkedGitdirs {
     /// Gitdirs git uses in this workspace: the one `.git` leads to, and the
@@ -32,9 +38,71 @@ pub(crate) struct LinkedGitdirs {
     pub gitdirs: Vec<PathBuf>,
     /// Entries below the workspace that the way to those gitdirs passes
     /// through: each symlink and directory, the gitfile, and the gitdirs
-    /// themselves. `.git` itself is left out: the profile protects every
-    /// `.git` entry already.
+    /// themselves. `.git` itself is left out, and so is the directory that
+    /// holds it and everything above that: the profile and the guard protect
+    /// every `.git` entry already.
     pub entries: Vec<PathBuf>,
+    /// Whether a gitfile or `commondir` file on the way is there but could
+    /// not be read, so a gitdir may be missing. (The profile has no use for
+    /// it; the Linux guard reports it.)
+    pub unreadable: bool,
+}
+
+/// What resolving symlinks may look at: `readlink` calls, and the length of
+/// the path being resolved. Past either, a resolution gives up, as it does
+/// after [`MAX_SYMLINKS`] symlinks, and [`Allowance::ran_out`] says so.
+#[derive(Debug)]
+pub(crate) struct Allowance {
+    lookups_left: usize,
+    max_path: usize,
+    /// `readlink` calls made.
+    pub(crate) spent: usize,
+    /// Whether a resolution gave up for want of it.
+    pub(crate) ran_out: bool,
+}
+
+impl Allowance {
+    /// No bound: the macOS profile resolves whatever git would.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn unlimited() -> Allowance {
+        Allowance::new(usize::MAX, usize::MAX)
+    }
+
+    /// At most `lookups` lookups, of paths at most `max_path` bytes long.
+    pub(crate) fn new(lookups: usize, max_path: usize) -> Allowance {
+        Allowance {
+            lookups_left: lookups,
+            max_path,
+            spent: 0,
+            ran_out: false,
+        }
+    }
+
+    /// Takes one lookup of `path`: `false` when none is left or the path is
+    /// too long.
+    fn take(&mut self, path: &Path) -> bool {
+        if self.lookups_left == 0 || path.as_os_str().len() > self.max_path {
+            self.ran_out = true;
+            return false;
+        }
+        self.lookups_left -= 1;
+        self.spent += 1;
+        true
+    }
+}
+
+/// A gitfile or `commondir` file that is there but cannot be read through
+/// [`read_regular`]: not a regular file, not readable, or behind a symlink
+/// loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Unreadable;
+
+/// `found`, noting in `unreadable` when it is [`Unreadable`].
+pub(super) fn noting<T>(found: Result<Option<T>, Unreadable>, unreadable: &mut bool) -> Option<T> {
+    found.unwrap_or_else(|Unreadable| {
+        *unreadable = true;
+        None
+    })
 }
 
 /// The gitdirs `<workspace>/.git` leads to when it is a symlink or a gitfile.
@@ -45,8 +113,20 @@ pub(crate) struct LinkedGitdirs {
 /// names where git would look once it is created). The entries on the way
 /// are listed even when no gitdir is found, so a symlinked gitfile git
 /// rejects today cannot be rewritten into one it accepts.
+#[cfg(target_os = "macos")]
 pub(crate) fn linked_gitdirs(workspace: &Path) -> LinkedGitdirs {
-    let dot_git = workspace.join(".git");
+    linked_gitdirs_at(workspace, workspace, &mut Allowance::unlimited())
+}
+
+/// [`linked_gitdirs`] for the `.git` in `holder`, a directory in the
+/// canonical `workspace` (or the workspace itself), within `allowance`. A
+/// gitfile's path is relative to `holder`.
+pub(crate) fn linked_gitdirs_at(
+    holder: &Path,
+    workspace: &Path,
+    allowance: &mut Allowance,
+) -> LinkedGitdirs {
+    let dot_git = holder.join(".git");
     let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
         return LinkedGitdirs::default();
     };
@@ -56,68 +136,111 @@ pub(crate) fn linked_gitdirs(workspace: &Path) -> LinkedGitdirs {
 
     let mut visited = Vec::new();
     let mut gitdirs = Vec::new();
-    if let Some(gitdir) = gitdir_of(workspace, &dot_git, &mut visited) {
-        let common = pointer(&gitdir.join("commondir"), b"")
-            .and_then(|common| follow(&gitdir.join(common), &mut visited));
+    let mut unreadable = false;
+    let gitdir = gitdir_of(holder, &dot_git, &mut visited, allowance);
+    if let Some(gitdir) = noting(gitdir, &mut unreadable) {
+        let common = noting(
+            common_dir(&gitdir, &mut visited, allowance),
+            &mut unreadable,
+        );
         gitdirs.push(gitdir);
         gitdirs.extend(common);
     }
 
     let mut entries: Vec<PathBuf> = Vec::new();
+    let mut seen = HashSet::new();
     for entry in visited {
-        if entry != workspace
+        if !holder.starts_with(&entry)
             && entry != dot_git
             && within(&entry, workspace)
-            && !entries.contains(&entry)
+            && seen.insert(entry.clone())
         {
             entries.push(entry);
         }
     }
     gitdirs.retain(|gitdir| within(gitdir, workspace));
-    LinkedGitdirs { gitdirs, entries }
+    LinkedGitdirs {
+        gitdirs,
+        entries,
+        unreadable,
+    }
+}
+
+/// Where the `.git` in `holder` leads, inside the workspace or not: the
+/// directory it is or resolves to, or the path its gitfile names.
+pub(super) fn gitdir_at(
+    holder: &Path,
+    allowance: &mut Allowance,
+) -> Result<Option<PathBuf>, Unreadable> {
+    gitdir_of(holder, &holder.join(".git"), &mut Vec::new(), allowance)
+}
+
+/// The directory `gitdir`'s `commondir` file names, relative to `gitdir`, as
+/// git resolves it. Every entry on the way is pushed to `visited`.
+pub(super) fn common_dir(
+    gitdir: &Path,
+    visited: &mut Vec<PathBuf>,
+    allowance: &mut Allowance,
+) -> Result<Option<PathBuf>, Unreadable> {
+    Ok(pointer(&gitdir.join("commondir"), b"", allowance)?
+        .and_then(|common| follow(&gitdir.join(common), visited, allowance)))
 }
 
 /// Where git finds the gitdir through `dot_git`: the directory it resolves
 /// to, or, when it resolves to a regular file, the path that gitfile names.
-fn gitdir_of(workspace: &Path, dot_git: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
-    let target = follow(dot_git, visited)?;
+fn gitdir_of(
+    holder: &Path,
+    dot_git: &Path,
+    visited: &mut Vec<PathBuf>,
+    allowance: &mut Allowance,
+) -> Result<Option<PathBuf>, Unreadable> {
+    let Some(target) = follow(dot_git, visited, allowance) else {
+        return Ok(None);
+    };
     if !std::fs::metadata(&target).is_ok_and(|m| m.is_file()) {
         // A directory, a path that does not exist, or something git cannot
         // read a gitfile from (a FIFO is never opened).
-        return Some(target);
+        return Ok(Some(target));
     }
-    let named = pointer(&target, b"gitdir: ")?;
+    let Some(named) = pointer(&target, b"gitdir: ", allowance)? else {
+        return Ok(None);
+    };
     // Relative to the directory holding `.git`, even through a symlink.
-    follow(&workspace.join(named), visited)
+    Ok(follow(&holder.join(named), visited, allowance))
 }
 
 /// The path a gitfile (`prefix` `gitdir: `) or a `commondir` file (no prefix)
 /// holds, as git reads it: up to the first NUL, without trailing newlines.
-/// `None` if it is not a regular file, lacks the prefix, or names nothing.
-fn pointer(file: &Path, prefix: &[u8]) -> Option<PathBuf> {
-    if !std::fs::metadata(file).is_ok_and(|m| m.is_file()) {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::open(file)
-        .ok()?
-        .take(MAX_POINTER_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
+/// `None` if there is no such file (git follows a symlinked `commondir`), or
+/// it lacks the prefix or names nothing.
+fn pointer(
+    file: &Path,
+    prefix: &[u8],
+    allowance: &mut Allowance,
+) -> Result<Option<PathBuf>, Unreadable> {
+    let file = follow(file, &mut Vec::new(), allowance).ok_or(Unreadable)?;
+    let bytes = match read_regular(&file, MAX_POINTER_BYTES) {
+        Ok(bytes) => bytes,
+        Err(err) if missing(&err) => return Ok(None),
+        Err(_) => return Err(Unreadable),
+    };
     let text = bytes.split(|&b| b == 0).next().unwrap_or_default();
-    let mut path = text.strip_prefix(prefix)?;
+    let Some(mut path) = text.strip_prefix(prefix) else {
+        return Ok(None);
+    };
     while let [rest @ .., b'\n' | b'\r'] = path {
         path = rest;
     }
-    (!path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(path)))
+    Ok((!path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(path))))
 }
 
 /// Resolves the absolute `path` as the kernel would, following every symlink
 /// on the way, and returns where it ends up. A component that does not exist
 /// is taken as written, and so is everything after it. Every entry looked at
 /// is pushed to `visited`, each symlink before it is followed. `None` after
-/// [`MAX_SYMLINKS`] symlinks.
-fn follow(path: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
+/// [`MAX_SYMLINKS`] symlinks, or when `allowance` runs out: each entry looked
+/// at takes one lookup.
+fn follow(path: &Path, visited: &mut Vec<PathBuf>, allowance: &mut Allowance) -> Option<PathBuf> {
     let mut resolved = PathBuf::from("/");
     let mut pending = VecDeque::new();
     prepend(&mut pending, path);
@@ -128,6 +251,9 @@ fn follow(path: &Path, visited: &mut Vec<PathBuf>) -> Option<PathBuf> {
             continue;
         };
         let next = resolved.join(&name);
+        if !allowance.take(&next) {
+            return None;
+        }
         visited.push(next.clone());
         // `readlink` fails for anything but a symlink.
         match std::fs::read_link(&next) {
@@ -159,25 +285,59 @@ fn prepend(pending: &mut VecDeque<Option<OsString>>, path: &Path) {
     }
 }
 
-/// Whether `path` is `base` or below it, comparing names ASCII
+/// Whether `path` is `base` or below it. On macOS names are compared ASCII
 /// case-insensitively: on the default case-insensitive volume a symlink may
 /// spell the workspace in another case, and Seatbelt's rules match either.
-fn within(path: &Path, base: &Path) -> bool {
+/// Elsewhere names must match exactly.
+pub(crate) fn within(path: &Path, base: &Path) -> bool {
     let mut components = path.components();
     base.components().all(|b| {
-        components.next().is_some_and(|c| {
-            c.as_os_str()
-                .as_bytes()
-                .eq_ignore_ascii_case(b.as_os_str().as_bytes())
-        })
+        components
+            .next()
+            .is_some_and(|c| same_name(c.as_os_str(), b.as_os_str()))
     })
+}
+
+fn same_name(a: &OsStr, b: &OsStr) -> bool {
+    if cfg!(target_os = "macos") {
+        a.as_bytes().eq_ignore_ascii_case(b.as_bytes())
+    } else {
+        a == b
+    }
+}
+
+/// Test helper: symlinks `{name}0` to `{name}{links - 1}` in `dir`, each to
+/// the next and the last to `end` (as is, when it is absolute). Each goes
+/// through 90 missing names of its own and back out with `..`, so resolving
+/// the chain looks at about 90 entries per link, all different.
+#[cfg(test)]
+pub(super) fn long_chain(dir: &Path, name: &str, links: usize, end: &str) {
+    for k in 0..links {
+        let mut target: String = (0..90).map(|i| format!("{name}{k}.{i}/")).collect();
+        target.push_str(&"../".repeat(90));
+        if k + 1 < links {
+            target.push_str(&format!("{name}{}", k + 1));
+        } else if Path::new(end).is_absolute() {
+            target = end.to_string();
+        } else {
+            target.push_str(end);
+        }
+        std::os::unix::fs::symlink(target, dir.join(format!("{name}{k}"))).unwrap();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use super::*;
+
+    /// The workspace's own `.git`, as the macOS profile asks for it.
+    fn linked_gitdirs(workspace: &Path) -> LinkedGitdirs {
+        linked_gitdirs_at(workspace, workspace, &mut Allowance::unlimited())
+    }
 
     fn workspace() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -351,5 +511,81 @@ mod tests {
         symlink("fifo", ws.join(".git")).unwrap();
         // Reading it would block forever; it is taken as the gitdir's path.
         check(&ws, &["fifo"], &["fifo"]);
+    }
+
+    #[test]
+    fn a_nested_gitfile_is_read_relative_to_its_own_directory() {
+        let (_d, ws) = workspace();
+        mkdirs(&ws, ".git/modules/sub");
+        mkdirs(&ws, "sub");
+        std::fs::write(ws.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        let found = linked_gitdirs_at(&ws.join("sub"), &ws, &mut Allowance::unlimited());
+        assert_eq!(
+            found.gitdirs,
+            vec![ws.join(".git/modules/sub")],
+            "{found:?}"
+        );
+        assert!(found.entries.contains(&ws.join(".git/modules/sub")));
+        // The directory holding `.git`, and everything above it, is not "on the way".
+        assert!(!found.entries.contains(&ws.join("sub")), "{found:?}");
+        assert!(!found.entries.contains(&ws), "{found:?}");
+    }
+
+    #[test]
+    fn names_are_case_insensitive_only_on_macos() {
+        let inside = within(Path::new("/Work/Repo/x"), Path::new("/work/repo"));
+        assert_eq!(inside, cfg!(target_os = "macos"));
+        assert!(within(Path::new("/work/repo/x"), Path::new("/work/repo")));
+        assert!(!within(
+            Path::new("/work/repository"),
+            Path::new("/work/repo")
+        ));
+    }
+
+    /// A workspace whose `.git` goes through three chains of `links` long
+    /// links each (see [`long_chain`]): `.git` to a gitfile naming the second
+    /// chain, to a gitdir whose `commondir` names the third.
+    fn chained(links: usize) -> (tempfile::TempDir, PathBuf) {
+        let (dir, ws) = workspace();
+        mkdirs(&ws, "gd");
+        mkdirs(&ws, "common");
+        long_chain(&ws, "a", links - 1, "gitfile");
+        let gitfile = format!("gitdir: {}\n", ws.join("b0").display());
+        std::fs::write(ws.join("gitfile"), gitfile).unwrap();
+        long_chain(&ws, "b", links, "gd");
+        std::fs::write(ws.join("gd/commondir"), "../c0\n").unwrap();
+        long_chain(&ws, "c", links, "common");
+        symlink("a0", ws.join(".git")).unwrap();
+        (dir, ws)
+    }
+
+    /// How long [`linked_gitdirs`] takes on `ws` at best, of three tries, on
+    /// a thread that must finish within 10 seconds.
+    fn fastest(ws: &Path) -> Duration {
+        let dir = ws.to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let times = (0..3).map(|_| {
+                let started = Instant::now();
+                let found = linked_gitdirs(&dir);
+                assert_eq!(found.gitdirs, vec![dir.join("gd"), dir.join("common")]);
+                started.elapsed()
+            });
+            let _ = tx.send(times.min().unwrap());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("took longer than 10s")
+    }
+
+    #[test]
+    fn the_entries_on_the_way_are_deduplicated_in_linear_time() {
+        // About 2,600 and 10,500 entries on the way: four times as many take
+        // about four times as long, not sixteen. (A ratio, so it holds on a
+        // machine of any speed.)
+        let (_s, small) = chained(10);
+        let (_l, large) = chained(39);
+        assert!(linked_gitdirs(&large).entries.len() > 10_000);
+        let (small, large) = (fastest(&small), fastest(&large));
+        assert!(large < small * 8, "{large:?} against {small:?}");
     }
 }

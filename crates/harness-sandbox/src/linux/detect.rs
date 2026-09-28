@@ -50,7 +50,7 @@ pub fn landlock_abi() -> Option<i32> {
 
 /// Whether this process can rely on the Linux sandbox backend: the Landlock
 /// half requires kernel ABI >= 3, and the seccomp half requires the
-/// network-deny filter to actually build (see [`super::seccomp::build_network_deny_filter`],
+/// deny filters to actually build (see [`super::seccomp::build_deny_filter`],
 /// which includes its own prologue-shape check). The architecture check
 /// that used to live here is now a compile-time gate instead: the whole
 /// `linux` module (see `lib.rs`) only builds on `x86_64`/`aarch64`, the two
@@ -70,7 +70,8 @@ pub fn landlock_abi() -> Option<i32> {
 /// outright.
 pub fn linux_sandbox_available() -> bool {
     landlock_abi().is_some_and(|abi| abi >= MIN_SUPPORTED_ABI)
-        && super::seccomp::build_network_deny_filter().is_ok()
+        && super::seccomp::build_deny_filter().is_ok()
+        && super::seccomp::build_clone3_filter().is_ok()
 }
 
 #[cfg(test)]
@@ -83,13 +84,17 @@ mod tests {
     }
 
     #[test]
-    fn network_deny_filter_builds_on_this_host_architecture() {
+    fn seccomp_filters_build_on_this_host_architecture() {
         // Independent of Landlock support: `linux_sandbox_available`'s
-        // seccomp half should always succeed on x86_64/aarch64, the only
+        // seccomp filters should always succeed on x86_64/aarch64, the only
         // architectures this module compiles for at all.
         assert!(
-            crate::linux::seccomp::build_network_deny_filter().is_ok(),
-            "the seccomp filter should always build on this architecture"
+            crate::linux::seccomp::build_deny_filter().is_ok(),
+            "the deny filter should always build on this architecture"
+        );
+        assert!(
+            crate::linux::seccomp::build_clone3_filter().is_ok(),
+            "the clone3 filter should always build on this architecture"
         );
     }
 }

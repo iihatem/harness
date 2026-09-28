@@ -131,15 +131,47 @@ The system SHALL classify every shell command as allow-listed (every sub-command
 - **THEN** the user is asked to approve it
 
 ### Requirement: The sandbox protects repository hooks and config
-In workspace-write sandboxes the system SHALL deny writes to `.git/config`, `.git/hooks`, the `.git` directory entry itself, a top-level `HEAD` file, and `.harness/` inside the workspace, while allowing other writes under `.git` so that commit, checkout, and stash work.
+In workspace-write sandboxes the system SHALL protect `.git/config`, `.git/hooks`, `commondir`, the `.git` directory entry itself, a top-level `HEAD` file, and `.harness/` inside the workspace, while allowing other writes under `.git` so that commit, checkout, and stash work.
+
+On macOS, and on Linux when unprivileged user namespaces are available (the full tier), writes to these paths MUST fail. On Linux, names that do not exist yet MUST be caught by a guard that moves them to a quarantine directory, never deleting them, and reports it in the tool result. The guard's scan for new repositories MUST use the ignore rules as they were when the session started, so that an ignore rule written during the session cannot hide a new repository.
+
+When user namespaces are unavailable (the basic tier), the system MUST warn at startup and point to `harness sandbox doctor`. The guard MUST restore changed protected files after each command, and, while a process started by an earlier sandboxed command is still running, also before each later command. When harness exits, it MUST end the processes sandboxed commands left running and check once more. With `sandbox.linux_git_protection = "required"`, the basic tier MUST require approval for every shell command in `ask` and `auto`.
 
 #### Scenario: Planting a hook
-- **WHEN** a sandboxed command runs `echo x > .git/hooks/pre-commit` in `auto` mode
+- **WHEN** a sandboxed command runs `echo x > .git/hooks/pre-commit` in `auto` mode on macOS, or on Linux in the full tier
 - **THEN** the write fails
 
 #### Scenario: Committing
 - **WHEN** a sandboxed command runs `git commit --allow-empty -m test` in `auto` mode
 - **THEN** the commit succeeds
+
+#### Scenario: Planting a hook in the Linux basic tier
+- **WHEN** user namespaces are blocked and a sandboxed command in `auto` mode writes `.git/hooks/pre-commit`
+- **THEN** the file is moved to the quarantine directory after the command
+- **AND** the tool result says so
+- **AND** the command counts as blocked: headless runs exit 3 and no re-run outside the sandbox is offered
+
+#### Scenario: A new nested repository on Linux
+- **WHEN** a sandboxed command runs `git init sub` in `auto` mode on Linux
+- **THEN** `sub/.git` is moved to the quarantine directory and the tool result says so
+
+#### Scenario: Hiding a new repository behind an ignore rule
+- **WHEN** a sandboxed command on Linux adds `sub/` to `.gitignore` and then runs `git init sub`
+- **THEN** `sub/.git` is moved to the quarantine directory and the tool result says so
+
+#### Scenario: A background process outlives harness
+- **WHEN** a sandboxed command on Linux leaves a background process running and harness then exits
+- **THEN** harness ends that process before it exits, undoes any change it made to protected files, and says so on stderr
+- **AND** the exit code is unchanged
+
+#### Scenario: A background process changes config in the Linux basic tier
+- **WHEN** user namespaces are blocked and a sandboxed command starts a background process that rewrites `.git/config` after the command ends
+- **THEN** `.git/config` is restored before the next command runs, the changed version is kept in the quarantine directory
+- **AND** that command's result says so, without the command counting as blocked
+
+#### Scenario: Strict git protection without user namespaces
+- **WHEN** user namespaces are blocked, `sandbox.linux_git_protection = "required"`, and the model runs `ls` in `auto` mode
+- **THEN** the user is asked to approve it
 
 ### Requirement: Commands run in bash without startup files
 The system SHALL run shell commands with `bash --noprofile --norc -c` with `BASH_ENV` and `ENV` removed from the environment. Bash MUST be looked for only at `/bin/bash`, `/usr/bin/bash`, and `/run/current-system/sw/bin/bash`, never on `PATH`, and `/bin/sh -c` MUST be used only when none of them exists.

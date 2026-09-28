@@ -8,11 +8,12 @@ publish = false
 
 [dependencies]
 harness-core.workspace = true
+ignore.workspace = true
+libc.workspace = true
 tokio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
-libc.workspace = true
 seccompiler.workspace = true
 
 [dev-dependencies]

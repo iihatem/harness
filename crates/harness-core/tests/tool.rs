@@ -98,3 +98,64 @@ fn limiting_never_splits_a_multibyte_character() {
     let limited = limit_output(&content, 999, dir.path(), "u");
     assert!(limited.contains("omitted"));
 }
+
+use harness_core::permission::FsAccess;
+use harness_core::tool::{CommandSandbox, GitProtection};
+
+/// A sandbox that only implements the required methods.
+#[derive(Debug)]
+struct Plain;
+
+impl CommandSandbox for Plain {
+    fn name(&self) -> &'static str {
+        "plain"
+    }
+    fn command(
+        &self,
+        _access: FsAccess,
+        _workspace: &Path,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<tokio::process::Command> {
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args);
+        Ok(cmd)
+    }
+    fn is_denial(&self, _exit_code: Option<i32>, _output: &str) -> bool {
+        false
+    }
+}
+
+#[test]
+fn a_sandbox_without_a_guard_prepares_its_plain_command() {
+    let prepared = Plain
+        .prepare(FsAccess::WorkspaceWrite, Path::new("/w"), "echo", &["hi"])
+        .unwrap();
+    assert!(prepared.guard.is_none());
+    let std = prepared.command.as_std();
+    assert_eq!(std.get_program(), "echo");
+    assert_eq!(std.get_args().collect::<Vec<_>>(), ["hi"]);
+    assert_eq!(Plain.git_protection(), GitProtection::Full);
+}
+
+#[test]
+fn a_sandbox_without_a_session_to_start_does_nothing_when_it_starts() {
+    // The default: nothing to read from the workspace, nothing to set up.
+    Plain.start_session(Path::new("/nonexistent/workspace"));
+}
+
+/// A guard that only implements `finish`.
+struct Finishing;
+
+impl harness_core::tool::CommandGuard for Finishing {
+    fn finish(self: Box<Self>) -> Option<harness_core::tool::GuardReport> {
+        None
+    }
+}
+
+#[test]
+fn a_guard_that_does_not_track_processes_ignores_the_started_command() {
+    let mut guard: Box<dyn harness_core::tool::CommandGuard> = Box::new(Finishing);
+    guard.started(4242);
+    assert_eq!(guard.finish(), None);
+}

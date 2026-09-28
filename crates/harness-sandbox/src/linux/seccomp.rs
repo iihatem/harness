@@ -1,5 +1,5 @@
-//! Compiles the seccomp-BPF program that denies network access, in the
-//! parent process.
+//! Compiles the seccomp-BPF programs that deny network access, mount
+//! changes and new namespaces, in the parent process.
 //!
 //! Like [`super::fs::build_ruleset_fd`], this runs entirely before `fork()`.
 //! `seccompiler::SeccompFilter::try_into::<BpfProgram>()` allocates the
@@ -46,6 +46,20 @@
 //! cheap to check and the consequence of skipping it (installing a filter
 //! whose x32 block landed in the wrong place, or not at all) is silent and
 //! severe.
+//!
+//! ## Mounts and namespaces
+//!
+//! The full tier's read-only binds (`mountns.rs`) are set up before this
+//! filter is installed; afterwards the filter refuses every call that changes
+//! mounts (`mount`, `umount2`, `mount_setattr`, `move_mount`, `open_tree`,
+//! `open_tree_attr`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `pivot_root`)
+//! or enters a namespace (`unshare`, `setns`, and `clone` with any
+//! `CLONE_NEW*` flag), in both tiers. The sandboxed command has no
+//! capability over the mount namespace anyway, and Landlock refuses mount
+//! changes too; this closes the door independently of both. `clone3` passes
+//! its flags in memory a filter cannot read, so a second, one-rule program
+//! ([`build_clone3_filter`]) makes it fail with `ENOSYS`, which glibc and
+//! other runtimes answer by falling back to `clone`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -57,10 +71,15 @@ use seccompiler::{
     SeccompFilter, SeccompRule, TargetArch,
 };
 
+/// `open_tree_attr` (Linux 6.15), which `libc` does not name yet. New
+/// syscalls share one number on the architectures harness supports.
+const SYS_OPEN_TREE_ATTR: i64 = 467;
+
 /// Syscalls denied unconditionally (regardless of arguments): the rest of
-/// the socket lifecycle beyond creation, plus `io_uring`, which can perform
+/// the socket lifecycle beyond creation; `io_uring`, which can perform
 /// network I/O (including creating `AF_VSOCK`/`AF_INET` sockets under the
-/// hood on newer kernels) without ever calling `socket(2)` itself.
+/// hood on newer kernels) without ever calling `socket(2)` itself; and every
+/// call that changes mounts or enters a namespace (see the module docs).
 const DENY_UNCONDITIONALLY: &[i64] = &[
     libc::SYS_connect,
     libc::SYS_bind,
@@ -70,9 +89,35 @@ const DENY_UNCONDITIONALLY: &[i64] = &[
     libc::SYS_io_uring_setup,
     libc::SYS_io_uring_enter,
     libc::SYS_io_uring_register,
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_mount_setattr,
+    libc::SYS_move_mount,
+    libc::SYS_open_tree,
+    SYS_OPEN_TREE_ATTR,
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_fspick,
+    libc::SYS_pivot_root,
+    libc::SYS_unshare,
+    libc::SYS_setns,
 ];
 
-/// Builds the network-denying seccomp-BPF program.
+/// The `clone` flags that create a namespace. (`CLONE_NEWTIME` is left out:
+/// `clone` reads that bit as part of the exit signal; only `clone3` and
+/// `unshare` accept it, and both are refused outright.)
+const CLONE_NAMESPACE_FLAGS: [libc::c_int; 7] = [
+    libc::CLONE_NEWNS,
+    libc::CLONE_NEWCGROUP,
+    libc::CLONE_NEWUTS,
+    libc::CLONE_NEWIPC,
+    libc::CLONE_NEWUSER,
+    libc::CLONE_NEWPID,
+    libc::CLONE_NEWNET,
+];
+
+/// Builds the main seccomp-BPF program: network, mounts and namespaces.
 ///
 /// Default action is `Allow` (every syscall not mentioned below runs
 /// normally); the on-match action is `Errno(EPERM)`, so a denied call fails
@@ -90,7 +135,7 @@ const DENY_UNCONDITIONALLY: &[i64] = &[
 /// `Err` (in the parent, before any child exists, so the spawn simply fails
 /// rather than running unfiltered) if seccompiler's compiled output does
 /// not have the exact shape [`deny_x32_syscalls`] depends on.
-pub fn build_network_deny_filter() -> io::Result<BpfProgram> {
+pub fn build_deny_filter() -> io::Result<BpfProgram> {
     #[allow(unused_mut)]
     let mut program = compile_rules().map_err(io::Error::other)?;
     #[cfg(target_arch = "x86_64")]
@@ -101,7 +146,7 @@ pub fn build_network_deny_filter() -> io::Result<BpfProgram> {
     Ok(program)
 }
 
-/// The rule-based part of [`build_network_deny_filter`], without the x32
+/// The rule-based part of [`build_deny_filter`], without the x32
 /// post-processing — factored out so the x32 unit tests below can compare
 /// against the program as seccompiler itself compiled it.
 fn compile_rules() -> Result<BpfProgram, Error> {
@@ -114,6 +159,12 @@ fn compile_rules() -> Result<BpfProgram, Error> {
 
     rules.insert(libc::SYS_socket, vec![not_af_unix(0)?]);
     rules.insert(libc::SYS_socketpair, vec![not_af_unix(0)?]);
+    // A syscall's rules match when any one of them does: one rule per flag.
+    let namespace_rules = CLONE_NAMESPACE_FLAGS
+        .iter()
+        .map(|&flag| has_flag(0, flag))
+        .collect::<Result<Vec<_>, Error>>()?;
+    rules.insert(libc::SYS_clone, namespace_rules);
 
     let filter = SeccompFilter::new(
         rules,
@@ -123,6 +174,31 @@ fn compile_rules() -> Result<BpfProgram, Error> {
     )?;
 
     Ok(filter.try_into()?)
+}
+
+/// The program that makes `clone3` fail with `ENOSYS` (see the module docs).
+/// Installed after [`build_deny_filter`]'s; everything else is allowed.
+pub fn build_clone3_filter() -> io::Result<BpfProgram> {
+    let rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::from([(libc::SYS_clone3, vec![])]);
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        target_arch(),
+    )
+    .map_err(io::Error::other)?;
+    filter.try_into().map_err(io::Error::other)
+}
+
+/// A rule matching "argument `arg_index` has `flag` set".
+fn has_flag(arg_index: u8, flag: libc::c_int) -> Result<SeccompRule, Error> {
+    let flag = flag as u64;
+    Ok(SeccompRule::new(vec![SeccompCondition::new(
+        arg_index,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::MaskedEq(flag),
+        flag,
+    )?])?)
 }
 
 /// A rule matching "argument `arg_index` (the socket domain) is not
@@ -337,9 +413,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn network_deny_filter_compiles_to_a_non_empty_program() {
-        let program = build_network_deny_filter().expect("filter should compile");
+    fn deny_filter_compiles_to_a_non_empty_program() {
+        let program = build_deny_filter().expect("filter should compile");
         assert!(!program.is_empty());
+    }
+
+    #[test]
+    fn clone3_filter_compiles_to_a_non_empty_program() {
+        let program = build_clone3_filter().expect("filter should compile");
+        assert!(!program.is_empty());
+    }
+
+    #[test]
+    fn mount_and_namespace_syscalls_are_denied_unconditionally() {
+        for nr in [
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_mount_setattr,
+            libc::SYS_move_mount,
+            libc::SYS_open_tree,
+            SYS_OPEN_TREE_ATTR,
+            libc::SYS_fsopen,
+            libc::SYS_fsconfig,
+            libc::SYS_fsmount,
+            libc::SYS_fspick,
+            libc::SYS_pivot_root,
+            libc::SYS_unshare,
+            libc::SYS_setns,
+        ] {
+            assert!(DENY_UNCONDITIONALLY.contains(&nr), "{nr}");
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -382,7 +485,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn x32_denial_block_lands_exactly_after_the_prologue() {
-        let program = build_network_deny_filter().expect("filter should compile");
+        let program = build_deny_filter().expect("filter should compile");
         let inserted = &program[ARCH_PROLOGUE_LEN..ARCH_PROLOGUE_LEN + 3];
 
         assert_eq!(inserted[0].code, bpf_opcode::LD_W_ABS);
@@ -407,7 +510,7 @@ mod tests {
     #[test]
     fn rules_after_the_x32_block_are_unchanged_and_still_reachable() {
         let plain = compile_rules().expect("filter should compile");
-        let patched = build_network_deny_filter().expect("filter should compile");
+        let patched = build_deny_filter().expect("filter should compile");
 
         assert_eq!(patched.len(), plain.len() + 3);
         assert_eq!(

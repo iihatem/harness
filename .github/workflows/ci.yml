@@ -11,19 +11,85 @@ jobs:
       matrix:
         # ubuntu-24.04: kernel 6.8+ with Landlock ABI ≥ 4 (harness needs ≥ 3); pinned so the sandbox suite keeps running on a known kernel.
         os: [ubuntu-24.04, macos-latest]
+        tier: [default]
+        include:
+          # The same Linux runner with unprivileged user namespaces allowed, so the full tier of
+          # Linux git-metadata protection (read-only mounts) is tested too. The default Linux job
+          # tests the basic tier: GitHub's Ubuntu runners restrict user namespaces with AppArmor.
+          - os: ubuntu-24.04
+            tier: full
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.tier }}
+      - name: Allow unprivileged user namespaces
+        if: matrix.tier == 'full'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo fmt --all --check
+        if: matrix.tier != 'full'
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        if: matrix.tier != 'full'
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
         env:
           HARNESS_REQUIRE_LINUX_SANDBOX: ${{ runner.os == 'Linux' && '1' || '0' }}
+          HARNESS_EXPECT_LINUX_TIER: ${{ runner.os == 'Linux' && (matrix.tier == 'full' && 'full' || 'basic') || '' }}
   deny:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+  overlayfs:
+    # Docker on ubuntu-24.04 runners stores container layers on overlay2. The guard's own git
+    # repos are still made fresh inside the container (nothing new to copy up there), but this
+    # bakes the checkout into an image layer and runs the guard's Linux tests with the container's
+    # whole root filesystem, .git included, on overlay2, and with Docker's default seccomp profile
+    # blocking user namespaces, so the basic tier is what runs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: overlayfs
+      - name: Build the guard's test binaries
+        run: |
+          mkdir -p docker/tests
+          for t in git_guard linux_git_guard; do
+            bin=$(cargo test -p harness-sandbox --test "$t" --no-run --message-format=json \
+              | jq -r 'select(.executable != null) | .executable' | tail -n1)
+            cp "$bin" "docker/tests/$t"
+          done
+      - name: Run them in a container whose root filesystem is overlay2
+        run: |
+          printf 'target\n' > .dockerignore
+          cat > Dockerfile.overlayfs <<'EOF'
+          FROM ubuntu:24.04
+          # gcc and libc6-dev: a test builds a small C helper (a process whose main thread exits
+          # first), and HARNESS_REQUIRE_LINUX_SANDBOX makes it fail rather than skip without one.
+          RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+              gcc libc6-dev \
+              && rm -rf /var/lib/apt/lists/*
+          # A repository committed here, in a RUN step, sits in a lower, read-only image layer.
+          # The first write under its .git from a running container forces overlayfs to copy it
+          # up: the real check that copy-up doesn't make .git look replaced (Task 4's L1).
+          RUN git init -q /image-repo \
+              && git -C /image-repo config user.email t@example.com \
+              && git -C /image-repo config user.name original \
+              && git -C /image-repo config commit.gpgsign false \
+              && git -C /image-repo commit -q --allow-empty -m first
+          ENV HARNESS_IMAGE_LAYER_REPO=/image-repo
+          COPY . /workspace
+          WORKDIR /workspace
+          EOF
+          docker build -f Dockerfile.overlayfs -t harness-overlayfs-test .
+          docker run --rm \
+            -e HARNESS_REQUIRE_LINUX_SANDBOX=1 \
+            -e HARNESS_EXPECT_LINUX_TIER=basic \
+            harness-overlayfs-test \
+            sh -c 'chmod +x docker/tests/git_guard docker/tests/linux_git_guard \
+              && ./docker/tests/git_guard --test-threads=1 \
+              && ./docker/tests/linux_git_guard --test-threads=1'

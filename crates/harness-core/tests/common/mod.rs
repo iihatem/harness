@@ -112,6 +112,46 @@ impl Tool for Boxed {
     }
 }
 
+/// Reports a command whose result the sandbox's git-metadata guard blocked: `is_error`,
+/// `guard_blocked` and (as the heuristic would have set it) `sandbox_denied` are all set. Each
+/// run appends a line to `guard_blocked_calls.log` in the workspace recording whether it ran
+/// with `ctx.unsandboxed`, so tests can check it ran exactly once and never unsandboxed.
+pub struct GuardBlocked;
+#[async_trait]
+impl Tool for GuardBlocked {
+    fn spec(&self) -> ToolSpec {
+        spec("guard_blocked", json!({"type": "object"}))
+    }
+    fn action(&self, _args: &Value, _ctx: &ToolContext) -> Action {
+        Action::Bash("echo ok".into())
+    }
+    async fn run(&self, _args: Value, ctx: &ToolContext) -> ToolOutput {
+        use std::io::Write;
+        let log = ctx.workspace.join("guard_blocked_calls.log");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            if ctx.unsandboxed {
+                "unsandboxed"
+            } else {
+                "sandboxed"
+            }
+        )
+        .unwrap();
+        let mut out = ToolOutput::error(
+            "exit code 0\n[the sandbox's git-metadata guard undid changes: .git/hooks/pre-commit]",
+        );
+        out.guard_blocked = true;
+        out.sandbox_denied = true;
+        out
+    }
+}
+
 pub struct AlwaysApprove;
 #[async_trait]
 impl Approver for AlwaysApprove {
@@ -151,6 +191,7 @@ fn build(
         Arc::new(Fail),
         Arc::new(Sleepy),
         Arc::new(Boxed),
+        Arc::new(GuardBlocked),
     ]);
     let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode,

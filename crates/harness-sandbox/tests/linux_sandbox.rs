@@ -845,6 +845,128 @@ else:
 }
 
 // ---------------------------------------------------------------------------
+// Mounts and namespaces
+// ---------------------------------------------------------------------------
+
+/// Every mount-changing and namespace-entering syscall fails with `EPERM` — a value only the
+/// seccomp filter gives for all of them: without it, `setns(-1)` is `EBADF`, `open_tree` of `/`
+/// succeeds, and `open_tree_attr` is `ENOSYS` on kernels before 6.15.
+#[tokio::test]
+async fn mount_and_namespace_syscalls_fail_with_eperm() {
+    let Some(ws) = new_workspace() else {
+        return;
+    };
+    if require_command("python3") {
+        return;
+    }
+    let policy = workspace_write_policy(ws.path());
+    let script = r#"
+import ctypes, errno, platform, sys
+libc = ctypes.CDLL(None, use_errno=True)
+x86 = platform.machine() == "x86_64"
+AT_FDCWD = -100
+calls = [
+    ("mount", 165 if x86 else 40, (b"none", b"/tmp", b"tmpfs", 0, None)),
+    ("umount2", 166 if x86 else 39, (b"/tmp", 0)),
+    ("pivot_root", 155 if x86 else 41, (b".", b".")),
+    ("unshare", 272 if x86 else 97, (0x10000000,)),
+    ("setns", 308 if x86 else 268, (-1, 0)),
+    ("open_tree", 428, (AT_FDCWD, b"/", 0)),
+    ("move_mount", 429, (AT_FDCWD, b"/", AT_FDCWD, b"/tmp", 0)),
+    ("fsopen", 430, (b"tmpfs", 0)),
+    ("fsconfig", 431, (-1, 0, None, None, 0)),
+    ("fsmount", 432, (-1, 0, 0)),
+    ("fspick", 433, (AT_FDCWD, b"/", 0)),
+    ("mount_setattr", 442, (AT_FDCWD, b"/", 0, None, 0)),
+    ("open_tree_attr", 467, (AT_FDCWD, b"/", 0, None, 0)),
+]
+for name, nr, args in calls:
+    rc = libc.syscall(nr, *args)
+    err = ctypes.get_errno()
+    if rc != -1 or err != errno.EPERM:
+        sys.exit(f"{name}: expected EPERM, got rc={rc} errno={err}")
+print("ok")
+"#;
+
+    let output = run(&policy, "python3", &["-c", script]).await;
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+}
+
+/// `clone` with a namespace flag fails with `EPERM`; plain `clone` (a fork) still works.
+#[tokio::test]
+async fn clone_with_a_namespace_flag_fails_with_eperm() {
+    let Some(ws) = new_workspace() else {
+        return;
+    };
+    if require_command("python3") {
+        return;
+    }
+    let policy = workspace_write_policy(ws.path());
+    let script = r#"
+import ctypes, errno, os, platform, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+SYS_clone = ctypes.c_long(56 if platform.machine() == "x86_64" else 220)
+SIGCHLD = 17
+NULL = ctypes.c_void_p(None)
+for flag in [0x20000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000]:
+    rc = libc.syscall(SYS_clone, ctypes.c_ulong(flag | SIGCHLD), NULL, NULL, NULL, NULL)
+    if rc == 0:
+        os._exit(0)
+    err = ctypes.get_errno()
+    if rc != -1 or err != errno.EPERM:
+        sys.exit(f"clone({flag:#x}): expected EPERM, got rc={rc} errno={err}")
+pid = libc.syscall(SYS_clone, ctypes.c_ulong(SIGCHLD), NULL, NULL, NULL, NULL)
+if pid == 0:
+    os._exit(7)
+if pid < 0:
+    sys.exit(f"a plain clone failed: errno={ctypes.get_errno()}")
+_, status = os.waitpid(pid, 0)
+if os.WEXITSTATUS(status) != 7:
+    sys.exit(f"the child exited with {status}")
+print("ok")
+"#;
+
+    let output = run(&policy, "python3", &["-c", script]).await;
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+}
+
+/// `clone3` fails with `ENOSYS`, so runtimes fall back to `clone`: threads and subprocesses
+/// keep working.
+#[tokio::test]
+async fn clone3_fails_with_enosys_and_threads_still_work() {
+    let Some(ws) = new_workspace() else {
+        return;
+    };
+    if require_command("python3") {
+        return;
+    }
+    let policy = workspace_write_policy(ws.path());
+    let script = r#"
+import ctypes, errno, subprocess, sys, threading
+libc = ctypes.CDLL(None, use_errno=True)
+rc = libc.syscall(435, None, 0)
+if rc != -1 or ctypes.get_errno() != errno.ENOSYS:
+    sys.exit(f"clone3: expected ENOSYS, got rc={rc} errno={ctypes.get_errno()}")
+done = []
+thread = threading.Thread(target=lambda: done.append(1))
+thread.start()
+thread.join()
+if done != [1]:
+    sys.exit("the thread did not run")
+if subprocess.run(["true"]).returncode != 0:
+    sys.exit("a subprocess failed")
+print("ok")
+"#;
+
+    let output = run(&policy, "python3", &["-c", script]).await;
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+}
+
+// ---------------------------------------------------------------------------
 // Process hierarchy
 // ---------------------------------------------------------------------------
 
@@ -976,5 +1098,43 @@ async fn child_proc_status_reports_no_new_privs_and_seccomp_filter_active() {
     assert!(
         stdout.lines().any(|line| line == "Seccomp:\t2"),
         "missing Seccomp:\\t2 in:\n{stdout}"
+    );
+}
+
+/// The sandboxed child reports exactly 2 more seccomp filters than the test process did when it
+/// spawned it. The test process could be running under Docker, Podman, or harness's own sandbox
+/// (which adds 2 filters of its own), so we measure the difference rather than assert a fixed count.
+#[tokio::test]
+async fn child_proc_status_reports_two_more_seccomp_filters_than_parent() {
+    let Some(ws) = new_workspace() else {
+        return;
+    };
+    let policy = workspace_write_policy(ws.path());
+
+    // Read the parent process's own Seccomp_filters value.
+    let parent_status = std::fs::read_to_string("/proc/self/status")
+        .expect("failed to read parent /proc/self/status");
+    let parent_filters: u32 = parent_status
+        .lines()
+        .find_map(|line| line.strip_prefix("Seccomp_filters:\t"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let output = run(&policy, "cat", &["/proc/self/status"]).await;
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    let child_stdout = String::from_utf8_lossy(&output.stdout);
+    let child_filters: u32 = child_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Seccomp_filters:\t"))
+        .and_then(|s| s.parse().ok())
+        .expect("missing Seccomp_filters in child output");
+
+    assert_eq!(
+        child_filters,
+        parent_filters + 2,
+        "expected child to have parent_filters ({}) + 2, but got {}",
+        parent_filters,
+        child_filters
     );
 }

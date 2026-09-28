@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::gitdir::{LinkedGitdirs, linked_gitdirs};
+use crate::gitmeta::{LinkedGitdirs, linked_gitdirs};
 use crate::policy::{FsAccess, SandboxPolicy};
 use crate::roots::{home_dir, safe_root};
 
@@ -303,7 +303,7 @@ fn write_section(root_keys: &[String], gitdir_keys: &[String], entry_keys: &[Str
 ; it are protected, and so is every entry on the way there (each symlink and
 ; directory, the gitfile, and the gitdir itself), so none of them can be
 ; moved out and back, repointed or swapped. They are looked up again for
-; every command (see gitdir.rs); one outside the workspace is not covered.
+; every command (see gitmeta/linked.rs); one outside the workspace is not covered.
 ;
 ; These are path rules: moving a parent dir of any other gitdir (a nested
 ; repo, `.git/modules/*`, `.git/worktrees/<id>`) out to a writable root,

@@ -16,7 +16,11 @@
 //!   `landlock_restrict_self` and, inside [`fdcleanup`], for `close_range`
 //!   and `getdents64`), [`libc::open`], [`libc::fcntl`], [`libc::close`] are
 //!   all thin wrappers around a single `syscall(2)` — no heap allocation, no
-//!   userspace locking.
+//!   userspace locking. The full tier's mount setup ([`mountns::enter`]) is
+//!   made of the same kind of calls (`unshare`, `open`/`write` of
+//!   `/proc/self/*_map`, `mount`, `openat2`, `fstat`, `open_tree`,
+//!   `mount_setattr`, `move_mount`, `getcwd`, `chdir`, `prctl`, `capset`,
+//!   `close`), on the plan and pipe built in the parent, with stack buffers.
 //! - [`seccompiler::apply_filter`] builds a `sock_fprog` on the stack that
 //!   just points at the already-allocated [`seccompiler::BpfProgram`] slice
 //!   (no allocation of its own) and calls `prctl`/`syscall(SYS_seccomp)`
@@ -38,6 +42,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use seccompiler::BpfProgram;
 
 use super::fdcleanup;
+use super::mountns::{self, MountPlan};
 
 /// Everything [`apply`] needs, computed in the parent (see `fs.rs` and
 /// `seccomp.rs`) before the child is forked.
@@ -46,8 +51,14 @@ pub(super) struct PreparedSandbox {
     /// errors in the parent, before the child is ever forked, rather than
     /// handing back a `PreparedSandbox` with nothing to restrict.
     pub(super) landlock_ruleset_fd: OwnedFd,
-    /// The compiled network-deny seccomp-BPF program.
+    /// The main seccomp-BPF program: network, mounts and namespaces.
     pub(super) seccomp_program: BpfProgram,
+    /// The `clone3`-specific seccomp-BPF program that makes it fail with `ENOSYS`.
+    pub(super) clone3_program: BpfProgram,
+    /// The full tier's namespace and mounts, and the write end of the pipe
+    /// the child reports a failed step to. `None` in the basic tier, and in
+    /// the full tier when there is nothing to protect.
+    pub(super) mounts: Option<(MountPlan, Option<OwnedFd>)>,
 }
 
 /// Installs the sandbox in the calling process. Must only be invoked from a
@@ -66,20 +77,31 @@ pub(super) fn apply(prepared: &PreparedSandbox) -> io::Result<()> {
     //    could otherwise deny. Fails closed: see `fdcleanup`'s module docs.
     fdcleanup::mark_inherited_fds_close_on_exec()?;
 
-    // 3. Required before `seccomp(2)` will install a filter; applied ahead
+    // 3. The full tier's user and mount namespace and self-binds, after
+    //    which the child locks its securebits and drops every capability it
+    //    gained in the namespace. Must come before Landlock, which refuses
+    //    every mount change, and before seccomp, which refuses `unshare` and
+    //    the mount calls. Fails closed: the command does not run, and the
+    //    step that failed is written to the setup pipe for the parent.
+    if let Some((plan, report)) = &prepared.mounts {
+        mountns::enter(plan, report.as_ref().map(AsRawFd::as_raw_fd))?;
+    }
+
+    // 4. Required before `seccomp(2)` will install a filter; applied ahead
     //    of Landlock too so nothing between here and `execve` could regain
     //    privileges (e.g. via a setuid/setgid binary) that the sandbox is
     //    about to remove.
     set_no_new_privs()?;
 
-    // 4. Filesystem restriction. `landlock_ruleset_fd` is always present
+    // 5. Filesystem restriction. `landlock_ruleset_fd` is always present
     //    (see `PreparedSandbox`'s docs): a kernel that cannot enforce it was
     //    already rejected in the parent, before fork.
     landlock_restrict_self(prepared.landlock_ruleset_fd.as_raw_fd())?;
 
-    // 5. Network restriction. Installed last so none of the syscalls above
-    //    can themselves be filtered.
+    // 6. Network, mount and namespace restriction. Installed last so none of
+    //    the syscalls above can themselves be filtered.
     seccompiler::apply_filter(&prepared.seccomp_program).map_err(seccomp_apply_error)?;
+    seccompiler::apply_filter(&prepared.clone3_program).map_err(seccomp_apply_error)?;
 
     Ok(())
 }

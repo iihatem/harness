@@ -119,12 +119,18 @@ pub fn summary_request(
 }
 
 /// `messages` as plain text for the summarizer, each clipped, the oldest left out when the whole
-/// would exceed `max_tokens` (an earlier summary at the start is always kept).
+/// would exceed `max_tokens`. An earlier summary at the start is always kept, and clipped only to
+/// the whole budget: it ends with what remains to be done.
 fn transcript(messages: &[Message], max_tokens: u64) -> String {
+    let budget = max_tokens.saturating_mul(4) as usize;
+    let keep_first = matches!(messages.first(), Some(Message::User { content }) if content.starts_with(SUMMARY_PREFIX));
     let mut tools: HashMap<&str, &str> = HashMap::new();
     let mut entries: Vec<String> = Vec::new();
     for message in messages {
         let entry = match message {
+            Message::User { content } if keep_first && entries.is_empty() => {
+                format!("User: {}", clip(content, budget))
+            }
             Message::User { content } => format!("User: {}", clip(content, MAX_MESSAGE_CHARS)),
             Message::Assistant {
                 content,
@@ -161,8 +167,6 @@ fn transcript(messages: &[Message], max_tokens: u64) -> String {
         };
         entries.push(entry);
     }
-    let budget = max_tokens.saturating_mul(4) as usize;
-    let keep_first = matches!(messages.first(), Some(Message::User { content }) if content.starts_with(SUMMARY_PREFIX));
     let mut dropped = 0;
     while entries.iter().map(|e| e.len() + 2).sum::<usize>() > budget
         && entries.len() > usize::from(keep_first) + 1
@@ -240,6 +244,28 @@ mod tests {
         assert!(text.len() <= 900, "{}", text.len());
         assert!(text.contains("message 19") && !text.contains("message 0 "));
         assert!(text.contains("earlier messages left out"));
+    }
+
+    // Review F I2: a summary ends with what remains to be done, so clipping an earlier one
+    // lost the most important part, more with each compaction.
+    #[test]
+    fn an_earlier_summary_is_kept_whole() {
+        let summary = format!("{}TAIL-REMAINING-WORK", "s".repeat(6_000));
+        let messages = vec![
+            summary_message(&summary),
+            user(&"x".repeat(5_000)),
+            user("next"),
+        ];
+        let text = transcript(&messages, 16_000);
+        assert!(text.contains("TAIL-REMAINING-WORK"));
+        // Only the transcript's whole budget limits it.
+        let text = transcript(&messages, 1_000);
+        assert!(text.len() <= 4_000 + 200, "{}", text.len());
+        assert!(
+            text.starts_with(&format!("User: {SUMMARY_PREFIX}")),
+            "{text:.100}"
+        );
+        assert!(text.contains("next"));
     }
 
     #[test]

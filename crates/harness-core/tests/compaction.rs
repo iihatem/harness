@@ -229,6 +229,41 @@ async fn reported_usage_counts_toward_the_threshold() {
     assert_eq!(compacted(&events).len(), 1, "{events:?}");
 }
 
+// Review F I2: compacting again must not cut the end off the earlier summary, where it says
+// what remains to be done.
+#[tokio::test]
+async fn compacting_again_keeps_the_end_of_the_earlier_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let long_summary = format!("{} TAIL-REMAINING-WORK", "s".repeat(6_000));
+    let provider = MockProvider::new(vec![
+        Script::text("noted"),
+        Script::text(&long_summary),
+        Script::text("answer"),
+        Script::text("second summary"),
+        Script::text("second answer"),
+    ]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    // Room for the 6,000-character summary in a summary request (half the window).
+    agent.config_mut().context_window = 4_000;
+    run(&mut agent, &"x".repeat(12_000)).await;
+    let (_, events) = run(&mut agent, "short question").await;
+    assert_eq!(compacted(&events).len(), 1, "{events:?}");
+    let (_, events) = run(&mut agent, &"q".repeat(6_000)).await;
+    assert_eq!(compacted(&events).len(), 1, "{events:?}");
+    let summaries: Vec<_> = provider
+        .requests()
+        .into_iter()
+        .filter(is_summary_request)
+        .collect();
+    assert_eq!(summaries.len(), 2);
+    assert!(first_user(&summaries[1].messages).contains("TAIL-REMAINING-WORK"));
+}
+
 // Review F I3: output tokens, reasoning included, are not sent back to the model, so only the
 // reported input counts; the reply itself is estimated like any other message.
 #[tokio::test]

@@ -220,3 +220,60 @@ async fn a_checkpoint_repository_sandboxed_commands_can_write_disables_checkpoin
     .await
     .unwrap();
 }
+
+// Review E minor 14: a run prunes the snapshots of sessions whose files are gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_prunes_the_snapshots_of_sessions_that_are_gone() {
+    let server = MockServer::start().await;
+    write_then_answer(&server).await;
+    let (home, ws) = env(&server.uri());
+    tokio::task::spawn_blocking(move || {
+        let run = || {
+            let output = cmd(&home, &ws)
+                .env("HARNESS_SANDBOX", "none")
+                .args(["--mode", "auto", "ask", "make hello.txt"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        };
+        run();
+        let shadow = std::fs::read_dir(home.path().join("data/checkpoints"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&shadow)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let live = git(&["for-each-ref", "--format=%(refname)", "refs/harness/"]);
+        assert_eq!(live.lines().count(), 1, "{live}");
+        let tree = git(&["hash-object", "-t", "tree", "-w", "/dev/null"]);
+        let old = git(&["commit-tree", tree.trim(), "-m", "a session that is gone"]);
+        git(&[
+            "update-ref",
+            "refs/harness/20200101T000000Z-deadbeef",
+            old.trim(),
+        ]);
+        run();
+        let refs = git(&["for-each-ref", "--format=%(refname)", "refs/harness/"]);
+        assert!(!refs.contains("deadbeef"), "{refs}");
+        assert!(refs.contains(live.trim()), "{refs}");
+    })
+    .await
+    .unwrap();
+}

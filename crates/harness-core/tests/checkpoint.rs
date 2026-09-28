@@ -971,6 +971,71 @@ fn a_shadow_repository_where_commands_can_write_is_refused() {
     checkpoint::check_location(&f.gitdir, &roots).unwrap();
 }
 
+// Review E minor 14: the snapshots of sessions that no longer exist are pruned: their refs, their
+// files in the shadow repository, and the objects nothing else reaches.
+#[test]
+fn snapshots_of_sessions_that_are_gone_are_pruned() {
+    let f = fixture();
+    f.write("a.txt", "shared\n");
+    let gone = Checkpoints::open(&f.gitdir, &f.ws, "gone").unwrap();
+    f.write("b.txt", "only the session that is gone saw this\n");
+    let old = gone.snapshot("turn 1").unwrap();
+    let blob = git(&f.gitdir, &["rev-parse", &format!("{old}:b.txt")]);
+    drop(gone);
+    std::fs::remove_file(f.ws.join("b.txt")).unwrap();
+    let live = Checkpoints::open(&f.gitdir, &f.ws, "live").unwrap();
+    let kept = live.snapshot("turn 1").unwrap();
+    // A session's last snapshot less than a day old may belong to one whose file is not written
+    // yet: it stays.
+    assert_eq!(live.prune(|id| id == "live").unwrap(), 0);
+    let live = live.with_prune_age(Duration::ZERO);
+    assert_eq!(live.prune(|id| id == "live").unwrap(), 1);
+    assert_eq!(
+        git(
+            &f.gitdir,
+            &["for-each-ref", "--format=%(refname)", "refs/harness/"]
+        ),
+        "refs/harness/live\n"
+    );
+    assert!(!f.gitdir.join("indexes/gone").exists());
+    let exists = Command::new("git")
+        .args(["--git-dir"])
+        .arg(&f.gitdir)
+        .args(["cat-file", "-e", blob.trim()])
+        .status()
+        .unwrap();
+    assert!(!exists.success());
+    f.write("a.txt", "changed\n");
+    live.restore(&kept).unwrap();
+    assert_eq!(f.read("a.txt").as_deref(), Some("shared\n"));
+}
+
+// An index can name objects that were pruned since (a new session starts from the last index any
+// session wrote): the snapshot then starts again from an empty index rather than failing.
+#[test]
+fn an_index_naming_a_pruned_object_is_started_afresh() {
+    let f = fixture();
+    f.write("a.txt", "one\n");
+    // An old file, so git trusts the index entry rather than hashing the file again.
+    std::fs::File::options()
+        .write(true)
+        .open(f.ws.join("a.txt"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    let checkpoints = f.checkpoints();
+    checkpoints.snapshot("turn 1").unwrap();
+    // What pruning this session's snapshots, and the index new sessions start from, would leave.
+    git(&f.gitdir, &["update-ref", "-d", "refs/harness/s1"]);
+    std::fs::remove_file(f.gitdir.join("index")).unwrap();
+    git(&f.gitdir, &["prune", "--expire=now"]);
+    let second = checkpoints.snapshot("turn 2").unwrap();
+    assert_eq!(
+        checkpoints.files(&second).unwrap(),
+        [PathBuf::from("a.txt")]
+    );
+}
+
 /// Whether the tests run as root, which permissions do not stop.
 fn is_root() -> bool {
     // SAFETY: `geteuid` cannot fail.

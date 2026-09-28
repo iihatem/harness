@@ -14,7 +14,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::subprocess::output_within;
@@ -31,6 +31,13 @@ const RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
 const BUILTIN_EXCLUDES: &str = ".git\nnode_modules/\ntarget/\n/.harness/\n/HEAD\n";
 /// Directories left out of snapshots wherever they are.
 const EXCLUDED_DIRS: [&[u8]; 2] = [b"node_modules", b"target"];
+/// The snapshots of a session that is gone are pruned once its last one is this old: a younger
+/// one may belong to a session whose file is not written yet. Objects nothing reaches are pruned
+/// once this old too, since another session may be writing a snapshot that will reach them.
+const PRUNE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// How many sessions one prune removes at most, and how long it may take.
+const PRUNE_AT_MOST: usize = 20;
+const PRUNE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The first item of a snapshot's record, which says how to read the rest.
 const RECORD_MAGIC: &[u8] = b"harness snapshot record 1";
 /// How many private files a snapshot records the mode of at most. (Past that many, the user's
@@ -112,7 +119,9 @@ pub struct Checkpoints {
     record: PathBuf,
     /// The ref that keeps this session's snapshots reachable.
     reference: String,
+    session: String,
     timeout: Duration,
+    prune_age: Duration,
     restore_timeout: Duration,
 }
 
@@ -174,6 +183,8 @@ impl Checkpoints {
             pathspecs: gitdir.join("pathspecs").join(session_id),
             record: gitdir.join("records").join(session_id),
             reference: format!("refs/harness/{session_id}"),
+            session: session_id.to_string(),
+            prune_age: PRUNE_AGE,
             timeout: SNAPSHOT_TIMEOUT,
             restore_timeout: RESTORE_TIMEOUT,
         };
@@ -226,6 +237,74 @@ impl Checkpoints {
         self
     }
 
+    /// Replaces how old a gone session's snapshots must be to be pruned (for tests).
+    pub fn with_prune_age(mut self, age: Duration) -> Self {
+        self.prune_age = age;
+        self
+    }
+
+    /// Removes the snapshots of sessions that no longer exist (`live` says which session ids
+    /// still do): their refs and their files here, then every object nothing reaches any more.
+    /// A session whose last snapshot is less than a day old is kept, and one call removes at most
+    /// [`PRUNE_AT_MOST`] sessions within [`PRUNE_TIMEOUT`], so it stays quick. Returns how many
+    /// sessions it removed.
+    pub fn prune(&self, live: impl Fn(&str) -> bool) -> Result<usize, CheckpointError> {
+        let deadline = Instant::now() + PRUNE_TIMEOUT;
+        let listed = self.git_bytes(
+            &[
+                "for-each-ref",
+                "--format=%(refname)%00%(committerdate:unix)",
+                "refs/harness/",
+            ],
+            deadline,
+        )?;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut removed = 0;
+        for line in String::from_utf8_lossy(&listed).lines() {
+            let Some((name, date)) = line.split_once('\0') else {
+                continue;
+            };
+            let Some(id) = name.strip_prefix("refs/harness/") else {
+                continue;
+            };
+            let age = now.saturating_sub(date.parse().unwrap_or(now));
+            if id == self.session
+                || !crate::session::is_valid_id(id)
+                || live(id)
+                || age < self.prune_age.as_secs()
+            {
+                continue;
+            }
+            if removed == PRUNE_AT_MOST {
+                break;
+            }
+            self.git(&["update-ref", "-d", name], remaining(deadline)?)?;
+            for file in [
+                self.gitdir.join("indexes").join(id),
+                self.gitdir.join("indexes").join(format!("restore-{id}")),
+                self.gitdir.join("pathspecs").join(id),
+                self.gitdir.join("records").join(id),
+                self.gitdir.join("records").join(format!("{id}.tree")),
+            ] {
+                let _ = std::fs::remove_file(file);
+            }
+            removed += 1;
+        }
+        if removed > 0 {
+            // The index new sessions start from keeps what it names.
+            let mut prune = self.command();
+            prune
+                .env("GIT_INDEX_FILE", self.gitdir.join("index"))
+                .arg("prune")
+                .arg(format!("--expire={}.seconds.ago", self.prune_age.as_secs()));
+            self.run(prune, "prune", deadline)?;
+        }
+        Ok(removed)
+    }
+
     /// Replaces the time a restore may take (for tests).
     pub fn with_restore_timeout(mut self, timeout: Duration) -> Self {
         self.restore_timeout = timeout;
@@ -265,6 +344,18 @@ impl Checkpoints {
 
     fn snapshot_within(&self, message: &str, timeout: Duration) -> Result<String, CheckpointError> {
         let deadline = Instant::now() + timeout;
+        match self.snapshot_until(message, deadline) {
+            // The index names objects that were pruned since it was written (it may come from a
+            // session that is gone): start from an empty one.
+            Err(CheckpointError::Git { command, .. }) if command == "write-tree" => {
+                let _ = std::fs::remove_file(&self.index);
+                self.snapshot_until(message, deadline)
+            }
+            result => result,
+        }
+    }
+
+    fn snapshot_until(&self, message: &str, deadline: Instant) -> Result<String, CheckpointError> {
         // Everything in the index, and every file git would add.
         let within = self.within();
         let listed = self.list(

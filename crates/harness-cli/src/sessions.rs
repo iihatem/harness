@@ -47,7 +47,17 @@ pub fn checkpoints(
     let opened = checkpoint::check_location(&gitdir, writable)
         .and_then(|()| Checkpoints::open(&gitdir, &setup.workspace, session.id()));
     match opened {
-        Ok(checkpoints) => Some(Arc::new(checkpoints)),
+        Ok(checkpoints) => {
+            // The snapshots of sessions that were deleted go too. Only when the sessions can be
+            // listed: otherwise every session would look gone.
+            let sessions = dir(setup);
+            if std::fs::read_dir(&sessions).is_ok() {
+                let _ = checkpoints.prune(|id| {
+                    std::fs::symlink_metadata(sessions.join(format!("{id}.jsonl"))).is_ok()
+                });
+            }
+            Some(Arc::new(checkpoints))
+        }
         Err(e) => {
             eprintln!(
                 "warning: checkpoints are disabled: {}; turns run normally but cannot be rewound",

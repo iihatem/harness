@@ -422,7 +422,23 @@ impl Agent {
                 let commit = commit.clone();
                 let restored =
                     tokio::task::spawn_blocking(move || checkpoints.restore(&commit)).await;
-                snapshot = Some(restored.map_err(|e| CheckpointError::Io(e.into()))??);
+                match restored.map_err(|e| CheckpointError::Io(e.into()))? {
+                    Ok(before) => snapshot = Some(before),
+                    Err(CheckpointError::Restore { before, source }) => {
+                        // Files may be half restored: recorded as a rewind of code, undoing it
+                        // puts them back as they were. The conversation stays.
+                        let from = self.session.leaf().to_string();
+                        self.session.append(EntryKind::Rewind {
+                            from,
+                            target: entry.to_string(),
+                            scope: RewindScope::Code,
+                            snapshot: Some(before.clone()),
+                        });
+                        self.after_session_change();
+                        return Err(CheckpointError::Restore { before, source }.into());
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         let from = self.session.leaf().to_string();
@@ -457,14 +473,24 @@ impl Agent {
         else {
             return Err(RewindError::NothingToUndo);
         };
+        let mut before = None;
         if let Some(snapshot) = snapshot {
             let checkpoints = self.checkpoints.clone().ok_or(RewindError::NoCheckpoints)?;
-            tokio::task::spawn_blocking(move || checkpoints.restore(&snapshot))
-                .await
-                .map_err(|e| CheckpointError::Io(e.into()))??;
+            before = Some(
+                tokio::task::spawn_blocking(move || checkpoints.restore(&snapshot))
+                    .await
+                    .map_err(|e| CheckpointError::Io(e.into()))??,
+            );
         }
-        self.session
-            .append_under(&from, EntryKind::UndoRewind { rewind: id });
+        // The snapshot taken just before is kept, so changes made since the rewind (in an
+        // editor, say) are not lost.
+        self.session.append_under(
+            &from,
+            EntryKind::UndoRewind {
+                rewind: id,
+                snapshot: before,
+            },
+        );
         self.after_session_change();
         Ok(())
     }

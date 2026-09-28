@@ -73,6 +73,11 @@ pub enum CheckpointError {
         taken.display()
     )]
     OtherWorkspace { taken: PathBuf },
+    #[error("{source}; snapshot {before} holds the files as they were just before")]
+    Restore {
+        before: String,
+        source: Box<CheckpointError>,
+    },
 }
 
 /// One session's checkpoints of a workspace.
@@ -230,7 +235,14 @@ impl Checkpoints {
     /// (on this session's indexes and ref), so later snapshots and restores still work. Only this
     /// process uses them: the session is locked to it.
     fn unlock_after<T>(&self, result: Result<T, CheckpointError>) -> Result<T, CheckpointError> {
-        if matches!(result, Err(CheckpointError::TooSlow)) {
+        let timed_out = match &result {
+            Err(CheckpointError::TooSlow) => true,
+            Err(CheckpointError::Restore { source, .. }) => {
+                matches!(**source, CheckpointError::TooSlow)
+            }
+            _ => false,
+        };
+        if timed_out {
             for path in [
                 &self.index,
                 &self.scratch,
@@ -478,7 +490,13 @@ impl Checkpoints {
             }
         }
         let before = self.snapshot_within("before a rewind", self.restore_timeout)?;
-        self.restore_to(commit, &target, &before)?;
+        // From here on, files may be half restored: the error names the snapshot that holds them
+        // as they were.
+        self.restore_to(commit, &target, &before)
+            .map_err(|source| CheckpointError::Restore {
+                before: before.clone(),
+                source: Box::new(source),
+            })?;
         Ok(before)
     }
 
@@ -528,6 +546,29 @@ impl Checkpoints {
             if then_paths.contains(path.as_slice()) && !skipped.contains(path.as_slice()) {
                 self.set_mode(path, *mode);
             }
+        }
+        // git only warns when it cannot remove a file. (A nested repository's directory is never
+        // removed, and a directory may now stand where a removed file was.)
+        let kept: HashSet<&[u8]> = kept.iter().map(|e| e.path.as_slice()).collect();
+        let left: Vec<&[u8]> = now
+            .iter()
+            .filter(|e| e.mode != GITLINK)
+            .map(|e| e.path.as_slice())
+            .filter(|p| !then_paths.contains(p) && !kept.contains(p))
+            .filter(|p| {
+                std::fs::symlink_metadata(self.root.join(OsStr::from_bytes(p)))
+                    .is_ok_and(|m| !m.is_dir())
+            })
+            .collect();
+        if let Some(first) = left.first() {
+            return Err(CheckpointError::Git {
+                command: "read-tree".into(),
+                message: format!(
+                    "could not remove {} file(s) created since the snapshot, such as {}",
+                    left.len(),
+                    String::from_utf8_lossy(first)
+                ),
+            });
         }
         Ok(())
     }

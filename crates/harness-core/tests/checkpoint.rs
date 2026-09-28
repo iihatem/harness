@@ -632,6 +632,9 @@ fn a_file_ignored_when_the_snapshot_was_taken_survives_a_restore() {
 #[test]
 fn a_file_unreadable_when_the_snapshot_was_taken_survives_a_restore() {
     use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return; // root reads the file anyway
+    }
     let f = fixture();
     f.write("a.txt", "a\n");
     f.write("locked.txt", "user data\n");
@@ -877,4 +880,63 @@ fn a_snapshot_is_restored_only_in_the_workspace_it_was_taken_for() {
         assert!(!sub.join("a.txt").exists());
         assert!(!sub.join("sub").exists());
     }
+}
+
+// Review E minor 11: a restore that fails after its pre-rewind snapshot names that snapshot, which
+// holds the files as they were before the restore began.
+#[test]
+fn a_restore_that_fails_partway_names_the_snapshot_taken_before_it() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return; // root writes into read-only directories
+    }
+    let f = fixture();
+    f.write("ro/a.txt", "one\n");
+    f.write("b.txt", "one\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    f.write("ro/a.txt", "two\n");
+    f.write("b.txt", "two\n");
+    let ro = f.ws.join("ro");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = checkpoints.restore(&first);
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let Err(CheckpointError::Restore { before, .. }) = failed else {
+        panic!("{failed:?}");
+    };
+    checkpoints.restore(&before).unwrap();
+    assert_eq!(f.read("ro/a.txt").as_deref(), Some("two\n"));
+    assert_eq!(f.read("b.txt").as_deref(), Some("two\n"));
+}
+
+// git only warns when it cannot remove a file; a restore that leaves one behind fails too, naming
+// the snapshot taken before it.
+#[test]
+fn a_restore_that_cannot_remove_a_file_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return; // root writes into read-only directories
+    }
+    let f = fixture();
+    f.write("b.txt", "one\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    f.write("ro/new.txt", "made since\n");
+    f.write("b.txt", "two\n");
+    let ro = f.ws.join("ro");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = checkpoints.restore(&first);
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let Err(CheckpointError::Restore { before, source }) = failed else {
+        panic!("{failed:?}");
+    };
+    assert!(source.to_string().contains("ro/new.txt"), "{source}");
+    checkpoints.restore(&before).unwrap();
+    assert_eq!(f.read("b.txt").as_deref(), Some("two\n"));
+}
+
+/// Whether the tests run as root, which permissions do not stop.
+fn is_root() -> bool {
+    // SAFETY: `geteuid` cannot fail.
+    unsafe { libc::geteuid() == 0 }
 }

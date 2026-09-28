@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use common::*;
 use harness_core::agent::{Agent, NonInteractive, RewindError};
-use harness_core::checkpoint::Checkpoints;
+use harness_core::checkpoint::{CheckpointError, Checkpoints};
 use harness_core::event::AgentEvent;
 use harness_core::message::Message;
 use harness_core::permission::Mode;
-use harness_core::session::{RewindScope, Session};
+use harness_core::session::{EntryKind, RewindScope, Session};
 use harness_core::testing::{MockProvider, Script};
 use serde_json::json;
 
@@ -503,4 +503,80 @@ async fn code_is_not_restored_across_a_turn_without_a_checkpoint() {
     second.rewind(&two, RewindScope::Code).await.unwrap();
     assert_eq!(f.read("a.txt").as_deref(), Some("one"));
     assert_eq!(f.read("b.txt").as_deref(), Some("original"));
+}
+
+// Review E minor 11: undoing a rewind snapshots the workspace first, like a rewind, and the
+// session keeps that snapshot: edits made between the rewind and the undo are not lost.
+#[tokio::test]
+async fn undoing_a_rewind_keeps_a_snapshot_of_what_it_replaced() {
+    let f = fixture();
+    f.write("a.txt", "original");
+    let provider = MockProvider::new(vec![put("c1", "a.txt", "turn one"), Script::text("one")]);
+    let mut agent = f.agent(provider, Mode::Auto);
+    run(&mut agent, "first").await;
+    let target = point(&agent, "first");
+    agent.rewind(&target, RewindScope::Code).await.unwrap();
+    f.write("a.txt", "edited in an editor after the rewind");
+    agent.undo_rewind().await.unwrap();
+    assert_eq!(f.read("a.txt").as_deref(), Some("turn one"));
+    let Some(EntryKind::UndoRewind {
+        snapshot: Some(snapshot),
+        ..
+    }) = agent.session().branch().last().map(|e| e.kind.clone())
+    else {
+        panic!("{:?}", agent.session().branch().last());
+    };
+    let checkpoints =
+        Checkpoints::open(&f.data.join("checkpoints.git"), &f.ws, agent.session().id()).unwrap();
+    checkpoints.restore(&snapshot).unwrap();
+    assert_eq!(
+        f.read("a.txt").as_deref(),
+        Some("edited in an editor after the rewind")
+    );
+}
+
+// Review E minor 11: a rewind whose restore fails partway is recorded, so undoing it puts the
+// files back as they were before it began.
+#[tokio::test]
+async fn a_rewind_that_fails_partway_can_be_undone() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return; // root writes into read-only directories
+    }
+    let f = fixture();
+    let provider = MockProvider::new(vec![
+        Script::text("hello"),
+        put("c1", "ro/a.txt", "two"),
+        put("c2", "b.txt", "two"),
+        Script::text("done"),
+    ]);
+    let mut agent = f.agent(provider, Mode::Auto);
+    run(&mut agent, "hi").await;
+    run(&mut agent, "change them").await;
+    let history = agent.history().to_vec();
+    let ro = f.ws.join("ro");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let target = point(&agent, "change them");
+    let failed = agent
+        .rewind(&target, RewindScope::CodeAndConversation)
+        .await;
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(
+            failed,
+            Err(RewindError::Restore(CheckpointError::Restore { .. }))
+        ),
+        "{failed:?}"
+    );
+    assert_eq!(agent.history(), history.as_slice());
+    assert!(agent.can_undo_rewind());
+    agent.undo_rewind().await.unwrap();
+    assert_eq!(f.read("ro/a.txt").as_deref(), Some("two"));
+    assert_eq!(f.read("b.txt").as_deref(), Some("two"));
+}
+
+/// Whether the tests run as root, which permissions do not stop.
+fn is_root() -> bool {
+    // SAFETY: `geteuid` cannot fail.
+    unsafe { libc::geteuid() == 0 }
 }

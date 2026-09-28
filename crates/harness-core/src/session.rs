@@ -73,7 +73,12 @@ pub enum EntryKind {
         snapshot: Option<String>,
     },
     /// Undoes the rewind `rewind`: the active branch continues from where that rewind started.
-    UndoRewind { rewind: String },
+    /// `snapshot` is the workspace just before files were restored.
+    UndoRewind {
+        rewind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot: Option<String>,
+    },
 }
 
 /// What a rewind restores.

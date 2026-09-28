@@ -57,7 +57,7 @@ The system SHALL honour the frontmatter fields `description`, `argument-hint`, `
 - **THEN** `rm -rf build` during that command is blocked
 
 ### Requirement: Placeholders are expanded
-The system SHALL expand `$ARGUMENTS` to the full argument string, `$1` through `$9` to positional arguments (whitespace-separated, respecting quotes), `@<path>` to the content of a workspace file, and `` !`<command>` `` to the output of a shell command. When the body uses none of the argument placeholders, non-empty arguments MUST be appended as `ARGUMENTS: <arguments>`. File references and shell commands MUST be expanded only in the command body, never in the arguments. An argument filled into a shell command MUST reach that command as data, however the command file quotes the placeholder; where the system cannot guarantee that, the shell command MUST NOT run, and a warning MUST say why. Shell expansions MUST go through the same permission rules and sandbox as the `bash` tool.
+The system SHALL expand `$ARGUMENTS` to the full argument string, `$1` through `$9` to positional arguments (whitespace-separated, respecting quotes), `@<path>` to the content of a workspace file, and `` !`<command>` `` to the output of a shell command. When the body uses none of the argument placeholders, non-empty arguments MUST be appended as `ARGUMENTS: <arguments>`. File references and shell commands MUST be expanded only in the command body, never in the arguments. Arguments MUST NOT be written into a shell command's text: a shell command that uses them MUST receive them as shell parameters (`$1`–`$9`, `$@`, and `$ARGUMENTS`), set by a prelude the system writes before the command, so their values reach it as data with the usual shell semantics. A shell command that uses the arguments together with a construct where the shell may evaluate a parameter's value as code, arithmetic or a variable name MUST NOT run; it MUST be left as `[not expanded: …]` in the prompt, and a warning MUST say why. Shell expansions MUST go through the same permission rules and sandbox as the `bash` tool.
 
 #### Scenario: Positional arguments
 - **WHEN** the user runs `/review "src/lib.rs" strict` for a command whose body contains `Review $1 in $2 mode`
@@ -67,9 +67,13 @@ The system SHALL expand `$ARGUMENTS` to the full argument string, `$1` through `
 - **WHEN** a command body contains no argument placeholder and the user runs `/opsx:propose add-login`
 - **THEN** the prompt sent is the body followed by `ARGUMENTS: add-login`
 
-#### Scenario: A hostile argument in a quoted placeholder
-- **WHEN** a command body contains `` !`git log --oneline --grep "$1"` `` and a script runs `harness ask "/review \"$TITLE\""` with the title `$(touch pwned)`
-- **THEN** `git log` receives `$(touch pwned)` as its argument and no command in the title runs
+#### Scenario: An argument with shell syntax reaches the command as data
+- **WHEN** a command body contains `` !`git log --oneline --grep "$1"` `` and a script runs `harness ask "/review \"$TITLE\""` with a title containing `$(…)`
+- **THEN** `git log` receives the title, byte for byte, as its `--grep` argument, and nothing in the title runs
+
+#### Scenario: An argument evaluated as arithmetic
+- **WHEN** a command body contains `` !`echo $[ b[0] + $1 ]` `` and the user runs it with any argument
+- **THEN** the shell command does not run, the prompt holds `[not expanded: …]` in its place, and a warning names `$[`
 
 #### Scenario: Shell expansion in ask mode
 - **WHEN** a command body contains `` !`git diff` `` and the session is in `ask` mode

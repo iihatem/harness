@@ -2,50 +2,127 @@
 
 use std::{
     io::Read,
+    os::unix::process::CommandExt,
     process::{Command, Output, Stdio},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
+use nix::{
+    sys::{
+        signal::{Signal, killpg},
+        wait::{WaitPidFlag, WaitStatus, waitpid},
+    },
+    unistd::Pid,
+};
+
+/// How long the output is still waited for once the command's process group was killed.
+const AFTER_KILL: Duration = Duration::from_secs(1);
+
 /// Runs `command` with stdin closed and stdout and stderr captured. Returns `Ok(None)` when it
-/// was still running after `timeout`, in which case it has been killed.
+/// was still running after `timeout`, or when it exited but a process it started still held its
+/// output open then; everything in its process group has been killed in that case.
+///
+/// The command leads its own process group, so the timeout reaches what it started (a shell that
+/// does not `exec` its last command leaves that command holding the pipes). It stays in harness's
+/// session, as harness's helpers must: see `harness_sandbox::procs`.
 pub fn output_within(command: &mut Command, timeout: Duration) -> std::io::Result<Option<Output>> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()?;
+    let group = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
     // Read both pipes on their own threads, so a child that fills a pipe cannot stall.
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let mut stderr = child.stderr.take().expect("stderr is piped");
-    let out = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let err = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        buf
-    });
+    let out = read_all(child.stdout.take().expect("stdout is piped"));
+    let err = read_all(child.stderr.take().expect("stderr is piped"));
     let deadline = Instant::now() + timeout;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let _ = killpg(group, Signal::SIGKILL);
+                break None;
+            }
+            Err(e) => {
+                let _ = killpg(group, Signal::SIGKILL);
+                let _ = child.wait();
+                return Err(e);
+            }
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(5));
     };
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
+    // The pipes close once nothing holds them any more. Something the command started may still
+    // hold them after it exited: that counts as running, until the deadline.
+    let mut timed_out = status.is_none();
+    if !timed_out && !finished_by(&[&out, &err], deadline) {
+        let _ = killpg(group, Signal::SIGKILL);
+        timed_out = true;
+    }
+    let reaped = child.wait().is_ok();
+    // A process outside the group (one that made its own session) could still hold a pipe: its
+    // reader is then left to finish on its own rather than waited for.
+    let finished = finished_by(&[&out, &err], Instant::now() + AFTER_KILL);
+    // Only once the command itself is reaped, so waiting on its group cannot take its status.
+    if reaped {
+        reap_group(group, timed_out);
+    }
+    if timed_out || !finished {
+        return Ok(None);
+    }
     Ok(status.map(|status| Output {
         status,
-        stdout,
-        stderr,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
     }))
+}
+
+/// Reads `pipe` to its end on a thread of its own.
+fn read_all(mut pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
+}
+
+/// Whether all of `readers` finished by `deadline`.
+fn finished_by(readers: &[&JoinHandle<Vec<u8>>], deadline: Instant) -> bool {
+    loop {
+        if readers.iter().all(|r| r.is_finished()) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Reaps the members of `group` that are harness's own children: where harness is a child
+/// subreaper (Linux git-metadata protection), what the command started is reparented to harness
+/// when the command exits, and stays a zombie until reaped. After a kill, the group is watched
+/// until it is empty, for [`AFTER_KILL`] at most. Only this group is waited for, never any child
+/// (`-1`), which would take statuses std and tokio wait for.
+fn reap_group(group: Pid, killed: bool) {
+    // A group id of 1 or less would make this `waitpid(-1)` or worse.
+    if group.as_raw() <= 1 {
+        return;
+    }
+    let members = Pid::from_raw(-group.as_raw());
+    let deadline = Instant::now() + AFTER_KILL;
+    loop {
+        while let Ok(status) = waitpid(members, Some(WaitPidFlag::WNOHANG)) {
+            if status == WaitStatus::StillAlive {
+                break;
+            }
+        }
+        if !killed || killpg(group, None).is_err() || Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[cfg(test)]
@@ -75,6 +152,74 @@ mod tests {
         .unwrap();
         assert!(out.is_none());
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A shell that does not `exec` its last command (dash, `/bin/sh` on Ubuntu, never does, and
+    /// no shell does when another command follows) leaves the command's own child holding the
+    /// pipes: it must be killed too, or reading the output waits for it.
+    #[test]
+    fn a_grandchild_holding_the_pipes_is_killed_too() {
+        let start = Instant::now();
+        let out = output_within(
+            Command::new("/bin/sh").args(["-c", "sleep 30; exit 0"]),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(out.is_none());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A command that exits in time but leaves a process running that holds its output open has
+    /// not finished either: that process is ended once the time is up.
+    #[test]
+    fn a_background_process_holding_the_pipes_is_ended_at_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("sleep 30 & echo $! > '{}'; exit 0", pid_file.display());
+        let start = Instant::now();
+        let out = output_within(
+            Command::new("/bin/sh").args(["-c", &script]),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(out.is_none());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let pid = nix::unistd::Pid::from_raw(pid);
+        // It was killed; whoever it was reparented to reaps it shortly.
+        let gone = Instant::now();
+        while nix::sys::signal::kill(pid, None).is_ok() {
+            assert!(
+                gone.elapsed() < Duration::from_secs(5),
+                "the background process is still running"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A command that finishes in time is not affected by what the timeout does.
+    #[test]
+    fn a_background_process_that_does_not_hold_the_pipes_is_left_alone() {
+        let out = output_within(
+            Command::new("/bin/sh").args(["-c", "sleep 1 >/dev/null 2>&1 & echo done"]),
+            Duration::from_secs(10),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"done\n");
     }
 
     #[test]

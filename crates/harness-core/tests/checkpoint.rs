@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use harness_core::checkpoint::{CheckpointError, Checkpoints, MAX_FILE_SIZE};
+use harness_core::checkpoint::{self, CheckpointError, Checkpoints, MAX_FILE_SIZE};
 
 /// A workspace and a data directory for the shadow repository, resolved through symlinks.
 struct Fixture {
@@ -933,6 +933,42 @@ fn a_restore_that_cannot_remove_a_file_fails() {
     assert!(source.to_string().contains("ro/new.txt"), "{source}");
     checkpoints.restore(&before).unwrap();
     assert_eq!(f.read("b.txt").as_deref(), Some("two\n"));
+}
+
+// Review E minor 9 (probe L): a shadow repository inside the workspace would snapshot itself, and
+// sandboxed commands could change its configuration, which git reads outside the sandbox.
+#[test]
+fn a_shadow_repository_inside_the_workspace_is_refused() {
+    let f = fixture();
+    f.write("a.txt", "a\n");
+    let base = f.ws.parent().unwrap();
+    std::os::unix::fs::symlink(&f.ws, base.join("link")).unwrap();
+    for gitdir in [
+        f.ws.join(".local/share/harness/checkpoints/p.git"),
+        base.join("link/data/p.git"),
+        base.join("elsewhere/missing/../../ws/data/p.git"),
+    ] {
+        match Checkpoints::open(&gitdir, &f.ws, "s1") {
+            Err(CheckpointError::Exposed { root, .. }) => assert_eq!(root, f.ws),
+            other => panic!("{}: {other:?}", gitdir.display()),
+        }
+    }
+    assert!(!f.ws.join(".local").exists());
+    assert!(!f.ws.join("data").exists());
+}
+
+// The CLI checks the directories sandboxed commands can write to the same way.
+#[test]
+fn a_shadow_repository_where_commands_can_write_is_refused() {
+    let f = fixture();
+    let tmp = f.ws.parent().unwrap().join("tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    let roots = [f.ws.clone(), tmp.clone()];
+    assert!(matches!(
+        checkpoint::check_location(&tmp.join("harness/checkpoints/p.git"), &roots),
+        Err(CheckpointError::Exposed { .. })
+    ));
+    checkpoint::check_location(&f.gitdir, &roots).unwrap();
 }
 
 /// Whether the tests run as root, which permissions do not stop.

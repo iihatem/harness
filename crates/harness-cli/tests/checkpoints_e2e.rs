@@ -60,9 +60,12 @@ async fn a_turn_that_writes_takes_a_checkpoint() {
     let server = MockServer::start().await;
     write_then_answer(&server).await;
     let (home, ws) = env(&server.uri());
-    // Not a git repository: checkpoints work anyway (ask mode would block the write).
+    // Not a git repository: checkpoints work anyway (ask mode would block the write). The test's
+    // data directory is in the temp directory, which sandboxed commands can write to, so there is
+    // no sandbox here: checkpoints would be off otherwise.
     let output = tokio::task::spawn_blocking(move || {
         let output = cmd(&home, &ws)
+            .env("HARNESS_SANDBOX", "none")
             .args(["--mode", "auto", "ask", "--json", "make hello.txt"])
             .output()
             .unwrap();
@@ -99,7 +102,9 @@ async fn without_git_checkpoints_are_disabled_and_turns_proceed() {
     write_then_answer(&server).await;
     let (home, ws) = env(&server.uri());
     tokio::task::spawn_blocking(move || {
+        // No sandbox, as above: the temp directory it makes writable holds the data directory.
         cmd(&home, &ws)
+            .env("HARNESS_SANDBOX", "none")
             .env("PATH", "/nonexistent")
             .args(["--mode", "auto", "ask", "make hello.txt"])
             .assert()
@@ -112,6 +117,105 @@ async fn without_git_checkpoints_are_disabled_and_turns_proceed() {
             std::fs::read_to_string(ws.path().join("hello.txt")).unwrap(),
             "hi\n"
         );
+    })
+    .await
+    .unwrap();
+}
+
+/// Skips the test when this host has no OS sandbox (CI's Linux job requires one).
+fn host_has_sandbox() -> bool {
+    let ok = harness_sandbox::detect(harness_sandbox::SandboxSettings::default()).is_some();
+    if !ok {
+        if std::env::var("HARNESS_REQUIRE_LINUX_SANDBOX").as_deref() == Ok("1") {
+            panic!("HARNESS_REQUIRE_LINUX_SANDBOX=1 but no sandbox was found");
+        }
+        eprintln!("skipping: no OS sandbox on this host");
+    }
+    ok
+}
+
+fn checkpoint_events(stdout: &[u8]) -> usize {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e["type"] == "checkpoint_created")
+        .count()
+}
+
+// Review E minor 9 (probe L): a data directory inside the workspace would put the checkpoint
+// repository where the agent can change it, and where snapshots would hold it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checkpoint_repository_inside_the_workspace_disables_checkpoints() {
+    let server = MockServer::start().await;
+    write_then_answer(&server).await;
+    let (_home, ws) = env(&server.uri());
+    let inner = ws.path().join("home");
+    std::fs::create_dir_all(inner.join("config")).unwrap();
+    std::fs::write(
+        inner.join("config/config.toml"),
+        format!("model = \"mock/test-model\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n", server.uri()),
+    )
+    .unwrap();
+    tokio::task::spawn_blocking(move || {
+        let output = Command::new(BIN)
+            .current_dir(ws.path())
+            .env("HARNESS_HOME", &inner)
+            .env("HARNESS_SANDBOX", "none")
+            .env_remove("XDG_DATA_HOME")
+            .args(["--mode", "auto", "ask", "--json", "make hello.txt"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("warning: checkpoints are disabled: the checkpoint repository")
+                && stderr.contains("where commands can change it"),
+            "{stderr}"
+        );
+        assert_eq!(checkpoint_events(&output.stdout), 0);
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("hello.txt")).unwrap(),
+            "hi\n"
+        );
+        assert!(!inner.join("data/checkpoints").exists());
+    })
+    .await
+    .unwrap();
+}
+
+// Review E minor 9 (probe P): nor may it be where sandboxed commands can write, such as a
+// configured writable root.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checkpoint_repository_sandboxed_commands_can_write_disables_checkpoints() {
+    if !host_has_sandbox() {
+        return;
+    }
+    let server = MockServer::start().await;
+    write_then_answer(&server).await;
+    let (home, ws) = env(&server.uri());
+    let data = home.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let config = home.path().join("config/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text = format!(
+        "[sandbox]\nwritable_roots = [{:?}]\n",
+        data.display().to_string()
+    ) + &text;
+    // Keys after a table header belong to it: the model settings go first.
+    let (sandbox, rest) = text.split_at(text.find("model =").unwrap());
+    std::fs::write(&config, format!("{rest}{sandbox}")).unwrap();
+    tokio::task::spawn_blocking(move || {
+        let output = cmd(&home, &ws)
+            .args(["--mode", "auto", "ask", "--json", "make hello.txt"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("warning: checkpoints are disabled: the checkpoint repository"),
+            "{stderr}"
+        );
+        assert_eq!(checkpoint_events(&output.stdout), 0);
     })
     .await
     .unwrap();

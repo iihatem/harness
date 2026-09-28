@@ -177,6 +177,17 @@ fn user_temp_dir(home: Option<&Path>) -> Option<PathBuf> {
     cached(&CACHE, || getconf_dir("DARWIN_USER_TEMP_DIR", home))
 }
 
+/// The per-user directories the profile makes writable: the temp directory it uses (`TMPDIR`,
+/// or `DARWIN_USER_TEMP_DIR`) and `DARWIN_USER_CACHE_DIR`.
+pub(crate) fn user_writable_roots() -> Vec<PathBuf> {
+    let home = home_dir();
+    let home = home.as_deref();
+    let tmpdir = tmpdir_root(std::env::var_os("TMPDIR").as_deref(), home, || {
+        user_temp_dir(home)
+    });
+    tmpdir.into_iter().chain(user_cache_dir(home)).collect()
+}
+
 /// Generates a per-invocation tag used as the Seatbelt `(with message ...)`
 /// value on every deny rule, so unified-log denial entries can be
 /// correlated back to the command that produced them.

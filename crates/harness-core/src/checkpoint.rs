@@ -73,6 +73,12 @@ pub enum CheckpointError {
         taken.display()
     )]
     OtherWorkspace { taken: PathBuf },
+    #[error(
+        "the checkpoint repository {} is inside {}, where commands can change it; move harness's data directory (HARNESS_HOME or XDG_DATA_HOME) out of it",
+        gitdir.display(),
+        root.display()
+    )]
+    Exposed { gitdir: PathBuf, root: PathBuf },
     #[error("{source}; snapshot {before} holds the files as they were just before")]
     Restore {
         before: String,
@@ -132,6 +138,7 @@ impl Checkpoints {
         if !crate::session::is_valid_id(session_id) {
             return Err(CheckpointError::InvalidSession(session_id.to_string()));
         }
+        check_location(gitdir, &[workspace.to_path_buf()])?;
         let mut version = Command::new(git);
         version
             .arg("--version")
@@ -877,6 +884,52 @@ fn failure(command: &str, stderr: &[u8]) -> CheckpointError {
         command: command.to_string(),
         message: String::from_utf8_lossy(stderr).trim().to_string(),
     }
+}
+
+/// Fails when the shadow repository `gitdir` is inside one of `roots`, directories that commands
+/// can write to: a command could then change the repository's configuration, which checkpoint git
+/// reads outside any sandbox, and the snapshots themselves.
+pub fn check_location(gitdir: &Path, roots: &[PathBuf]) -> Result<(), CheckpointError> {
+    let gitdir = resolve(gitdir);
+    for root in roots {
+        if gitdir.starts_with(resolve(root)) {
+            return Err(CheckpointError::Exposed {
+                gitdir,
+                root: root.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `path` made absolute, with symlinks resolved as far as it exists, and `.` and `..` resolved in
+/// the rest, which does not exist yet and so holds no symlink.
+fn resolve(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut existing = absolute.as_path();
+    let mut rest = Vec::new();
+    let mut resolved = loop {
+        if let Ok(canonical) = existing.canonicalize() {
+            break canonical;
+        }
+        match (existing.parent(), existing.components().next_back()) {
+            (Some(parent), Some(last)) => {
+                rest.push(last.as_os_str().to_os_string());
+                existing = parent;
+            }
+            _ => return absolute,
+        }
+    };
+    for part in rest.iter().rev() {
+        match part.to_str() {
+            Some(".") => {}
+            Some("..") => {
+                resolved.pop();
+            }
+            _ => resolved.push(part),
+        }
+    }
+    resolved
 }
 
 /// The work tree snapshots of `workspace` are taken in: the repository it is in, found as

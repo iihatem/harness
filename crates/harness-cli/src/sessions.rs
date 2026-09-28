@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use harness_context::project::{project_key, project_root};
 use harness_core::{
-    checkpoint::Checkpoints,
+    checkpoint::{self, Checkpoints},
     session::{self, Session},
 };
 
@@ -31,15 +31,22 @@ pub fn dir(setup: &Setup) -> PathBuf {
 }
 
 /// The checkpoints of `session`, in the project's shadow repository. `None`, after a warning,
-/// when they cannot work (no `git` on `PATH`, or the repository cannot be created).
-pub fn checkpoints(setup: &Setup, session: &Session) -> Option<Arc<Checkpoints>> {
+/// when they cannot work (no `git` on `PATH`, the repository cannot be created, or it is inside
+/// the workspace or one of the `writable` directories sandboxed commands can write to).
+pub fn checkpoints(
+    setup: &Setup,
+    session: &Session,
+    writable: &[PathBuf],
+) -> Option<Arc<Checkpoints>> {
     let key = project_key(&project_root(&setup.workspace));
     let gitdir = setup
         .paths
         .data_dir
         .join("checkpoints")
         .join(format!("{key}.git"));
-    match Checkpoints::open(&gitdir, &setup.workspace, session.id()) {
+    let opened = checkpoint::check_location(&gitdir, writable)
+        .and_then(|()| Checkpoints::open(&gitdir, &setup.workspace, session.id()));
+    match opened {
         Ok(checkpoints) => Some(Arc::new(checkpoints)),
         Err(e) => {
             eprintln!(

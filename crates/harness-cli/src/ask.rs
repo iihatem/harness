@@ -123,15 +123,16 @@ pub async fn run(
     let workspace_too_broad = mode.fs_access() == FsAccess::WorkspaceWrite
         && harness_sandbox::workspace_is_too_broad(&setup.workspace);
     let required = setup.config.linux_git_protection == LinuxGitProtection::Required;
+    let settings = harness_sandbox::SandboxSettings {
+        extra_writable: setup.config.writable_roots.clone(),
+        allow_localhost: setup.config.allow_localhost,
+        quarantine_dir: Some(setup.paths.data_dir.join("quarantine")),
+        require_full_git_protection: required,
+    };
     let detected = if mode == Mode::FullAccess || sandbox_disabled_by_env || workspace_too_broad {
         None
     } else {
-        harness_sandbox::detect(harness_sandbox::SandboxSettings {
-            extra_writable: setup.config.writable_roots.clone(),
-            allow_localhost: setup.config.allow_localhost,
-            quarantine_dir: Some(setup.paths.data_dir.join("quarantine")),
-            require_full_git_protection: required,
-        })
+        harness_sandbox::detect(settings.clone())
     };
     let choice = sandbox::choose(detected, mode.fs_access(), required);
     if let Some(warning) = &choice.warning {
@@ -200,7 +201,14 @@ pub async fn run(
         &setup,
         &*policy,
     );
-    let checkpoints = crate::sessions::checkpoints(&setup, &session);
+    // Sandboxed commands run without approval: what they can write to must not hold the
+    // checkpoint repository, which harness's own git reads outside the sandbox.
+    let writable = if sandboxed {
+        harness_sandbox::writable_roots(&settings, &setup.workspace)
+    } else {
+        Vec::new()
+    };
+    let checkpoints = crate::sessions::checkpoints(&setup, &session, &writable);
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin(),

@@ -58,7 +58,7 @@ pub use policy::{FsAccess, SandboxPolicy};
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub use procs::subreaper_active;
+pub use procs::{reaps_through_pidfds, subreaper_active};
 
 /// User settings that apply to every sandboxed command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

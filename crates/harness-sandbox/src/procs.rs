@@ -495,6 +495,32 @@ pub(crate) fn look_and_reap() -> bool {
     verdict(looked, subreaper())
 }
 
+/// Whether `pidfd_open` failing with `err` means pidfds are refused here (a
+/// seccomp profile, say), rather than that the process is gone.
+pub(crate) fn pidfds_refused(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EPERM))
+}
+
+/// Whether `pidfd_open` was refused in this process: orphans were then
+/// reaped by pid, see `reap`.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+static PIDFDS_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process reaps the orphans of sandboxed commands through
+/// pidfds, which no pid reused meanwhile can mislead: `false` once the kernel
+/// refused one (a seccomp profile, say), and it waits by pid instead. For
+/// `harness sandbox doctor`.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn reaps_through_pidfds() -> bool {
+    !PIDFDS_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Reaps `pid`, a zombie the scan found that `me` may reap, unless the pid
 /// has changed hands since: whether it did.
 ///
@@ -507,30 +533,73 @@ pub(crate) fn look_and_reap() -> bool {
 /// the process the pidfd is for is still there to be waited for, it had the
 /// pid all along, so what was read is about it. Kernels since 5.4 have both
 /// calls, and the sandbox needs 6.2.
+///
+/// Where pidfds are refused, it waits by pid after the same check again,
+/// which leaves the window between the check and the wait that pidfds close.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 fn reap(pid: i32, me: i32, my_sid: i32, registry: &Registry) -> bool {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    reap_with(pid, me, my_sid, registry, pidfd_open)
+}
+
+/// A pidfd for `pid`.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn pidfd_open(pid: i32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
 
     // SAFETY: `pidfd_open(2)` takes a pid and flags, and returns a new
     // descriptor or -1.
     let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    let Ok(fd) = i32::try_from(opened) else {
-        return false;
-    };
-    if fd < 0 {
-        return false;
+    match i32::try_from(opened) {
+        Ok(fd) if fd >= 0 => {
+            // SAFETY: `fd` was just created, and nothing else owns it.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+        _ => Err(std::io::Error::last_os_error()),
     }
-    // SAFETY: `fd` was just created, and nothing else owns it.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+}
+
+/// [`reap`], with `open` giving the pidfd.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn reap_with(
+    pid: i32,
+    me: i32,
+    my_sid: i32,
+    registry: &Registry,
+    open: impl FnOnce(i32) -> std::io::Result<std::os::fd::OwnedFd>,
+) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let pidfd = match open(pid) {
+        Ok(pidfd) => Some(pidfd),
+        Err(err) if pidfds_refused(&err) => {
+            PIDFDS_REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+        // Gone, most likely: reaped meanwhile.
+        Err(_) => return false,
+    };
     let Some(now) = read_proc(&Path::new("/proc").join(pid.to_string()), pid) else {
         return false;
     };
     if !may_reap(&now, me, my_sid, registry) {
         return false;
     }
+    let Some(pidfd) = pidfd else {
+        let mut status = 0;
+        // SAFETY: waits, without blocking, for this one zombie child, which
+        // nothing else waits for while `may_reap` allows it (see the module
+        // docs).
+        return unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid;
+    };
     let Ok(id) = libc::id_t::try_from(pidfd.as_raw_fd()) else {
         return false;
     };
@@ -798,6 +867,73 @@ mod tests {
         look_and_reap();
         assert_eq!(read_stat(&dir), None, "the orphan was not reaped");
         assert!(orphan.try_wait().is_err(), "nothing is left to wait for");
+    }
+
+    #[test]
+    fn only_enosys_and_eperm_mean_pidfds_are_refused() {
+        for errno in [libc::ENOSYS, libc::EPERM] {
+            assert!(pidfds_refused(&std::io::Error::from_raw_os_error(errno)));
+        }
+        for errno in [libc::ESRCH, libc::EINVAL, libc::EMFILE] {
+            assert!(!pidfds_refused(&std::io::Error::from_raw_os_error(errno)));
+        }
+    }
+
+    /// This process's pid and session.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn me() -> (i32, i32) {
+        // SAFETY: `getsid(0)` asks for this process's own session id.
+        let sid = unsafe { libc::getsid(0) };
+        (i32::try_from(std::process::id()).unwrap(), sid)
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn a_zombie_waited_for_already_is_not_reaped_again() {
+        let mut child = zombie_in_its_own_session();
+        let pid = i32::try_from(child.id()).unwrap();
+        assert_eq!(child.wait().expect("its exit status").code(), Some(3));
+        let (me, my_sid) = me();
+        assert!(!reap(pid, me, my_sid, &Registry::default()));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn where_pidfds_are_refused_an_orphan_is_reaped_by_its_pid() {
+        let (me, my_sid) = me();
+        let mut gone = zombie_in_its_own_session();
+        let pid = i32::try_from(gone.id()).unwrap();
+        let no_such_process = |_| Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        assert!(!reap_with(
+            pid,
+            me,
+            my_sid,
+            &Registry::default(),
+            no_such_process
+        ));
+        assert!(!pidfds_refused(&std::io::Error::from_raw_os_error(
+            libc::ESRCH
+        )));
+        let refused = |_| Err(std::io::Error::from_raw_os_error(libc::ENOSYS));
+        assert!(reap_with(pid, me, my_sid, &Registry::default(), refused));
+        assert!(gone.try_wait().is_err(), "nothing is left to wait for");
+        assert!(!reaps_through_pidfds());
+        // Waiting by pid still leaves what harness waits for alone.
+        let mut managed = zombie_in_its_own_session();
+        let pid = i32::try_from(managed.id()).unwrap();
+        let registry = registry(&[pid], 0);
+        let refused = |_| Err(std::io::Error::from_raw_os_error(libc::EPERM));
+        assert!(!reap_with(pid, me, my_sid, &registry, refused));
+        assert_eq!(managed.wait().expect("its exit status").code(), Some(3));
     }
 
     #[test]

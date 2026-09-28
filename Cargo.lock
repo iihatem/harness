@@ -972,6 +972,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-context"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "harness-core"
 version = "0.1.0"
 dependencies = [

@@ -408,7 +408,7 @@ fn arguments_reach_a_shell_expansion_byte_for_byte() {
 
 /// A `!` command that uses the arguments with one of these, where bash may evaluate a parameter's
 /// value as code, arithmetic or a variable name, and the construct the warning names.
-const TRIGGERS: [(&str, &str); 36] = [
+const TRIGGERS: [(&str, &str); 52] = [
     (r#"echo $(( "$1" + 1 ))"#, "`((`"),
     (r#"(( $1 > 0 )) && echo big"#, "`((`"),
     (r#"echo $[ "$1" ]"#, "`$[`"),
@@ -442,6 +442,25 @@ const TRIGGERS: [(&str, &str); 36] = [
     (r#"readarray -t "$1" < /dev/null"#, "`readarray`"),
     (r#"x=abc; echo "${x:$1}""#, "a substring"),
     (r#"x=abc; echo "${x:0:$1}""#, "a substring"),
+    // `${…@op}` transforms: `@P` expands the value as a prompt string, which runs its command
+    // substitutions (bash 4.4 and later); every `@` operator is refused.
+    (r#"echo "${1@P}""#, "`${…@…}`"),
+    (r#"echo "${ARGUMENTS@P}""#, "`${…@…}`"),
+    (r#"echo "${x@Q}" "$1""#, "`${…@…}`"),
+    (r#"echo "${1@Q}""#, "`${…@…}`"),
+    (r#"echo "${@@Q}""#, "`${…@…}`"),
+    (r#"echo "${1@E}" "${1@A}" "${1@a}""#, "`${…@…}`"),
+    (r#"echo "${x:-${1@U}}""#, "`${…@…}`"),
+    // `export` and `readonly` with a parameter in a name.
+    (r#"export "$1"=x"#, "a parameter in a name"),
+    (r#"readonly "$1""#, "a parameter in a name"),
+    (r#"export X "$1""#, "a parameter in a name"),
+    (r#"export -n "X$1"=1"#, "a parameter in a name"),
+    (r#"true; builtin readonly ${1}"#, "a parameter in a name"),
+    (r#"getopts ab "$1""#, "`getopts`"),
+    (r#"getopts ab opt "$@""#, "`getopts`"),
+    (r#"sleep 1 & wait -p "$1""#, "`wait -p`"),
+    (r#"sleep 1 & wait -n -p x; echo "$1""#, "`wait -p`"),
     // Quotes and backslashes do not hide a word from the check.
     (r#"e''val "$1""#, "`eval`"),
     (r#"\eval "$1""#, "`eval`"),
@@ -474,7 +493,13 @@ fn a_shell_expansion_using_arguments_where_bash_evaluates_them_is_never_run() {
 #[test]
 fn the_same_constructs_without_arguments_run_as_written() {
     for (shell, _) in TRIGGERS {
-        let plain = shell.replace("$1", "v").replace("${!1}", "${!v}");
+        let plain = shell
+            .replace("${!1}", "${!v}")
+            .replace("${1", "${v")
+            .replace("$1", "v")
+            .replace("${@@", "${v@")
+            .replace("\"$@\"", "v")
+            .replace("ARGUMENTS", "V");
         assert_eq!(
             parts(&format!("!`{plain}`"), ""),
             [Shell(plain.clone())],
@@ -498,6 +523,11 @@ fn ordinary_shell_expansions_using_arguments_expand() {
         r#"echo "${1:-none}" "${1#x}" "${1%.rs}" "${#1}""#,
         r#"x="$1"; echo "$x""#,
         r#"export NAME="$1"; env | grep -c NAME"#,
+        r#"export -n NAME="$1" OTHER="$ARGUMENTS""#,
+        r#"readonly NAME="$1"; echo "$NAME""#,
+        r#"echo "${1:-user@host}" "${ARGUMENTS:+x@y}""#,
+        r#"sleep 1 & wait; echo "$1""#,
+        r#"grep -p "$1" file"#,
         r#"for f in "$@"; do echo "$f"; done"#,
         r#"case "$1" in a) echo a;; esac"#,
         r#"echo 'text [with] brackets' "$1""#,

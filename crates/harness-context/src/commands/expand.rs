@@ -264,6 +264,9 @@ fn evaluates_parameters(shell: &str) -> Option<&'static str> {
     if substring_expansion(&text) {
         return Some("a substring `${…:…}` (arithmetic)");
     }
+    if transform_expansion(&text) {
+        return Some("a `${…@…}` transform (`@P` runs a prompt string's commands)");
+    }
     // Words, and whether each is where a command starts.
     let mut words: Vec<(&str, bool)> = Vec::new();
     let mut command_start = true;
@@ -298,6 +301,33 @@ fn evaluates_parameters(shell: &str) -> Option<&'static str> {
     if words.iter().any(|(word, first)| *word == "." && *first) {
         return Some("`.` as a command");
     }
+    if has("getopts") {
+        return Some("`getopts`");
+    }
+    if has("wait")
+        && words
+            .iter()
+            .any(|(w, _)| w.starts_with('-') && !w.starts_with("--") && w.contains('p'))
+    {
+        return Some("`wait -p`");
+    }
+    // `export` and `readonly` take their operands as names, which may be array elements: a
+    // parameter in a name (before any `=`) is evaluated. `export NAME="$1"` is only a value.
+    for (i, (word, _)) in words.iter().enumerate() {
+        if matches!(*word, "export" | "readonly")
+            && words[i + 1..]
+                .iter()
+                .take_while(|(_, first)| !first)
+                .filter(|(w, _)| !w.starts_with('-'))
+                .any(|(w, _)| {
+                    w.split('=')
+                        .next()
+                        .is_some_and(|name| name.contains(['$', '`']))
+                })
+        {
+            return Some("a parameter in a name for `export` or `readonly`");
+        }
+    }
     let comparisons = ["-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-v"];
     if has("[[") && comparisons.iter().any(|c| has(c)) {
         return Some("`[[` with an arithmetic comparison or `-v`");
@@ -306,6 +336,25 @@ fn evaluates_parameters(shell: &str) -> Option<&'static str> {
         return Some("`-v` in a test");
     }
     None
+}
+
+/// Whether `text` has a `${name@op}` transform, such as `${1@P}`, which expands the value as a
+/// prompt string and so runs its command substitutions (bash 4.4 and later). Every operator is
+/// refused. An `@` later in the expansion, as in `${1:-user@host}`, is text.
+fn transform_expansion(text: &str) -> bool {
+    text.match_indices("${").any(|(i, _)| {
+        let inside = &text[i + 2..];
+        let inside = inside.strip_prefix(['#', '!']).unwrap_or(inside);
+        let name = if inside.starts_with(|c: char| "@*#?$!-".contains(c)) {
+            1
+        } else {
+            inside
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(inside.len())
+        };
+        let after = &inside[name..];
+        after.starts_with('@') && after[1..].starts_with(|c: char| c.is_ascii_alphabetic())
+    })
 }
 
 /// Whether `text` has a `${name:offset}` or `${name:offset:length}` expansion, whose offset and

@@ -197,10 +197,17 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        let pid = nix::unistd::Pid::from_raw(pid);
-        // It was killed; whoever it was reparented to reaps it shortly.
+        // It was killed: gone, or a zombie until whoever it was reparented to reaps it.
+        let alive = || {
+            let out = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            !stat.is_empty() && !stat.starts_with('Z')
+        };
         let gone = Instant::now();
-        while nix::sys::signal::kill(pid, None).is_ok() {
+        while alive() {
             assert!(
                 gone.elapsed() < Duration::from_secs(5),
                 "the background process is still running"

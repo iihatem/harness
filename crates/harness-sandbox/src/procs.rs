@@ -23,10 +23,12 @@
 //! harness a subreaper ([`subreaper_active`]).
 //!
 //! As a subreaper, harness must reap the orphans that exit, or they stay
-//! zombies. [`look_and_reap`] waits, with `waitpid(pid, WNOHANG)`, for each
-//! zombie child of harness in another session whose pid is not managed. It
-//! never calls `waitpid(-1)`, which would take exit statuses that tokio and
-//! std wait for.
+//! zombies. [`look_and_reap`] waits, without blocking, for each zombie child
+//! of harness in another session whose pid is not managed ([`may_reap`]),
+//! through a pidfd, after checking again what has the pid: the pid may have
+//! been reaped by something else and given to another process since the scan
+//! (see `reap`). It never waits for "any child" (`waitpid(-1)`), which would
+//! take exit statuses that tokio and std wait for.
 //!
 //! **Invariant.** Any other child harness spawns must stay in harness's
 //! session, or be registered ([`Registration`]) from before it is spawned
@@ -162,15 +164,20 @@ pub(crate) fn zombies_to_reap(
     }
     procs
         .iter()
-        .filter(|proc| {
-            proc.pid > 1
-                && proc.ppid == me
-                && proc.zombie()
-                && proc.sid != my_sid
-                && !registry.managed.contains_key(&proc.pid)
-        })
+        .filter(|proc| may_reap(proc, me, my_sid, registry))
         .map(|proc| proc.pid)
         .collect()
+}
+
+/// Whether `me` may reap `proc`: a zombie child of it, in another session
+/// than `my_sid`, whose pid `registry` does not manage. Asked of what a scan
+/// found, and again of what has that pid once a pidfd holds it.
+pub(crate) fn may_reap(proc: &Proc, me: i32, my_sid: i32, registry: &Registry) -> bool {
+    proc.pid > 1
+        && proc.ppid == me
+        && proc.zombie()
+        && proc.sid != my_sid
+        && !registry.managed.contains_key(&proc.pid)
 }
 
 /// The processes one scan found.
@@ -206,10 +213,7 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Scan {
         let Some(pid) = name.to_str().and_then(|name| name.parse::<i32>().ok()) else {
             continue;
         };
-        if let Some(mut proc) = read_stat(&entry.path()).filter(|proc| proc.pid == pid) {
-            if proc.state == b'Z' {
-                proc.other_threads = other_threads(&entry.path(), pid);
-            }
+        if let Some(proc) = read_proc(&entry.path(), pid) {
             procs.push(proc);
         }
     }
@@ -217,6 +221,17 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Scan {
         procs,
         complete: true,
     }
+}
+
+/// What `dir` (`/proc/<pid>`) says about process `pid`: its stat line, and
+/// for a zombie leader whether other threads of it run on. `None` when it
+/// cannot be read, or is not about `pid`.
+fn read_proc(dir: &Path, pid: i32) -> Option<Proc> {
+    let mut proc = read_stat(dir).filter(|proc| proc.pid == pid)?;
+    if proc.state == b'Z' {
+        proc.other_threads = other_threads(dir, pid);
+    }
+    Some(proc)
 }
 
 /// Whether the process in `dir` (`/proc/<pid>`), whose thread-group leader
@@ -474,15 +489,61 @@ pub(crate) fn look_and_reap() -> bool {
         my_sid,
         &registry,
         || scan(Path::new("/proc"), MAX_PROCESSES),
-        |pid| {
-            let mut status = 0;
-            // SAFETY: waits, without blocking, for this one zombie child,
-            // which nothing else waits for (see the module docs).
-            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) == pid }
-        },
+        |pid| reap(pid, me, my_sid, &registry),
     );
     drop(registry);
     verdict(looked, subreaper())
+}
+
+/// Reaps `pid`, a zombie the scan found that `me` may reap, unless the pid
+/// has changed hands since: whether it did.
+///
+/// Something else can reap it meanwhile (the bash tool waits for what is left
+/// of a killed command's process group), and the pid can then go to another
+/// process, which `waitpid(pid)` would take the exit status of. So the wait
+/// goes through a pidfd: whatever it was opened for is the only process it
+/// can wait for, and only until that process is reaped, even once its pid is
+/// someone else's. What has the pid is read after the pidfd is opened, and if
+/// the process the pidfd is for is still there to be waited for, it had the
+/// pid all along, so what was read is about it. Kernels since 5.4 have both
+/// calls, and the sandbox needs 6.2.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn reap(pid: i32, me: i32, my_sid: i32, registry: &Registry) -> bool {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // SAFETY: `pidfd_open(2)` takes a pid and flags, and returns a new
+    // descriptor or -1.
+    let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let Ok(fd) = i32::try_from(opened) else {
+        return false;
+    };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: `fd` was just created, and nothing else owns it.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let Some(now) = read_proc(&Path::new("/proc").join(pid.to_string()), pid) else {
+        return false;
+    };
+    if !may_reap(&now, me, my_sid, registry) {
+        return false;
+    }
+    let Ok(id) = libc::id_t::try_from(pidfd.as_raw_fd()) else {
+        return false;
+    };
+    // SAFETY: an all-zero `siginfo_t` is valid; `waitid` fills it in.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waits, without blocking, for the one process `pidfd` is for,
+    // which nothing else waits for while `may_reap` allows it (see the module
+    // docs); `info` outlives the call.
+    let waited =
+        unsafe { libc::waitid(libc::P_PIDFD, id, &mut info, libc::WEXITED | libc::WNOHANG) };
+    // SAFETY: `waitid` filled `info` in, or left it zeroed (no child had
+    // exited), and `si_pid` reads the pid field either way.
+    waited == 0 && unsafe { info.si_pid() } == pid
 }
 
 #[cfg(test)]
@@ -656,6 +717,87 @@ mod tests {
         let mut reaped = zombies_to_reap(&procs, me, my_sid, &registry(&[202], 0));
         reaped.sort_unstable();
         assert_eq!(reaped, [200, 201]);
+    }
+
+    #[test]
+    fn a_pid_that_changed_hands_since_the_scan_is_not_reaped() {
+        let me = 100;
+        let my_sid = 50;
+        let free = registry(&[], 0);
+        // Still the orphan the scan found.
+        assert!(may_reap(&p(200, me, 200, b'Z'), me, my_sid, &free));
+        // Reaped meanwhile, and the pid given to another process:
+        for now in [
+            p(200, me, my_sid, b'Z'), // harness's own helper, which std or tokio waits for
+            p(200, me, 200, b'S'),    // one still running
+            p(200, 300, 200, b'Z'),   // another process's child
+            leader_gone(200, me, 200),
+        ] {
+            assert!(!may_reap(&now, me, my_sid, &free), "{now:?}");
+        }
+        // A command harness spawned and waits for.
+        assert!(!may_reap(
+            &p(200, me, 200, b'Z'),
+            me,
+            my_sid,
+            &registry(&[200], 0)
+        ));
+        assert!(!may_reap(&p(1, me, 1, b'Z'), me, my_sid, &free));
+    }
+
+    /// Spawns `sh -c 'exit 3'` in a session of its own and waits until it is a zombie.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn zombie_in_its_own_session() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 3"]);
+        // SAFETY: `setsid` is async-signal-safe, and nothing else runs in the child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn sh");
+        let pid = i32::try_from(child.id()).unwrap();
+        let dir = Path::new("/proc").join(pid.to_string());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while read_stat(&dir).is_none_or(|proc| proc.state != b'Z') {
+            assert!(std::time::Instant::now() < deadline, "sh did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn the_reaper_leaves_a_managed_zombie_to_its_waiter_and_reaps_an_orphan_through_a_pidfd() {
+        let mut managed = zombie_in_its_own_session();
+        let mut registration = Registration::new();
+        registration.started(managed.id());
+        look_and_reap();
+        let dir = Path::new("/proc").join(managed.id().to_string());
+        assert_eq!(
+            read_stat(&dir).map(|proc| proc.state),
+            Some(b'Z'),
+            "the reaper took a zombie harness waits for"
+        );
+        assert_eq!(managed.wait().expect("its exit status").code(), Some(3));
+        drop(registration);
+
+        let mut orphan = zombie_in_its_own_session();
+        let dir = Path::new("/proc").join(orphan.id().to_string());
+        look_and_reap();
+        assert_eq!(read_stat(&dir), None, "the orphan was not reaped");
+        assert!(orphan.try_wait().is_err(), "nothing is left to wait for");
     }
 
     #[test]

@@ -231,6 +231,26 @@ fn a_slow_snapshot_is_abandoned_without_leaving_a_lock() {
     assert!(locks.is_empty());
 }
 
+// Final review, minor 5: a workspace too large to snapshot in time makes every run wait at its
+// first change, so the warning says what makes snapshots faster.
+#[test]
+fn a_slow_snapshot_names_the_remedy() {
+    let f = fixture();
+    f.write("a.txt", "x\n");
+    let error = f
+        .checkpoints()
+        .with_timeout(Duration::from_millis(1))
+        .snapshot("turn 1")
+        .unwrap_err();
+    assert!(matches!(error, CheckpointError::TooSlow), "{error:?}");
+    let text = error.to_string();
+    assert!(
+        text.contains("a snapshot took longer than 5 seconds")
+            && text.contains("add large generated directories to `.gitignore`"),
+        "{text}"
+    );
+}
+
 #[test]
 fn a_missing_git_is_reported() {
     let f = fixture();

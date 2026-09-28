@@ -74,7 +74,10 @@ const OVERRIDES: [&str; 3] = [
 pub enum CheckpointError {
     #[error("git was not found on PATH")]
     GitMissing,
-    #[error("a snapshot took longer than {} seconds", SNAPSHOT_TIMEOUT.as_secs())]
+    #[error(
+        "a snapshot took longer than {} seconds; add large generated directories to `.gitignore` to make snapshots faster",
+        SNAPSHOT_TIMEOUT.as_secs()
+    )]
     TooSlow,
     #[error("git {command} failed: {message}")]
     Git { command: String, message: String },

@@ -575,6 +575,85 @@ async fn a_rewind_that_fails_partway_can_be_undone() {
     assert_eq!(f.read("b.txt").as_deref(), Some("two"));
 }
 
+// Re-review E, nit a: an undo whose restore fails partway is recorded like a rewind of code, so it
+// can be undone in turn; after that, the rewind can be undone again.
+#[tokio::test]
+async fn an_undo_that_fails_partway_can_be_undone_and_then_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return; // root writes into read-only directories
+    }
+    let f = fixture();
+    let provider = MockProvider::new(vec![
+        put("c1", "ro/a.txt", "one"),
+        Script::text("done"),
+        put("c2", "ro/a.txt", "two"),
+        Script::text("done"),
+    ]);
+    let mut agent = f.agent(provider, Mode::Auto);
+    run(&mut agent, "first").await;
+    run(&mut agent, "second").await;
+    let target = point(&agent, "second");
+    agent
+        .rewind(&target, RewindScope::CodeAndConversation)
+        .await
+        .unwrap();
+    assert_eq!(f.read("ro/a.txt").as_deref(), Some("one"));
+    let rewound = agent.history().to_vec();
+    let ro = f.ws.join("ro");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = agent.undo_rewind().await;
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(
+            failed,
+            Err(RewindError::Restore(CheckpointError::Restore { .. }))
+        ),
+        "{failed:?}"
+    );
+    assert_eq!(agent.history(), rewound.as_slice());
+    // Undoing the failed undo: the files as they were just before it.
+    assert!(agent.can_undo_rewind());
+    agent.undo_rewind().await.unwrap();
+    assert_eq!(f.read("ro/a.txt").as_deref(), Some("one"));
+    assert_eq!(agent.history(), rewound.as_slice());
+    // And the rewind itself can still be undone.
+    assert!(agent.can_undo_rewind());
+    agent.undo_rewind().await.unwrap();
+    assert_eq!(f.read("ro/a.txt").as_deref(), Some("two"));
+    assert_eq!(user_texts(&agent), ["first", "second"]);
+    assert!(!agent.can_undo_rewind());
+}
+
+// Undoing a rewind made right after another one returns to just after the first, where nothing
+// has happened since it: that one can be undone too.
+#[tokio::test]
+async fn undoing_a_second_rewind_leaves_the_first_undoable() {
+    let f = fixture();
+    f.write("a.txt", "original");
+    let provider = MockProvider::new(vec![
+        put("c1", "a.txt", "one"),
+        Script::text("done"),
+        put("c2", "a.txt", "two"),
+        Script::text("done"),
+    ]);
+    let mut agent = f.agent(provider, Mode::Auto);
+    run(&mut agent, "first").await;
+    run(&mut agent, "second").await;
+    let second = point(&agent, "second");
+    agent.rewind(&second, RewindScope::Code).await.unwrap();
+    assert_eq!(f.read("a.txt").as_deref(), Some("one"));
+    let first = point(&agent, "first");
+    agent.rewind(&first, RewindScope::Code).await.unwrap();
+    assert_eq!(f.read("a.txt").as_deref(), Some("original"));
+    agent.undo_rewind().await.unwrap();
+    assert_eq!(f.read("a.txt").as_deref(), Some("one"));
+    assert!(agent.can_undo_rewind());
+    agent.undo_rewind().await.unwrap();
+    assert_eq!(f.read("a.txt").as_deref(), Some("two"));
+    assert!(!agent.can_undo_rewind());
+}
+
 /// Whether the tests run as root, which permissions do not stop.
 fn is_root() -> bool {
     // SAFETY: `geteuid` cannot fail.

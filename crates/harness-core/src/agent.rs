@@ -463,11 +463,18 @@ impl Agent {
     }
 
     /// Undoes the last rewind, when nothing has happened since: restores the files and the
-    /// conversation as they were just before it.
+    /// conversation as they were just before it. An undo whose restore fails partway is recorded
+    /// as a rewind of code, which can be undone in turn.
     pub async fn undo_rewind(&mut self) -> Result<(), RewindError> {
         let Some(Entry {
             id,
-            kind: EntryKind::Rewind { from, snapshot, .. },
+            kind:
+                EntryKind::Rewind {
+                    from,
+                    target,
+                    snapshot,
+                    ..
+                },
             ..
         }) = self.session.get(self.session.leaf()).cloned()
         else {
@@ -476,21 +483,43 @@ impl Agent {
         let mut before = None;
         if let Some(snapshot) = snapshot {
             let checkpoints = self.checkpoints.clone().ok_or(RewindError::NoCheckpoints)?;
-            before = Some(
-                tokio::task::spawn_blocking(move || checkpoints.restore(&snapshot))
-                    .await
-                    .map_err(|e| CheckpointError::Io(e.into()))??,
-            );
+            let restored =
+                tokio::task::spawn_blocking(move || checkpoints.restore(&snapshot)).await;
+            match restored.map_err(|e| CheckpointError::Io(e.into()))? {
+                Ok(snapshot) => before = Some(snapshot),
+                Err(CheckpointError::Restore { before, source }) => {
+                    // Files may be half restored: recorded as a rewind of code, undoing it puts
+                    // them back as they were, and this rewind can then be undone again.
+                    self.session.append(EntryKind::Rewind {
+                        from: id,
+                        target,
+                        scope: RewindScope::Code,
+                        snapshot: Some(before.clone()),
+                    });
+                    self.after_session_change();
+                    return Err(CheckpointError::Restore { before, source }.into());
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         // The snapshot taken just before is kept, so changes made since the rewind (in an
         // editor, say) are not lost.
-        self.session.append_under(
+        let undone = self.session.append_under(
             &from,
             EntryKind::UndoRewind {
                 rewind: id,
                 snapshot: before,
             },
         );
+        // Back where `from` left the session. When that was just after another rewind, nothing
+        // has happened since that one, so it can still be undone.
+        if let Some(Entry {
+            kind: rewind @ EntryKind::Rewind { .. },
+            ..
+        }) = self.session.get(&from).cloned()
+        {
+            self.session.append_under(&undone, rewind);
+        }
         self.after_session_change();
         Ok(())
     }

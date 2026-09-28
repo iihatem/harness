@@ -5,7 +5,7 @@ Sessions preserve conversations on disk so they survive crashes, can be resumed 
 ## ADDED Requirements
 
 ### Requirement: Sessions are persisted incrementally
-The system SHALL persist each session as an append-only JSON Lines file in the `sessions/<project-key>/` directory of the harness data directory, where `<project-key>` is derived from the canonical repository root path, or from the canonical working directory outside a repository. Each entry MUST be appended as soon as it is complete and MUST carry an `id` and a `parent_id`. Session files MUST be readable and writable only by the user who owns them. A file MUST be loaded as a session only when it is a regular file named after the session id its first line gives, and that id consists of 1 to 64 ASCII letters, digits and dashes.
+The system SHALL persist each session as an append-only JSON Lines file in the `sessions/<project-key>/` directory of the harness data directory, where `<project-key>` is derived from the canonical repository root path, or from the canonical working directory outside a repository. Each entry MUST be appended as soon as it is complete and MUST carry an `id` and a `parent_id`. Session files MUST be readable and writable only by the user who owns them. A file MUST be loaded as a session only when it is a regular file named after the session id its first line gives, and that id consists of 1 to 64 ASCII letters, digits and dashes. Continuing a file in an older format MUST first append an entry recording the current format version, and a file whose first line or any such entry names a format newer than the running harness understands MUST be refused before anything in it changes.
 
 #### Scenario: Entries survive a crash
 - **WHEN** the harness process is killed after two completed turns
@@ -18,6 +18,10 @@ The system SHALL persist each session as an append-only JSON Lines file in the `
 #### Scenario: Session files are private
 - **WHEN** a session is saved
 - **THEN** only the user who owns the file can read or write it, and only that user can open the folders that hold it
+
+#### Scenario: Session continued by a newer harness
+- **WHEN** a harness continues a session file started in an older format, and an older harness later tries to continue it
+- **THEN** the newer harness recorded its format version before its first entry, and the older harness refuses the file and leaves it unchanged
 
 #### Scenario: Session id that does not match its file
 - **WHEN** the first line of a session file gives a session id other than the file's name

@@ -525,3 +525,79 @@ fn checkpoints_name_their_workspace_from_format_two_on() {
         }
     )));
 }
+
+// Final review, minor 3: a file an older harness started, and this one continues, gains entries
+// in this format under the older header. Before its first entry this harness records its own
+// format version, so a harness that understands only the older one refuses the file.
+#[test]
+fn continuing_an_older_file_first_records_the_current_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = session_with_lines(dir.path(), ID, 1, &[user_line("a", ID, "A")]);
+    let (mut session, _) = Session::open(&path).unwrap();
+    session.append(assistant("B"));
+    session.append(user("C"));
+    drop(session);
+    let saved = lines(&path);
+    assert_eq!(saved.len(), 5, "{saved:#?}");
+    let version: serde_json::Value = serde_json::from_str(&saved[2]).unwrap();
+    assert_eq!(version["type"], "version", "{version}");
+    assert_eq!(version["version"], session::FORMAT_VERSION);
+    assert_eq!(version["parent_id"], "a");
+    // The conversation reads on as before, and the version is recorded once.
+    let (mut session, warnings) = Session::open(&path).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(texts(&session), ["A", "B", "C"]);
+    session.append(assistant("D"));
+    drop(session);
+    let saved = lines(&path);
+    assert_eq!(
+        saved
+            .iter()
+            .filter(|l| l.contains("\"type\":\"version\""))
+            .count(),
+        1,
+        "{saved:#?}"
+    );
+    // A file in this format gets no version entry.
+    let mut fresh = Session::create(dir.path(), Path::new("/work"));
+    fresh.append(user("x"));
+    let fresh_path = fresh.path().unwrap().to_path_buf();
+    drop(fresh);
+    let (mut fresh, _) = Session::open(&fresh_path).unwrap();
+    fresh.append(user("y"));
+    drop(fresh);
+    let saved = lines(&fresh_path);
+    assert_eq!(saved.len(), 3, "{saved:#?}");
+    assert!(
+        saved.iter().all(|l| !l.contains("\"type\":\"version\"")),
+        "{saved:#?}"
+    );
+}
+
+// On open, a version entry newer than this harness refuses the file as a newer header does,
+// before anything in it changes.
+#[test]
+fn a_session_a_newer_harness_continued_is_refused_and_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    for header in [1, session::FORMAT_VERSION] {
+        let path = session_with_lines(
+            dir.path(),
+            ID,
+            header,
+            &[
+                user_line("a", ID, "A"),
+                serde_json::json!({"id": "b", "parent_id": "a", "type": "version", "version": session::FORMAT_VERSION + 1}),
+                user_line("c", "a", "C"),
+            ],
+        );
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"id\":\"half");
+        std::fs::write(&path, &text).unwrap();
+        let error = Session::open(&path).unwrap_err();
+        assert!(
+            matches!(error, SessionError::TooNew { version, .. } if version == session::FORMAT_VERSION + 1),
+            "{error:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+}

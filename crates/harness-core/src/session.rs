@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use crate::{compaction, message::Message, time};
 
 /// The session file format written by this version. Version 2 added the workspace of each
-/// checkpoint: a harness that reads version 1 only would restore them in the wrong place.
+/// checkpoint: a harness that reads version 1 only would restore them in the wrong place. A file
+/// records it in its first line, and in a [`EntryKind::Version`] entry where a newer harness
+/// continued an older file.
 pub const FORMAT_VERSION: u32 = 2;
 
 /// One line of a session file.
@@ -79,6 +81,11 @@ pub enum EntryKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         snapshot: Option<String>,
     },
+    /// A harness whose format is `version` continued a file in an older one from here: the
+    /// entries after it can be in that format, so a harness that understands only the older one
+    /// refuses the file, as it refuses a newer header. It hangs off the leaf it was written
+    /// after, without becoming the leaf.
+    Version { version: u32 },
 }
 
 /// What a rewind restores.
@@ -124,6 +131,9 @@ pub struct Session {
     save_error: Option<std::io::Error>,
     /// Warnings about saving, until someone takes them.
     warnings: Vec<String>,
+    /// The file is in an older format than this harness writes, so a [`EntryKind::Version`]
+    /// entry goes before the next entry appended.
+    record_version: bool,
 }
 
 /// Where a session is saved. The file is created, and locked, when the first entry after the
@@ -175,6 +185,7 @@ impl Session {
             store,
             save_error: None,
             warnings: Vec::new(),
+            record_version: false,
         }
     }
 
@@ -227,10 +238,19 @@ impl Session {
         if id != file_id {
             return Err(not_a_session());
         }
-        if *version > FORMAT_VERSION {
+        // The newest format anything in the file was written in: its header's, or that of a
+        // newer harness that continued it.
+        let newest = entries
+            .iter()
+            .filter_map(|entry| match entry.kind {
+                EntryKind::Version { version } => Some(version),
+                _ => None,
+            })
+            .fold(*version, u32::max);
+        if newest > FORMAT_VERSION {
             return Err(SessionError::TooNew {
                 path: path.to_path_buf(),
-                version: *version,
+                version: newest,
             });
         }
         // Only a session in this format is changed.
@@ -269,6 +289,7 @@ impl Session {
             }),
             save_error: None,
             warnings: Vec::new(),
+            record_version: newest < FORMAT_VERSION,
         };
         if let Some(problem) = session.walk().1 {
             warnings.push(format!("{}: {problem}", path.display()));
@@ -306,6 +327,26 @@ impl Session {
     /// memory and [`take_save_error`](Self::take_save_error) says why.
     pub fn append_under(&mut self, parent: &str, kind: EntryKind) -> String {
         assert!(self.index.contains_key(parent), "unknown parent {parent}");
+        // Written in the same batch as the entry, and under the current leaf, so that a file cut
+        // off after it still continues from there.
+        if self.record_version && self.store.is_some() {
+            self.record_version = false;
+            let leaf = self.leaf.clone();
+            self.push(
+                &leaf,
+                EntryKind::Version {
+                    version: FORMAT_VERSION,
+                },
+            );
+        }
+        let id = self.push(parent, kind);
+        self.leaf = id.clone();
+        self.save();
+        id
+    }
+
+    /// Adds `kind` under `parent` to the entries, with a new id, which it returns.
+    fn push(&mut self, parent: &str, kind: EntryKind) -> String {
         let id = loop {
             let candidate = format!("{:08x}", random_u64() as u32);
             if !self.index.contains_key(&candidate) {
@@ -318,8 +359,6 @@ impl Session {
             parent_id: Some(parent.to_string()),
             kind,
         });
-        self.leaf = id.clone();
-        self.save();
         id
     }
 

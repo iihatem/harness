@@ -159,6 +159,18 @@ impl Env {
         }
     }
 
+    /// What every version of `rel` in the quarantine holds.
+    fn all_quarantined(&self, rel: &str) -> Vec<String> {
+        let stored = stored(rel);
+        std::fs::read_dir(&self.quarantine)
+            .map(|dirs| {
+                dirs.filter_map(Result::ok)
+                    .filter_map(|dir| std::fs::read_to_string(dir.path().join(&stored)).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The one entry the quarantine holds for `rel` (relative to the workspace): see [`stored`].
     fn quarantined(&self, rel: &str) -> PathBuf {
         let stored = stored(rel);
@@ -272,6 +284,53 @@ async fn run(sandbox: &LinuxSandbox, env: &Env, script: &str) -> (Output, Option
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Who owns what, with which mode, in `dir` and on the way to it from the workspace, and
+/// whether this process can create a file there: for a failure a sandboxed command's write
+/// cannot explain by itself.
+fn permissions_around(env: &Env, dir: &str) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let line = |path: &Path| match std::fs::symlink_metadata(path) {
+        Ok(meta) => format!(
+            "{}: mode {:o}, uid {}, gid {}, dev {}, ino {}\n",
+            path.display(),
+            meta.mode(),
+            meta.uid(),
+            meta.gid(),
+            meta.dev(),
+            meta.ino()
+        ),
+        Err(e) => format!("{}: {e}\n", path.display()),
+    };
+    let mut text = String::new();
+    let mut path = env.ws.clone();
+    text.push_str(&line(&path));
+    for part in Path::new(dir).iter() {
+        path.push(part);
+        text.push_str(&line(&path));
+    }
+    if let Ok(entries) = std::fs::read_dir(&path) {
+        for entry in entries.flatten() {
+            text.push_str(&line(&entry.path()));
+        }
+    }
+    let probe = path.join(".harness-test-can-write");
+    text.push_str(&match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            "this process can create a file there\n".to_string()
+        }
+        Err(e) => format!("this process cannot create a file there: {e}\n"),
+    });
+    // SAFETY: `getuid`, `getgid` and `umask` cannot fail; the umask is set back at once.
+    let (uid, gid, umask) = unsafe {
+        let umask = libc::umask(0o022);
+        libc::umask(umask);
+        (libc::getuid(), libc::getgid(), umask)
+    };
+    text.push_str(&format!("uid {uid}, gid {gid}, umask {umask:o}\n"));
+    text
 }
 
 /// Polls `done` every 20 ms for up to 10 s.
@@ -477,7 +536,12 @@ async fn basic_tier_quarantines_a_planted_hook() {
         "echo 'echo pwned' > .git/hooks/pre-commit",
     )
     .await;
-    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        output.status.success(),
+        "{}{}report: {report:?}",
+        stderr(&output),
+        permissions_around(&env, ".git/hooks")
+    );
     let report = report.expect("a report");
     assert!(report.blocked);
     assert!(
@@ -1227,6 +1291,66 @@ async fn full_tier_refuses_git_config() {
     assert_eq!(std::fs::read(env.ws.join(".git/config")).unwrap(), before);
 }
 
+/// Git rewrites `.git/config` by writing a lock file and renaming it over the config. Done from
+/// outside a command's mount namespace, by the user say, that detaches the command's read-only
+/// bind on the file, and the command can write the new one. The full tier saved it before the
+/// command, as the basic tier does, and puts it back afterwards: the command's write, and the
+/// user's own edit (the documented trade-off), go to the quarantine.
+#[tokio::test]
+async fn full_tier_restores_a_config_a_rename_from_outside_left_writable() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    let config = env.ws.join(".git/config");
+    let before = std::fs::read(&config).unwrap();
+    let prepared = sandbox
+        .prepare(
+            FsAccess::WorkspaceWrite,
+            &env.ws,
+            "/bin/sh",
+            &[
+                "-c",
+                "while [ ! -e go ]; do sleep 0.05; done; \
+                 printf '[core]\\n\\tfsmonitor = evil\\n' >> .git/config",
+            ],
+        )
+        .expect("prepare the sandboxed command");
+    let mut guard = prepared.guard.expect("a workspace-write guard");
+    let mut cmd = prepared.command;
+    cmd.current_dir(&env.ws)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().expect("spawn the sandboxed command");
+    guard.started(child.id().expect("a pid"));
+    // The user runs `git config` outside harness meanwhile.
+    let mut mine = before.clone();
+    mine.extend_from_slice(b"[user]\n\tname = mine\n");
+    std::fs::write(env.ws.join(".git/config.lock"), &mine).unwrap();
+    std::fs::rename(env.ws.join(".git/config.lock"), &config).unwrap();
+    std::fs::write(env.ws.join("go"), b"").unwrap();
+    let output = child.wait_with_output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "the rename from outside should have left the command's config writable: {}",
+        stderr(&output)
+    );
+    let report = guard.finish().expect("a report");
+    assert!(report.blocked, "{}", report.message);
+    assert!(
+        report.message.contains("- .git/config: "),
+        "{}",
+        report.message
+    );
+    assert_eq!(std::fs::read(&config).unwrap(), before);
+    let kept = env.all_quarantined(".git/config");
+    assert!(
+        kept.iter()
+            .any(|version| version.contains("fsmonitor = evil")),
+        "{kept:?}"
+    );
+}
+
 #[tokio::test]
 async fn full_tier_pins_dot_git() {
     let _serial = SERIAL.lock().await;
@@ -1750,8 +1874,8 @@ async fn full_tier_commands_hold_no_capability_and_cannot_regain_one() {
 import ctypes, sys
 libc = ctypes.CDLL(None, use_errno=True)
 bits = libc.prctl(27, 0, 0, 0, 0)
-if bits != 0xef:
-    sys.exit("securebits: expected 0xef, got %#x" % bits)
+if bits < 0 or bits & 0xef != 0xef:
+    sys.exit("securebits: expected at least 0xef, got %#x" % bits)
 for line in open("/proc/self/status"):
     name, _, value = line.partition(":")
     if name in ("CapInh", "CapPrm", "CapEff", "CapAmb") and int(value, 16):

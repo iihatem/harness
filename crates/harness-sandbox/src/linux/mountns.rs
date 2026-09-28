@@ -11,8 +11,8 @@
 //! which). It changes into its working directory again, so that a working
 //! directory inside a newly covered directory resolves through the new
 //! mount. Last, it locks the securebits (no root privileges, no set-uid
-//! fixups, no ambient capabilities, all locked) and drops every capability
-//! it holds. Without that, `execve` would clear them only for a command
+//! fixups, no ambient capabilities, all locked, on top of any it inherited)
+//! and drops every capability it holds. Without that, `execve` would clear them only for a command
 //! that is not uid 0 in the namespace, and harness may run as root.
 //!
 //! Every step works on file descriptors: entries are opened with `openat2`
@@ -195,11 +195,21 @@ fn setup(plan: &MountPlan) -> Result<(), Failure> {
     drop_capabilities().map_err(fail(Step::Capabilities))
 }
 
-/// Sets and locks [`LOCKED_SECUREBITS`].
+/// Sets and locks [`LOCKED_SECUREBITS`], keeping every bit already set:
+/// a locked bit cannot be cleared, so a call that tried would fail.
 fn lock_securebits() -> Result<(), i32> {
     // SAFETY: `prctl` with integer arguments only.
-    check(unsafe { libc::prctl(libc::PR_SET_SECUREBITS, LOCKED_SECUREBITS, 0, 0, 0) }.into())
-        .map(|_| ())
+    let current = check(unsafe { libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0) }.into())?;
+    let bits = securebits_to_set(current as libc::c_ulong);
+    // SAFETY: `prctl` with integer arguments only.
+    check(unsafe { libc::prctl(libc::PR_SET_SECUREBITS, bits, 0, 0, 0) }.into()).map(|_| ())
+}
+
+/// The securebits to set when `current` are set: ours, and whatever was
+/// already there (harness may inherit a locked bit, `keep-caps` from
+/// systemd, say).
+fn securebits_to_set(current: libc::c_ulong) -> libc::c_ulong {
+    current | LOCKED_SECUREBITS
 }
 
 /// Empties this process's effective, permitted and inheritable capability
@@ -367,6 +377,15 @@ mod tests {
         assert_eq!(size_of::<MountAttr>(), 32);
         assert_eq!(size_of::<CapHeader>(), 8);
         assert_eq!(size_of::<[CapData; 2]>(), 24);
+    }
+
+    #[test]
+    fn securebits_already_set_or_locked_are_kept() {
+        assert_eq!(securebits_to_set(0), LOCKED_SECUREBITS);
+        // `keep-caps` and its lock, as systemd can leave them.
+        assert_eq!(securebits_to_set(0x30), 0xff);
+        // A bit this code does not know yet (`SECBIT_EXEC_RESTRICT_FILE`).
+        assert_eq!(securebits_to_set(0x100), 0x1ef);
     }
 
     #[test]

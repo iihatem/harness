@@ -50,7 +50,7 @@ pub fn linux_git_protection() -> GitProtection {
 /// writing. `Err` says why the full tier is unavailable.
 ///
 /// The child stays in harness's session and is waited for here, by pid, so
-/// the basic tier's reaper (`crate::procs`) never takes it.
+/// the reaper (`crate::procs`) never takes it.
 fn probe() -> Result<(), String> {
     let dir =
         ProbeDir::create().map_err(|e| format!("the probe could not create a directory: {e}"))?;

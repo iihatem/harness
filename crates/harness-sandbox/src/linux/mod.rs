@@ -48,11 +48,13 @@
 //! [`LinuxSandbox::new`] takes the tier it gives. In the **full** tier each
 //! workspace-write command gets its own namespace, in which the gitdirs are
 //! pinned and the protected entries bound read-only (`crate::mounts` says
-//! what), so writes to them fail; the guard covers what mounts cannot, and
-//! saves only protected symlinks and files with a second hard link, unless
-//! processes earlier commands left are running (below). In the **basic**
-//! tier there are no mounts, and the guard saves every protected file so it
-//! can undo changes after the fact.
+//! what), so writes to them fail. In the **basic** tier there are no
+//! mounts. In both tiers the guard saves every protected file before each
+//! command, so it can undo changes after the fact, and covers what mounts
+//! cannot: in the full tier, a name that does not exist yet, and an entry
+//! whose bind came off because it was renamed or removed from outside the
+//! command's namespace (git rewrites `.git/config` that way), which detaches
+//! the bind in every other namespace.
 //!
 //! If a full-tier command's setup fails, the command does not run: the
 //! child writes the step that failed to a pipe, which the command's guard
@@ -74,8 +76,8 @@
 //! the tier probe's child keeps it by staying in harness's session). In the
 //! full tier such a process stays in its command's namespace, under that
 //! command's mounts, but a protected entry that appeared since is not
-//! mounted there: so while any is alive, the full tier's guard saves every
-//! protected file too, and its checks restore them as the basic tier's do.
+//! mounted there: so while any is alive, the guard's checks restore the
+//! protected files in both tiers alike.
 //! Each command's pid is registered with [`CommandGuard::started`] until its
 //! guard finishes, so harness never reaps the process tokio waits for.
 //!
@@ -332,11 +334,10 @@ impl CommandSandbox for LinuxSandbox {
     /// Stops the workspace's watcher between commands, reaps what commands
     /// left behind, starts the guard for a workspace-write command,
     /// registers the command as about to be spawned, builds it, and starts
-    /// its watcher. In the basic tier the guard saves every protected file
-    /// so it can be restored; in the full tier it saves only what mounts
-    /// cannot protect, unless processes earlier commands left are running,
-    /// and the command gets mounts over what the guard's index found, and a
-    /// pipe its child reports a failed setup step to. A read-only
+    /// its watcher. In both tiers the guard saves every protected file so
+    /// it can be restored; in the full tier the command also gets mounts
+    /// over what the guard's index found, and a pipe its child reports a
+    /// failed setup step to. A read-only
     /// command has no git metadata to guard, but it runs in a session of its
     /// own all the same, so it is registered too; it cannot write to the
     /// workspace, so the watcher between commands goes on meanwhile, and
@@ -364,12 +365,13 @@ impl CommandSandbox for LinuxSandbox {
         // overlap.
         self.watching.stop_between(&workspace);
         // `begin` asks the probe only when an earlier command left something
-        // to check, so orphans are reaped here as well. While any process an
-        // earlier command left is running, the full tier saves every
-        // protected file too: that process keeps its own command's
+        // to check, so orphans are reaped here as well.
+        procs::look_and_reap();
+        // Every protected file is saved in the full tier too: a rename or an
+        // unlink from outside the command's namespace detaches its bind
+        // there, and a process an earlier command left keeps its own
         // namespace, where what appeared since has no mount.
-        let survivors = procs::look_and_reap();
-        let save_all = !full || survivors;
+        let save_all = true;
         // The plan is made from the guard's index, after the scan and before
         // the guard records which protected names exist, so the guard takes
         // the `hooks/` placeholders for existing ones.
@@ -605,8 +607,8 @@ impl SetupReport {
 
 /// Drops the session to the basic tier after the kernel or the host refused
 /// a full-tier command's setup: from the next command on, there are no
-/// mounts and the guard saves every protected file (`prepare` reads the
-/// tier). The subreaper and the survivor probe are already on in both tiers.
+/// mounts (`prepare` reads the tier). The guard saves every protected file,
+/// and the subreaper and the survivor probe are on, in both tiers already.
 fn drop_to_basic(tier: &Mutex<GitProtection>, failure: &str) {
     *lock(tier) = GitProtection::Basic {
         reason: format!("the full tier's setup failed during the session: {failure}"),

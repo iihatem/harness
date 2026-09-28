@@ -225,8 +225,7 @@ impl GuardSession {
     /// module docs. `placeholders` runs after the workspace is indexed and
     /// before the existing protected names are recorded (the Linux full tier
     /// creates empty `hooks/` directories there). With `save_all`, every
-    /// protected file is saved so it can be restored (the Linux basic tier,
-    /// and the full tier while processes earlier commands left are running);
+    /// protected file is saved so it can be restored (both Linux tiers);
     /// without it, only protected symlinks and files with more than one hard
     /// link are.
     pub fn begin(

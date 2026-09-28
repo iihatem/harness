@@ -14,8 +14,7 @@
 //!
 //! - It watches what [`Target::dirs`] names: each known gitdir, its
 //!   `worktrees` and `modules`, the workspace root, and, when the guard saves
-//!   every protected file (the Linux basic tier, and the full tier while
-//!   processes an earlier command left are running), the directories inside
+//!   every protected file (in both Linux tiers), the directories inside
 //!   protected entries. Each is watched as the directory
 //!   it is (its device and inode), reached without following a symlink: a
 //!   directory made anew at a path is watched as well, and one reached under

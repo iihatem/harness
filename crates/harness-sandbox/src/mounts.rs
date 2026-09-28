@@ -126,13 +126,16 @@ pub(crate) fn mounts(
     }
     // Parents come first, so a read-only entry is known before what is below
     // it: a pin there is read-only too, since a read-write bind would open
-    // that part of it again.
+    // that part of it again. In that order, what lies beneath a read-only
+    // entry follows it at once, so only the last one found can hold a path.
     let mut read_only: Vec<PathBuf> = Vec::new();
     wanted
         .0
         .into_iter()
         .map(|(path, (own, dev, ino))| {
-            let beneath = read_only.iter().any(|above| path.starts_with(above));
+            let beneath = read_only
+                .last()
+                .is_some_and(|above| path.starts_with(above));
             if own && !beneath {
                 read_only.push(path.clone());
             }
@@ -315,7 +318,15 @@ impl Failure {
     /// plan's ops' absolute paths.
     pub(crate) fn describe(&self, paths: &[PathBuf]) -> String {
         let err = io::Error::from_raw_os_error(self.errno);
-        match self.op.and_then(|op| paths.get(usize::from(op))) {
+        let per_entry = matches!(
+            self.step,
+            Step::Open | Step::Identity | Step::OpenTree | Step::ReadOnly | Step::MoveMount
+        );
+        match self
+            .op
+            .filter(|_| per_entry)
+            .and_then(|op| paths.get(usize::from(op)))
+        {
             Some(path) => format!("{} {} failed: {err}", self.step.describe(), path.display()),
             None => format!("{} failed: {err}", self.step.describe()),
         }
@@ -749,6 +760,25 @@ mod tests {
             for errno in [libc::ENOSPC, libc::ENOMEM, libc::EMFILE, libc::ENFILE] {
                 assert!(!failed(step, errno).drops_tier(), "{step:?} {errno}");
             }
+        }
+    }
+
+    #[test]
+    fn a_step_that_is_not_about_an_entry_names_none() {
+        // The child gives only per-entry steps an op, but a record could say otherwise.
+        let paths = vec![PathBuf::from("/ws/.git"), PathBuf::from("/ws/.git/config")];
+        for step in Step::ALL {
+            let text = Failure {
+                step,
+                op: Some(1),
+                errno: libc::EPERM,
+            }
+            .describe(&paths);
+            let per_entry = matches!(
+                step,
+                Step::Open | Step::Identity | Step::OpenTree | Step::ReadOnly | Step::MoveMount
+            );
+            assert_eq!(text.contains("/ws/.git/config"), per_entry, "{text}");
         }
     }
 

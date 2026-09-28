@@ -5,7 +5,7 @@ Checkpoints snapshot the workspace during a session so the user can rewind code,
 ## ADDED Requirements
 
 ### Requirement: Workspace snapshots before mutating actions
-Before the first mutating action of each turn (`write`, `edit`, or `bash` in a mode that allows writes, including a slash command's shell part), the system SHALL snapshot the workspace into a shadow repository in the harness data directory. The snapshot MUST NOT modify the user's own git repository, index, branches, or history, and MUST work in directories that are not git repositories. Snapshots MUST honour `.gitignore`, including the repository's rules when the workspace is a subdirectory of a repository, exclude `.git`, `node_modules`, `target`, and `.harness/` and a `HEAD` at the top of the workspace, and skip files larger than 10 MB, whatever a `.gitignore` negation says. Each snapshot MUST record what existed but was left out, and the directory it was taken for. Files MUST be stored and restored byte for byte, whatever `.gitattributes` says.
+Before the first mutating action of each turn (`write`, `edit`, or `bash` in a mode that allows writes, including a slash command's shell part), the system SHALL snapshot the workspace into a shadow repository in the harness data directory. The snapshot MUST NOT modify the user's own git repository, index, branches, or history, and MUST work in directories that are not git repositories. Snapshots MUST honour `.gitignore`, including the repository's rules when the workspace is a subdirectory of a repository, exclude `.git`, `node_modules`, `target`, and `.harness/` and a `HEAD` at the top of the workspace, and skip files larger than 10 MB, whatever a `.gitignore` negation says. A workspace the repository's rules ignore MUST be snapshotted by its own ignore files, as a directory outside any repository. Each snapshot MUST record what existed but was left out, and the directory it was taken for. Files MUST be stored and restored byte for byte, whatever `.gitattributes` says.
 
 #### Scenario: User's repository untouched
 - **WHEN** a turn edits files in a git repository with staged changes
@@ -27,8 +27,16 @@ Before the first mutating action of each turn (`write`, `edit`, or `bash` in a m
 - **WHEN** harness runs in a subdirectory of a repository whose root `.gitignore` ignores `.env` and `*.log`
 - **THEN** snapshots leave that subdirectory's `.env` and log files out, and rewinding code neither reverts nor deletes them
 
+#### Scenario: Workspace its repository ignores
+- **WHEN** harness runs in a directory its repository's `.gitignore` ignores, and the agent changes files there
+- **THEN** snapshots hold that directory's files, and rewinding code restores them
+
+#### Scenario: Rewind empties a subdirectory workspace
+- **WHEN** harness runs in an empty subdirectory of a repository, the agent creates files there, and the user rewinds code to before that
+- **THEN** the files are removed and the subdirectory, and the directories above it, still exist
+
 ### Requirement: Rewind restores code, conversation, or both
-The system SHALL provide `/rewind` (and Esc pressed twice on empty input) listing the session's previous user messages. After the user selects one, the system MUST offer to restore code and conversation, code only, or conversation only, to the state before that message. Restoring code MUST revert modified files, recreate deleted files, and remove files created since that point, including changes made by `bash` and by a slash command's shell parts. A checkpoint MUST be restored only in the directory it was taken for, and code MUST NOT be restored across a turn that changed files while checkpoints were off. A restore MUST NOT write through a symlink, and MUST give files only their owner could read their permissions again.
+The system SHALL provide `/rewind` (and Esc pressed twice on empty input) listing the session's previous user messages. After the user selects one, the system MUST offer to restore code and conversation, code only, or conversation only, to the state before that message. Restoring code MUST revert modified files, recreate deleted files, and remove files created since that point, including changes made by `bash` and by a slash command's shell parts. A checkpoint MUST be restored only in the directory it was taken for, and code MUST NOT be restored across a turn that changed files while checkpoints were off. A restore MUST NOT write through a symlink, MUST NOT remove the workspace directory, and MUST give files only their owner could read their permissions again.
 
 #### Scenario: Undo a bad refactor
 - **WHEN** the agent modified three files and ran a formatter via `bash`, and the user rewinds code and conversation to before that turn

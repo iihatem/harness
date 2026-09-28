@@ -438,7 +438,49 @@ impl CommandSandbox for LinuxSandbox {
     fn git_protection(&self) -> GitProtection {
         lock(&self.tier).clone()
     }
+
+    /// As harness exits: stops the watchers between commands, ends the
+    /// processes sandboxed commands left running (`SIGTERM`, then `SIGKILL`
+    /// after a second; processes in harness's own session, approved
+    /// unsandboxed runs included, are left alone), then runs one last check
+    /// of each workspace with them assumed, which undoes what they changed.
+    /// Returns within about three seconds.
+    fn end_session(&self) -> Option<String> {
+        self.watching.stop_all_between();
+        let ended = procs::end_survivors(END_GRACE, END_AFTER_KILL);
+        let mut text = String::new();
+        if ended.signalled > 0 {
+            let processes = if ended.signalled == 1 {
+                "process"
+            } else {
+                "processes"
+            };
+            let left = if ended.left {
+                ", but some are still running"
+            } else {
+                ""
+            };
+            text.push_str(&format!(
+                "[harness ended {} {processes} that sandboxed commands left running{left}.]\n",
+                ended.signalled
+            ));
+        } else if ended.left {
+            text.push_str(
+                "[harness could not tell whether processes sandboxed commands left are still running, so it checked git metadata once more.]\n",
+            );
+        }
+        if let Some(report) = self.guards.end_session() {
+            text.push_str(&report.message);
+        }
+        (!text.is_empty()).then_some(text)
+    }
 }
+
+/// How long [`LinuxSandbox::end_session`] gives the processes commands left
+/// to exit after `SIGTERM`,
+const END_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+/// and after `SIGKILL`.
+const END_AFTER_KILL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl LinuxSandbox {
     fn after(&self, workspace: PathBuf) -> After {
@@ -503,6 +545,14 @@ impl Watching {
     /// What the next report is to say, if anything.
     fn take_note(&self) -> Option<String> {
         lock(&self.0.note).unsaid.take()
+    }
+
+    /// Stops every watcher between commands, and waits for them.
+    fn stop_all_between(&self) {
+        let watchers = std::mem::take(&mut *lock(&self.0.between));
+        for watcher in watchers.into_values() {
+            watcher.stop();
+        }
     }
 
     /// Stops the watcher between commands in `workspace`, if there is one,

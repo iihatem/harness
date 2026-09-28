@@ -124,6 +124,9 @@ pub async fn run(
         eprintln!("warning: {}", terminal_safe(warning));
     }
     let sandbox = choice.sandbox;
+    // From here on, however `run` is left, the sandbox's session ends: on Linux that ends what
+    // sandboxed commands left running, and checks git metadata once more.
+    let session = SessionEnd::new(sandbox.clone());
     let sandboxed = sandbox.is_some();
     if mode != Mode::FullAccess && !sandboxed && choice.warning.is_none() {
         if sandbox_disabled_by_env {
@@ -196,7 +199,39 @@ pub async fn run(
             terminal_safe_text(&final_text)
         );
     }
+    session.end();
     exit_code(reason, blocked)
+}
+
+/// Ends the sandbox's session ([`CommandSandbox::end_session`]) once: when [`end`](Self::end) is
+/// called, or when dropped, so that an early return or a panic ends it too. What that says goes
+/// to stderr, escaped; the exit code does not depend on it. It takes a few seconds at most.
+struct SessionEnd(Option<Arc<dyn CommandSandbox>>);
+
+impl SessionEnd {
+    fn new(sandbox: Option<Arc<dyn CommandSandbox>>) -> SessionEnd {
+        SessionEnd(sandbox)
+    }
+
+    /// Ends the session now.
+    fn end(mut self) {
+        self.run();
+    }
+
+    fn run(&mut self) {
+        let Some(sandbox) = self.0.take() else {
+            return;
+        };
+        if let Some(text) = sandbox.end_session() {
+            let _ = write!(std::io::stderr().lock(), "{}", terminal_safe_text(&text));
+        }
+    }
+}
+
+impl Drop for SessionEnd {
+    fn drop(&mut self) {
+        self.run();
+    }
 }
 
 /// The tools' context, with the sandbox's session started first: before the agent runs, so what
@@ -434,6 +469,47 @@ mod tests {
                 .unwrap()
                 .push(format!("start_session {}", workspace.display()));
         }
+
+        fn end_session(&self) -> Option<String> {
+            self.log.lock().unwrap().push("end_session".into());
+            Some("ended\n".into())
+        }
+    }
+
+    fn ended(sandbox: &Recording) -> usize {
+        sandbox
+            .log()
+            .iter()
+            .filter(|entry| *entry == "end_session")
+            .count()
+    }
+
+    #[test]
+    fn the_sandbox_session_ends_once_when_the_turn_ends() {
+        let sandbox = Arc::new(Recording::default());
+        let shared: Arc<dyn CommandSandbox> = sandbox.clone();
+        let session = SessionEnd::new(Some(shared));
+        assert_eq!(ended(&sandbox), 0);
+        session.end();
+        assert_eq!(ended(&sandbox), 1);
+    }
+
+    #[test]
+    fn the_sandbox_session_ends_however_run_is_left() {
+        // An early return drops the guard; so does a panic.
+        let sandbox = Arc::new(Recording::default());
+        let shared: Arc<dyn CommandSandbox> = sandbox.clone();
+        drop(SessionEnd::new(Some(shared)));
+        assert_eq!(ended(&sandbox), 1);
+        let shared: Arc<dyn CommandSandbox> = sandbox.clone();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _session = SessionEnd::new(Some(shared));
+            panic!("the turn failed");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(ended(&sandbox), 2);
+        // Without a sandbox there is nothing to end.
+        SessionEnd::new(None).end();
     }
 
     #[tokio::test]

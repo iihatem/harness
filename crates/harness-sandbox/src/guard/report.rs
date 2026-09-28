@@ -19,6 +19,8 @@ const MAX_KEPT: usize = 1_000;
 
 pub(super) const BEFORE: &str = "[before this command ran, harness found protected git metadata created or changed after the previous command ended, probably by a process it left running:";
 
+pub(super) const AT_EXIT: &str = "[as harness exits, it found protected git metadata created or changed after the last command ended, by a process that command left running:";
+
 const AFTER: &str = "[the sandbox undid changes this command made to protected git metadata (hooks, config, commondir, repositories, .harness/, a top-level HEAD), which git outside the sandbox would otherwise use:";
 
 const UNCHECKABLE: &str = "[this command left the workspace too large or unreadable for harness to scan completely (a directory, gitfile or commondir file it cannot read, a modules/ tree over 64 levels deep, or more than 200,000 entries or 5 seconds of scanning), so harness cannot tell whether it created a repository, and the command counts as blocked. harness reads .gitignore rules once per session: rules that skip directories created since then apply after harness restarts.]\n";
@@ -244,6 +246,9 @@ pub(super) struct Findings {
     /// What an earlier command could not move or restore, and this one
     /// could not either: recalled, without blocking.
     pub(super) stuck: Vec<PathBuf>,
+    /// Said as harness exits: what was found before is found after the last
+    /// command instead.
+    pub(super) at_exit: bool,
 }
 
 impl Findings {
@@ -265,7 +270,8 @@ impl Findings {
             Err(_) => path.display().to_string(),
         };
         let mut message = String::new();
-        for (header, findings) in [(BEFORE, &self.before), (AFTER, &self.after)] {
+        let before = if self.at_exit { AT_EXIT } else { BEFORE };
+        for (header, findings) in [(before, &self.before), (AFTER, &self.after)] {
             if !findings.is_empty() {
                 let lines = findings.lines(&rel);
                 section(&mut message, header, lines, findings.count(), MAX_LINES);

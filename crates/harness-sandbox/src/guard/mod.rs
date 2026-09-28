@@ -407,6 +407,54 @@ impl GuardSession {
         })
     }
 
+    /// As harness exits, once the processes sandboxed commands left running
+    /// have been ended: one last check of each workspace, with such
+    /// processes assumed, so that what they changed is undone. What it and
+    /// the checks between commands found, not said yet, without blocking.
+    pub fn end_session(&self) -> Option<GuardReport> {
+        let workspaces: Vec<PathBuf> = lock(&self.workspaces).keys().cloned().collect();
+        let mut message = String::new();
+        for workspace in workspaces {
+            let mut quarantine = self.quarantine(&workspace);
+            let (found, gone) = {
+                let mut all = lock(&self.workspaces);
+                let Some(kept) = all
+                    .get_mut(&workspace)
+                    .and_then(|entry| entry.kept.as_mut())
+                else {
+                    continue;
+                };
+                if let Some(used) = kept.quarantine.take() {
+                    quarantine = used;
+                }
+                kept.check(
+                    &Tree::new(&workspace),
+                    &mut quarantine,
+                    true,
+                    self.max_changes(),
+                );
+                kept.quarantine = Some(quarantine);
+                (
+                    std::mem::take(&mut kept.found),
+                    std::mem::take(&mut kept.gone),
+                )
+            };
+            let findings = Findings {
+                before: found,
+                gone,
+                at_exit: true,
+                ..Findings::default()
+            };
+            if let Some(report) = findings.report(&workspace) {
+                message.push_str(&report.message);
+            }
+        }
+        (!message.is_empty()).then_some(GuardReport {
+            message,
+            blocked: false,
+        })
+    }
+
     /// Between the command of `generation` and the next, no process it left
     /// is running any more: see [`WatchHandle::survivors_gone`].
     fn clear_survivors(&self, workspace: &Path, generation: u64) {

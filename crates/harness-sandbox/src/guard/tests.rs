@@ -1037,3 +1037,39 @@ fn a_real_dot_git_the_user_moves_back_is_not_quarantined() {
     );
     assert!(!env.quarantine.exists());
 }
+
+#[test]
+fn when_the_session_ends_what_was_changed_since_the_last_command_is_undone_and_said() {
+    // At exit, once the processes commands left have been ended, one last
+    // check assumes they were there.
+    let env = env();
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    std::fs::write(env.ws.join(".git/config"), EVIL).unwrap();
+    std::fs::write(env.ws.join(".git/commondir"), "/tmp/evil\n").unwrap();
+    let report = env.session.end_session().expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report.message.starts_with(report::AT_EXIT),
+        "{}",
+        report.message
+    );
+    for line in [
+        "\n- .git/config: changed; restored the earlier version",
+        "\n- .git/commondir: new; moved to ",
+    ] {
+        assert!(report.message.contains(line), "{line}: {}", report.message);
+    }
+    assert_eq!(
+        read(&env.ws.join(".git/config")),
+        "[core]\n\tbare = false\n"
+    );
+    assert!(!env.ws.join(".git/commondir").exists());
+}
+
+#[test]
+fn a_session_that_ends_with_nothing_changed_has_nothing_to_say() {
+    let env = env();
+    assert_eq!(env.session.end_session(), None);
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.end_session(), None);
+}

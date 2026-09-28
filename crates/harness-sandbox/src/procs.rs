@@ -182,6 +182,15 @@ pub(crate) fn may_reap(proc: &Proc, me: i32, my_sid: i32, registry: &Registry) -
         && !registry.managed.contains_key(&proc.pid)
 }
 
+/// Whether the process that has pid `now.pid` now, once a pidfd holds it,
+/// may be signalled as a survivor: live, in another session than `my_sid`,
+/// and a child of `me` or of a survivor the scan `found`. So a pid that went,
+/// since the scan, to one of harness's own helpers or to a process that is
+/// not harness's is left alone.
+pub(crate) fn may_signal(now: &Proc, me: i32, my_sid: i32, found: &BTreeSet<i32>) -> bool {
+    now.pid > 1 && now.live() && now.sid != my_sid && (now.ppid == me || found.contains(&now.ppid))
+}
+
 /// The processes one scan found.
 #[derive(Debug)]
 pub(crate) struct Scan {
@@ -511,6 +520,143 @@ pub(crate) fn look_and_reap() -> bool {
     );
     drop(registry);
     verdict(looked, subreaper())
+}
+
+/// What [`end_survivors`] did.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Ended {
+    /// How many processes it signalled.
+    pub(crate) signalled: usize,
+    /// Whether survivors were still there when it gave up.
+    pub(crate) left: bool,
+}
+
+/// Ends the survivors, as harness exits: `SIGTERM`, then, for any still
+/// there after `grace`, `SIGKILL`, reaping as they go, until none is left
+/// or `after_kill` more has passed. Each is signalled through a pidfd once
+/// what has its pid is checked again ([`may_signal`]), as `reap` does, or by
+/// pid where pidfds are refused. Processes in harness's own session, its
+/// helpers and commands approved to run outside the sandbox, are not
+/// survivors, and are left alone. Returns within about
+/// `grace + after_kill`, and a scan of `/proc` each 20 ms.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) fn end_survivors(grace: std::time::Duration, after_kill: std::time::Duration) -> Ended {
+    let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+    // SAFETY: `getsid(0)` asks for this process's own session id.
+    let my_sid = unsafe { libc::getsid(0) };
+    if my_sid < 0 {
+        // Its helpers cannot be told from survivors: nothing is signalled.
+        return Ended {
+            signalled: 0,
+            left: true,
+        };
+    }
+    let mut signalled = BTreeSet::new();
+    signal_survivors(libc::SIGTERM, me, my_sid, &mut signalled);
+    if signalled.is_empty() && !look_and_reap() {
+        return Ended {
+            signalled: 0,
+            left: false,
+        };
+    }
+    if !gone_within(grace) {
+        signal_survivors(libc::SIGKILL, me, my_sid, &mut signalled);
+        let left = !gone_within(after_kill);
+        return Ended {
+            signalled: signalled.len(),
+            left,
+        };
+    }
+    Ended {
+        signalled: signalled.len(),
+        left: false,
+    }
+}
+
+/// Sends `signal` to each survivor a scan finds, adding each it reached to
+/// `signalled`.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn signal_survivors(signal: libc::c_int, me: i32, my_sid: i32, signalled: &mut BTreeSet<i32>) {
+    let found = scan(Path::new("/proc"), MAX_PROCESSES);
+    let targets: BTreeSet<i32> = survivors(&found.procs, me, my_sid).into_iter().collect();
+    for &pid in &targets {
+        if send(pid, signal, me, my_sid, &targets) {
+            signalled.insert(pid);
+        }
+    }
+}
+
+/// Sends `signal` to `pid`, a survivor among `found`, unless the pid has
+/// changed hands since: whether it did.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn send(pid: i32, signal: libc::c_int, me: i32, my_sid: i32, found: &BTreeSet<i32>) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let pidfd = match pidfd_open(pid) {
+        Ok(pidfd) => Some(pidfd),
+        Err(err) if pidfds_refused(&err) => {
+            PIDFDS_REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+        // Gone, most likely.
+        Err(_) => return false,
+    };
+    // Read once the pidfd holds the process: if that process still has the
+    // pid, what was read is about it.
+    let Some(now) = read_proc(&Path::new("/proc").join(pid.to_string()), pid) else {
+        return false;
+    };
+    if !may_signal(&now, me, my_sid, found) {
+        return false;
+    }
+    match pidfd {
+        // SAFETY: `pidfd_send_signal(2)` takes a pidfd, a signal, no
+        // `siginfo_t` and no flags; the pidfd is open for the call.
+        Some(pidfd) => unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            ) == 0
+        },
+        // SAFETY: sends a signal to `pid`, which `may_signal` just allowed;
+        // the window until the call is the one pidfds close.
+        None => unsafe { libc::kill(pid, signal) == 0 },
+    }
+}
+
+/// Reaps, and looks every 20 ms, until no survivor is left or `limit` has
+/// passed: whether none is left.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn gone_within(limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if !look_and_reap() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Whether `pidfd_open` failing with `err` means pidfds are refused here (a
@@ -903,6 +1049,34 @@ mod tests {
         look_and_reap();
         assert_eq!(read_stat(&dir), None, "the orphan was not reaped");
         assert!(orphan.try_wait().is_err(), "nothing is left to wait for");
+    }
+
+    #[test]
+    fn only_live_survivors_in_another_session_are_signalled() {
+        let me = 100;
+        let my_sid = 50;
+        let found = BTreeSet::from([200, 210]);
+        // The survivor the scan found, a child one of them started since, and
+        // one reparented to harness since its parent exited.
+        for now in [
+            p(200, me, 190, b'S'),
+            p(211, 210, 210, b'R'),
+            p(212, me, 212, b'S'),
+            leader_gone(213, me, 213),
+        ] {
+            assert!(may_signal(&now, me, my_sid, &found), "{now:?}");
+        }
+        // The pid given meanwhile to one of harness's own helpers, to a
+        // process that is not harness's, or to one that has exited.
+        for now in [
+            p(200, me, my_sid, b'S'),
+            p(200, 1, 200, b'S'),
+            p(200, 300, 200, b'S'),
+            p(200, me, 200, b'Z'),
+            p(1, me, 1, b'S'),
+        ] {
+            assert!(!may_signal(&now, me, my_sid, &found), "{now:?}");
+        }
     }
 
     #[test]

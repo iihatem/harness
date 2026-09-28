@@ -2031,3 +2031,136 @@ async fn a_commit_in_a_repository_from_an_image_layer_gets_no_report() {
     assert!(!env.exists(".git/hooks/pre-commit"));
     env.quarantined(".git/hooks/pre-commit");
 }
+
+// ---------------------------------------------------------------------------
+// When harness exits
+// ---------------------------------------------------------------------------
+
+/// A job that rewrites `.git/config` a second after its command ends, then runs on, is ended
+/// when the session ends, and what it did is undone and said.
+async fn a_job_left_running_is_ended_at_exit_and_its_change_undone(
+    sandbox: &LinuxSandbox,
+    env: &Env,
+) {
+    let before = env.read(".git/config");
+    let (output, report) = run(
+        sandbox,
+        env,
+        r##"sh -c 'echo $$ > job.pid; sleep 1; echo "# evil" >> .git/config; exec sleep 30' > /dev/null 2>&1 &"##,
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(report, None);
+    let job = Job::from_pid_file(env, "job.pid").await;
+    wait_until("the job wrote the config", || {
+        env.in_quarantine(".git/config")
+            || env
+                .read_now(".git/config")
+                .is_some_and(|c| c.contains("# evil"))
+    })
+    .await;
+    let started = Instant::now();
+    let said = sandbox.end_session().expect("something to say");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(!job.alive(), "the job still runs: {said}");
+    assert!(
+        said.contains("harness ended 1 process that sandboxed commands left running"),
+        "{said}"
+    );
+    assert!(
+        said.contains("\n- .git/config: changed; restored the earlier version"),
+        "{said}"
+    );
+    assert_eq!(env.read(".git/config"), before);
+    let changed = std::fs::read_to_string(env.quarantined(".git/config")).unwrap();
+    assert!(changed.contains("# evil"), "{changed}");
+    assert_eq!(orphaned_zombies(), Vec::<i32>::new(), "{said}");
+}
+
+#[tokio::test]
+async fn at_exit_a_job_left_running_is_ended_and_its_change_undone_in_the_basic_tier() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let sandbox = env.basic();
+    a_job_left_running_is_ended_at_exit_and_its_change_undone(&sandbox, &env).await;
+}
+
+#[tokio::test]
+async fn at_exit_a_job_left_running_is_ended_and_its_change_undone_in_the_full_tier() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    a_job_left_running_is_ended_at_exit_and_its_change_undone(&sandbox, &env).await;
+}
+
+#[tokio::test]
+async fn at_exit_a_detached_job_is_ended() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    if !have("setsid") {
+        return;
+    }
+    let sandbox = env.basic();
+    let (output, _) = run(
+        &sandbox,
+        &env,
+        "setsid -f sh -c 'echo $$ > job.pid; exec sleep 30' > /dev/null 2>&1 < /dev/null",
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let job = Job::from_pid_file(&env, "job.pid").await;
+    let said = sandbox.end_session().expect("something to say");
+    assert!(!job.alive(), "the detached job still runs: {said}");
+    assert!(said.contains("harness ended 1 process"), "{said}");
+}
+
+#[tokio::test]
+async fn at_exit_a_job_that_ignores_sigterm_is_killed_within_the_bound() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let sandbox = env.basic();
+    let (output, _) = run(
+        &sandbox,
+        &env,
+        r#"sh -c 'trap "" TERM; echo $$ > job.pid; exec sleep 30' > /dev/null 2>&1 &"#,
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let job = Job::from_pid_file(&env, "job.pid").await;
+    let started = Instant::now();
+    let said = sandbox.end_session().expect("something to say");
+    let took = started.elapsed();
+    assert!(!job.alive(), "the job still runs: {said}");
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert!(
+        took >= Duration::from_millis(900),
+        "killed only after a grace: {took:?}"
+    );
+    assert!(said.contains("harness ended 1 process"), "{said}");
+}
+
+#[tokio::test]
+async fn at_exit_a_process_in_harness_s_own_session_is_left_alone() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let sandbox = env.basic();
+    let (output, report) = run(&sandbox, &env, "true").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(report, None);
+    // Like harness's own helpers, or a command approved to run outside the sandbox.
+    let mut own = Killed(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep"),
+    );
+    assert_eq!(sandbox.end_session(), None);
+    assert!(
+        own.0.try_wait().unwrap().is_none(),
+        "a process in harness's own session was ended"
+    );
+}

@@ -42,7 +42,8 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use landlock::{
-    ABI, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr,
+    ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError, Ruleset,
+    RulesetAttr, RulesetCreatedAttr,
 };
 
 use crate::policy::{FsAccess, SandboxPolicy};
@@ -136,11 +137,33 @@ pub fn build_ruleset_fd(policy: &SandboxPolicy) -> io::Result<OwnedFd> {
     let ruleset = match policy.access {
         FsAccess::ReadOnly => ruleset,
         FsAccess::WorkspaceWrite => {
+            // The workspace's rule is not best-effort: without it, every write
+            // to the workspace would fail with `EACCES`, and nothing would say
+            // why.
+            let workspace = PathFd::new(&policy.workspace).map_err(|err| {
+                let PathFdError::OpenCall { source, .. } = err else {
+                    return io::Error::other(err);
+                };
+                io::Error::new(
+                    source.kind(),
+                    format!(
+                        "the sandbox cannot open the workspace {} for its rules: {source}",
+                        policy.workspace.display()
+                    ),
+                )
+            })?;
+            let ruleset = ruleset
+                .add_rule(PathBeneath::new(workspace, access_rw))
+                .map_err(io::Error::other)?;
+            // The other roots are best-effort: `path_beneath_rules` leaves out
+            // one it cannot open (a `TMPDIR` or `writable_roots` entry that is
+            // gone, say).
             let mut roots = writable_roots(
                 policy,
                 std::env::var_os("TMPDIR").as_deref(),
                 home_dir().as_deref(),
             );
+            roots.retain(|root| *root != policy.workspace);
             roots.extend(WORKSPACE_WRITE_DEVICES.iter().map(PathBuf::from));
             ruleset
                 .add_rules(landlock::path_beneath_rules(roots, access_rw))
@@ -364,5 +387,33 @@ mod tests {
             tmpdir_override(FsAccess::ReadOnly, Some(OsStr::new("/")), Some(&home)),
             None
         );
+    }
+
+    #[test]
+    fn a_workspace_the_rules_cannot_open_fails_the_ruleset() {
+        if !crate::linux::linux_sandbox_available() {
+            eprintln!("skipping: linux sandbox unavailable");
+            return;
+        }
+        let (_dir, base) = canon_tempdir();
+        let workspace = base.join("gone");
+        let err = build_ruleset_fd(&policy_for(&workspace))
+            .expect_err("a ruleset without the workspace would refuse every write to it");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        let text = err.to_string();
+        assert!(text.contains(&workspace.display().to_string()), "{text}");
+        assert!(text.contains("No such file or directory"), "{text}");
+    }
+
+    #[test]
+    fn another_writable_root_that_cannot_be_opened_is_left_out() {
+        if !crate::linux::linux_sandbox_available() {
+            eprintln!("skipping: linux sandbox unavailable");
+            return;
+        }
+        let (_ws, workspace) = canon_tempdir();
+        let mut policy = policy_for(&workspace);
+        policy.extra_writable.push(workspace.join("gone"));
+        assert!(build_ruleset_fd(&policy).is_ok());
     }
 }

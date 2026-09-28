@@ -159,16 +159,39 @@ impl Env {
         }
     }
 
-    /// What every version of `rel` in the quarantine holds.
+    /// What every version of `rel` in the quarantine holds: in each command's directory, the
+    /// one stored at `rel` and those stored next to it as `<name>.<n>`, when one command's
+    /// checks took that path more than once.
     fn all_quarantined(&self, rel: &str) -> Vec<String> {
         let stored = stored(rel);
-        std::fs::read_dir(&self.quarantine)
-            .map(|dirs| {
-                dirs.filter_map(Result::ok)
-                    .filter_map(|dir| std::fs::read_to_string(dir.path().join(&stored)).ok())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let (Some(within), Some(name)) = (stored.parent(), stored.file_name()) else {
+            return Vec::new();
+        };
+        let name = name.to_string_lossy().into_owned();
+        let numbered = |entry: &str| {
+            entry == name
+                || entry
+                    .strip_prefix(&format!("{name}."))
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let mut found = Vec::new();
+        for dir in std::fs::read_dir(&self.quarantine)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let Ok(entries) = std::fs::read_dir(dir.path().join(within)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if numbered(&entry.file_name().to_string_lossy())
+                    && let Ok(text) = std::fs::read_to_string(entry.path())
+                {
+                    found.push(text);
+                }
+            }
+        }
+        found
     }
 
     /// The one entry the quarantine holds for `rel` (relative to the workspace): see [`stored`].
@@ -530,6 +553,16 @@ fn the_probe_picks_the_expected_tier() {
 async fn basic_tier_quarantines_a_planted_hook() {
     let _serial = SERIAL.lock().await;
     let Some(env) = Env::new() else { return };
+    let inodes = |env: &Env| {
+        use std::os::unix::fs::MetadataExt;
+        [".git", ".git/hooks"].map(|rel| {
+            std::fs::symlink_metadata(env.ws.join(rel)).map_or_else(
+                |e| format!("{rel}: {e}"),
+                |meta| format!("{rel}: dev {} ino {}", meta.dev(), meta.ino()),
+            )
+        })
+    };
+    let before = inodes(&env);
     let (output, report) = run(
         &env.basic(),
         &env,
@@ -538,9 +571,10 @@ async fn basic_tier_quarantines_a_planted_hook() {
     .await;
     assert!(
         output.status.success(),
-        "{}{}report: {report:?}",
+        "{}{}before the command: {before:?}\nafter it: {:?}\nreport: {report:?}",
         stderr(&output),
-        permissions_around(&env, ".git/hooks")
+        permissions_around(&env, ".git/hooks"),
+        inodes(&env)
     );
     let report = report.expect("a report");
     assert!(report.blocked);

@@ -675,3 +675,150 @@ fn a_snapshot_without_a_record_is_refused() {
     ));
     assert_eq!(f.read("a.txt").as_deref(), Some("two\n"));
 }
+
+// Review E issue 2 (probe D1): where the target has `d/a.txt`, `d` is now a file too large to
+// snapshot. Making the directory would delete it; it is left alone instead.
+#[test]
+fn a_large_file_where_the_target_had_a_directory_is_left_alone() {
+    let f = fixture();
+    f.write("d/a.txt", "a\n");
+    f.write("b.txt", "b\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    std::fs::remove_dir_all(f.ws.join("d")).unwrap();
+    let large = vec![b'x'; MAX_FILE_SIZE as usize + 1];
+    std::fs::write(f.ws.join("d"), &large).unwrap();
+    f.write("b.txt", "changed\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(std::fs::read(f.ws.join("d")).unwrap(), large);
+    assert_eq!(f.read("b.txt").as_deref(), Some("b\n"));
+}
+
+// Review E issue 2 (probe D2): the same with a git-ignored file.
+#[test]
+fn an_ignored_file_where_the_target_had_a_directory_is_left_alone() {
+    let f = fixture();
+    f.write("e/a.txt", "a\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    std::fs::remove_dir_all(f.ws.join("e")).unwrap();
+    f.write(".gitignore", "/e\n");
+    f.write("e", "precious ignored file\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(f.read("e").as_deref(), Some("precious ignored file\n"));
+}
+
+// Review E issue 2 (probe G): `dir` is now a symlink to a directory outside that holds a file of
+// the same name. The symlink is in the pre-rewind snapshot, so the restore replaces it with the
+// directory, and the file outside is never touched.
+#[test]
+fn a_symlink_whose_target_holds_the_same_names_is_replaced_by_the_directory() {
+    let f = fixture();
+    f.write("dir/f.txt", "mine\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    let outside = f.ws.parent().unwrap().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("f.txt"), "outside\n").unwrap();
+    std::fs::remove_dir_all(f.ws.join("dir")).unwrap();
+    std::os::unix::fs::symlink(&outside, f.ws.join("dir")).unwrap();
+    checkpoints.restore(&first).unwrap();
+    assert!(
+        std::fs::symlink_metadata(f.ws.join("dir"))
+            .unwrap()
+            .is_dir()
+    );
+    assert_eq!(f.read("dir/f.txt").as_deref(), Some("mine\n"));
+    assert_eq!(
+        std::fs::read_to_string(outside.join("f.txt")).unwrap(),
+        "outside\n"
+    );
+}
+
+// Review E probe U: an ignored symlink where the target had a directory is left alone, and
+// nothing is written through it.
+#[test]
+fn an_ignored_symlink_where_the_target_had_a_directory_is_left_alone() {
+    let f = fixture();
+    f.write("dir/f.txt", "mine\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    let outside = f.ws.parent().unwrap().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::remove_dir_all(f.ws.join("dir")).unwrap();
+    std::os::unix::fs::symlink(&outside, f.ws.join("dir")).unwrap();
+    f.write(".gitignore", "/dir\n");
+    checkpoints.restore(&first).unwrap();
+    assert!(
+        std::fs::symlink_metadata(f.ws.join("dir"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+}
+
+// A file the agent replaced with a directory comes back when everything in the directory is in
+// the pre-rewind snapshot; a directory that holds something snapshots leave out is left alone.
+#[test]
+fn a_file_replaced_by_a_directory_comes_back_unless_the_directory_holds_what_snapshots_leave_out() {
+    let f = fixture();
+    f.write(".gitignore", "*.log\n");
+    f.write("x", "file x\n");
+    f.write("y", "file y\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    for name in ["x", "y"] {
+        std::fs::remove_file(f.ws.join(name)).unwrap();
+        f.write(&format!("{name}/a.txt"), "made by the agent\n");
+    }
+    f.write("y/keep.log", "ignored, so no snapshot holds it\n");
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(f.read("x").as_deref(), Some("file x\n"));
+    assert!(f.ws.join("y").is_dir());
+    assert_eq!(
+        f.read("y/keep.log").as_deref(),
+        Some("ignored, so no snapshot holds it\n")
+    );
+}
+
+// A directory that replaced a file and holds a nested repository is left alone: no snapshot holds
+// what is inside a nested repository.
+#[test]
+fn a_directory_holding_a_nested_repository_is_never_removed() {
+    let f = fixture();
+    f.write("x", "file x\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    std::fs::remove_file(f.ws.join("x")).unwrap();
+    let inner = f.ws.join("x/inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    git(&inner, &["init", "-q"]);
+    std::fs::write(inner.join("work.txt"), "the user's work\n").unwrap();
+    git(&inner, &["add", "work.txt"]);
+    git(&inner, &["commit", "-q", "-m", "work"]);
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(
+        f.read("x/inner/work.txt").as_deref(),
+        Some("the user's work\n")
+    );
+}
+
+// The same with a nested repository that has no commit yet: git cannot add it, and no snapshot
+// holds its files.
+#[test]
+fn a_directory_holding_an_empty_nested_repository_is_never_removed() {
+    let f = fixture();
+    f.write("x", "file x\n");
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    std::fs::remove_file(f.ws.join("x")).unwrap();
+    let inner = f.ws.join("x/inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    git(&inner, &["init", "-q"]);
+    std::fs::write(inner.join("work.txt"), "the user's work\n").unwrap();
+    checkpoints.restore(&first).unwrap();
+    assert_eq!(
+        f.read("x/inner/work.txt").as_deref(),
+        Some("the user's work\n")
+    );
+}

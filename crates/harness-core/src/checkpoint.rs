@@ -460,13 +460,21 @@ impl Checkpoints {
         let then = self.tree_entries(commit, deadline)?;
         let now_paths: HashSet<&[u8]> = now.iter().map(|e| e.path.as_slice()).collect();
         let then_paths: HashSet<&[u8]> = then.iter().map(|e| e.path.as_slice()).collect();
-        // Paths `commit` holds that exist now but are not in `before` are what snapshots leave
-        // out now: restoring them would overwrite something no snapshot holds.
+        let current = Current {
+            paths: &now_paths,
+            record: &self.record_of(before)?,
+            gitlinks: now
+                .iter()
+                .filter(|e| e.mode == GITLINK)
+                .map(|e| e.path.as_slice())
+                .collect(),
+        };
+        // Paths `commit` holds that `before` does not are written only where that removes
+        // nothing that no snapshot holds.
         let skipped: Vec<&[u8]> = then
             .iter()
             .map(|e| e.path.as_slice())
-            .filter(|p| !now_paths.contains(p))
-            .filter(|p| std::fs::symlink_metadata(self.root.join(OsStr::from_bytes(p))).is_ok())
+            .filter(|p| !now_paths.contains(p) && self.blocked(p, &current))
             .collect();
         // Paths `before` holds that `commit` does not would be removed as created since. Those
         // `commit` left out existed then, though: they stay as they are.
@@ -481,6 +489,39 @@ impl Checkpoints {
         };
         self.git(&["read-tree", "--reset", "-u", &tree], remaining(deadline)?)?;
         Ok(())
+    }
+
+    /// Whether writing the target's file at `path`, which `before` does not hold, would remove
+    /// something no snapshot holds. Each component is looked at without following symlinks. A
+    /// file, symlink or anything else but a directory on the way, or at `path`, would be removed:
+    /// that is fine only when `before` holds it (a symlink the agent made, say), not when
+    /// snapshots leave it out (large, ignored or unreadable). A directory at `path` would be
+    /// removed with everything in it: that is fine only when `before` holds all of it.
+    fn blocked(&self, path: &[u8], current: &Current) -> bool {
+        let mut at = self.root.clone();
+        let mut start = 0;
+        loop {
+            let end = path[start..]
+                .iter()
+                .position(|b| *b == b'/')
+                .map_or(path.len(), |i| start + i);
+            at.push(OsStr::from_bytes(&path[start..end]));
+            let here = &path[..end];
+            let meta = match std::fs::symlink_metadata(&at) {
+                Ok(meta) => meta,
+                // Nothing there: git makes what the target has.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+                // Whatever it is, it cannot be told apart: leave it.
+                Err(_) => return true,
+            };
+            if !meta.is_dir() {
+                return !current.paths.contains(here);
+            }
+            if end == path.len() {
+                return current.holds_what_snapshots_leave_out(here);
+            }
+            start = end + 1;
+        }
     }
 
     /// The tree of `commit` without the paths `skipped` and with the entries `kept`, built in the
@@ -830,6 +871,31 @@ impl Record {
                 .any(|(i, b)| *b == b'/' && self.left_out.contains(&path[..=i]))
     }
 }
+
+/// The workspace as the snapshot just taken before a restore holds it.
+struct Current<'a> {
+    paths: &'a HashSet<&'a [u8]>,
+    record: &'a Record,
+    /// Its nested repositories, whose contents no snapshot holds.
+    gitlinks: Vec<&'a [u8]>,
+}
+
+impl Current<'_> {
+    /// Whether the directory `dir` holds something no snapshot holds: what the record says was
+    /// left out, or a nested repository.
+    fn holds_what_snapshots_leave_out(&self, dir: &[u8]) -> bool {
+        let inside = [dir, &b"/"[..]].concat();
+        self.record
+            .left_out
+            .range(inside.clone()..)
+            .next()
+            .is_some_and(|p| p.starts_with(&inside))
+            || self.gitlinks.iter().any(|p| p.starts_with(&inside))
+    }
+}
+
+/// The mode of a nested repository in a tree.
+const GITLINK: &str = "160000";
 
 /// One file of a snapshot, as `ls-tree` lists it.
 #[derive(Debug)]

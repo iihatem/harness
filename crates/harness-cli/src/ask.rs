@@ -228,8 +228,15 @@ pub async fn run(
             terminal_safe_text(&final_text)
         );
     }
-    sandbox_session.end();
+    end_run(agent, sandbox_session);
     exit_code(reason, blocked)
+}
+
+/// Ends the run: first the agent, which releases the session file, then the sandbox's session,
+/// which can take a few seconds, so a `-c` started once the answer prints finds the file free.
+fn end_run(agent: Agent, sandbox_session: SessionEnd) {
+    drop(agent);
+    sandbox_session.end();
 }
 
 /// Ends the sandbox's session ([`CommandSandbox::end_session`]) once: when [`end`](Self::end) is
@@ -593,6 +600,88 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = tool_context(dir.path(), None, FsAccess::WorkspaceWrite).await;
         assert!(ctx.sandbox.is_none());
+    }
+
+    /// Records, when its session ends, whether the harness session file at `path` could be
+    /// opened then.
+    #[derive(Debug)]
+    struct LockProbe {
+        path: std::path::PathBuf,
+        free: Mutex<Option<bool>>,
+    }
+
+    impl CommandSandbox for LockProbe {
+        fn name(&self) -> &'static str {
+            "lock probe"
+        }
+
+        fn command(
+            &self,
+            _access: FsAccess,
+            _workspace: &Path,
+            program: &str,
+            _args: &[&str],
+        ) -> std::io::Result<tokio::process::Command> {
+            Ok(tokio::process::Command::new(program))
+        }
+
+        fn is_denial(&self, _exit_code: Option<i32>, _output: &str) -> bool {
+            false
+        }
+
+        fn start_session(&self, _workspace: &Path) {}
+
+        fn end_session(&self) -> Option<String> {
+            let free = harness_core::session::Session::open(&self.path).is_ok();
+            *self.free.lock().unwrap() = Some(free);
+            None
+        }
+    }
+
+    // Review D M9: ending the sandbox's session takes a few seconds on Linux; the session file
+    // is released before, so a `-c` started as soon as the answer prints can use it.
+    #[test]
+    fn the_session_is_released_before_the_sandbox_session_ends() {
+        use harness_core::{
+            message::Message,
+            session::{EntryKind, Session},
+            testing::MockProvider,
+            tool::ToolRegistry,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(&dir.path().join("sessions"), dir.path());
+        session.append(EntryKind::Message {
+            message: Message::User {
+                content: "hi".into(),
+            },
+            display: None,
+            note: false,
+        });
+        let path = session.path().unwrap().to_path_buf();
+        let policy = Arc::new(PermissionEngine::new(EngineConfig {
+            mode: Mode::Auto,
+            workspace: dir.path().to_path_buf(),
+            read_dirs: vec![],
+            rules: RuleSet::default(),
+            sandbox_available: false,
+            writes_need_approval: false,
+        }));
+        let agent = Agent::new(
+            MockProvider::new(vec![]),
+            ToolRegistry::new(vec![]),
+            policy,
+            Arc::new(NonInteractive),
+            AgentConfig::new("mock/m", "m", "system", dir.path().join("out")),
+            ToolContext::new(dir.path()),
+        )
+        .with_session(session);
+        let probe = Arc::new(LockProbe {
+            path,
+            free: Mutex::new(None),
+        });
+        let shared: Arc<dyn CommandSandbox> = probe.clone();
+        end_run(agent, SessionEnd::new(Some(shared)));
+        assert_eq!(*probe.free.lock().unwrap(), Some(true));
     }
 
     #[test]

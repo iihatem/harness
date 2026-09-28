@@ -720,3 +720,54 @@ fn project_dir(project: &str) -> (tempfile::TempDir, std::path::PathBuf, std::pa
     let none = dir.path().join("none.toml");
     (dir, ws, none)
 }
+
+// Re-review C, P3-R4 minor: a project config that is invalid once trusted is rejected while
+// untrusted too, even though its low threshold is not applied then.
+#[test]
+fn a_project_keep_share_is_checked_against_the_projects_own_threshold() {
+    let project = "[compaction]\nthreshold_percent = 30\nkeep_recent_percent = 40\n";
+    let (dir, ws, none) = project_dir(project);
+    let err = config::load(&none, &ws, &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(".harness/config.toml")
+            && err.contains("keep_recent_percent must be below compaction.threshold_percent"),
+        "{err}"
+    );
+    // The same config is rejected once trusted, and `harness trust` cannot trust it.
+    let err = config::project_widening(&none, &ws)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("keep_recent_percent must be below"), "{err}");
+    drop(dir);
+}
+
+// A valid project pair whose threshold is ignored keeps its keep share only while that share is
+// below the threshold that applies instead.
+#[test]
+fn an_ignored_low_threshold_takes_a_keep_share_it_cannot_hold_with_it() {
+    let global = "[compaction]\nthreshold_percent = 20\nkeep_recent_percent = 10\n";
+    let (cfg, _) = load_project(
+        Some(global),
+        "[compaction]\nthreshold_percent = 30\nkeep_recent_percent = 25\n",
+        true,
+    );
+    assert_eq!(cfg.compaction.threshold(), 0.2);
+    assert_eq!(cfg.compaction.keep_recent(), 0.1);
+    assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
+    assert!(
+        cfg.warnings[0].contains("compaction.threshold_percent = 30")
+            && cfg.warnings[0].contains("keep_recent_percent = 25"),
+        "{}",
+        cfg.warnings[0]
+    );
+    // One that fits under the threshold that applies is kept.
+    let (cfg, _) = load_project(
+        None,
+        "[compaction]\nthreshold_percent = 30\nkeep_recent_percent = 25\n",
+        true,
+    );
+    assert_eq!(cfg.compaction.threshold(), 0.8);
+    assert_eq!(cfg.compaction.keep_recent(), 0.25);
+}

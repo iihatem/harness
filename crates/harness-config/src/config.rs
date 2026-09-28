@@ -105,6 +105,14 @@ impl CompactionSettings {
         None
     }
 
+    /// These settings with `project`'s over them.
+    fn overlaid(&self, project: &CompactionSettings) -> CompactionSettings {
+        CompactionSettings {
+            threshold_percent: project.threshold_percent.or(self.threshold_percent),
+            keep_recent_percent: project.keep_recent_percent.or(self.keep_recent_percent),
+        }
+    }
+
     /// What is wrong with these settings, if anything.
     fn problem(&self) -> Option<String> {
         if let Some(problem) = self.out_of_range() {
@@ -295,10 +303,17 @@ pub fn project_file(workspace: &Path) -> PathBuf {
 /// `harness trust`). Whether a mode or step limit widens depends on the global config, so it is
 /// read too.
 pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening, ConfigError> {
-    let baseline = Baseline::new(parse_file(global_file)?.as_ref(), workspace);
+    let global = parse_file(global_file)?;
+    let baseline = Baseline::new(global.as_ref(), workspace);
     let path = project_file(workspace);
     let project = parse_file(&path)?.unwrap_or_default();
-    if let Some(message) = project.compaction.out_of_range() {
+    // Settings that would be invalid once trusted cannot be trusted.
+    let global_compaction = global.map(|g| g.compaction).unwrap_or_default();
+    if let Some(message) = project
+        .compaction
+        .out_of_range()
+        .or_else(|| global_compaction.overlaid(&project.compaction).problem())
+    {
         return Err(ConfigError::Parse { path, message });
     }
     Ok(widening(&project, baseline))
@@ -352,22 +367,34 @@ pub fn load(
         // Compaction settings change when the conversation is summarized, not what the agent
         // may do, so they apply without trust, except a threshold low enough to summarize (a paid
         // request that drops verbatim context) every few turns (ruling P3-R4).
-        let low = low_threshold(&project).filter(|_| !cfg.trusted);
-        if low.is_none() && project.compaction.threshold_percent.is_some() {
-            cfg.compaction.threshold_percent = project.compaction.threshold_percent;
-        }
-        if project.compaction.keep_recent_percent.is_some() {
-            cfg.compaction.keep_recent_percent = project.compaction.keep_recent_percent;
-        }
-        if let Some(message) = cfg.compaction.problem() {
+        // The project's settings are checked as they would apply once trusted, so a config that
+        // is invalid then is invalid now too.
+        let as_trusted = cfg.compaction.overlaid(&project.compaction);
+        if let Some(message) = as_trusted.problem() {
             return Err(ConfigError::Parse { path, message });
         }
-        if let Some(p) = low {
-            cfg.warnings.push(format!(
-                "{}: ignoring {THRESHOLD_ITEM}{p}: a project may compact below {MIN_UNTRUSTED_THRESHOLD_PERCENT}% of the context window only in a trusted workspace, so {}% applies; run `harness trust` to review and apply it",
-                path.display(),
-                (cfg.compaction.threshold() * 100.0).round()
-            ));
+        match low_threshold(&project).filter(|_| !cfg.trusted) {
+            None => cfg.compaction = as_trusted,
+            Some(p) => {
+                // The global threshold or the default applies, and the project's keep share
+                // with it only while it is below that threshold.
+                let with_keep = CompactionSettings {
+                    threshold_percent: cfg.compaction.threshold_percent,
+                    ..as_trusted
+                };
+                let mut ignored = format!("{THRESHOLD_ITEM}{p}");
+                if with_keep.problem().is_none() {
+                    cfg.compaction = with_keep;
+                } else if let Some(keep) = project.compaction.keep_recent_percent {
+                    ignored.push_str(&format!(" and keep_recent_percent = {keep}"));
+                }
+                cfg.warnings.push(format!(
+                    "{}: ignoring {ignored}: a project may compact below {MIN_UNTRUSTED_THRESHOLD_PERCENT}% of the context window only in a trusted workspace, so {}% applies, keeping {}%; run `harness trust` to review and apply it",
+                    path.display(),
+                    (cfg.compaction.threshold() * 100.0).round(),
+                    (cfg.compaction.keep_recent() * 100.0).round()
+                ));
+            }
         }
         if let Some(steps) = project.max_steps.filter(|&n| n <= baseline.max_steps) {
             cfg.max_steps = Some(steps);

@@ -341,3 +341,51 @@ fn a_command_file_over_the_size_limit_is_cut_with_a_warning() {
         found.warnings
     );
 }
+
+// Final review, minor 4: a whole namespace kept in a dotfiles repository,
+// `~/.claude/commands/opsx -> ~/dotfiles/opsx`, was skipped silently. In a global directory a
+// linked subdirectory is followed, and a loop of links ends.
+#[test]
+fn a_linked_subdirectory_in_a_global_commands_directory_is_followed() {
+    let (_dir, base) = setup();
+    write(&base.join("dotfiles/opsx/propose.md"), "Propose.\n");
+    write(&base.join("dotfiles/opsx/deep/apply.md"), "Apply.\n");
+    std::fs::create_dir_all(base.join("home/.claude/commands")).unwrap();
+    std::os::unix::fs::symlink(
+        base.join("dotfiles/opsx"),
+        base.join("home/.claude/commands/opsx"),
+    )
+    .unwrap();
+    // A link back up to a directory being read.
+    std::os::unix::fs::symlink("..", base.join("dotfiles/opsx/deep/up")).unwrap();
+    std::fs::create_dir_all(base.join("config/commands")).unwrap();
+    std::os::unix::fs::symlink(".", base.join("config/commands/self")).unwrap();
+    let found = discover(&base);
+    let names: Vec<&str> = found.custom.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["opsx:deep:apply", "opsx:propose"], "{names:?}");
+    assert!(
+        found.custom.iter().all(|c| c.scope == Scope::Global),
+        "{:?}",
+        found.custom
+    );
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}
+
+// In a project commands directory a linked subdirectory is still skipped, now with a warning.
+#[test]
+fn a_linked_subdirectory_in_a_project_commands_directory_is_skipped_with_a_warning() {
+    let (_dir, base) = setup();
+    write(&base.join("project/tools/opsx/propose.md"), "Propose.\n");
+    std::fs::create_dir_all(base.join("project/.claude/commands")).unwrap();
+    let link = base.join("project/.claude/commands/opsx");
+    std::os::unix::fs::symlink("../../tools/opsx", &link).unwrap();
+    let found = discover(&base);
+    assert!(found.custom.is_empty(), "{:?}", found.custom);
+    assert_eq!(found.warnings.len(), 1, "{:?}", found.warnings);
+    assert!(
+        found.warnings[0].contains(&format!("skipped {}", link.display()))
+            && found.warnings[0].contains("linked directory"),
+        "{}",
+        found.warnings[0]
+    );
+}

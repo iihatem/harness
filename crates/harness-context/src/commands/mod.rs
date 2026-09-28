@@ -6,7 +6,11 @@ pub mod expand;
 pub mod frontmatter;
 pub mod init;
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
 
 use crate::read::{not_regular, read_regular};
 
@@ -26,7 +30,8 @@ pub const BUILTINS: [(&str, &str); 12] = [
     ("quit", "Exit harness"),
 ];
 
-/// Command files deeper than this below a commands directory are ignored.
+/// Command files deeper than this below a commands directory are ignored, also through linked
+/// directories.
 const MAX_DEPTH: usize = 8;
 /// Bytes read from one command file.
 const MAX_FILE_BYTES: usize = 1024 * 1024;
@@ -96,9 +101,10 @@ pub fn is_builtin(name: &str) -> bool {
 
 /// Finds the custom commands for a project rooted at `project_root` (the repository root, or the
 /// working directory outside a repository). Project command files must resolve inside the
-/// project, and a project commands directory that links outside it is skipped with a warning;
-/// global ones, the user's own, may link anywhere. A project commands directory that is also a
-/// global one (in the home directory) is read as global.
+/// project, and a project commands directory that links outside it is skipped with a warning, as
+/// is a linked directory inside one; global ones, the user's own, may link anywhere, linked
+/// directories included. A project commands directory that is also a global one (in the home
+/// directory) is read as global.
 pub fn discover(project_root: &Path, config_dir: &Path, home: Option<&Path>) -> Commands {
     let project = project_root
         .canonicalize()
@@ -146,12 +152,23 @@ struct Finder {
     commands: Commands,
     /// The scope of the directory being walked.
     scope: Scope,
+    /// The directories read so far, by device and inode, so each is read once and a loop of
+    /// links ends.
+    visited: HashSet<(u64, u64)>,
 }
 
 impl Finder {
-    /// Reads the command files below `dir`. With `confine`, each must resolve inside it.
+    /// Reads the command files below `dir`. With `confine` (a project's directory), each must
+    /// resolve inside it, and linked directories are skipped with a warning; without, linked
+    /// directories are followed.
     fn walk(&mut self, dir: &Path, confine: Option<&Path>, namespace: &mut Vec<String>) {
         if namespace.len() > MAX_DEPTH {
+            return;
+        }
+        let Ok(meta) = std::fs::metadata(dir) else {
+            return;
+        };
+        if !self.visited.insert((meta.dev(), meta.ino())) {
             return;
         }
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -168,7 +185,16 @@ impl Finder {
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
-            if meta.is_dir() {
+            let linked_dir =
+                meta.is_symlink() && std::fs::metadata(&path).is_ok_and(|m| m.is_dir());
+            if linked_dir && confine.is_some() {
+                self.commands.warnings.push(format!(
+                    "skipped {}: it is a linked directory, and linked directories in a project's commands are not followed",
+                    path.display()
+                ));
+            } else if meta.is_dir() || linked_dir {
+                // A linked directory in the user's own commands: a namespace kept in a dotfiles
+                // repository, say.
                 namespace.push(name);
                 self.walk(&path, confine, namespace);
                 namespace.pop();

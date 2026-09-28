@@ -108,6 +108,42 @@ fn push_unique(list: &mut Vec<String>, reason: String) {
     }
 }
 
+/// Whether `cmd` is nothing but `ARGUMENTS='…'`, a single-quoted literal assigned to the variable
+/// harness sets for a command file's shell command (ruling P3-R5). Bash gives the name no
+/// meaning, and the value has no expansion, so it changes nothing the analysis relies on; a
+/// later `$ARGUMENTS` is only known at run time, like any parameter.
+fn sets_only_command_arguments(cmd: &ast::SimpleCommand) -> bool {
+    cmd.word_or_name.is_none()
+        && cmd.suffix.is_none()
+        && cmd.prefix.as_ref().is_some_and(|prefix| {
+            prefix.0.len() == 1
+                && matches!(&prefix.0[0], Item::AssignmentWord(assignment, _)
+                    if !assignment.append
+                        && matches!(&assignment.name,
+                            ast::AssignmentName::VariableName(name) if name == "ARGUMENTS")
+                        && matches!(&assignment.value,
+                            ast::AssignmentValue::Scalar(word) if single_quoted(&word.value)))
+        })
+}
+
+/// Whether `raw` is only single-quoted text, joined by `\'`, as harness writes it: `'a'\''b'`.
+fn single_quoted(raw: &str) -> bool {
+    let mut rest = raw;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('\'') {
+            let Some(end) = after.find('\'') else {
+                return false;
+            };
+            rest = &after[end + 1..];
+        } else if let Some(after) = rest.strip_prefix("\\'") {
+            rest = after;
+        } else {
+            return false;
+        }
+    }
+    raw.starts_with('\'')
+}
+
 /// The variable an assignment sets (`A` for `A[i]=x`).
 fn assignment_name(assignment: &ast::Assignment) -> &str {
     match &assignment.name {
@@ -452,7 +488,7 @@ impl Walker<'_> {
             operands.hidden = operands.hidden.union(hidden);
         }
         if argv.is_empty() {
-            if assigns {
+            if assigns && !sets_only_command_arguments(cmd) {
                 self.undecomposable("sets shell variables".into());
             }
             return;

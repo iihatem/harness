@@ -135,7 +135,7 @@ In workspace-write sandboxes the system SHALL protect `.git/config`, `.git/hooks
 
 On macOS, and on Linux when unprivileged user namespaces are available (the full tier), writes to these paths MUST fail. On Linux, names that do not exist yet MUST be caught by a guard that moves them to a quarantine directory, never deleting them, and reports it in the tool result. The guard's scan for new repositories MUST use the ignore rules as they were when the session started, so that an ignore rule written during the session cannot hide a new repository.
 
-When user namespaces are unavailable (the basic tier), the system MUST warn at startup and point to `harness sandbox doctor`. The guard MUST restore changed protected files after each command, and, while a process started by an earlier sandboxed command is still running, also before each later command. With `sandbox.linux_git_protection = "required"`, the basic tier MUST require approval for every shell command in `ask` and `auto`.
+When user namespaces are unavailable (the basic tier), the system MUST warn at startup and point to `harness sandbox doctor`. The guard MUST restore changed protected files after each command, and, while a process started by an earlier sandboxed command is still running, also before each later command. When harness exits, it MUST end the processes sandboxed commands left running and check once more. With `sandbox.linux_git_protection = "required"`, the basic tier MUST require approval for every shell command in `ask` and `auto`.
 
 #### Scenario: Planting a hook
 - **WHEN** a sandboxed command runs `echo x > .git/hooks/pre-commit` in `auto` mode on macOS, or on Linux in the full tier
@@ -158,6 +158,11 @@ When user namespaces are unavailable (the basic tier), the system MUST warn at s
 #### Scenario: Hiding a new repository behind an ignore rule
 - **WHEN** a sandboxed command on Linux adds `sub/` to `.gitignore` and then runs `git init sub`
 - **THEN** `sub/.git` is moved to the quarantine directory and the tool result says so
+
+#### Scenario: A background process outlives harness
+- **WHEN** a sandboxed command on Linux leaves a background process running and harness then exits
+- **THEN** harness ends that process before it exits, undoes any change it made to protected files, and says so on stderr
+- **AND** the exit code is unchanged
 
 #### Scenario: A background process changes config in the Linux basic tier
 - **WHEN** user namespaces are blocked and a sandboxed command starts a background process that rewrites `.git/config` after the command ends

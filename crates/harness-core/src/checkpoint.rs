@@ -1,8 +1,13 @@
 //! Checkpoints: snapshots of the workspace in a shadow git repository in harness's data
 //! directory. The shadow repository has its own `GIT_DIR` and index, so the user's repository,
 //! index, branches and history are never touched, and directories that are not repositories work
-//! too. git runs without the user's global and system configuration, so no configured filter,
-//! hook or file-system monitor runs.
+//! too. git runs without the user's global and system configuration, and with settings and
+//! attributes that outrank the shadow repository's own, so no filter, hook or file-system monitor
+//! runs and files are stored and restored byte for byte.
+//!
+//! What a snapshot leaves out (large, ignored or unreadable files, and the directories always left
+//! out) is recorded with it, so a restore never deletes what existed then, and never overwrites or
+//! removes to make room what the snapshot taken just before it leaves out.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -250,8 +255,7 @@ impl Checkpoints {
     /// Removes the snapshots of sessions that no longer exist (`live` says which session ids
     /// still do): their refs and their files here, then every object nothing reaches any more.
     /// A session whose last snapshot is less than a day old is kept, and one call removes at most
-    /// [`PRUNE_AT_MOST`] sessions within [`PRUNE_TIMEOUT`], so it stays quick. Returns how many
-    /// sessions it removed.
+    /// 20 sessions within 10 seconds, so it stays quick. Returns how many sessions it removed.
     pub fn prune(&self, live: impl Fn(&str) -> bool) -> Result<usize, CheckpointError> {
         let deadline = Instant::now() + PRUNE_TIMEOUT;
         let listed = self.git_bytes(
@@ -316,7 +320,10 @@ impl Checkpoints {
     }
 
     /// Snapshots the workspace and returns the commit. Files over [`MAX_FILE_SIZE`], git-ignored
-    /// files, `.git`, `node_modules` and `target` are left out.
+    /// files (in a repository, by the repository's rules), `.git`, `node_modules` and `target`, and
+    /// `.harness` and a `HEAD` at the top of the workspace are left out. A workspace whose first
+    /// snapshot takes longer than the time limit gets no index to start from, so later snapshots
+    /// there are no faster.
     pub fn snapshot(&self, message: &str) -> Result<String, CheckpointError> {
         self.unlock_after(self.snapshot_within(message, self.timeout))
     }

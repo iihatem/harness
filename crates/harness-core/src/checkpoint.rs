@@ -89,6 +89,12 @@ pub enum CheckpointError {
     )]
     OtherWorkspace { taken: PathBuf },
     #[error(
+        "this snapshot was taken with {} as git's work tree, but harness now uses {} for this directory (the repository's ignore rules for it changed since), so its paths would land in the wrong place",
+        taken.display(),
+        now.display()
+    )]
+    OtherRoot { taken: PathBuf, now: PathBuf },
+    #[error(
         "the checkpoint repository {} is inside {}, where commands can change it; move harness's data directory (HARNESS_HOME or XDG_DATA_HOME) out of it",
         gitdir.display(),
         root.display()
@@ -423,6 +429,7 @@ impl Checkpoints {
         // the snapshot records the mode of files only their owner may read.
         let mut record = Record {
             workspace: Some(self.workspace.clone()),
+            root: Some(self.root.clone()),
             ..Record::default()
         };
         for path in &listed {
@@ -660,6 +667,17 @@ impl Checkpoints {
             taken => {
                 return Err(CheckpointError::OtherWorkspace {
                     taken: taken.clone().unwrap_or_default(),
+                });
+            }
+        }
+        // The same workspace can have another work tree now: the repository's rules for it
+        // changed, so it is its own now, or no longer.
+        match &target.root {
+            Some(taken) if *taken == self.root => {}
+            taken => {
+                return Err(CheckpointError::OtherRoot {
+                    taken: taken.clone().unwrap_or_default(),
+                    now: self.root.clone(),
                 });
             }
         }
@@ -1215,18 +1233,22 @@ fn read_small_file(path: &Path) -> Option<String> {
     Some(text)
 }
 
-/// What a snapshot knows besides its files: the workspace it was taken for and, with paths
+/// What a snapshot knows besides its files: the workspace it was taken for, git's work tree then,
+/// and, with paths
 /// relative to the root, the paths that existed but were left out (large, ignored or unreadable
 /// files, and whole directories, which end with `/`), and the permissions of its private files.
 #[derive(Debug, Default)]
 struct Record {
     workspace: Option<PathBuf>,
+    /// git's work tree when it was taken, which its paths are relative to.
+    root: Option<PathBuf>,
     left_out: BTreeSet<Vec<u8>>,
     modes: BTreeMap<Vec<u8>, u32>,
 }
 
 impl Record {
-    /// NUL-terminated items: [`RECORD_MAGIC`], `workspace <path>`, then `left-out <path>` for
+    /// NUL-terminated items: [`RECORD_MAGIC`], `workspace <path>`, `root <path>`, then
+    /// `left-out <path>` for
     /// each path left out, and `mode <octal> <path>` for each private file.
     fn encode(&self) -> Vec<u8> {
         let mut out = RECORD_MAGIC.to_vec();
@@ -1234,6 +1256,11 @@ impl Record {
         if let Some(workspace) = &self.workspace {
             out.extend_from_slice(b"workspace ");
             out.extend_from_slice(workspace.as_os_str().as_bytes());
+            out.push(0);
+        }
+        if let Some(root) = &self.root {
+            out.extend_from_slice(b"root ");
+            out.extend_from_slice(root.as_os_str().as_bytes());
             out.push(0);
         }
         for path in &self.left_out {
@@ -1258,6 +1285,8 @@ impl Record {
         for item in items {
             if let Some(path) = item.strip_prefix(b"workspace ") {
                 record.workspace = Some(PathBuf::from(OsStr::from_bytes(path)));
+            } else if let Some(path) = item.strip_prefix(b"root ") {
+                record.root = Some(PathBuf::from(OsStr::from_bytes(path)));
             } else if let Some(path) = item.strip_prefix(b"left-out ") {
                 record.left_out.insert(path.to_vec());
             } else if let Some(rest) = item.strip_prefix(b"mode ") {
@@ -1411,6 +1440,7 @@ mod tests {
     fn a_record_round_trips_and_covers_what_lies_in_its_directories() {
         let mut record = Record {
             workspace: Some(PathBuf::from("/work/a b")),
+            root: Some(PathBuf::from("/work")),
             ..Record::default()
         };
         for path in [&b".env"[..], b"build/", b"odd\nname", b"web/node_modules/"] {
@@ -1421,6 +1451,7 @@ mod tests {
         assert_eq!(decoded.left_out, record.left_out);
         assert_eq!(decoded.modes, record.modes);
         assert_eq!(decoded.workspace, record.workspace);
+        assert_eq!(decoded.root, record.root);
         assert!(decoded.covers(b".env"));
         assert!(decoded.covers(b"build/out.o"));
         assert!(decoded.covers(b"build/deep/er.o"));

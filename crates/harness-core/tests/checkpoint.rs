@@ -1394,6 +1394,84 @@ fn a_users_file_named_record_is_never_read_as_a_record() {
     assert_eq!(f.read("a.txt").as_deref(), Some("two\n"));
 }
 
+/// Every file under `dir`, relative to it, leaving out `.git`.
+fn tree(dir: &Path) -> Vec<String> {
+    fn go(base: &Path, dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == ".git") {
+                continue;
+            }
+            if path.is_dir() {
+                go(base, &path, out);
+            } else {
+                out.push(path.strip_prefix(base).unwrap().display().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+// Re-review E, probe X: the repository ignored `scratch/` when the snapshot was taken there, so it
+// was its own work tree; now it does not, so the repository is. The snapshot's paths are relative
+// to the old root: restoring it would write at the repository's root and delete the workspace's
+// files. It is refused before anything changes.
+#[test]
+fn a_snapshot_taken_under_another_work_tree_is_refused_x() {
+    let f = fixture();
+    git(&f.ws, &["init", "-q"]);
+    f.write(".gitignore", "scratch/\n");
+    f.write("root.txt", "root\n");
+    f.write("scratch/notes.txt", "one\n");
+    let ws = f.ws.join("scratch");
+    let first = Checkpoints::open(&f.gitdir, &ws, "s1").unwrap();
+    let snapshot = first.snapshot("turn 1").unwrap();
+    drop(first);
+    f.write(".gitignore", "\n");
+    f.write("scratch/notes.txt", "two\n");
+    f.write("scratch/mine.txt", "user file\n");
+    let before = tree(&f.ws);
+    let second = Checkpoints::open(&f.gitdir, &ws, "s1").unwrap();
+    match second.restore(&snapshot) {
+        Err(CheckpointError::OtherRoot { taken, now }) => {
+            assert_eq!(taken, ws);
+            assert_eq!(now, f.ws);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(tree(&f.ws), before);
+    assert_eq!(f.read("scratch/notes.txt").as_deref(), Some("two\n"));
+}
+
+// Re-review E, probe Y: the reverse, from the repository's work tree to the workspace's own.
+#[test]
+fn a_snapshot_taken_under_another_work_tree_is_refused_y() {
+    let f = fixture();
+    git(&f.ws, &["init", "-q"]);
+    f.write("root.txt", "root\n");
+    f.write("scratch/notes.txt", "one\n");
+    let ws = f.ws.join("scratch");
+    let first = Checkpoints::open(&f.gitdir, &ws, "s1").unwrap();
+    let snapshot = first.snapshot("turn 1").unwrap();
+    drop(first);
+    f.write(".gitignore", "scratch/\n");
+    f.write("scratch/notes.txt", "two\n");
+    let before = tree(&f.ws);
+    let second = Checkpoints::open(&f.gitdir, &ws, "s1").unwrap();
+    match second.restore(&snapshot) {
+        Err(CheckpointError::OtherRoot { taken, now }) => {
+            assert_eq!(taken, f.ws);
+            assert_eq!(now, ws);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(tree(&f.ws), before);
+    assert!(!f.ws.join("scratch/scratch").exists());
+}
+
 /// Whether the tests run as root, which permissions do not stop.
 fn is_root() -> bool {
     // SAFETY: `geteuid` cannot fail.

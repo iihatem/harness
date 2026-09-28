@@ -109,6 +109,16 @@ impl Env {
             .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
     }
 
+    /// `git args`, which must succeed; its error output says why not.
+    fn git_ok(&self, args: &[&str]) {
+        let output = self.git(args);
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn settings(&self) -> SandboxSettings {
         SandboxSettings {
             quarantine_dir: Some(self.quarantine.clone()),
@@ -1281,18 +1291,16 @@ async fn full_tier_pins_the_way_to_a_gitdir_a_gitfile_names() {
     let Some(env) = Env::new() else { return };
     let Some(sandbox) = env.full() else { return };
     // A repository whose gitdir is kept apart, in `.seps/one`, named by the gitfile `one/.git`.
+    // Git makes the gitdir, but not the directory it goes in.
+    std::fs::create_dir(env.ws.join(".seps")).unwrap();
     let separate = env.ws.join(".seps/one");
-    assert!(
-        env.git(&[
-            "init",
-            "-q",
-            "--separate-git-dir",
-            separate.to_str().unwrap(),
-            "one"
-        ])
-        .status
-        .success()
-    );
+    env.git_ok(&[
+        "init",
+        "-q",
+        "--separate-git-dir",
+        separate.to_str().unwrap(),
+        "one",
+    ]);
     // A submodule's gitdir in `.git/modules`, named by the gitfile `sub/.git`.
     let module = env.ws.join(".git/modules/sub");
     std::fs::create_dir_all(module.join("refs")).unwrap();
@@ -1365,16 +1373,45 @@ async fn full_tier_allows_commit_checkout_and_stash() {
 }
 
 #[tokio::test]
-async fn full_tier_quarantines_a_new_commondir() {
-    // `commondir` cannot have a placeholder (git refuses an empty one), so the guard handles it.
+async fn full_tier_quarantines_a_new_commondir_while_the_command_runs() {
+    // `commondir` cannot have a placeholder (git refuses an empty one), so the guard and its
+    // watcher handle it.
     let _serial = SERIAL.lock().await;
     let Some(env) = Env::new() else { return };
     let Some(sandbox) = env.full() else { return };
-    let (output, report) = run(&sandbox, &env, "printf /tmp/elsewhere > .git/commondir").await;
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(report.expect("a report").blocked);
+    let prepared = sandbox
+        .prepare(
+            FsAccess::WorkspaceWrite,
+            &env.ws,
+            "/bin/sh",
+            &[
+                "-c",
+                "printf /tmp/elsewhere > .git/commondir; exec sleep 30",
+            ],
+        )
+        .expect("prepare the sandboxed command");
+    let mut guard = prepared.guard.expect("a workspace-write guard");
+    let mut cmd = prepared.command;
+    cmd.current_dir(&env.ws)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn the sandboxed command");
+    guard.started(child.id().expect("a pid"));
+    env.wait_for_quarantine(".git/commondir").await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the command should still be running"
+    );
     assert!(!env.exists(".git/commondir"));
-    env.quarantined(".git/commondir");
+    child.kill().await.unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(report.blocked, "{}", report.message);
+    assert!(
+        report.message.contains("- .git/commondir: "),
+        "{}",
+        report.message
+    );
 }
 
 #[tokio::test]
@@ -1473,7 +1510,9 @@ except PermissionError as e:
 }
 
 /// The namespace and mounts are set up before seccomp is installed, which then refuses to make
-/// more.
+/// more. Task 5's tests (`linux_sandbox.rs`) prove the filter refuses the mount calls; this one
+/// proves it still refuses `unshare` and `setns`, and the mount calls, in a child that set up a
+/// namespace of its own and held every capability in it until just before.
 #[tokio::test]
 async fn full_tier_commands_cannot_make_namespaces_or_mounts_of_their_own() {
     let _serial = SERIAL.lock().await;
@@ -1505,43 +1544,71 @@ for name, nr, args in calls:
     assert!(output.status.success(), "{}", stderr(&output));
 }
 
-/// Where user namespaces are blocked, a full-tier sandbox fails at `unshare` or the id maps;
-/// where they work, at the identity check: `.git/config` is replaced after the plan recorded it.
-/// Either way the command does not run, and the session goes on in the basic tier.
-#[tokio::test]
-async fn a_failed_mount_setup_drops_the_session_to_the_basic_tier() {
-    let _serial = SERIAL.lock().await;
-    let Some(env) = Env::new() else { return };
-    let sandbox = LinuxSandbox::with_git_protection(env.settings(), GitProtection::Full);
-    sandbox.start_session(&env.ws);
+/// Prepares `script` in the workspace with `sandbox`, runs `between` (which may change the
+/// workspace between the plan and the setup), and spawns the command as the bash tool does.
+/// Says whether it ran, and gives its guard's report.
+async fn spawn_after(
+    sandbox: &LinuxSandbox,
+    env: &Env,
+    script: &str,
+    between: impl FnOnce(),
+) -> (bool, Option<GuardReport>) {
     let prepared = sandbox
         .prepare(
             FsAccess::WorkspaceWrite,
             &env.ws,
             "/bin/sh",
-            &["-c", "touch ran"],
+            &["-c", script],
         )
         .expect("prepare the sandboxed command");
-    let config = env.ws.join(".git/config");
-    std::fs::copy(&config, env.ws.join(".git/config.new")).unwrap();
-    std::fs::rename(env.ws.join(".git/config.new"), &config).unwrap();
-    let guard = prepared.guard.expect("a workspace-write guard");
+    between();
+    let mut guard = prepared.guard.expect("a workspace-write guard");
     let mut cmd = prepared.command;
     cmd.current_dir(&env.ws)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Ok(child) = cmd.spawn() {
-        let _ = child.wait_with_output().await;
-        panic!("the command must not run without its mounts");
+    let ran = match cmd.spawn() {
+        Ok(mut child) => {
+            guard.started(child.id().expect("a pid"));
+            let _ = child.wait().await;
+            true
+        }
+        Err(_) => false,
+    };
+    (ran, guard.finish())
+}
+
+/// Where user namespaces are blocked, a full-tier sandbox's setup is refused at `unshare` or the
+/// id maps: the command does not run, and the session goes on in the basic tier.
+#[tokio::test]
+async fn a_refused_mount_setup_drops_the_session_to_the_basic_tier() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    if let GitProtection::Full = linux_git_protection() {
+        assert!(
+            expected_tier().as_deref() != Some("basic"),
+            "HARNESS_EXPECT_LINUX_TIER=basic, but the probe picked the full tier"
+        );
+        eprintln!("skipping: user namespaces work here, so nothing refuses the setup");
+        return;
     }
+    let sandbox = LinuxSandbox::with_git_protection(env.settings(), GitProtection::Full);
+    sandbox.start_session(&env.ws);
+    let (ran, report) = spawn_after(&sandbox, &env, "touch ran", || {}).await;
+    assert!(!ran, "the command must not run without its mounts");
     assert!(!env.exists("ran"));
-    let report = guard.finish().expect("a report");
+    let report = report.expect("a report");
     assert!(!report.blocked, "{}", report.message);
     assert!(
         report
             .message
             .contains("could not set up its read-only mounts"),
+        "{}",
+        report.message
+    );
+    assert!(
+        report.message.contains("now uses the basic tier"),
         "{}",
         report.message
     );
@@ -1553,7 +1620,7 @@ async fn a_failed_mount_setup_drops_the_session_to_the_basic_tier() {
     }
     assert!(
         subreaper_active(),
-        "the basic tier tracks the processes commands leave running"
+        "harness tracks the processes commands leave running"
     );
     // The next command runs, in the basic tier.
     let (output, report) = run(&sandbox, &env, "touch ran").await;
@@ -1561,6 +1628,7 @@ async fn a_failed_mount_setup_drops_the_session_to_the_basic_tier() {
     assert_eq!(report, None);
     assert!(env.exists("ran"));
     // And its guard puts a changed config back, as the basic tier's does.
+    let config = env.ws.join(".git/config");
     let before = std::fs::read(&config).unwrap();
     let (output, report) = run(&sandbox, &env, "git config user.name evil").await;
     assert!(output.status.success(), "{}", stderr(&output));
@@ -1568,4 +1636,127 @@ async fn a_failed_mount_setup_drops_the_session_to_the_basic_tier() {
     assert_eq!(std::fs::read(&config).unwrap(), before);
     let changed = std::fs::read_to_string(env.quarantined(".git/config")).unwrap();
     assert!(changed.contains("evil"), "{changed}");
+}
+
+/// Where user namespaces work, an entry replaced between the plan and the setup fails the
+/// child's identity check: the command does not run, and the session keeps the full tier, so
+/// nothing outside a command can downgrade it.
+#[tokio::test]
+async fn an_entry_replaced_before_the_setup_stops_the_command_and_keeps_the_full_tier() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    let config = env.ws.join(".git/config");
+    let (ran, report) = spawn_after(&sandbox, &env, "touch ran", || {
+        std::fs::copy(&config, env.ws.join(".git/config.new")).unwrap();
+        std::fs::rename(env.ws.join(".git/config.new"), &config).unwrap();
+    })
+    .await;
+    assert!(!ran, "the command must not run without its mounts");
+    assert!(!env.exists("ran"));
+    let report = report.expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report.message.contains("checking that nothing replaced ")
+            && report.message.contains("Run the command again"),
+        "{}",
+        report.message
+    );
+    assert!(!report.message.contains("basic tier"), "{}", report.message);
+    assert_eq!(sandbox.git_protection(), GitProtection::Full);
+    // The next command runs, under its mounts.
+    let (output, _) = run(&sandbox, &env, "echo 'echo pwned' > .git/hooks/pre-commit").await;
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("Read-only file system"),
+        "{}",
+        stderr(&output)
+    );
+    let (output, _) = run(&sandbox, &env, "touch ran").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+/// A process a full-tier command leaves running keeps that command's namespace, where a gitdir
+/// added later has no mounts. While it runs, the full tier saves every protected file, as the
+/// basic tier does, so what it changes there is undone before the next command.
+#[tokio::test]
+async fn a_process_a_full_tier_command_leaves_cannot_keep_a_change_to_a_gitdir_added_later() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    assert!(
+        subreaper_active(),
+        "harness tracks the processes commands leave running in the full tier too"
+    );
+    let (output, report) = run(
+        &sandbox,
+        &env,
+        "(while [ ! -e go ]; do sleep 0.05; done; \
+          printf /tmp/elsewhere > .git/worktrees/w/commondir; touch done) > /dev/null 2>&1 &",
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(report, None);
+    // The user adds a linked worktree's gitdir, outside harness.
+    let worktree = env.ws.join(".git/worktrees/w");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("HEAD"), "ref: refs/heads/w\n").unwrap();
+    std::fs::write(worktree.join("commondir"), "../..\n").unwrap();
+    std::fs::write(worktree.join("gitdir"), "/elsewhere/w/.git\n").unwrap();
+    // A command runs while the process lives.
+    let (output, report) = run(&sandbox, &env, "true").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    if let Some(report) = &report {
+        assert!(!report.blocked, "{}", report.message);
+    }
+    // Then the process rewrites the new gitdir's `commondir`, which its namespace does not cover.
+    std::fs::write(env.ws.join("go"), "").unwrap();
+    wait_until("the process left running wrote commondir", || {
+        env.exists("done")
+    })
+    .await;
+    let (output, report) = run(&sandbox, &env, "true").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = report.expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report.message.starts_with("[before this command ran"),
+        "{}",
+        report.message
+    );
+    assert!(
+        report
+            .message
+            .contains("- .git/worktrees/w/commondir: changed; restored the earlier version"),
+        "{}",
+        report.message
+    );
+    assert_eq!(env.read(".git/worktrees/w/commondir"), "../..\n");
+    let changed = std::fs::read_to_string(env.quarantined(".git/worktrees/w/commondir")).unwrap();
+    assert_eq!(changed, "/tmp/elsewhere");
+}
+
+/// After its mounts, the child locks the securebits and drops every capability it held in its
+/// user namespace, so nothing the command runs can regain one, even where harness runs as root.
+#[tokio::test]
+async fn full_tier_commands_hold_no_capability_and_cannot_regain_one() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    if !have("python3") {
+        return;
+    }
+    let script = r#"exec python3 -c '
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+bits = libc.prctl(27, 0, 0, 0, 0)
+if bits != 0xef:
+    sys.exit("securebits: expected 0xef, got %#x" % bits)
+for line in open("/proc/self/status"):
+    name, _, value = line.partition(":")
+    if name in ("CapInh", "CapPrm", "CapEff", "CapAmb") and int(value, 16):
+        sys.exit("%s is %s" % (name, value.strip()))
+'"#;
+    let (output, _) = run(&sandbox, &env, script).await;
+    assert!(output.status.success(), "{}", stderr(&output));
 }

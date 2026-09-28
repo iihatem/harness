@@ -7,12 +7,13 @@
 //!
 //! - before it, moves to quarantine protected names that appeared in a known
 //!   gitdir, or at the top of the workspace, since the previous command
-//!   ended (a process that command left running may have planted them), and
-//!   in the basic tier, when such processes were running, restores the
-//!   protected files they changed ([`GuardSession::set_survivor_probe`]);
+//!   ended (a process that command left running may have planted them), and,
+//!   when such processes were running and every protected file was saved
+//!   (`save_all`), restores the protected files they changed
+//!   ([`GuardSession::set_survivor_probe`]);
 //! - indexes the workspace ([`discover`](crate::gitmeta::discover), with the
 //!   ignore rules read once per session: [`GuardSession::prime`]) and records
-//!   which protected names exist, and in the basic tier saves the protected
+//!   which protected names exist, and with `save_all` saves the protected
 //!   files;
 //! - while it runs (a watcher calls [`WatchHandle::check`]) and after it
 //!   ends, moves to quarantine every new protected name, new gitdir and
@@ -170,8 +171,9 @@ impl GuardSession {
 
     /// Sets what says whether processes that sandboxed commands started are
     /// still running. When it says so as a command's guard finishes, or at
-    /// any check after that, the basic tier restores the protected files
-    /// those processes change before the next command begins (and whenever
+    /// any check after that, a guard that saved every protected file
+    /// (`save_all`) restores the protected files those processes change
+    /// before the next command begins (and whenever
     /// [`between_commands`](Self::between_commands)' handle checks).
     pub fn set_survivor_probe(&self, probe: SurvivorProbe) {
         *lock(&self.probe) = probe;
@@ -223,7 +225,8 @@ impl GuardSession {
     /// module docs. `placeholders` runs after the workspace is indexed and
     /// before the existing protected names are recorded (the Linux full tier
     /// creates empty `hooks/` directories there). With `save_all`, every
-    /// protected file is saved so it can be restored (the Linux basic tier);
+    /// protected file is saved so it can be restored (the Linux basic tier,
+    /// and the full tier while processes earlier commands left are running);
     /// without it, only protected symlinks and files with more than one hard
     /// link are.
     pub fn begin(
@@ -1273,11 +1276,10 @@ struct Kept {
     gitdirs: BTreeSet<PathBuf>,
     candidates: BTreeSet<PathBuf>,
     existing: BTreeSet<PathBuf>,
-    /// The snapshot taken before the command: every protected file in the
-    /// basic tier, protected symlinks and multiply linked files in the full
-    /// tier.
+    /// The snapshot taken before the command: every protected file with
+    /// `save_all`, only protected symlinks and multiply linked files without.
     snapshot: Snapshot,
-    /// Whether the snapshot holds every protected file (the basic tier).
+    /// Whether the snapshot holds every protected file (`save_all`).
     save_all: bool,
     /// Below these, the snapshot is not compared: see [`State::detached`].
     detached: BTreeSet<PathBuf>,

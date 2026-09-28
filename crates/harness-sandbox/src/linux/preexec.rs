@@ -19,8 +19,8 @@
 //!   userspace locking. The full tier's mount setup ([`mountns::enter`]) is
 //!   made of the same kind of calls (`unshare`, `open`/`write` of
 //!   `/proc/self/*_map`, `mount`, `openat2`, `fstat`, `open_tree`,
-//!   `mount_setattr`, `move_mount`, `getcwd`, `chdir`, `close`), on the plan
-//!   and pipe built in the parent, with stack buffers.
+//!   `mount_setattr`, `move_mount`, `getcwd`, `chdir`, `prctl`, `capset`,
+//!   `close`), on the plan and pipe built in the parent, with stack buffers.
 //! - [`seccompiler::apply_filter`] builds a `sock_fprog` on the stack that
 //!   just points at the already-allocated [`seccompiler::BpfProgram`] slice
 //!   (no allocation of its own) and calls `prctl`/`syscall(SYS_seccomp)`
@@ -77,11 +77,12 @@ pub(super) fn apply(prepared: &PreparedSandbox) -> io::Result<()> {
     //    could otherwise deny. Fails closed: see `fdcleanup`'s module docs.
     fdcleanup::mark_inherited_fds_close_on_exec()?;
 
-    // 3. The full tier's user and mount namespace and self-binds. Must come
-    //    before Landlock, which refuses every mount change, and before
-    //    seccomp, which refuses `unshare` and the mount calls. Fails closed:
-    //    the command does not run, and the step that failed is written to
-    //    the setup pipe for the parent.
+    // 3. The full tier's user and mount namespace and self-binds, after
+    //    which the child locks its securebits and drops every capability it
+    //    gained in the namespace. Must come before Landlock, which refuses
+    //    every mount change, and before seccomp, which refuses `unshare` and
+    //    the mount calls. Fails closed: the command does not run, and the
+    //    step that failed is written to the setup pipe for the parent.
     if let Some((plan, report)) = &prepared.mounts {
         mountns::enter(plan, report.as_ref().map(AsRawFd::as_raw_fd))?;
     }

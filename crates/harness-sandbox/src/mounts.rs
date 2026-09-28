@@ -23,7 +23,7 @@
 //!   `config.worktree`, `commondir`, `hooks/`, `gitweb/`, `pid`) is bound
 //!   read-only, and so are every gitfile (each `.git` file, and each file on
 //!   the way to a gitdir), and `.harness/` and `HEAD` at the top of the
-//!   workspace.
+//!   workspace. A pin beneath a read-only entry is read-only as well.
 //!
 //! Symlinks cannot be mounted over, so an entry that is a symlink, or that is
 //! reached through one, is left to the guard. So is every name that does not
@@ -124,14 +124,24 @@ pub(crate) fn mounts(
     for name in WORKSPACE_PROTECTED {
         wanted.read_only(&workspace.join(name), |_| true);
     }
+    // Parents come first, so a read-only entry is known before what is below
+    // it: a pin there is read-only too, since a read-write bind would open
+    // that part of it again.
+    let mut read_only: Vec<PathBuf> = Vec::new();
     wanted
         .0
         .into_iter()
-        .map(|(path, (read_only, dev, ino))| Mount {
-            path,
-            read_only,
-            dev,
-            ino,
+        .map(|(path, (own, dev, ino))| {
+            let beneath = read_only.iter().any(|above| path.starts_with(above));
+            if own && !beneath {
+                read_only.push(path.clone());
+            }
+            Mount {
+                path,
+                read_only: own || beneath,
+                dev,
+                ino,
+            }
         })
         .collect()
 }
@@ -199,10 +209,12 @@ pub(crate) enum Step {
     ReadOnly,
     MoveMount,
     Chdir,
+    Securebits,
+    Capabilities,
 }
 
 impl Step {
-    const ALL: [Step; 12] = [
+    const ALL: [Step; 14] = [
         Step::Unshare,
         Step::Setgroups,
         Step::UidMap,
@@ -215,6 +227,8 @@ impl Step {
         Step::ReadOnly,
         Step::MoveMount,
         Step::Chdir,
+        Step::Securebits,
+        Step::Capabilities,
     ];
 
     fn describe(self) -> &'static str {
@@ -231,6 +245,8 @@ impl Step {
             Step::ReadOnly => "making read-only",
             Step::MoveMount => "mounting",
             Step::Chdir => "changing into the working directory again",
+            Step::Securebits => "locking the securebits",
+            Step::Capabilities => "dropping capabilities",
         }
     }
 }
@@ -252,6 +268,35 @@ impl Failure {
         let [o0, o1] = op.to_le_bytes();
         let [e0, e1, e2, e3] = self.errno.to_le_bytes();
         [self.step as u8, 0, o0, o1, e0, e1, e2, e3]
+    }
+
+    /// Whether the kernel or the host refused the full tier: a namespace, id
+    /// map or capability step, or a mount call refused as not permitted or
+    /// not supported. The session then drops to the basic tier. Anything
+    /// else (a path that changed between the plan and the setup, a resource
+    /// limit) stops only the command it happened to, and the session keeps
+    /// the full tier, so nothing outside a command can downgrade it.
+    pub(crate) fn drops_tier(&self) -> bool {
+        if matches!(
+            self.errno,
+            libc::ENOSPC | libc::ENOMEM | libc::EMFILE | libc::ENFILE
+        ) {
+            return false;
+        }
+        match self.step {
+            Step::Unshare
+            | Step::Setgroups
+            | Step::UidMap
+            | Step::GidMap
+            | Step::Private
+            | Step::Securebits
+            | Step::Capabilities => true,
+            Step::OpenTree | Step::ReadOnly | Step::MoveMount => matches!(
+                self.errno,
+                libc::EPERM | libc::EACCES | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP
+            ),
+            Step::Workspace | Step::Open | Step::Identity | Step::Chdir => false,
+        }
     }
 
     /// What [`encode`](Self::encode) wrote, if `bytes` is that.
@@ -544,15 +589,21 @@ mod tests {
     #[test]
     fn a_protected_entry_is_read_only_even_on_the_way_to_a_gitdir() {
         let (_dir, ws) = workspace();
-        mkdirs(&ws, &[".harness/g"]);
+        mkdirs(&ws, &[".harness/g/hooks"]);
         let index = GitIndex {
             gitdirs: paths(&ws, &[".harness/g"]),
             links: paths(&ws, &[".harness"]),
             ..GitIndex::default()
         };
+        // A pin beneath a read-only entry is read-only too: a read-write one would open that
+        // part of it again. It still cannot be renamed.
         assert_eq!(
             plan(&ws, &index),
-            expect(&[(".harness", true), (".harness/g", false)])
+            expect(&[
+                (".harness", true),
+                (".harness/g", true),
+                (".harness/g/hooks", true)
+            ])
         );
     }
 
@@ -621,7 +672,8 @@ mod tests {
         };
         assert_eq!(Failure::decode(&failure.encode()), Some(failure));
         assert_eq!(Failure::decode(&[0; 8]), None);
-        assert_eq!(Failure::decode(&[13; 8]), None);
+        let unknown = Step::ALL.len() as u8 + 1;
+        assert_eq!(Failure::decode(&[unknown; 8]), None);
         assert_eq!(Failure::decode(&[1; 7]), None);
     }
 
@@ -629,6 +681,74 @@ mod tests {
     fn every_step_has_a_distinct_code() {
         for (i, step) in Step::ALL.iter().enumerate() {
             assert_eq!(*step as u8 as usize, i + 1);
+        }
+    }
+
+    fn failed(step: Step, errno: i32) -> Failure {
+        Failure {
+            step,
+            op: None,
+            errno,
+        }
+    }
+
+    #[test]
+    fn a_refused_namespace_or_capability_step_drops_the_tier() {
+        for step in [
+            Step::Unshare,
+            Step::Setgroups,
+            Step::UidMap,
+            Step::GidMap,
+            Step::Private,
+            Step::Securebits,
+            Step::Capabilities,
+        ] {
+            for errno in [libc::EPERM, libc::EACCES, libc::EINVAL, libc::ENOSYS] {
+                assert!(failed(step, errno).drops_tier(), "{step:?} {errno}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_mount_call_drops_the_tier() {
+        for step in [Step::OpenTree, Step::ReadOnly, Step::MoveMount] {
+            for errno in [
+                libc::EPERM,
+                libc::EACCES,
+                libc::EINVAL,
+                libc::ENOSYS,
+                libc::EOPNOTSUPP,
+            ] {
+                assert!(failed(step, errno).drops_tier(), "{step:?} {errno}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_path_that_changed_keeps_the_tier() {
+        for step in [Step::Workspace, Step::Open, Step::Identity, Step::Chdir] {
+            for errno in [
+                libc::ENOENT,
+                libc::ESTALE,
+                libc::ELOOP,
+                libc::EXDEV,
+                libc::EPERM,
+                libc::EACCES,
+            ] {
+                assert!(!failed(step, errno).drops_tier(), "{step:?} {errno}");
+            }
+        }
+        for step in [Step::OpenTree, Step::MoveMount] {
+            assert!(!failed(step, libc::ENOENT).drops_tier(), "{step:?}");
+        }
+    }
+
+    #[test]
+    fn a_resource_limit_keeps_the_tier_at_any_step() {
+        for step in Step::ALL {
+            for errno in [libc::ENOSPC, libc::ENOMEM, libc::EMFILE, libc::ENFILE] {
+                assert!(!failed(step, errno).drops_tier(), "{step:?} {errno}");
+            }
         }
     }
 
@@ -653,6 +773,13 @@ mod tests {
         let text = failure.describe(&paths);
         assert!(
             text.starts_with("writing /proc/self/uid_map failed: "),
+            "{text}"
+        );
+        let text = failed(Step::Capabilities, libc::EPERM).describe(&paths);
+        assert!(text.starts_with("dropping capabilities failed: "), "{text}");
+        let text = failed(Step::Securebits, libc::EPERM).describe(&paths);
+        assert!(
+            text.starts_with("locking the securebits failed: "),
             "{text}"
         );
         // An op the paths do not reach is not named.

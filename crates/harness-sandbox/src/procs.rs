@@ -1,9 +1,11 @@
-//! The processes sandboxed commands leave running, for the Linux basic tier of
-//! git-metadata protection (design D5, "Background processes, basic tier").
+//! The processes sandboxed commands leave running, for Linux git-metadata
+//! protection in both tiers (design D5, "Background processes").
 //!
 //! A command can leave a process running that changes protected git metadata
-//! after the command ends. In the basic tier there are no mounts to stop it,
-//! so harness keeps track of such processes: it registers as a child
+//! after the command ends. In the basic tier there are no mounts to stop it;
+//! in the full tier it keeps its command's namespace, where a protected
+//! entry that appeared since is not mounted. So harness keeps track of such
+//! processes: it registers as a child
 //! subreaper ([`track_orphans`]), so that a process whose parent exits,
 //! detached (`setsid` and a double fork) or not, is reparented to harness and
 //! stays visible as one of its descendants.
@@ -447,8 +449,9 @@ fn subreaper() -> Subreaper {
 }
 
 /// Whether this process is a child subreaper, so that processes sandboxed
-/// commands leave running stay its descendants, which the Linux basic tier
-/// relies on. `false` until a basic-tier [`crate::LinuxSandbox`] asks for it,
+/// commands leave running stay its descendants, which Linux git-metadata
+/// protection relies on in both tiers. `false` until a
+/// [`crate::LinuxSandbox`] asks for it,
 /// and when the kernel refused; then survivors are always assumed, and
 /// protected files are restored before every command. For `harness sandbox
 /// doctor`.

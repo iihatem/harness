@@ -2,15 +2,18 @@
 //! (see `preexec.rs`), after the close-on-exec marking and before
 //! `no_new_privs`, Landlock and seccomp.
 //!
-//! The child unshares a user and a mount namespace, maps its own uid and gid
-//! 1:1 (so the command, which is not uid 0, keeps no capability once it
-//! execs), makes every mount private, and then, for each [`MountOp`] in
-//! order, self-binds the entry at its path relative to the workspace:
-//! read-write for a pin (a mount point can no longer be renamed, removed or
-//! replaced) and read-only for a protected entry (`crate::mounts` says which
-//! is which). Finally it changes into its working directory again, so that
-//! a working directory inside a newly covered directory resolves through the
-//! new mount.
+//! The child unshares a user and a mount namespace, which gives it every
+//! capability in the new user namespace, maps its own uid and gid 1:1,
+//! makes every mount private, and then, for each [`MountOp`] in order,
+//! self-binds the entry at its path relative to the workspace: read-write
+//! for a pin (a mount point can no longer be renamed, removed or replaced)
+//! and read-only for a protected entry (`crate::mounts` says which is
+//! which). It changes into its working directory again, so that a working
+//! directory inside a newly covered directory resolves through the new
+//! mount. Last, it locks the securebits (no root privileges, no set-uid
+//! fixups, no ambient capabilities, all locked) and drops every capability
+//! it holds. Without that, `execve` would clear them only for a command
+//! that is not uid 0 in the namespace, and harness may run as root.
 //!
 //! Every step works on file descriptors: entries are opened with `openat2`
 //! beneath the workspace without following any symlink, checked against the
@@ -43,6 +46,25 @@ const OPEN_TREE_CLOEXEC: c_uint = libc::O_CLOEXEC as c_uint;
 const MOVE_MOUNT_F_EMPTY_PATH: c_uint = 0x04;
 const MOVE_MOUNT_T_EMPTY_PATH: c_uint = 0x40;
 const MOUNT_ATTR_RDONLY: u64 = 0x01;
+// From <linux/securebits.h> and <linux/capability.h>.
+const SECBIT_NOROOT: libc::c_ulong = 1 << 0;
+const SECBIT_NOROOT_LOCKED: libc::c_ulong = 1 << 1;
+const SECBIT_NO_SETUID_FIXUP: libc::c_ulong = 1 << 2;
+const SECBIT_NO_SETUID_FIXUP_LOCKED: libc::c_ulong = 1 << 3;
+const SECBIT_KEEP_CAPS_LOCKED: libc::c_ulong = 1 << 5;
+const SECBIT_NO_CAP_AMBIENT_RAISE: libc::c_ulong = 1 << 6;
+const SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED: libc::c_ulong = 1 << 7;
+/// What the child sets and locks: root gets no capability from `execve`,
+/// changing uids adjusts none, `keep_caps` stays off, and nothing is raised
+/// into the ambient set.
+const LOCKED_SECUREBITS: libc::c_ulong = SECBIT_NOROOT
+    | SECBIT_NOROOT_LOCKED
+    | SECBIT_NO_SETUID_FIXUP
+    | SECBIT_NO_SETUID_FIXUP_LOCKED
+    | SECBIT_KEEP_CAPS_LOCKED
+    | SECBIT_NO_CAP_AMBIENT_RAISE
+    | SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 pub(super) const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 pub(super) const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 pub(super) const RESOLVE_BENEATH: u64 = 0x08;
@@ -62,6 +84,22 @@ struct MountAttr {
     attr_clr: u64,
     propagation: u64,
     userns_fd: u64,
+}
+
+/// `struct __user_cap_header_struct`.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+/// `struct __user_cap_data_struct`: version 3 takes two, for 64 bits.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
 }
 
 /// Everything the child needs, built by the parent (`mountplan.rs`).
@@ -150,7 +188,36 @@ fn setup(plan: &MountPlan) -> Result<(), Failure> {
         })?;
     }
     drop(workspace);
-    chdir_again().map_err(fail(Step::Chdir))
+    chdir_again().map_err(fail(Step::Chdir))?;
+    // The securebits first: setting them takes `CAP_SETPCAP`, which the
+    // next step drops.
+    lock_securebits().map_err(fail(Step::Securebits))?;
+    drop_capabilities().map_err(fail(Step::Capabilities))
+}
+
+/// Sets and locks [`LOCKED_SECUREBITS`].
+fn lock_securebits() -> Result<(), i32> {
+    // SAFETY: `prctl` with integer arguments only.
+    check(unsafe { libc::prctl(libc::PR_SET_SECUREBITS, LOCKED_SECUREBITS, 0, 0, 0) }.into())
+        .map(|_| ())
+}
+
+/// Empties this process's effective, permitted and inheritable capability
+/// sets, which empties the ambient set too.
+fn drop_capabilities() -> Result<(), i32> {
+    let header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let none = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: `capset` reads `header` and the two `CapData` of version 3,
+    // all on the stack.
+    check(unsafe { libc::syscall(libc::SYS_capset, &header as *const CapHeader, none.as_ptr()) })
+        .map(|_| ())
 }
 
 /// Self-binds `op`'s entry, found beneath `workspace`, which is opened in
@@ -298,5 +365,14 @@ mod tests {
     fn uapi_structs_have_the_kernel_sizes() {
         assert_eq!(size_of::<OpenHow>(), 24);
         assert_eq!(size_of::<MountAttr>(), 32);
+        assert_eq!(size_of::<CapHeader>(), 8);
+        assert_eq!(size_of::<[CapData; 2]>(), 24);
+    }
+
+    #[test]
+    fn the_securebits_locked_are_the_ones_the_kernel_names() {
+        // SECBIT_NOROOT, _NO_SETUID_FIXUP, _NO_CAP_AMBIENT_RAISE and their locks, and the lock
+        // of SECBIT_KEEP_CAPS (0x10) without it.
+        assert_eq!(LOCKED_SECUREBITS, 0xef);
     }
 }

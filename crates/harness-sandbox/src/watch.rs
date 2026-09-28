@@ -1,7 +1,7 @@
 //! The file watcher that runs the git-metadata guard's checks the moment a
 //! protected name appears or changes (design D5): while a sandboxed command
-//! runs, and in the Linux basic tier between commands, while processes a
-//! command left running are alive.
+//! runs, and between commands, while processes a command left running are
+//! alive.
 //!
 //! The kernel side, `inotify(7)`, is in `linux/inotify.rs`. This is the part
 //! that does not depend on it, so it is tested on every host: reading inotify
@@ -13,8 +13,10 @@
 //! follow a symlink: an event only says "check now". So:
 //!
 //! - It watches what [`Target::dirs`] names: each known gitdir, its
-//!   `worktrees` and `modules`, the workspace root, and in the basic tier the
-//!   directories inside protected entries. Each is watched as the directory
+//!   `worktrees` and `modules`, the workspace root, and, when the guard saves
+//!   every protected file (the Linux basic tier, and the full tier while
+//!   processes an earlier command left are running), the directories inside
+//!   protected entries. Each is watched as the directory
 //!   it is (its device and inode), reached without following a symlink: a
 //!   directory made anew at a path is watched as well, and one reached under
 //!   two paths once. A directory it cannot watch (the per-user watch limit,

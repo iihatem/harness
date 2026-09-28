@@ -30,9 +30,10 @@
 //!    connectable fd cannot leak into the sandboxed program through
 //!    inheritance. This runs before Landlock is restricted because it needs
 //!    to open `/proc/self/fd`.
-//! 3. Full tier only: unshare a user and mount namespace and make the
-//!    self-binds (`mountns.rs`). Before Landlock and seccomp, which refuse
-//!    mount changes and `unshare`.
+//! 3. Full tier only: unshare a user and mount namespace, make the
+//!    self-binds, then lock the securebits and drop every capability
+//!    (`mountns.rs`). Before Landlock and seccomp, which refuse mount
+//!    changes and `unshare`.
 //! 4. `prctl(PR_SET_NO_NEW_PRIVS)` — required before `seccomp(2)` will
 //!    install a filter, and applied before Landlock too so nothing between
 //!    here and `execve` could regain privileges via a setuid/setgid binary.
@@ -48,26 +49,33 @@
 //! workspace-write command gets its own namespace, in which the gitdirs are
 //! pinned and the protected entries bound read-only (`crate::mounts` says
 //! what), so writes to them fail; the guard covers what mounts cannot, and
-//! saves only protected symlinks and files with a second hard link. In the
-//! **basic** tier there are no mounts, and the guard saves every protected
-//! file so it can undo changes after the fact.
+//! saves only protected symlinks and files with a second hard link, unless
+//! processes earlier commands left are running (below). In the **basic**
+//! tier there are no mounts, and the guard saves every protected file so it
+//! can undo changes after the fact.
 //!
-//! If a full-tier command's setup fails (user namespaces blocked after the
-//! probe, a racing rename), the command does not run: the child writes the
-//! step that failed to a pipe, and the command's guard, when it finishes,
-//! drops the session to the basic tier for every later command and says so.
+//! If a full-tier command's setup fails, the command does not run: the
+//! child writes the step that failed to a pipe, which the command's guard
+//! reads when it finishes, and says what happened. When the kernel or the
+//! host refused a step (user namespaces blocked after the probe, a mount
+//! call not permitted), the session drops to the basic tier for every later
+//! command. When a path changed between the plan and the setup, or a
+//! resource limit was hit, only that command is stopped, and the session
+//! keeps the full tier ([`crate::mounts::Failure::drops_tier`]): nothing
+//! outside a command can downgrade it.
 //!
 //! ## Processes a command leaves running
 //!
-//! In the basic tier, [`LinuxSandbox`] makes harness a child subreaper when
-//! it is created, or when its session drops to the basic tier, so what a
-//! command leaves running stays among harness's descendants, and its guard
-//! session asks at every check whether any such process is still alive,
-//! reaping the ones that exited (`crate::procs`, whose docs state the
-//! invariant every other child of harness must keep; the tier probe's child
-//! keeps it by staying in harness's session). In the full tier a process a
-//! command leaves running stays in that command's namespace, under its
-//! mounts.
+//! In both tiers, [`LinuxSandbox`] makes harness a child subreaper when it
+//! is created, so what a command leaves running stays among harness's
+//! descendants, and its guard session asks at every check whether any such
+//! process is still alive, reaping the ones that exited (`crate::procs`,
+//! whose docs state the invariant every other child of harness must keep;
+//! the tier probe's child keeps it by staying in harness's session). In the
+//! full tier such a process stays in its command's namespace, under that
+//! command's mounts, but a protected entry that appeared since is not
+//! mounted there: so while any is alive, the full tier's guard saves every
+//! protected file too, and its checks restore them as the basic tier's do.
 //! Each command's pid is registered with [`CommandGuard::started`] until its
 //! guard finishes, so harness never reaps the process tokio waits for.
 //!
@@ -227,7 +235,7 @@ pub struct LinuxSandbox {
     quarantine: PathBuf,
     guards: Arc<GuardSession>,
     /// The session's tier. The full tier drops to the basic tier for good
-    /// when a command's setup fails.
+    /// when the kernel or the host refuses a command's setup.
     tier: Arc<Mutex<GitProtection>>,
     watching: Watching,
 }
@@ -241,7 +249,7 @@ impl LinuxSandbox {
     /// A sandbox in `tier`, which [`CommandSandbox::git_protection`]
     /// reports. The full tier on a host that does not support it fails its
     /// first workspace-write command, which does not run, and then drops to
-    /// the basic tier. In the basic tier, this process becomes a child
+    /// the basic tier. In either tier, this process becomes a child
     /// subreaper, so the processes commands leave running stay its
     /// descendants: see the [module docs](self).
     pub fn with_git_protection(settings: SandboxSettings, tier: GitProtection) -> Self {
@@ -251,9 +259,7 @@ impl LinuxSandbox {
             .unwrap_or_else(|| std::env::temp_dir().join("harness-quarantine"));
         let guards = GuardSession::new(&quarantine);
         guards.set_survivor_probe(Arc::new(procs::look_and_reap));
-        if matches!(tier, GitProtection::Basic { .. }) {
-            procs::track_orphans();
-        }
+        procs::track_orphans();
         LinuxSandbox {
             settings,
             quarantine: canonical(&quarantine),
@@ -328,8 +334,9 @@ impl CommandSandbox for LinuxSandbox {
     /// registers the command as about to be spawned, builds it, and starts
     /// its watcher. In the basic tier the guard saves every protected file
     /// so it can be restored; in the full tier it saves only what mounts
-    /// cannot protect, and the command gets mounts over what the guard's
-    /// index found, and a pipe its child reports a failed setup step to. A read-only
+    /// cannot protect, unless processes earlier commands left are running,
+    /// and the command gets mounts over what the guard's index found, and a
+    /// pipe its child reports a failed setup step to. A read-only
     /// command has no git metadata to guard, but it runs in a session of its
     /// own all the same, so it is registered too; it cannot write to the
     /// workspace, so the watcher between commands goes on meanwhile, and
@@ -357,13 +364,17 @@ impl CommandSandbox for LinuxSandbox {
         // overlap.
         self.watching.stop_between(&workspace);
         // `begin` asks the probe only when an earlier command left something
-        // to check, so orphans are reaped here as well.
-        procs::look_and_reap();
+        // to check, so orphans are reaped here as well. While any process an
+        // earlier command left is running, the full tier saves every
+        // protected file too: that process keeps its own command's
+        // namespace, where what appeared since has no mount.
+        let survivors = procs::look_and_reap();
+        let save_all = !full || survivors;
         // The plan is made from the guard's index, after the scan and before
         // the guard records which protected names exist, so the guard takes
         // the `hooks/` placeholders for existing ones.
         let mut planned = None;
-        let guard = self.guards.begin(&workspace, !full, |index| {
+        let guard = self.guards.begin(&workspace, save_all, |index| {
             if full {
                 planned = mountplan::plan(&workspace, index);
             }
@@ -583,23 +594,23 @@ struct SetupReport {
 }
 
 impl SetupReport {
-    /// What failed, if the child said a setup step did. Once the command
-    /// has been spawned, or failed to be, the child has written all it will.
-    fn failure(&self) -> Option<String> {
-        mountplan::read_failure(&self.reader).map(|failure| failure.describe(&self.paths))
+    /// What failed, if the child said a setup step did, and whether that
+    /// drops the session to the basic tier. Once the command has been
+    /// spawned, or failed to be, the child has written all it will.
+    fn failure(&self) -> Option<(String, bool)> {
+        mountplan::read_failure(&self.reader)
+            .map(|failure| (failure.describe(&self.paths), failure.drops_tier()))
     }
 }
 
-/// Drops the session to the basic tier after a full-tier command's setup
-/// failed: from the next command on, the guard saves every protected file
-/// (`prepare` reads the tier), and harness becomes a child subreaper, as it
-/// does in a sandbox made in the basic tier. The survivor probe is already
-/// set in both tiers.
+/// Drops the session to the basic tier after the kernel or the host refused
+/// a full-tier command's setup: from the next command on, there are no
+/// mounts and the guard saves every protected file (`prepare` reads the
+/// tier). The subreaper and the survivor probe are already on in both tiers.
 fn drop_to_basic(tier: &Mutex<GitProtection>, failure: &str) {
     *lock(tier) = GitProtection::Basic {
         reason: format!("the full tier's setup failed during the session: {failure}"),
     };
-    procs::track_orphans();
 }
 
 /// The guard for one command, its place in the registry of the processes
@@ -629,9 +640,10 @@ impl CommandGuard for LinuxGuard {
     /// again, which reaps on the same tick, and so does the watcher every
     /// couple of seconds, until none is left.
     ///
-    /// If the child reported a failed mount step, the command did not run:
-    /// the session drops to the basic tier, and the report says so, without
-    /// blocking.
+    /// If the child reported a failed setup step, the command did not run,
+    /// and the report says so, without blocking. When the kernel or the host
+    /// refused the step, the session drops to the basic tier; otherwise (a
+    /// path that changed meanwhile, a resource limit) it keeps the full tier.
     fn finish(self: Box<Self>) -> Option<GuardReport> {
         let LinuxGuard {
             guard,
@@ -645,15 +657,21 @@ impl CommandGuard for LinuxGuard {
             watcher.stop();
         }
         drop(registration);
-        let failure = setup.as_ref().and_then(SetupReport::failure);
-        if let Some(failure) = &failure {
-            drop_to_basic(&tier, failure);
-        }
-        let note = failure.map(|failure| {
-            format!(
-                "[the sandbox could not set up its read-only mounts ({failure}), so this command did not run. This session now uses the basic tier, which checks git metadata after each command instead. Run the command again.]\n"
-            )
-        });
+        let note = setup
+            .as_ref()
+            .and_then(SetupReport::failure)
+            .map(|(failure, drops)| {
+                if drops {
+                    drop_to_basic(&tier, &failure);
+                    format!(
+                        "[the sandbox could not set up its read-only mounts ({failure}), so this command did not run. This session now uses the basic tier, which checks git metadata after each command instead. Run the command again.]\n"
+                    )
+                } else {
+                    format!(
+                        "[the sandbox could not set up its read-only mounts ({failure}), so this command did not run: a change made while the sandbox was being set up stopped it, or a system limit was reached. Run the command again.]\n"
+                    )
+                }
+            });
         after.finished(with_note(guard.finish(), note))
     }
 }
@@ -769,13 +787,14 @@ mod tests {
         (sandbox, guard, [ws, quarantine])
     }
 
-    #[test]
-    fn a_failed_setup_step_drops_the_session_to_the_basic_tier_and_says_why() {
+    /// A setup pipe holding the record the child writes when `step` fails
+    /// with `errno`, for the plan's two ops.
+    fn reported(step: crate::mounts::Step, errno: i32) -> SetupReport {
         let (reader, writer) = mountplan::setup_pipe().unwrap();
         let failure = crate::mounts::Failure {
-            step: crate::mounts::Step::Identity,
+            step,
             op: Some(1),
-            errno: libc::ESTALE,
+            errno,
         }
         .encode();
         // SAFETY: writes `failure` to the pipe just made, as the child would.
@@ -788,35 +807,79 @@ mod tests {
         };
         assert_eq!(n, failure.len() as isize);
         let paths = vec![PathBuf::from("/ws/.git"), PathBuf::from("/ws/.git/config")];
-        let (sandbox, guard, _dirs) = full_tier_guard(Some(SetupReport { reader, paths }));
+        SetupReport { reader, paths }
+    }
+
+    #[test]
+    fn a_refused_setup_step_drops_the_session_to_the_basic_tier_and_says_why() {
+        let _serial = procs::serial();
+        let setup = reported(crate::mounts::Step::UidMap, libc::EPERM);
+        let (sandbox, guard, _dirs) = full_tier_guard(Some(setup));
         let report = guard.finish().expect("a report");
         assert!(!report.blocked, "{}", report.message);
         assert!(
             report.message.starts_with(
-                "[the sandbox could not set up its read-only mounts (checking that nothing replaced /ws/.git/config failed: "
+                "[the sandbox could not set up its read-only mounts (writing /proc/self/uid_map failed: "
             ),
             "{}",
             report.message
         );
         assert!(
-            report.message.ends_with("Run the command again.]\n"),
+            report
+                .message
+                .contains("This session now uses the basic tier"),
             "{}",
             report.message
         );
         match sandbox.git_protection() {
             GitProtection::Basic { reason } => assert!(
                 reason.starts_with(
-                    "the full tier's setup failed during the session: checking that nothing replaced /ws/.git/config failed: "
+                    "the full tier's setup failed during the session: writing /proc/self/uid_map failed: "
                 ),
                 "{reason}"
             ),
             GitProtection::Full => panic!("the session should have dropped to the basic tier"),
         }
-        assert!(crate::procs::subreaper_active());
+    }
+
+    #[test]
+    fn a_path_that_changed_during_the_setup_stops_the_command_and_keeps_the_full_tier() {
+        let _serial = procs::serial();
+        for (step, errno) in [
+            (crate::mounts::Step::Identity, libc::ESTALE),
+            (crate::mounts::Step::Open, libc::ENOENT),
+            (crate::mounts::Step::MoveMount, libc::ENOSPC),
+        ] {
+            let (sandbox, guard, _dirs) = full_tier_guard(Some(reported(step, errno)));
+            let report = guard.finish().expect("a report");
+            assert!(!report.blocked, "{}", report.message);
+            assert!(
+                report
+                    .message
+                    .starts_with("[the sandbox could not set up its read-only mounts ("),
+                "{}",
+                report.message
+            );
+            assert!(
+                report
+                    .message
+                    .contains("a change made while the sandbox was being set up stopped it"),
+                "{}",
+                report.message
+            );
+            assert!(
+                report.message.ends_with("Run the command again.]\n"),
+                "{}",
+                report.message
+            );
+            assert!(!report.message.contains("basic tier"), "{}", report.message);
+            assert_eq!(sandbox.git_protection(), GitProtection::Full, "{step:?}");
+        }
     }
 
     #[test]
     fn a_setup_that_went_well_leaves_the_tier_alone() {
+        let _serial = procs::serial();
         let (reader, _writer) = mountplan::setup_pipe().unwrap();
         let (sandbox, guard, _dirs) = full_tier_guard(Some(SetupReport {
             reader,

@@ -28,8 +28,8 @@ mod macos;
 ))]
 mod mounts;
 mod policy;
-// The processes sandboxed commands leave running, for the Linux basic tier. Its platform-neutral
-// parts are unit-tested on every host.
+// The processes sandboxed commands leave running, for Linux git-metadata protection in both
+// tiers. Its platform-neutral parts are unit-tested on every host.
 #[cfg(any(
     test,
     all(

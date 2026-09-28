@@ -309,3 +309,172 @@ fn session_ids_are_letters_digits_and_dashes() {
         assert!(!session::is_valid_id(id), "{id}");
     }
 }
+
+/// Writes a session file named after `id` with these lines after its header.
+fn session_with_lines(
+    dir: &Path,
+    id: &str,
+    version: u32,
+    lines: &[serde_json::Value],
+) -> std::path::PathBuf {
+    let path = dir.join(format!("{id}.jsonl"));
+    let header = serde_json::json!({
+        "id": id,
+        "parent_id": null,
+        "type": "session",
+        "version": version,
+        "started_at": "2026-01-02T00:00:00Z",
+        "cwd": "/work",
+    });
+    let mut text = format!("{header}\n");
+    for line in lines {
+        text.push_str(&format!("{line}\n"));
+    }
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+fn user_line(id: &str, parent: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "parent_id": parent,
+        "type": "message",
+        "message": {"role": "user", "content": text},
+    })
+}
+
+const ID: &str = "20260102T000000Z-00000001";
+
+// Review D M1: a corrupted tree (a repeated id makes a loop) must not repeat messages.
+#[test]
+fn a_loop_in_the_entries_ends_the_branch_with_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = session_with_lines(
+        dir.path(),
+        ID,
+        1,
+        &[
+            user_line("a", ID, "A"),
+            user_line("b", "a", "B"),
+            // A second entry `a`, under `b`: `b`'s parent is now this one.
+            user_line("a", "b", "A2"),
+        ],
+    );
+    let (session, warnings) = Session::open(&path).unwrap();
+    assert_eq!(texts(&session), ["B", "A2"]);
+    assert!(warnings.iter().any(|w| w.contains("loop")), "{warnings:?}");
+}
+
+#[test]
+fn a_missing_parent_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = session_with_lines(
+        dir.path(),
+        ID,
+        1,
+        &[
+            user_line("a", ID, "A"),
+            user_line("b", "gone", "B"),
+            user_line("c", "b", "C"),
+        ],
+    );
+    let (session, warnings) = Session::open(&path).unwrap();
+    assert_eq!(texts(&session), ["B", "C"]);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("missing") && w.contains("gone")),
+        "{warnings:?}"
+    );
+}
+
+/// Runs `f` on a thread, and fails if it takes more than five seconds.
+fn within_5s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("it hung")
+}
+
+// Review D M3: only regular files are sessions. A symlink could make harness append to its
+// target, and a FIFO would hang the listing.
+#[test]
+fn symlinks_and_special_files_are_not_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let target = session_with_lines(elsewhere.path(), ID, 1, &[user_line("a", ID, "A")]);
+    let link = dir.path().join(format!("{ID}.jsonl"));
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let fifo = dir.path().join("20260102T000000Z-00000002.jsonl");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let listed = {
+        let dir = dir.path().to_path_buf();
+        within_5s(move || session::list(&dir))
+    };
+    assert!(listed.is_empty(), "{listed:?}");
+    assert!(matches!(
+        within_5s(move || Session::open(&link).map(|_| ())),
+        Err(SessionError::NotASession(_))
+    ));
+    assert!(matches!(
+        within_5s(move || Session::open(&fifo).map(|_| ())),
+        Err(SessionError::NotASession(_))
+    ));
+}
+
+// Review D M6: two runs started in the same second must not pick the same id.
+#[test]
+fn session_ids_have_32_random_bits() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = Session::create(dir.path(), Path::new("/work"))
+        .id()
+        .to_string();
+    let (stamp, random) = id.split_once('-').unwrap();
+    assert_eq!(stamp.len(), 16, "{id}");
+    assert_eq!(random.len(), 8, "{id}");
+    assert!(random.bytes().all(|b| b.is_ascii_hexdigit()), "{id}");
+}
+
+// Review D M7: a complete last entry without its newline (an outside edit) is kept.
+#[test]
+fn a_complete_last_line_without_a_newline_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = session_with_lines(dir.path(), ID, 1, &[user_line("a", ID, "A")]);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.trim_end()).unwrap();
+    let (mut session, warnings) = Session::open(&path).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(texts(&session), ["A"]);
+    session.append(user("B"));
+    drop(session);
+    let (session, warnings) = Session::open(&path).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(texts(&session), ["A", "B"]);
+}
+
+// Review D M8: an older harness must not add to a file in a newer format.
+#[test]
+fn a_session_from_a_newer_harness_is_refused_and_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = session_with_lines(
+        dir.path(),
+        ID,
+        session::FORMAT_VERSION + 1,
+        &[user_line("a", ID, "A")],
+    );
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("{\"id\":\"half");
+    std::fs::write(&path, &text).unwrap();
+    let error = Session::open(&path).unwrap_err();
+    assert!(matches!(error, SessionError::TooNew { .. }), "{error:?}");
+    assert!(error.to_string().contains("newer"), "{error}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+}

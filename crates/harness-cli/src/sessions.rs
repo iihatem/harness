@@ -63,9 +63,10 @@ pub fn open(setup: &Setup, choice: &Choice) -> Result<Session, String> {
             .map(|s| s.path)
             .ok_or("there is no earlier session in this project to continue")?,
         Choice::Resume(id) => {
-            // The id becomes a path: only a valid one is looked up.
+            // The id becomes a path: only a valid one is looked up, and only a regular file.
             let path = dir.join(format!("{id}.jsonl"));
-            if !session::is_valid_id(id) || !path.is_file() {
+            let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+            if !session::is_valid_id(id) || !regular {
                 return Err(format!(
                     "there is no session {id} in this project; run `harness --resume` to list them"
                 ));

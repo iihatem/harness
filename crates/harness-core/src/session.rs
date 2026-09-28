@@ -3,8 +3,8 @@
 //! current leaf. Rewinding moves the leaf, so earlier branches stay in the file.
 
 use std::{
-    collections::HashMap,
-    fs::{File, OpenOptions},
+    collections::{HashMap, HashSet},
+    fs::{File, OpenOptions, TryLockError},
     hash::{BuildHasher, Hasher},
     io::{BufRead, BufReader, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
@@ -85,8 +85,17 @@ pub enum SessionError {
     },
     #[error("{0} is open in another harness process")]
     InUse(PathBuf),
+    #[error("cannot lock {path}: {source}")]
+    Lock {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("{0} is not a harness session file")]
     NotASession(PathBuf),
+    #[error(
+        "{path} was saved by a newer version of harness (session format {version}); update harness to continue it"
+    )]
+    TooNew { path: PathBuf, version: u32 },
 }
 
 /// A session: its entries, the current leaf, and (unless it lives only in memory) its file.
@@ -99,6 +108,8 @@ pub struct Session {
     store: Option<Store>,
     /// Why the session stopped saving, until someone takes it.
     save_error: Option<std::io::Error>,
+    /// Warnings about saving, until someone takes them.
+    warnings: Vec<String>,
 }
 
 /// Where a session is saved. The file is created, and locked, when the first entry after the
@@ -149,12 +160,14 @@ impl Session {
             entries: vec![header],
             store,
             save_error: None,
+            warnings: Vec::new(),
         }
     }
 
     /// Opens a saved session to continue it, locking the file against other harness processes.
-    /// Unreadable lines are skipped, and an incomplete last line (from a process that stopped
-    /// while writing it) is removed from the file; the warnings say so.
+    /// Only a regular file named after the id on its first line is a session. Unreadable lines
+    /// are skipped, and an incomplete last line (from a process that stopped while writing it)
+    /// is removed from the file; the warnings say so, and what else is wrong with the file.
     pub fn open(path: &Path) -> Result<(Session, Vec<String>), SessionError> {
         let io = |source| SessionError::Io {
             path: path.to_path_buf(),
@@ -162,39 +175,14 @@ impl Session {
         };
         let not_a_session = || SessionError::NotASession(path.to_path_buf());
         let file_id = file_id(path).ok_or_else(not_a_session)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(path)
-            .map_err(io)?;
-        // A lock can outlive its owner for a moment while this process starts a child (the child
-        // holds a copy of the descriptor until it runs its program), so a held lock is tried a
-        // few more times before the session counts as in use.
-        let mut attempts = 0;
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) if attempts < 10 => {
-                    attempts += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(SessionError::InUse(path.to_path_buf()));
-                }
-                Err(std::fs::TryLockError::Error(e)) => return Err(io(e)),
-            }
-        }
+        let mut file = open_regular(OpenOptions::new().read(true).append(true), path)
+            .map_err(io)?
+            .ok_or_else(not_a_session)?;
+        let mut warnings = Vec::new();
+        warnings.extend(lock(path, || file.try_lock())?);
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(io)?;
-        let mut warnings = Vec::new();
         let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-        if complete < bytes.len() {
-            warnings.push(format!(
-                "the last line of {} was incomplete, probably because harness stopped while writing it; it was dropped",
-                path.display()
-            ));
-            file.set_len(complete as u64).map_err(io)?;
-        }
         let mut entries: Vec<Entry> = Vec::new();
         let mut unreadable = 0;
         for line in bytes[..complete].split(|b| *b == b'\n') {
@@ -206,17 +194,17 @@ impl Session {
                 Err(_) => unreadable += 1,
             }
         }
-        if unreadable > 0 {
-            warnings.push(format!(
-                "skipped {unreadable} unreadable line(s) in {}",
-                path.display()
-            ));
-        }
+        // A last line without its newline is complete when it reads as an entry (an outside
+        // edit), and was cut short otherwise.
+        let tail = &bytes[complete..];
+        let tail_entry = serde_json::from_slice::<Entry>(tail).ok();
+        let tail_complete = tail_entry.is_some();
+        entries.extend(tail_entry);
         // The id becomes part of other paths (the checkpoint index), so it must be the file's
         // own name, which was checked above.
         let Some(Entry {
             id,
-            kind: EntryKind::Session { .. },
+            kind: EntryKind::Session { version, .. },
             ..
         }) = entries.first()
         else {
@@ -224,6 +212,28 @@ impl Session {
         };
         if id != file_id {
             return Err(not_a_session());
+        }
+        if *version > FORMAT_VERSION {
+            return Err(SessionError::TooNew {
+                path: path.to_path_buf(),
+                version: *version,
+            });
+        }
+        // Only a session in this format is changed.
+        if tail_complete {
+            file.write_all(b"\n").map_err(io)?;
+        } else if !tail.is_empty() {
+            warnings.push(format!(
+                "the last line of {} was incomplete, probably because harness stopped while writing it; it was dropped",
+                path.display()
+            ));
+            file.set_len(complete as u64).map_err(io)?;
+        }
+        if unreadable > 0 {
+            warnings.push(format!(
+                "skipped {unreadable} unreadable line(s) in {}",
+                path.display()
+            ));
         }
         let id = id.clone();
         let leaf = entries.last().map(|e| e.id.clone()).unwrap_or(id.clone());
@@ -233,21 +243,23 @@ impl Session {
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
         let written = entries.len();
-        Ok((
-            Session {
-                id,
-                entries,
-                index,
-                leaf,
-                store: Some(Store {
-                    path: path.to_path_buf(),
-                    file: Some(file),
-                    written,
-                }),
-                save_error: None,
-            },
-            warnings,
-        ))
+        let session = Session {
+            id,
+            entries,
+            index,
+            leaf,
+            store: Some(Store {
+                path: path.to_path_buf(),
+                file: Some(file),
+                written,
+            }),
+            save_error: None,
+            warnings: Vec::new(),
+        };
+        if let Some(problem) = session.walk().1 {
+            warnings.push(format!("{}: {problem}", path.display()));
+        }
+        Ok((session, warnings))
     }
 
     /// The session's id, which [`is_valid_id`] accepts.
@@ -303,7 +315,7 @@ impl Session {
         let Some(store) = self.store.as_mut() else {
             return;
         };
-        if let Err(e) = store.write(&self.entries) {
+        if let Err(e) = store.write(&self.entries, &mut self.warnings) {
             self.store = None;
             self.save_error = Some(e);
         }
@@ -314,20 +326,42 @@ impl Session {
         self.save_error.take()
     }
 
+    /// Warnings about saving the session (such as a file that cannot be locked), each once.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
+    }
+
     /// The entries from the session's first line to the leaf.
     pub fn branch(&self) -> Vec<&Entry> {
-        let mut out = Vec::new();
+        self.walk().0
+    }
+
+    /// The entries from the leaf back to the session's first line, in order, and what cut the
+    /// walk short in a damaged file: a parent that is missing, or a loop.
+    fn walk(&self) -> (Vec<&Entry>, Option<String>) {
+        let mut out: Vec<&Entry> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut problem = None;
         let mut next = Some(self.leaf.as_str());
         while let Some(id) = next {
-            let Some(entry) = self.get(id) else { break };
-            out.push(entry);
-            if out.len() > self.entries.len() {
+            let Some(entry) = self.get(id) else {
+                let child = out.last().map_or("?", |e| e.id.as_str());
+                problem = Some(format!(
+                    "the parent {id} of entry {child} is missing, so the conversation before it is not loaded"
+                ));
+                break;
+            };
+            if !seen.insert(id) {
+                problem = Some(format!(
+                    "the entries loop back to {id}, so the conversation before it is not loaded"
+                ));
                 break;
             }
+            out.push(entry);
             next = entry.parent_id.as_deref();
         }
         out.reverse();
-        out
+        (out, problem)
     }
 
     /// The conversation on the active branch, with each message's entry id. A compaction
@@ -359,7 +393,8 @@ impl Session {
 }
 
 impl Store {
-    fn write(&mut self, entries: &[Entry]) -> std::io::Result<()> {
+    /// Writes the entries not yet in the file; a warning about it goes to `warnings`.
+    fn write(&mut self, entries: &[Entry], warnings: &mut Vec<String>) -> std::io::Result<()> {
         if self.file.is_none() {
             // Sessions hold prompts, code and tool output: only their owner may read them.
             if let Some(dir) = self.path.parent() {
@@ -373,7 +408,10 @@ impl Store {
                 .create_new(true)
                 .mode(0o600)
                 .open(&self.path)?;
-            file.try_lock().map_err(std::io::Error::from)?;
+            warnings.extend(
+                lock(&self.path, || file.try_lock())
+                    .map_err(|e| std::io::Error::other(e.to_string()))?,
+            );
             self.file = Some(file);
         }
         let file = self.file.as_mut().expect("opened above");
@@ -407,6 +445,7 @@ pub fn list(dir: &Path) -> Vec<SessionSummary> {
     };
     let mut out: Vec<SessionSummary> = read
         .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
         .filter_map(|path| summary(&path))
@@ -419,7 +458,7 @@ pub fn list(dir: &Path) -> Vec<SessionSummary> {
 /// [`Session::open`] would open.
 fn summary(path: &Path) -> Option<SessionSummary> {
     let id = file_id(path)?;
-    let file = File::open(path).ok()?;
+    let file = open_regular(OpenOptions::new().read(true), path).ok()??;
     let modified = file.metadata().ok()?.modified().ok()?;
     let mut lines = BufReader::new(file).lines();
     let header: Entry = serde_json::from_str(&lines.next()?.ok()?).ok()?;
@@ -449,6 +488,62 @@ fn summary(path: &Path) -> Option<SessionSummary> {
     })
 }
 
+/// Opens `path` with `options` when it is a regular file, never following a symbolic link in
+/// its last component nor waiting on a FIFO; `None` when it is something else.
+fn open_regular(options: &mut OpenOptions, path: &Path) -> std::io::Result<Option<File>> {
+    let file = match options
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(file.metadata()?.is_file().then_some(file))
+}
+
+/// Locks the session file at `path` with `try_lock`, against other harness processes. A lock
+/// can outlive its owner for a moment while that process starts a child (the child holds a copy
+/// of the descriptor until it runs its program), so a held lock is tried a few more times before
+/// the session counts as in use. Where the file system cannot lock files, the session goes on
+/// unlocked, and the returned warning says so.
+fn lock(
+    path: &Path,
+    mut try_lock: impl FnMut() -> Result<(), TryLockError>,
+) -> Result<Option<String>, SessionError> {
+    let mut attempts = 0;
+    loop {
+        match try_lock() {
+            Ok(()) => return Ok(None),
+            Err(TryLockError::WouldBlock) if attempts < 10 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(TryLockError::WouldBlock) => return Err(SessionError::InUse(path.to_path_buf())),
+            Err(TryLockError::Error(e)) if locks_unsupported(&e) => {
+                return Ok(Some(format!(
+                    "cannot lock {} ({e}): its file system does not support file locks, so nothing stops another harness process from writing to this session at the same time",
+                    path.display()
+                )));
+            }
+            Err(TryLockError::Error(source)) => {
+                return Err(SessionError::Lock {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+}
+
+/// Whether `error` says the file system cannot lock files (some network and FUSE mounts).
+fn locks_unsupported(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        || error.raw_os_error().is_some_and(|code| {
+            [libc::ENOLCK, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS].contains(&code)
+        })
+}
+
 /// The session id a file at `path` must have: its name without `.jsonl`, when that is a valid
 /// id.
 fn file_id(path: &Path) -> Option<&str> {
@@ -462,13 +557,13 @@ pub fn is_valid_id(id: &str) -> bool {
     (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// A session id that sorts by start time: `20260927T123456Z-1a2b`.
+/// A session id that sorts by start time: `20260927T123456Z-1a2b3c4d`.
 fn new_session_id() -> String {
     let stamp: String = time::timestamp(time::now_unix())
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
-    format!("{stamp}-{:04x}", random_u64() as u16)
+    format!("{stamp}-{:08x}", random_u64() as u32)
 }
 
 /// A random number from the standard library's per-process hash keys.
@@ -481,4 +576,53 @@ fn random_u64() -> u64 {
             .unwrap_or(0),
     );
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failing(error: std::io::Error) -> impl FnMut() -> Result<(), TryLockError> {
+        let mut error = Some(error);
+        move || Err(TryLockError::Error(error.take().expect("tried once")))
+    }
+
+    // Review D M2: some network and FUSE file systems cannot lock files at all. Sessions there
+    // work unlocked, with a warning that says it is about locking.
+    #[test]
+    fn a_file_system_without_locks_is_used_unlocked_with_a_warning() {
+        let path = Path::new("/mnt/nfs/s.jsonl");
+        for error in [
+            std::io::Error::from(std::io::ErrorKind::Unsupported),
+            std::io::Error::from_raw_os_error(libc::ENOLCK),
+            std::io::Error::from_raw_os_error(libc::ENOTSUP),
+        ] {
+            let warning = lock(path, failing(error)).unwrap().expect("a warning");
+            assert!(
+                warning.starts_with("cannot lock /mnt/nfs/s.jsonl")
+                    && warning.contains("file locks"),
+                "{warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_lock_errors_are_named_as_such() {
+        let path = Path::new("/s.jsonl");
+        let error = lock(
+            path,
+            failing(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, SessionError::Lock { .. }), "{error:?}");
+        assert!(
+            error.to_string().starts_with("cannot lock /s.jsonl"),
+            "{error}"
+        );
+        assert!(matches!(
+            lock(path, || Err(TryLockError::WouldBlock)),
+            Err(SessionError::InUse(_))
+        ));
+        assert_eq!(lock(path, || Ok(())).unwrap(), None);
+    }
 }

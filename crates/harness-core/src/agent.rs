@@ -420,8 +420,10 @@ impl Agent {
         self.note_save_error();
     }
 
-    /// Queues a warning, once, when the session file could not be written.
+    /// Queues a warning, once, when the session file could not be written, and the session's
+    /// warnings about saving.
     fn note_save_error(&mut self) {
+        self.warnings.extend(self.session.take_warnings());
         if let Some(e) = self.session.take_save_error() {
             self.warnings.push(format!(
                 "cannot save the session: {e}; the conversation continues but is no longer saved"

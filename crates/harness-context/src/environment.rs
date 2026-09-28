@@ -2,13 +2,13 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
     time::Duration,
 };
 
 use harness_core::subprocess::output_within;
 
-use crate::project::repo_root;
+use crate::{project::repo_root, read::read_regular};
 
 /// How long each `git` query may take before its answer is left out.
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -48,10 +48,25 @@ pub fn capture(cwd: &Path, date: &str) -> Environment {
     }
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+/// Settings given on every git command line, where they outrank the repository's own
+/// configuration: git runs no file-system monitor or hook that configuration names. (The
+/// repository may come from anywhere, and this runs before any approval, outside the sandbox.)
+const OVERRIDES: [&str; 2] = ["core.fsmonitor=false", "core.hooksPath=/dev/null"];
+
+/// Runs git in `cwd` with [`OVERRIDES`]; `None` when it cannot run or does not finish in time.
+fn run_git(cwd: &Path, args: &[&str]) -> Option<Output> {
     let mut command = Command::new("git");
-    command.arg("-C").arg(cwd).args(args);
-    let output = output_within(&mut command, GIT_TIMEOUT).ok()??;
+    command.arg("-C").arg(cwd);
+    for setting in OVERRIDES {
+        command.args(["-c", setting]);
+    }
+    command.args(args);
+    output_within(&mut command, GIT_TIMEOUT).ok()?
+}
+
+/// git's trimmed output, when it succeeds.
+fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = run_git(cwd, args)?;
     output.status.success().then(|| {
         String::from_utf8_lossy(&output.stdout)
             .trim_end()
@@ -60,15 +75,73 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git_state(cwd: &Path) -> GitState {
-    let head = git(cwd, &["symbolic-ref", "--short", "-q", "HEAD"])
-        .filter(|branch| !branch.is_empty())
+    let head = repo_root(cwd)
+        .and_then(|root| head_from_file(&root))
         .or_else(|| {
-            git(cwd, &["rev-parse", "--short", "HEAD"])
-                .map(|commit| format!("detached HEAD at {commit}"))
+            git(cwd, &["symbolic-ref", "--short", "-q", "HEAD"])
+                .filter(|branch| !branch.is_empty())
+                .or_else(|| {
+                    git(cwd, &["rev-parse", "--short", "HEAD"])
+                        .map(|commit| format!("detached HEAD at {commit}"))
+                })
         });
-    let dirty = git(cwd, &["--no-optional-locks", "status", "--porcelain"])
-        .map(|status| !status.is_empty());
+    // `status` runs the clean filter of every file whose stat changed, so with a filter driver
+    // configured anywhere git looks, the answer is left out. Reading the configuration runs
+    // nothing. Submodules are left alone: `status` would run `git status` in each, with the
+    // submodule's own configuration.
+    let dirty = if filters_configured(cwd) {
+        None
+    } else {
+        git(
+            cwd,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "--ignore-submodules=all",
+            ],
+        )
+        .map(|status| !status.is_empty())
+    };
     GitState { head, dirty }
+}
+
+/// Whether git's configuration for `cwd` defines any filter driver (`filter.<driver>.clean`,
+/// `smudge` or `process`); also when git cannot say.
+fn filters_configured(cwd: &Path) -> bool {
+    match run_git(cwd, &["config", "--get-regexp", r"^filter\."]) {
+        // Exit code 1: no such setting.
+        Some(output) => output.status.code() != Some(1),
+        None => true,
+    }
+}
+
+/// The branch, or `detached HEAD at <commit>`, read from the `HEAD` file of the repository at
+/// `root` without running git; `None` when that file is anything but the simple case (a
+/// `.git` file naming the git directory is followed, as for a linked worktree).
+fn head_from_file(root: &Path) -> Option<String> {
+    let dotgit = root.join(".git");
+    let gitdir = if std::fs::metadata(&dotgit).ok()?.is_dir() {
+        dotgit
+    } else {
+        let text = small_file(&dotgit)?;
+        root.join(text.lines().next()?.strip_prefix("gitdir:")?.trim())
+    };
+    let head = small_file(&gitdir.join("HEAD"))?;
+    let head = head.trim_end();
+    if let Some(reference) = head.strip_prefix("ref: ") {
+        // A reftable repository keeps a placeholder here.
+        let branch = reference.strip_prefix("refs/heads/")?;
+        return (!branch.is_empty() && branch != ".invalid").then(|| branch.to_string());
+    }
+    let hex = head.bytes().all(|b| b.is_ascii_hexdigit());
+    (hex && matches!(head.len(), 40 | 64)).then(|| format!("detached HEAD at {}", &head[..7]))
+}
+
+/// The text of the regular file at `path`, at most 4 KiB of it.
+fn small_file(path: &Path) -> Option<String> {
+    let bytes = read_regular(path, 4096).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 impl Environment {

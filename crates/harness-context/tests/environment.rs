@@ -99,3 +99,126 @@ fn on_macos_the_environment_says_how_to_commit_a_multi_line_message() {
     let linux = environment("linux").render();
     assert!(!linux.contains("git commit"), "{linux}");
 }
+
+/// An executable script at `dir/name` that creates `dir/<name>.ran` and passes its input through.
+fn marker_script(dir: &Path, name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join(name);
+    let marker = dir.join(format!("{name}.ran"));
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script, marker)
+}
+
+// Final review, important 1 (probe p3): the repository's own configuration names a file-system
+// monitor. Capturing the environment runs before any approval and outside the sandbox, so it
+// must not run it.
+#[test]
+fn a_file_system_monitor_the_repository_names_never_runs() {
+    let dir = repo();
+    let tools = tempfile::tempdir().unwrap();
+    let (script, marker) = marker_script(tools.path(), "fsmonitor");
+    git(
+        dir.path(),
+        &["config", "core.fsmonitor", script.to_str().unwrap()],
+    );
+    std::fs::write(dir.path().join("a.txt"), "b\n").unwrap();
+    let env = environment::capture(dir.path(), "2026-09-27");
+    assert!(!marker.exists(), "the fsmonitor hook ran");
+    assert_eq!(env.git.unwrap().head.as_deref(), Some("main"));
+}
+
+// A clean filter runs for a file whose stat changed; with a filter configured, whether the work
+// tree is dirty is left unsaid rather than asked of git.
+#[test]
+fn a_clean_filter_the_repository_assigns_never_runs() {
+    let dir = repo();
+    let tools = tempfile::tempdir().unwrap();
+    let (script, marker) = marker_script(tools.path(), "clean");
+    git(
+        dir.path(),
+        &["config", "filter.x.clean", script.to_str().unwrap()],
+    );
+    std::fs::write(dir.path().join(".gitattributes"), "* filter=x\n").unwrap();
+    // Same size, new content: git has to compare it, through the filter.
+    std::fs::write(dir.path().join("a.txt"), "b\n").unwrap();
+    let env = environment::capture(dir.path(), "2026-09-27");
+    assert!(!marker.exists(), "the clean filter ran");
+    let git_state = env.git.clone().unwrap();
+    assert_eq!(git_state.head.as_deref(), Some("main"));
+    assert_eq!(git_state.dirty, None);
+    let text = env.render();
+    assert!(text.contains("Git branch: main\n"), "{text}");
+    assert!(!text.contains("Uncommitted changes"), "{text}");
+}
+
+// `git status` runs `git status` in each submodule, with the submodule's own configuration.
+#[test]
+fn a_clean_filter_in_a_submodule_never_runs() {
+    let dir = repo();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    git(&sub, &["init", "-q", "-b", "main"]);
+    std::fs::write(sub.join("s.txt"), "s\n").unwrap();
+    git(&sub, &["add", "s.txt"]);
+    git(&sub, &["commit", "-q", "-m", "sub"]);
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(&sub)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let head = String::from_utf8(head.stdout).unwrap();
+    git(
+        dir.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{},sub", head.trim()),
+        ],
+    );
+    git(dir.path(), &["commit", "-q", "-m", "add sub"]);
+    let tools = tempfile::tempdir().unwrap();
+    let (script, marker) = marker_script(tools.path(), "clean");
+    git(
+        &sub,
+        &["config", "filter.x.clean", script.to_str().unwrap()],
+    );
+    std::fs::write(sub.join(".gitattributes"), "* filter=x\n").unwrap();
+    std::fs::write(sub.join("s.txt"), "t\n").unwrap();
+    let env = environment::capture(dir.path(), "2026-09-27");
+    assert!(!marker.exists(), "the submodule's clean filter ran");
+    assert_eq!(env.git.unwrap().head.as_deref(), Some("main"));
+}
+
+// The branch is read from `HEAD`, which a linked worktree keeps in its own git directory.
+#[test]
+fn a_linked_worktree_reports_its_own_branch() {
+    let dir = repo();
+    let linked = tempfile::tempdir().unwrap();
+    let path = linked.path().join("wt");
+    git(
+        dir.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "topic",
+            path.to_str().unwrap(),
+        ],
+    );
+    let env = environment::capture(&path, "2026-09-27");
+    assert_eq!(
+        env.git,
+        Some(GitState {
+            head: Some("topic".into()),
+            dirty: Some(false),
+        })
+    );
+}

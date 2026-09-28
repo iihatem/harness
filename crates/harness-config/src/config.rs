@@ -55,6 +55,9 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub writable_roots: Vec<String>,
     pub allow_localhost: Option<bool>,
+    /// `sandbox.linux_git_protection`: see [`LinuxGitProtection`]; unset means `"best-effort"`.
+    /// A project's `"required"` always applies; a project's `"best-effort"` over a global
+    /// `"required"` widens it, so it applies only once the workspace is trusted.
     pub linux_git_protection: Option<LinuxGitProtection>,
 }
 

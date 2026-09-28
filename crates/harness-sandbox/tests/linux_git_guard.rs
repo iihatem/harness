@@ -1193,14 +1193,14 @@ int main(void) {
     match built {
         Ok(output) if output.status.success() => Some(program),
         Ok(output) => {
-            eprintln!(
-                "skipping: cc could not build the test helper: {}",
+            skip_or_require(&format!(
+                "cc could not build the test helper: {}",
                 String::from_utf8_lossy(&output.stderr)
-            );
+            ));
             None
         }
         Err(e) => {
-            eprintln!("skipping: no C compiler (cc) to build the test helper: {e}");
+            skip_or_require(&format!("no C compiler (cc) to build the test helper: {e}"));
             None
         }
     }

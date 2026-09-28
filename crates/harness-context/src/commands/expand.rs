@@ -214,7 +214,7 @@ fn uses_shell_arguments(shell: &str) -> bool {
 
 /// Words that run their operands, or evaluate them as arithmetic, a variable name or a
 /// subscript, and the name the warning gives each.
-const EVALUATING_WORDS: [(&str, &str); 12] = [
+const EVALUATING_WORDS: [(&str, &str); 15] = [
     ("let", "`let`"),
     ("declare", "`declare`"),
     ("typeset", "`typeset`"),
@@ -227,6 +227,11 @@ const EVALUATING_WORDS: [(&str, &str); 12] = [
     ("mapfile", "`mapfile`"),
     ("readarray", "`readarray`"),
     ("printf", "`printf -v`"),
+    // `-W` expands a word list and `-C` runs a command.
+    ("compgen", "`compgen`"),
+    ("complete", "`complete`"),
+    // `enable -f` loads a shared library.
+    ("enable", "`enable`"),
 ];
 
 /// Words after which the next word is a command.
@@ -311,8 +316,12 @@ fn evaluates_parameters(shell: &str) -> Option<&'static str> {
     {
         return Some("`wait -p`");
     }
+    if let Some(why) = export_names_from_parameters(shell) {
+        return Some(why);
+    }
     // `export` and `readonly` take their operands as names, which may be array elements: a
     // parameter in a name (before any `=`) is evaluated. `export NAME="$1"` is only a value.
+    // This coarser reading also finds them inside quoted text run by another shell.
     for (i, (word, _)) in words.iter().enumerate() {
         if matches!(*word, "export" | "readonly")
             && words[i + 1..]
@@ -336,6 +345,94 @@ fn evaluates_parameters(shell: &str) -> Option<&'static str> {
         return Some("`-v` in a test");
     }
     None
+}
+
+/// A word of shell text, read with its quotes: the text without them, and whether a `$` or
+/// backtick in it is unquoted, so that bash splits what it expands to.
+struct RawWord {
+    text: String,
+    unquoted_expansion: bool,
+}
+
+/// The words of the shell text `shell`, read with quotes and backslashes as bash reads them at the
+/// top level, with `None` where a command ends (`;`, `&`, `|`, `(`, `)` or a newline). Text inside
+/// quotes is not read again as a nested command.
+fn raw_words(shell: &str) -> Vec<Option<RawWord>> {
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut words = Vec::new();
+    let mut word: Option<RawWord> = None;
+    let mut quote = Quote::None;
+    let mut chars = shell.chars();
+    fn current(word: &mut Option<RawWord>) -> &mut RawWord {
+        word.get_or_insert_with(|| RawWord {
+            text: String::new(),
+            unquoted_expansion: false,
+        })
+    }
+    while let Some(c) = chars.next() {
+        match quote {
+            Quote::Single if c == '\'' => quote = Quote::None,
+            Quote::Single => current(&mut word).text.push(c),
+            Quote::Double if c == '"' => quote = Quote::None,
+            Quote::Double if c == '\\' => current(&mut word).text.extend(chars.next()),
+            Quote::Double => current(&mut word).text.push(c),
+            Quote::None => match c {
+                '\'' => {
+                    current(&mut word);
+                    quote = Quote::Single;
+                }
+                '"' => {
+                    current(&mut word);
+                    quote = Quote::Double;
+                }
+                '\\' => current(&mut word).text.extend(chars.next()),
+                '$' | '`' => {
+                    let w = current(&mut word);
+                    w.unquoted_expansion = true;
+                    w.text.push(c);
+                }
+                ';' | '&' | '|' | '(' | ')' | '\n' => {
+                    words.extend(word.take().map(Some));
+                    words.push(None);
+                }
+                c if c.is_whitespace() || matches!(c, '<' | '>') => {
+                    words.extend(word.take().map(Some))
+                }
+                c => current(&mut word).text.push(c),
+            },
+        }
+    }
+    words.extend(word.take().map(Some));
+    words
+}
+
+/// Why an `export` or `readonly` in `shell` may take a name from a parameter, if it may: an
+/// operand with a parameter before its `=`, or one with an unquoted `$` or backtick, which bash
+/// splits when the builtin is reached through `builtin`, `command`, a quoted name or a preceding
+/// assignment. `export NAME="$1"` has neither.
+fn export_names_from_parameters(shell: &str) -> Option<&'static str> {
+    let words = raw_words(shell);
+    let operands = words.iter().enumerate().flat_map(|(i, word)| {
+        let builtin = word
+            .as_ref()
+            .is_some_and(|w| matches!(w.text.as_str(), "export" | "readonly"));
+        let rest = if builtin { &words[i + 1..] } else { &[][..] };
+        rest.iter().map_while(Option::as_ref)
+    });
+    let mut unquoted = false;
+    for operand in operands {
+        let name = operand.text.split('=').next().unwrap_or_default();
+        if name.contains(['$', '`']) {
+            return Some("a parameter in a name for `export` or `readonly`");
+        }
+        unquoted |= operand.unquoted_expansion;
+    }
+    unquoted.then_some("an unquoted parameter in an `export` or `readonly` operand")
 }
 
 /// Whether `text` has a `${name@op}` transform, such as `${1@P}`, which expands the value as a

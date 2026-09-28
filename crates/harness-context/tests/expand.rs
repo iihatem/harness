@@ -408,7 +408,7 @@ fn arguments_reach_a_shell_expansion_byte_for_byte() {
 
 /// A `!` command that uses the arguments with one of these, where bash may evaluate a parameter's
 /// value as code, arithmetic or a variable name, and the construct the warning names.
-const TRIGGERS: [(&str, &str); 52] = [
+const TRIGGERS: [(&str, &str); 67] = [
     (r#"echo $(( "$1" + 1 ))"#, "`((`"),
     (r#"(( $1 > 0 )) && echo big"#, "`((`"),
     (r#"echo $[ "$1" ]"#, "`$[`"),
@@ -457,6 +457,25 @@ const TRIGGERS: [(&str, &str); 52] = [
     (r#"export X "$1""#, "a parameter in a name"),
     (r#"export -n "X$1"=1"#, "a parameter in a name"),
     (r#"true; builtin readonly ${1}"#, "a parameter in a name"),
+    // An unquoted parameter in an `export` or `readonly` operand: through `builtin`, `command`, a
+    // quoted name or a preceding assignment, bash splits it, and part of it becomes a name.
+    (r#"export X=$1"#, "an unquoted parameter"),
+    (r#"builtin export X=$1"#, "an unquoted parameter"),
+    (r#"command export X=$1"#, "an unquoted parameter"),
+    (r#""export" X=$1"#, "an unquoted parameter"),
+    (r#"\export X=$1"#, "an unquoted parameter"),
+    (r#"Y=1 export X=$1"#, "an unquoted parameter"),
+    (r#"export X="a"$1"#, "an unquoted parameter"),
+    (r#"builtin readonly X=${1}"#, "an unquoted parameter"),
+    (r#"readonly X=$ARGUMENTS"#, "an unquoted parameter"),
+    // Completion and loadable builtins: `-W` expands a word list, `-C` runs a command, and
+    // `enable -f` loads a shared library.
+    (r#"compgen -W "$1" x"#, "`compgen`"),
+    (r#"compgen -C "$1" x"#, "`compgen`"),
+    (r#"complete -W "$1" git"#, "`complete`"),
+    (r#"complete -C "$1" git"#, "`complete`"),
+    (r#"enable -f "$1" x"#, "`enable`"),
+    (r#"enable "$1""#, "`enable`"),
     (r#"getopts ab "$1""#, "`getopts`"),
     (r#"getopts ab opt "$@""#, "`getopts`"),
     (r#"sleep 1 & wait -p "$1""#, "`wait -p`"),
@@ -525,6 +544,8 @@ fn ordinary_shell_expansions_using_arguments_expand() {
         r#"export NAME="$1"; env | grep -c NAME"#,
         r#"export -n NAME="$1" OTHER="$ARGUMENTS""#,
         r#"readonly NAME="$1"; echo "$NAME""#,
+        r#"builtin export NAME="$1"; command export B="$ARGUMENTS""#,
+        r#"export NAME='$1' OTHER="${1}x"; Y=$1"#,
         r#"echo "${1:-user@host}" "${ARGUMENTS:+x@y}""#,
         r#"sleep 1 & wait; echo "$1""#,
         r#"grep -p "$1" file"#,

@@ -28,15 +28,23 @@ fn host_has_sandbox() -> bool {
 
 /// On Linux with a sandbox, whether this host gets the basic git-protection tier (`Some(true)`)
 /// or the full one (`Some(false)`); `None` elsewhere. With `HARNESS_EXPECT_LINUX_TIER` set (CI
-/// sets `basic` or `full`), any other tier fails the test.
+/// sets `basic` or `full`), any other tier — including no sandbox at all — fails the test loudly,
+/// rather than this quietly returning `None` and every caller skipping instead.
 fn linux_basic_tier() -> Option<bool> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let protection =
-        harness_sandbox::detect(harness_sandbox::SandboxSettings::default())?.git_protection();
-    let basic = matches!(protection, GitProtection::Basic { .. });
     let expected = std::env::var("HARNESS_EXPECT_LINUX_TIER").unwrap_or_default();
+    let detected = harness_sandbox::detect(harness_sandbox::SandboxSettings::default());
+    let Some(sandbox) = detected else {
+        assert!(
+            expected.is_empty(),
+            "HARNESS_EXPECT_LINUX_TIER={expected} but this host has no sandbox at all"
+        );
+        return None;
+    };
+    let protection = sandbox.git_protection();
+    let basic = matches!(protection, GitProtection::Basic { .. });
     if !expected.is_empty() {
         let tier = if basic { "basic" } else { "full" };
         assert_eq!(tier, expected, "{protection:?}");
@@ -307,9 +315,10 @@ async fn planting_a_git_hook_fails_in_the_sandbox() {
     );
     if basic {
         let quarantine = env.home.path().join("data/quarantine");
+        // The guard maps `.git` to `dot-git` in the quarantine (Task 4's I4/B2).
         let moved = std::fs::read_dir(&quarantine)
             .unwrap()
-            .map(|d| d.unwrap().path().join(".git/hooks/pre-commit"))
+            .map(|d| d.unwrap().path().join("dot-git/hooks/pre-commit"))
             .find(|p| p.exists())
             .expect("the hook is in the quarantine");
         assert_eq!(std::fs::read_to_string(moved).unwrap(), "echo pwned\n");

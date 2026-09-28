@@ -23,6 +23,7 @@ pub fn run() -> u8 {
     let facts = Facts {
         linux: cfg!(target_os = "linux"),
         mechanism: detected.as_ref().map(|s| s.name()),
+        landlock_abi: landlock_abi_status(),
         unavailable: detected.is_none().then(harness_sandbox::unavailable_reason),
         protection: detected.as_ref().map(|s| s.git_protection()),
         disabled: std::env::var("HARNESS_SANDBOX").as_deref() == Ok("none"),
@@ -38,6 +39,25 @@ pub fn run() -> u8 {
     };
     print!("{}", render(&facts));
     0
+}
+
+/// The kernel's Landlock ABI version ([`harness_sandbox::landlock_abi`]), printed next to the
+/// mechanism. Directly knowable in a fresh process: it is a plain syscall probe, not something
+/// that depends on a command having run.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn landlock_abi_status() -> Option<i32> {
+    harness_sandbox::landlock_abi()
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+fn landlock_abi_status() -> Option<i32> {
+    None
 }
 
 /// Whether harness has managed to become a child subreaper ([`harness_sandbox::subreaper_active`]),
@@ -105,20 +125,25 @@ fn watcher_status() -> WatcherStatus {
     WatcherStatus::default()
 }
 
+/// Whether orphans are reaped through pidfds, probed directly on this process
+/// ([`harness_sandbox::probe_pidfd_support`]) rather than read from
+/// [`harness_sandbox::reaps_through_pidfds`]'s sticky flag, which stays "supported" in a fresh
+/// process that has not reaped anything yet regardless of whether the kernel actually allows it.
+/// Directly knowable in a fresh process, like the Landlock ABI and the subreaper attempt.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-fn pidfd_status() -> bool {
-    harness_sandbox::reaps_through_pidfds()
+fn pidfd_status() -> Result<(), String> {
+    harness_sandbox::probe_pidfd_support()
 }
 
 #[cfg(not(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
-fn pidfd_status() -> bool {
-    true
+fn pidfd_status() -> Result<(), String> {
+    Ok(())
 }
 
 /// What the report is made from.
@@ -126,6 +151,8 @@ fn pidfd_status() -> bool {
 pub struct Facts {
     pub linux: bool,
     pub mechanism: Option<&'static str>,
+    /// The kernel's Landlock ABI version, printed next to `mechanism`.
+    pub landlock_abi: Option<i32>,
     pub unavailable: Option<String>,
     pub protection: Option<GitProtection>,
     pub disabled: bool,
@@ -134,9 +161,8 @@ pub struct Facts {
     pub host: Host,
     pub subreaper: Subreaper,
     pub watcher: WatcherStatus,
-    /// Whether orphans are, so far, reaped through pidfds rather than the by-pid fallback.
-    /// Defaults to `true`: nothing has been refused until it is.
-    pub pidfds: bool,
+    /// Whether a probe opening a pidfd for this process just now succeeded; `Err` names why not.
+    pub pidfds: Result<(), String>,
     pub exe: Option<PathBuf>,
 }
 
@@ -145,6 +171,7 @@ impl Default for Facts {
         Facts {
             linux: false,
             mechanism: None,
+            landlock_abi: None,
             unavailable: None,
             protection: None,
             disabled: false,
@@ -153,7 +180,7 @@ impl Default for Facts {
             host: Host::default(),
             subreaper: Subreaper::default(),
             watcher: WatcherStatus::default(),
-            pidfds: true,
+            pidfds: Ok(()),
             exe: None,
         }
     }
@@ -193,7 +220,13 @@ impl Host {
 pub fn render(facts: &Facts) -> String {
     let mut out = String::new();
     match facts.mechanism {
-        Some(name) => out.push_str(&format!("Sandbox: {name}\n")),
+        Some(name) => {
+            let abi = facts
+                .landlock_abi
+                .map(|abi| format!(" (Landlock ABI {abi})"))
+                .unwrap_or_default();
+            out.push_str(&format!("Sandbox: {name}{abi}\n"));
+        }
         None => out.push_str(&format!(
             "Sandbox: none ({}); every shell command will need approval\n",
             terminal_safe(facts.unavailable.as_deref().unwrap_or("unknown reason"))
@@ -217,7 +250,7 @@ pub fn render(facts: &Facts) -> String {
             // watcher and pidfd machinery that the basic tier depends on is at work here too.
             out.push_str(&subreaper_note(facts.subreaper));
             out.push_str(&watcher_note(&facts.watcher));
-            out.push_str(&pidfd_note(facts.pidfds));
+            out.push_str(&pidfd_note(&facts.pidfds));
             out.push_str(&background_processes_note());
             return out;
         }
@@ -248,50 +281,81 @@ pub fn render(facts: &Facts) -> String {
         }
     });
     out.push_str(&watcher_note(&facts.watcher));
-    out.push_str(&pidfd_note(facts.pidfds));
+    out.push_str(&pidfd_note(&facts.pidfds));
     out.push_str(&background_processes_note());
-    out.push_str("\nTo get the full tier, harness must be able to create user namespaces.\n");
-    let mut fixes = 0;
-    if facts.host.userns_clone.as_deref() == Some("0") {
-        fixes += 1;
-        out.push_str(&sysctl_fix(
-            "They are turned off (kernel.unprivileged_userns_clone = 0). To turn them on:",
-            "kernel.unprivileged_userns_clone",
-            "1",
-        ));
-    }
-    if facts.host.max_user_namespaces.as_deref() == Some("0") {
-        fixes += 1;
-        out.push_str(&sysctl_fix(
-            "They are limited to none (user.max_user_namespaces = 0). To allow them:",
-            "user.max_user_namespaces",
-            "10000",
-        ));
-    }
-    if facts.host.apparmor_restrict.as_deref() == Some("1") {
-        fixes += 1;
-        out.push_str(&apparmor_fix(facts.exe.as_deref()));
-    }
+    // Advice matched to the failing step: a locked securebit gets only its own fix (the mounts
+    // and the namespace itself already worked, since securebits are set after them), the
+    // namespace-setup steps get the generic "enable user namespaces" advice, and anything else
+    // (a mount call refused for an unrelated reason, say) gets neither, since offering the wrong
+    // fix is worse than offering none.
     if reason.contains("securebit") || reason.contains("SECBIT") {
-        fixes += 1;
         out.push_str(
             "\nA locked securebit is refusing part of the sandbox's setup (for example systemd's\nservice-level `noroot-locked` without `noroot`). Remove that lock, or run harness from a unit\nor shell that does not set it.\n",
         );
-    }
-    if facts.host.container {
-        fixes += 1;
-        out.push_str(
-            "\nharness is running in a container, and container runtimes block user namespaces by default\n(Docker's seccomp profile does). The full tier needs the container started with a profile that\nallows them, for example `docker run --security-opt seccomp=unconfined --security-opt\napparmor=unconfined ...`, which lifts those limits for everything in the container.\n",
-        );
-    }
-    if fixes == 0 {
-        out.push_str(
-            "\nharness could not tell what blocks them here. Check `dmesg` for AppArmor or SELinux denials\naround the step named above, and the sysctls kernel.unprivileged_userns_clone and\nuser.max_user_namespaces.\n",
-        );
+    } else if NAMESPACE_SETUP_STEPS.iter().any(|kw| reason.contains(kw)) {
+        out.push_str("\nTo get the full tier, harness must be able to create user namespaces.\n");
+        let mut fixes = 0;
+        if facts.host.userns_clone.as_deref() == Some("0") {
+            fixes += 1;
+            out.push_str(&sysctl_fix(
+                "They are turned off (kernel.unprivileged_userns_clone = 0). To turn them on:",
+                "kernel.unprivileged_userns_clone",
+                "1",
+                "userns-clone",
+            ));
+        }
+        if facts.host.max_user_namespaces.as_deref() == Some("0") {
+            fixes += 1;
+            out.push_str(&sysctl_fix(
+                "They are limited to none (user.max_user_namespaces = 0). To allow them:",
+                "user.max_user_namespaces",
+                "10000",
+                "max-user-namespaces",
+            ));
+        }
+        if facts.host.apparmor_restrict.as_deref() == Some("1") {
+            fixes += 1;
+            out.push_str(&apparmor_fix(facts.exe.as_deref()));
+        }
+        if facts.host.container {
+            fixes += 1;
+            out.push_str(
+                "\nharness is running in a container, and container runtimes block user namespaces by default\n(Docker's seccomp profile does). The full tier needs the container started with a profile that\nallows them, for example `docker run --security-opt seccomp=unconfined --security-opt\napparmor=unconfined ...`, which lifts those limits for everything in the container.\n",
+            );
+        }
+        if fixes == 0 {
+            out.push_str(
+                "\nharness could not tell what blocks them here. Check `dmesg` for AppArmor or SELinux denials\naround the step named above, and the sysctls kernel.unprivileged_userns_clone and\nuser.max_user_namespaces.\n",
+            );
+        }
+    } else {
+        out.push_str(&format!(
+            "\nharness could not tell what blocks the full tier's setup here from the reason above ({}).\nCheck `dmesg` for AppArmor or SELinux denials around that step.\n",
+            terminal_safe(reason)
+        ));
     }
     out.push_str("\nharness does not change any of these settings itself.\n");
     out
 }
+
+/// Substrings of a drop reason that name one of the steps that create and configure the user and
+/// mount namespace itself (`Step::{Unshare,Setgroups,UidMap,GidMap,Private}` in
+/// `harness_sandbox::mounts`, as `Failure::describe` renders them): these are the steps AppArmor's
+/// `apparmor_restrict_unprivileged_userns` and the `unprivileged_userns_clone`/
+/// `max_user_namespaces` sysctls actually gate, so only a reason naming one of them gets the
+/// generic "enable user namespaces" advice. `"unshare"`, `"uid_map"` and `"gid_map"` are literal
+/// keywords; `Step::Unshare` and `Step::Private` render as prose ("creating a user and mount
+/// namespace", "making mounts private") that never contains the word "unshare", so both forms are
+/// matched — otherwise the single most common real cause (AppArmor refusing `unshare` itself)
+/// would never get this advice at all.
+const NAMESPACE_SETUP_STEPS: &[&str] = &[
+    "unshare",
+    "creating a user and mount namespace",
+    "setgroups",
+    "uid_map",
+    "gid_map",
+    "making mounts private",
+];
 
 /// The subreaper carry-forward note (task-6/7/8): what a fresh `doctor` process can and cannot
 /// know about `prctl(PR_SET_CHILD_SUBREAPER)`.
@@ -326,17 +390,22 @@ fn watcher_note(watcher: &WatcherStatus) -> String {
     )
 }
 
-/// Whether orphans an earlier command left running are reaped through pidfds, or through the
-/// `waitpid`-by-pid fallback (`harness_sandbox::reaps_through_pidfds`, Task 7's M9). The fallback
-/// is only ever taken when the kernel refuses `pidfd_open` (`ENOSYS`/`EPERM`); it is not itself a
-/// problem, so this is informational, not a fix.
-fn pidfd_note(pidfds: bool) -> String {
-    if pidfds {
-        String::new()
-    } else {
-        String::from(
-            "  This kernel refused pidfd_open, so harness reaps processes left running by their pid\n  instead of a pidfd; harmless, but it means a reused pid could in principle be reaped as if it\n  were the process harness meant.\n",
-        )
+/// Whether orphans an earlier command left running would be reaped through pidfds, or through the
+/// `waitpid`-by-pid fallback (Task 7's M9), probed directly on this process
+/// (`harness_sandbox::probe_pidfd_support`) rather than read from a sticky flag that stays
+/// "supported" until a real reap hits a refusal. The fallback is only ever taken when the kernel
+/// refuses `pidfd_open` (`ENOSYS`/`EPERM`); it is not itself a problem, so this is informational,
+/// not a fix. Printed either way, directly knowable in a fresh process (not "measured during a
+/// session": nothing needs to have run first).
+fn pidfd_note(pidfds: &Result<(), String>) -> String {
+    match pidfds {
+        Ok(()) => String::from(
+            "  Orphans a command leaves running are reaped through pidfds, which no pid reused meanwhile\n  can mislead.\n",
+        ),
+        Err(err) => format!(
+            "  Orphans a command leaves running are reaped by pid instead (pidfd_open refused: {}); harmless,\n  but a reused pid could in principle be reaped as if it were the process harness meant.\n",
+            terminal_safe(err)
+        ),
     }
 }
 
@@ -346,14 +415,24 @@ fn background_processes_note() -> String {
     )
 }
 
-fn sysctl_fix(what: &str, key: &str, value: &str) -> String {
+/// `slug` names a separate file per setting (`/etc/sysctl.d/60-harness-<slug>.conf`), so that
+/// following more than one of these fixes doesn't have the second `tee` overwrite the first
+/// setting's file — every fix's sysctl survives a reboot, not just the last one applied.
+fn sysctl_fix(what: &str, key: &str, value: &str, slug: &str) -> String {
     format!(
-        "\n{what}\n\n    sudo sysctl -w {key}={value}\n    echo '{key} = {value}' | sudo tee /etc/sysctl.d/60-harness-userns.conf\n"
+        "\n{what}\n\n    sudo sysctl -w {key}={value}\n    echo '{key} = {value}' | sudo tee /etc/sysctl.d/60-harness-{slug}.conf\n"
     )
 }
 
 /// Ubuntu's two ways out: an AppArmor profile that lets only this binary create user namespaces,
 /// or the sysctl for every program.
+///
+/// The profile is printed flush left, not indented under "1. …" like the rest of this block: a
+/// `<<'EOF'` heredoc's terminator must be exactly `EOF` at the start of a line, with no leading
+/// whitespace at all (that would need `<<-'EOF'`, which strips only leading *tabs*, not the spaces
+/// this report otherwise uses for indentation). An indented `    EOF` here would never end the
+/// heredoc: pasted into a shell, it would wait at `>` and swallow the next printed line — the
+/// `sudo apparmor_parser …` command — into the profile file's contents instead of running it.
 fn apparmor_fix(exe: Option<&Path>) -> String {
     let mut out = String::from(
         "\nUbuntu restricts them with AppArmor (kernel.apparmor_restrict_unprivileged_userns = 1). Either:\n\n1. Allow them for this harness binary only (recommended): save this profile and load it.\n\n",
@@ -363,7 +442,7 @@ fn apparmor_fix(exe: Option<&Path>) -> String {
         .filter(|p| !p.contains(['"', '\\']) && !p.chars().any(char::is_control));
     match path {
         Some(path) => out.push_str(&format!(
-            "    sudo tee /etc/apparmor.d/harness > /dev/null <<'EOF'\n    abi <abi/4.0>,\n    include <tunables/global>\n\n    profile harness \"{}\" flags=(unconfined) {{\n      userns,\n\n      include if exists <local/harness>\n    }}\n    EOF\n    sudo apparmor_parser -r /etc/apparmor.d/harness\n\n   Do it again if harness moves to another path.\n",
+            "sudo tee /etc/apparmor.d/harness > /dev/null <<'EOF'\nabi <abi/4.0>,\ninclude <tunables/global>\n\nprofile harness \"{}\" flags=(unconfined) {{\n  userns,\n\n  include if exists <local/harness>\n}}\nEOF\nsudo apparmor_parser -r /etc/apparmor.d/harness\n\nDo it again if harness moves to another path.\n",
             terminal_safe(path)
         )),
         None => out.push_str(
@@ -374,6 +453,7 @@ fn apparmor_fix(exe: Option<&Path>) -> String {
         "2. Or allow them for every program:",
         "kernel.apparmor_restrict_unprivileged_userns",
         "0",
+        "apparmor-userns",
     ));
     out
 }
@@ -411,16 +491,72 @@ mod tests {
         assert!(out.contains(
             "  Why: writing /proc/self/setgroups failed: Operation not permitted (os error 1)\n"
         ));
-        assert!(out.contains("    profile harness \"/home/u/.cargo/bin/harness\" flags=(unconfined) {\n      userns,\n"), "{out}");
-        assert!(out.contains("    sudo apparmor_parser -r /etc/apparmor.d/harness\n"));
+        assert!(
+            out.contains(
+                "profile harness \"/home/u/.cargo/bin/harness\" flags=(unconfined) {\n  userns,\n"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("sudo apparmor_parser -r /etc/apparmor.d/harness\n"));
         assert!(
             out.contains("    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n")
         );
-        assert!(out.contains("    echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | sudo tee /etc/sysctl.d/60-harness-userns.conf\n"));
+        assert!(out.contains("    echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | sudo tee /etc/sysctl.d/60-harness-apparmor-userns.conf\n"));
+        // The heredoc terminator must be exactly `EOF` on its own line, flush left, or a pasted
+        // shell never leaves the heredoc and swallows the next command into the profile file.
+        assert!(out.lines().any(|l| l == "EOF"), "{out}");
+        assert!(
+            !out.lines().any(|l| l == "    EOF"),
+            "an indented EOF would not end a <<'EOF' heredoc: {out}"
+        );
         assert!(out.contains("Quarantined files go to /home/u/.local/share/harness/quarantine"));
         assert!(out.contains("sandbox.linux_git_protection = \"best-effort\""));
         assert!(out.ends_with("harness does not change any of these settings itself.\n"));
         assert!(!out.contains("could not tell"));
+    }
+
+    #[test]
+    fn a_heredoc_pasted_as_printed_actually_runs_the_command_after_it() {
+        // Reproduces the reviewer's finding directly: run the printed block, exactly as printed,
+        // through a real shell (`sudo`/`tee`/`apparmor_parser` are stand-ins here — `tee` discards
+        // its input instead of writing the real `/etc/apparmor.d/harness`, so this never touches
+        // the filesystem outside its own temp dir), then check that `apparmor_parser` actually ran
+        // as a command. If the heredoc's `EOF` terminator were indented, the shell would still be
+        // inside the heredoc when the script ends, `apparmor_parser` would never run, and this
+        // fails.
+        let out = render(&basic(Host {
+            apparmor_restrict: Some("1".into()),
+            ..Host::default()
+        }));
+        let start = out.find("sudo tee").expect("the apparmor fix block");
+        let marker_line = "apparmor_parser -r /etc/apparmor.d/harness\n";
+        let end = out[start..]
+            .find(marker_line)
+            .expect("the apparmor_parser line")
+            + start
+            + marker_line.len();
+        let block = &out[start..end];
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("parser_ran");
+        let script = format!(
+            "sudo() {{ \"$@\"; }}\ntee() {{ cat > /dev/null; }}\napparmor_parser() {{ touch '{}'; }}\n{block}",
+            marker.display()
+        );
+        let result = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            marker.exists(),
+            "apparmor_parser never ran as a command — the heredoc likely swallowed it: {out}"
+        );
     }
 
     #[test]
@@ -441,6 +577,16 @@ mod tests {
         );
         assert!(out.contains("--security-opt seccomp=unconfined"), "{out}");
         assert!(!out.contains("apparmor_parser"));
+        // Two fixes, two separate sysctl.d files: `tee` (no `-a`) would otherwise have the second
+        // fix's file overwrite the first's, so only the last one applied would survive a reboot.
+        assert!(
+            out.contains("| sudo tee /etc/sysctl.d/60-harness-userns-clone.conf\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("| sudo tee /etc/sysctl.d/60-harness-max-user-namespaces.conf\n"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -454,14 +600,27 @@ mod tests {
 
     #[test]
     fn a_locked_securebit_gets_its_own_fix() {
-        let mut facts = basic(Host::default());
+        // The real text `Failure::describe` renders for `Step::Securebits` (see
+        // `harness_sandbox::mounts::tests`), not a made-up one.
+        let mut facts = basic(Host {
+            apparmor_restrict: Some("1".into()),
+            userns_clone: Some("0".into()),
+            max_user_namespaces: Some("0".into()),
+            container: true,
+        });
         facts.protection = Some(GitProtection::Basic {
-            reason: "prctl(PR_SET_SECUREBITS) failed: a securebit is locked (SECBIT_NOROOT_LOCKED)"
-                .into(),
+            reason: "locking the securebits failed: Operation not permitted (os error 1)".into(),
         });
         let out = render(&facts);
         assert!(out.contains("A locked securebit is refusing"), "{out}");
+        // The securebit case gets only its own fix: the mounts and the namespace itself already
+        // worked (securebits are locked down after them), so none of the generic namespace advice
+        // — which every `Host` fact above would otherwise trigger — belongs here.
         assert!(!out.contains("could not tell"), "{out}");
+        assert!(!out.contains("To get the full tier"), "{out}");
+        assert!(!out.contains("apparmor_parser"), "{out}");
+        assert!(!out.contains("unprivileged_userns_clone=1"), "{out}");
+        assert!(!out.contains("--security-opt"), "{out}");
     }
 
     #[test]
@@ -552,6 +711,7 @@ mod tests {
             failures: 2,
             last_error: Some("Too many open files (os error 24)".into()),
         };
+        facts.pidfds = Err("Function not implemented (os error 38)".into());
         let out = render(&facts);
         assert!(
             out.contains("The kernel refused to make harness a subreaper"),
@@ -560,6 +720,68 @@ mod tests {
         assert!(out.contains("could not start 2 time(s) here"), "{out}");
         assert!(out.contains("Too many open files (os error 24)"), "{out}");
         assert!(out.contains("fs.inotify.max_user_instances"), "{out}");
+        assert!(out.contains("reaped by pid instead"), "{out}");
+        assert!(
+            out.contains("pidfd_open refused: Function not implemented (os error 38)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_working_pidfd_probe_is_reported_too() {
+        let out = render(&basic(Host::default()));
+        assert!(
+            out.contains("Orphans a command leaves running are reaped through pidfds"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_landlock_abi_is_printed_next_to_the_mechanism() {
+        let mut facts = basic(Host::default());
+        facts.landlock_abi = Some(3);
+        assert!(
+            render(&facts).starts_with("Sandbox: landlock+seccomp (Landlock ABI 3)\n"),
+            "{}",
+            render(&facts)
+        );
+        facts.landlock_abi = None;
+        assert!(
+            render(&facts).starts_with("Sandbox: landlock+seccomp\n"),
+            "{}",
+            render(&facts)
+        );
+    }
+
+    #[test]
+    fn a_cause_that_names_neither_a_namespace_step_nor_a_securebit_gets_no_specific_fix() {
+        // An `OpenTree`/`ReadOnly`/`MoveMount` refusal (see `harness_sandbox::mounts::Step`) means
+        // the namespace and its id maps already worked; none of the AppArmor/sysctl advice, which
+        // is only about *creating* user namespaces, would help, so it must not be printed.
+        let mut facts = basic(Host {
+            apparmor_restrict: Some("1".into()),
+            userns_clone: Some("0".into()),
+            max_user_namespaces: Some("0".into()),
+            container: true,
+        });
+        facts.protection = Some(GitProtection::Basic {
+            reason:
+                "cloning a mount of /ws/.git/hooks failed: Operation not permitted (os error 1)"
+                    .into(),
+        });
+        let out = render(&facts);
+        assert!(!out.contains("To get the full tier"), "{out}");
+        assert!(!out.contains("apparmor_parser"), "{out}");
+        assert!(!out.contains("A locked securebit"), "{out}");
+        assert!(
+            !out.contains("could not tell what blocks them here"),
+            "{out}"
+        );
+        assert!(
+            out.contains("harness could not tell what blocks the full tier's setup here"),
+            "{out}"
+        );
+        assert!(out.ends_with("harness does not change any of these settings itself.\n"));
     }
 
     #[test]

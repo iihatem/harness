@@ -539,6 +539,23 @@ pub fn reaps_through_pidfds() -> bool {
     !PIDFDS_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Probes this process's own pidfd support directly, by opening (and at once closing) a pidfd
+/// for this process itself, rather than reading [`reaps_through_pidfds`]'s sticky flag: that flag
+/// only ever changes when a real reap hits a refusal, so in a process that has not reaped
+/// anything yet — `harness sandbox doctor`, say — it always reads as "supported" whether or not
+/// the kernel actually allows it. This is read-only: nothing is reaped, and no state here changes.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn probe_pidfd_support() -> Result<(), String> {
+    // SAFETY: `getpid()` takes no arguments and cannot fail.
+    let me = unsafe { libc::getpid() };
+    // The returned `OwnedFd` is dropped (closed) at the end of this function; nothing keeps it
+    // open past the probe.
+    pidfd_open(me).map(drop).map_err(|err| err.to_string())
+}
+
 /// Reaps `pid`, a zombie the scan found that `me` may reap, unless the pid
 /// has changed hands since: whether it did.
 ///
@@ -955,6 +972,22 @@ mod tests {
         let refused = |_| Err(std::io::Error::from_raw_os_error(libc::EPERM));
         assert!(!reap_with(pid, me, my_sid, &registry, refused));
         assert_eq!(managed.wait().expect("its exit status").code(), Some(3));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn probing_pidfd_support_on_this_live_process_succeeds_and_closes_the_fd() {
+        // A plain kernel with pidfds enabled (every kernel the sandbox supports, 6.2+) always
+        // allows opening a pidfd for a live process that is one's own; this is not gated behind
+        // `reaps_through_pidfds`'s sticky flag, which a fresh process never sets either way.
+        assert!(probe_pidfd_support().is_ok());
+        // Calling it many times must not leak descriptors: each probe closes its own.
+        for _ in 0..64 {
+            assert!(probe_pidfd_support().is_ok());
+        }
     }
 
     #[test]

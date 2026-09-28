@@ -360,13 +360,6 @@ impl CommandSandbox for LinuxSandbox {
             });
         }
         let tier = self.git_protection();
-        if let GitProtection::Basic { reason } = &tier
-            && self.settings.require_full_git_protection
-        {
-            return Err(io::Error::other(format!(
-                "git metadata protection is required (sandbox.linux_git_protection = \"required\"), but the full tier is unavailable: {reason}; restart harness to have every command ask first"
-            )));
-        }
         let full = tier == GitProtection::Full;
         let workspace = canonical(workspace);
         // What it would check, `begin` checks, and their checks must not
@@ -389,6 +382,22 @@ impl CommandSandbox for LinuxSandbox {
                 planned = mountplan::plan(&workspace, index);
             }
         });
+        if let GitProtection::Basic { reason } = &tier
+            && self.settings.require_full_git_protection
+        {
+            // Nothing runs; still finish the check `begin` started, so what it
+            // found (and what the watcher found between commands, before
+            // this) is not lost, exactly as the `mounted_command` error path
+            // below does for a setup failure.
+            let message = format!(
+                "git metadata protection is required (sandbox.linux_git_protection = \"required\"), but the full tier is unavailable: {reason}; restart harness to have every command ask first"
+            );
+            let report = self.after(workspace).finished(guard.finish());
+            return Err(match report {
+                Some(report) => io::Error::other(format!("{message}\n{}", report.message)),
+                None => io::Error::other(message),
+            });
+        }
         // From here until its guard finishes, the command is registered, so
         // the reaper leaves it to tokio even if it exits before its pid is
         // known.

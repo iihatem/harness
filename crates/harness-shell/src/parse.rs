@@ -20,6 +20,12 @@ const MAX_INPUT_CHARS: usize = 10_000;
 /// memory: it is undecomposable, so it prompts, and whenever a deny rule exists it counts as
 /// possibly hiding a denied command (see [`crate::Verdict::Ask`]'s `may_deny`).
 const MAX_SCAN_BYTES: usize = 262_144;
+/// bash reads the `-` of `>&-` or `<&-` as a word of its own; brush-parser reads it with
+/// what follows.
+const DUPLICATE_DASH: &str = "bash reads the `-` after `>&` or `<&` as a word of its own, so what follows may be another command";
+/// bash 4.1 and later read `{NAME}` right before a redirection as a variable for its file
+/// descriptor; brush-parser reads a word.
+const FD_VARIABLE: &str = "bash 4.1 and later read `{name}` before a redirection as a variable for its file descriptor, not as a word";
 /// Builtins whose `NAME=value` operands set shell variables.
 const DECLARATION_BUILTINS: &[&str] = &["export", "declare", "typeset", "local", "readonly"];
 /// Builtins that evaluate their operands' text as arithmetic, subscripts or variable
@@ -405,6 +411,7 @@ impl Walker<'_> {
     }
 
     fn simple(&mut self, cmd: &ast::SimpleCommand, cwd: &mut Cwd, depth: usize) {
+        self.fd_variables(cmd);
         let mut argv = Vec::new();
         let mut assigns = false;
         let mut dangerous_env = false;
@@ -458,6 +465,54 @@ impl Walker<'_> {
             self.unlisted("sets environment variables for the command".into());
         }
         self.exec(argv, &operands, cwd, depth, 0, true);
+    }
+
+    /// A word that bash 4.1 and later read as the file descriptor variable of the
+    /// redirection after it (`{fd}>out curl x` runs `curl x`) makes the program
+    /// undecomposable, and it is roughly scanned, which reads it as bash does.
+    fn fd_variables(&mut self, cmd: &ast::SimpleCommand) {
+        let mut previous = cmd.word_or_name.as_ref();
+        for item in cmd.suffix.iter().flat_map(|s| &s.0) {
+            if matches!(item, Item::IoRedirect(_)) && previous.is_some_and(|w| self.fd_variable(w))
+            {
+                self.undecomposable(FD_VARIABLE.into());
+                self.rescan = self.rescan.or(Some(FD_VARIABLE));
+            }
+            previous = match item {
+                Item::Word(w) => Some(w),
+                _ => None,
+            };
+        }
+    }
+
+    /// Whether bash may read `word`, just before a redirection, as its file descriptor
+    /// variable: `{NAME}` or `{NAME[SUBSCRIPT]}` with no blank before the redirection. NAME
+    /// is what bash may take for a name: its letters are the locale's, so any non-ASCII
+    /// character counts, and digits and `_` after the first. The blank is looked for where
+    /// brush-parser places the word, only if the text there is the word.
+    fn fd_variable(&self, word: &ast::Word) -> bool {
+        let Some(inner) = word
+            .value
+            .strip_prefix('{')
+            .and_then(|w| w.strip_suffix('}'))
+        else {
+            return false;
+        };
+        let (name, subscript) = inner.split_at(inner.find('[').unwrap_or(inner.len()));
+        let identifier = name.starts_with(|c: char| !c.is_ascii_digit())
+            && !name.is_empty()
+            && name
+                .chars()
+                .all(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_');
+        let array = subscript.is_empty() || subscript.len() > 1 && subscript.ends_with(']');
+        let blank_after = || {
+            let (loc, src) = (word.loc.as_ref()?, self.sources.last()?);
+            let len = loc.end.index.checked_sub(loc.start.index)?;
+            let mut chars = src.chars().skip(loc.start.index);
+            let text: String = chars.by_ref().take(len).collect();
+            Some(text == word.value && matches!(chars.next(), Some(' ' | '\t')))
+        };
+        identifier && array && blank_after() != Some(true)
     }
 
     /// Adds an argv word (if `item` is one) and returns its hidden literal text.
@@ -591,6 +646,11 @@ impl Walker<'_> {
                         self.redirect_path(&tok, output, cwd);
                     }
                     Target::Duplicate(w) => {
+                        // `>&-curl x` runs `curl x`; the rough scan reads it as bash does.
+                        if w.value.len() > 1 && w.value.starts_with('-') {
+                            self.undecomposable(DUPLICATE_DASH.into());
+                            self.rescan = self.rescan.or(Some(DUPLICATE_DASH));
+                        }
                         let tok = self.word(&w.value, cwd, depth);
                         let fd = tok
                             .lit()

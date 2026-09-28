@@ -5,7 +5,7 @@ Checkpoints snapshot the workspace during a session so the user can rewind code,
 ## ADDED Requirements
 
 ### Requirement: Workspace snapshots before mutating actions
-Before the first mutating action of each turn (`write`, `edit`, or `bash` in a mode that allows writes, including a slash command's shell part), the system SHALL snapshot the workspace into a shadow repository in the harness data directory. The snapshot MUST NOT modify the user's own git repository, index, branches, or history, and MUST work in directories that are not git repositories. Snapshots MUST honour `.gitignore`, including the repository's rules when the workspace is a subdirectory of a repository, exclude `.git`, `node_modules`, `target`, and `.harness/` and a `HEAD` at the top of the workspace, and skip files larger than 10 MB, whatever a `.gitignore` negation says. A workspace the repository's rules ignore MUST be snapshotted by its own ignore files, as a directory outside any repository. Each snapshot MUST record what existed but was left out, and the directory it was taken for. Files MUST be stored and restored byte for byte, whatever `.gitattributes` says.
+Before the first mutating action of each turn (`write`, `edit`, or `bash` in a mode that allows writes, including a slash command's shell part), the system SHALL snapshot the workspace into a shadow repository in the harness data directory. The snapshot MUST NOT modify the user's own git repository, index, branches, or history, and MUST work in directories that are not git repositories. Snapshots MUST honour `.gitignore`, including the repository's rules when the workspace is a subdirectory of a repository, exclude `.git`, `node_modules`, `target`, and `.harness/` and a `HEAD` at the top of the workspace, and skip files larger than 10 MB, whatever a `.gitignore` negation says. A workspace the repository's rules ignore MUST be snapshotted by its own ignore files, as a directory outside any repository. Each snapshot MUST record what existed but was left out, and the directory it was taken for. Files MUST be stored and restored byte for byte, whatever `.gitattributes` says. The shadow repository holds copies of the workspace's files, private ones included, so it MUST be readable only by the user, whatever the umask: its folders 0700 and its files closed to group and others, as session files are; the data directory, when harness creates it, MUST be 0700 too.
 
 #### Scenario: User's repository untouched
 - **WHEN** a turn edits files in a git repository with staged changes
@@ -30,6 +30,10 @@ Before the first mutating action of each turn (`write`, `edit`, or `bash` in a m
 #### Scenario: Workspace its repository ignores
 - **WHEN** harness runs in a directory its repository's `.gitignore` ignores, and the agent changes files there
 - **THEN** snapshots hold that directory's files, and rewinding code restores them
+
+#### Scenario: Checkpoint repository is private
+- **WHEN** a turn edits a workspace holding a 0600 `.env.local` and the umask is 022
+- **THEN** the data directory, the `checkpoints` directory and the shadow repository's folders are 0700 and no file in the shadow repository is readable by group or others
 
 #### Scenario: Rewind empties a subdirectory workspace
 - **WHEN** harness runs in an empty subdirectory of a repository, the agent creates files there, and the user rewinds code to before that

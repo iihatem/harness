@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::OpenOptions,
     io::Write,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process,
 };
@@ -82,8 +82,13 @@ impl TrustStore {
             path: path.clone(),
             source,
         };
+        // The data directory holds sessions and checkpoints too: only the user may read it.
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(io)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(io)?;
         }
         let text = toml::to_string(&self.file).map_err(|e| ConfigError::Parse {
             path: path.clone(),

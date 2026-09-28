@@ -12,7 +12,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     ffi::{OsStr, OsString},
-    io::Read,
+    io::{Read, Write},
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
@@ -62,8 +62,13 @@ const PROTECTED: [&[u8]; 2] = [b".harness", b"HEAD"];
 const ATTRIBUTES: &str = "* -text -ident -filter !eol !working-tree-encoding\n";
 /// Settings given on every git command line, where they outrank the shadow repository's own
 /// configuration: whatever that file says, git runs no file-system monitor or hook. (Commits are
-/// made with `--no-gpg-sign`, so no signing program runs either.)
-const OVERRIDES: [&str; 2] = ["core.fsmonitor=false", "core.hooksPath=/dev/null"];
+/// made with `--no-gpg-sign`, so no signing program runs either.) And every file and directory git
+/// creates is its owner's alone, whatever the umask: snapshots hold copies of private files.
+const OVERRIDES: [&str; 3] = [
+    "core.fsmonitor=false",
+    "core.hooksPath=/dev/null",
+    "core.sharedRepository=0600",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointError {
@@ -211,8 +216,11 @@ impl Checkpoints {
             timeout: SNAPSHOT_TIMEOUT,
             restore_timeout: RESTORE_TIMEOUT,
         };
+        // Only the user may read the repository: it holds copies of the workspace's files,
+        // private ones included. Directories harness makes on the way, the data directory among
+        // them, are private too; one an older harness made is made private here.
         if !gitdir.join("HEAD").is_file() {
-            std::fs::create_dir_all(gitdir)?;
+            private_dir(gitdir)?;
             let mut init = checkpoints.command();
             init.env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
@@ -221,12 +229,15 @@ impl Checkpoints {
             checkpoints.run(init, "init", Instant::now() + RESTORE_TIMEOUT)?;
             checkpoints.git(&["config", "gc.auto", "0"], RESTORE_TIMEOUT)?;
         }
-        std::fs::create_dir_all(gitdir.join("info"))?;
-        std::fs::write(gitdir.join("info/exclude"), BUILTIN_EXCLUDES)?;
-        std::fs::write(gitdir.join("info/attributes"), ATTRIBUTES)?;
-        std::fs::create_dir_all(gitdir.join("indexes"))?;
-        std::fs::create_dir_all(gitdir.join("pathspecs"))?;
-        std::fs::create_dir_all(gitdir.join("records"))?;
+        if std::fs::metadata(gitdir)?.permissions().mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(gitdir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        private_dir(&gitdir.join("info"))?;
+        write_private(&gitdir.join("info/exclude"), BUILTIN_EXCLUDES.as_bytes())?;
+        write_private(&gitdir.join("info/attributes"), ATTRIBUTES.as_bytes())?;
+        private_dir(&gitdir.join("indexes"))?;
+        private_dir(&gitdir.join("pathspecs"))?;
+        private_dir(&gitdir.join("records"))?;
         // A workspace its repository ignores would get empty snapshots, and a rewind would
         // restore nothing: it is snapshotted as a directory of its own, by its own ignore files.
         if !checkpoints.scope.is_empty() && checkpoints.repository_ignores_workspace()? {
@@ -590,14 +601,14 @@ impl Checkpoints {
         previous: Option<&str>,
         deadline: Instant,
     ) -> Result<String, CheckpointError> {
-        std::fs::write(&self.record, record)?;
+        write_private(&self.record, record)?;
         let blob = self.hash_object("blob", &self.record, deadline)?;
         let blob = hex::decode(&blob).map_err(|_| failure("hash-object", blob.as_bytes()))?;
         let mut tree = b"100644 record\0".to_vec();
         tree.extend_from_slice(&blob);
         let mut tree_file = self.record.clone().into_os_string();
         tree_file.push(".tree");
-        std::fs::write(&tree_file, tree)?;
+        write_private(Path::new(&tree_file), &tree)?;
         let tree = self.hash_object("tree", Path::new(&tree_file), deadline)?;
         let mut args = vec!["commit-tree", "--no-gpg-sign", &tree, "-m", RECORD_MESSAGE];
         if let Some(previous) = previous {
@@ -1033,7 +1044,7 @@ impl Checkpoints {
             bytes.extend_from_slice(pathspec);
             bytes.push(0);
         }
-        std::fs::write(&self.pathspecs, bytes)?;
+        write_private(&self.pathspecs, &bytes)?;
         Ok(())
     }
 
@@ -1116,6 +1127,27 @@ impl Checkpoints {
             Some(out) => Err(failure(name, &out.stderr)),
         }
     }
+}
+
+/// Makes the directory `path` and any missing parents, each readable only by its owner.
+fn private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+/// Writes `bytes` to the file at `path`, which only its owner may read, whatever the umask or an
+/// older harness left.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)
 }
 
 /// The time left before `deadline`, or `TooSlow` when it has passed.

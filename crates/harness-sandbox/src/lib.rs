@@ -44,6 +44,11 @@ pub use linux::{LinuxSandbox, landlock_abi, linux_sandbox_available, linux_sandb
 #[cfg(target_os = "macos")]
 pub use macos::{Seatbelt, seatbelt_available, seatbelt_command};
 pub use policy::{FsAccess, SandboxPolicy};
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub use procs::subreaper_active;
 
 /// User settings that apply to every sandboxed command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

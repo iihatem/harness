@@ -14,8 +14,13 @@
 //! `pre_exec`), and what it starts inherits that session or makes a new one;
 //! harness's own helpers (`git` for checkpoints, `$EDITOR`) stay in harness's
 //! session, as do unsandboxed re-runs, which the bash tool starts with
-//! `process_group(0)`. [`look_and_reap`] is the guard's survivor probe
-//! ([`crate::guard::GuardSession::set_survivor_probe`]).
+//! `process_group(0)`. A process whose main thread exited while its other
+//! threads run on reads as a zombie in `stat`, and counts as live.
+//! [`look_and_reap`] is the guard's survivor probe
+//! ([`crate::guard::GuardSession::set_survivor_probe`]). It errs toward
+//! finding survivors: when a scan cannot read all of `/proc`, when passes
+//! keep finding new zombies ([`look`]), and when the kernel refused to make
+//! harness a subreaper ([`subreaper_active`]).
 //!
 //! As a subreaper, harness must reap the orphans that exit, or they stay
 //! zombies. [`look_and_reap`] waits, with `waitpid(pid, WNOHANG)`, for each
@@ -52,6 +57,9 @@ const MAX_PROCESSES: usize = 100_000;
 /// How much of `/proc/<pid>/stat` is read: the fields used come first.
 const STAT_BYTES: usize = 4096;
 
+/// How many scans one look takes at most: see [`look`].
+const MAX_PASSES: usize = 3;
+
 /// What `/proc/<pid>/stat` says about one process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Proc {
@@ -59,17 +67,22 @@ pub(crate) struct Proc {
     pub(crate) ppid: i32,
     /// The session id.
     pub(crate) sid: i32,
-    /// The state letter: `R`, `S`, `D`, `Z` (zombie), `X` (dead), ...
+    /// The state letter of the thread-group leader: `R`, `S`, `D`, `Z`
+    /// (zombie), `X` (dead), ...
     pub(crate) state: u8,
+    /// The leader is a zombie, but other threads of the process run on: its
+    /// main thread exited, and the rest of it did not.
+    pub(crate) other_threads: bool,
 }
 
 impl Proc {
+    /// Exited as a whole, and not yet reaped.
     fn zombie(&self) -> bool {
-        self.state == b'Z'
+        self.state == b'Z' && !self.other_threads
     }
 
     fn live(&self) -> bool {
-        !matches!(self.state, b'Z' | b'X' | b'x')
+        !matches!(self.state, b'Z' | b'X' | b'x') || self.other_threads
     }
 }
 
@@ -96,6 +109,7 @@ pub(crate) fn parse_stat(stat: &[u8]) -> Option<Proc> {
         ppid,
         sid,
         state,
+        other_threads: false,
     })
 }
 
@@ -192,7 +206,10 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Scan {
         let Some(pid) = name.to_str().and_then(|name| name.parse::<i32>().ok()) else {
             continue;
         };
-        if let Some(proc) = read_stat(&entry.path()).filter(|proc| proc.pid == pid) {
+        if let Some(mut proc) = read_stat(&entry.path()).filter(|proc| proc.pid == pid) {
+            if proc.state == b'Z' {
+                proc.other_threads = other_threads(&entry.path(), pid);
+            }
             procs.push(proc);
         }
     }
@@ -200,6 +217,28 @@ pub(crate) fn scan(root: &Path, limit: usize) -> Scan {
         procs,
         complete: true,
     }
+}
+
+/// Whether the process in `dir` (`/proc/<pid>`), whose thread-group leader
+/// is a zombie, has other threads that run on: `stat` shows the leader's
+/// state, so a process whose main thread exited reads as a zombie while the
+/// rest of it runs. The first two entries of `task` tell. A `task` that cannot
+/// be listed is taken to run on, unless it is gone: the process was reaped
+/// meanwhile.
+fn other_threads(dir: &Path, pid: i32) -> bool {
+    let entries = match std::fs::read_dir(dir.join("task")) {
+        Ok(entries) => entries,
+        Err(err) => return err.kind() != std::io::ErrorKind::NotFound,
+    };
+    let leader = pid.to_string();
+    for entry in entries.take(2) {
+        match entry {
+            Ok(entry) if entry.file_name() != leader.as_str() => return true,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 /// The first [`STAT_BYTES`] of `<dir>/stat`, parsed.
@@ -216,6 +255,53 @@ fn read_stat(dir: &Path) -> Option<Proc> {
         }
     }
     parse_stat(&buf[..len])
+}
+
+/// Scans, reaps what `me` may reap (`reap` says whether it did), and says
+/// whether survivors exist. A scan that could not read everything assumes
+/// them. While a pass reaped anything, it scans again, up to [`MAX_PASSES`]
+/// in all: a chain of processes that fork and exit to slip past a scan (pids
+/// wrap, so a child may be listed before its parent) leaves zombies that
+/// only harness reaps. It is either seen by a later pass, or keeps the passes
+/// reaping until they run out, and then survivors are assumed.
+pub(crate) fn look(
+    me: i32,
+    my_sid: i32,
+    registry: &Registry,
+    mut scan: impl FnMut() -> Scan,
+    mut reap: impl FnMut(i32) -> bool,
+) -> bool {
+    for _ in 0..MAX_PASSES {
+        let found = scan();
+        let mut reaped = false;
+        for pid in zombies_to_reap(&found.procs, me, my_sid, registry) {
+            reaped |= reap(pid);
+        }
+        if !found.complete || !survivors(&found.procs, me, my_sid).is_empty() {
+            return true;
+        }
+        if !reaped {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether this process became a child subreaper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Subreaper {
+    /// Nothing asked it to (the full tier).
+    NotAsked,
+    Active,
+    /// The kernel refused: orphans go elsewhere, and detached processes a
+    /// command leaves running cannot be seen.
+    Refused,
+}
+
+/// The survivor probe's answer, given what [`look`] found: with the
+/// subreaper refused, survivors are always assumed.
+fn verdict(looked: bool, subreaper: Subreaper) -> bool {
+    looked || subreaper == Subreaper::Refused
 }
 
 /// The commands harness waits for: see the module docs.
@@ -310,9 +396,44 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Whether [`track_orphans`] made this process a child subreaper: 0 not
+/// asked, 1 active, 2 refused.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+static SUBREAPER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn subreaper() -> Subreaper {
+    match SUBREAPER.load(std::sync::atomic::Ordering::Acquire) {
+        1 => Subreaper::Active,
+        2 => Subreaper::Refused,
+        _ => Subreaper::NotAsked,
+    }
+}
+
+/// Whether this process is a child subreaper, so that processes sandboxed
+/// commands leave running stay its descendants, which the Linux basic tier
+/// relies on. `false` until a basic-tier [`crate::LinuxSandbox`] asks for it,
+/// and when the kernel refused; then survivors are always assumed, and
+/// protected files are restored before every command. For `harness sandbox
+/// doctor`.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn subreaper_active() -> bool {
+    subreaper() == Subreaper::Active
+}
+
 /// Makes harness a child subreaper, once: from then on, orphans of the
 /// processes it starts are reparented to it rather than to init. Kernels
-/// since 3.4 support it, and the sandbox needs 6.2.
+/// since 3.4 support it, and the sandbox needs 6.2. A refusal is recorded:
+/// see [`subreaper_active`].
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -322,13 +443,16 @@ pub(crate) fn track_orphans() {
     ONCE.call_once(|| {
         // SAFETY: `prctl(PR_SET_CHILD_SUBREAPER, 1)` takes only integers and
         // changes only an attribute of this process.
-        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        let rc = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        let state = if rc == 0 { 1 } else { 2 };
+        SUBREAPER.store(state, std::sync::atomic::Ordering::Release);
     });
 }
 
 /// Reaps the zombies harness may reap, then says whether survivors exist:
-/// the guard's survivor probe. One bounded scan of `/proc`; a scan that could
-/// not read it all assumes survivors.
+/// the guard's survivor probe. Up to [`MAX_PASSES`] bounded scans of `/proc`
+/// ([`look`]); a scan that could not read it all, or a refused subreaper,
+/// assumes survivors.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -343,17 +467,22 @@ pub(crate) fn look_and_reap() -> bool {
         return true;
     }
     // Held while scanning and reaping, so no command is spawned meanwhile
-    // that the scan might take for an orphan.
+    // that a scan might take for an orphan.
     let registry = lock(&REGISTRY);
-    let found = scan(Path::new("/proc"), MAX_PROCESSES);
-    for pid in zombies_to_reap(&found.procs, me, my_sid, &registry) {
-        let mut status = 0;
-        // SAFETY: waits, without blocking, for this one zombie child, which
-        // nothing else waits for (see the module docs).
-        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    }
+    let looked = look(
+        me,
+        my_sid,
+        &registry,
+        || scan(Path::new("/proc"), MAX_PROCESSES),
+        |pid| {
+            let mut status = 0;
+            // SAFETY: waits, without blocking, for this one zombie child,
+            // which nothing else waits for (see the module docs).
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) == pid }
+        },
+    );
     drop(registry);
-    !found.complete || !survivors(&found.procs, me, my_sid).is_empty()
+    verdict(looked, subreaper())
 }
 
 #[cfg(test)]
@@ -371,6 +500,15 @@ mod tests {
             ppid,
             sid,
             state,
+            other_threads: false,
+        }
+    }
+
+    /// A thread-group leader that exited while other threads of its process run on.
+    fn leader_gone(pid: i32, ppid: i32, sid: i32) -> Proc {
+        Proc {
+            other_threads: true,
+            ..p(pid, ppid, sid, b'Z')
         }
     }
 
@@ -640,5 +778,185 @@ mod tests {
         let found = scan(&dir.path().join("missing"), 100);
         assert!(!found.complete);
         assert!(found.procs.is_empty());
+    }
+
+    #[test]
+    fn a_zombie_leader_whose_threads_run_on_is_a_survivor_and_is_not_reaped() {
+        let me = 100;
+        let my_sid = 50;
+        let procs = [
+            p(me, 49, my_sid, b'S'),
+            leader_gone(200, me, 200),
+            leader_gone(300, me, my_sid),
+        ];
+        assert_eq!(survivors(&procs, me, my_sid), [200]);
+        assert!(zombies_to_reap(&procs, me, my_sid, &registry(&[], 0)).is_empty());
+    }
+
+    /// A stand-in for `/proc` whose entries have `task` directories: `tasks` lists the thread
+    /// ids of each, and `None` makes `task` a file, which cannot be listed.
+    fn fake_proc_with_tasks(entries: &[(i32, char, Option<&[i32]>)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (pid, state, tasks) in entries {
+            let entry = dir.path().join(pid.to_string());
+            std::fs::create_dir(&entry).unwrap();
+            std::fs::write(entry.join("stat"), line(*pid, "t", *state, 1, *pid)).unwrap();
+            match tasks {
+                Some(tasks) => {
+                    std::fs::create_dir(entry.join("task")).unwrap();
+                    for tid in *tasks {
+                        std::fs::create_dir(entry.join("task").join(tid.to_string())).unwrap();
+                    }
+                }
+                None => std::fs::write(entry.join("task"), "").unwrap(),
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn a_scan_looks_for_other_threads_of_a_zombie_leader() {
+        let dir = fake_proc_with_tasks(&[
+            (20, 'Z', Some(&[20, 21])), // its threads run on
+            (21, 'Z', Some(&[19, 21])), // one with a lower id
+            (30, 'Z', Some(&[30])),     // exited whole
+            (40, 'Z', Some(&[])),       // being reaped
+            (50, 'Z', None),            // cannot be listed: assumed to run on
+            (60, 'S', Some(&[60, 61])), // alive anyway
+        ]);
+        let found = scan(dir.path(), 100);
+        assert!(found.complete);
+        let mut threads: Vec<(i32, bool)> = found
+            .procs
+            .iter()
+            .map(|proc| (proc.pid, proc.other_threads))
+            .collect();
+        threads.sort_unstable();
+        assert_eq!(
+            threads,
+            [
+                (20, true),
+                (21, true),
+                (30, false),
+                (40, false),
+                (50, true),
+                (60, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_zombie_whose_task_directory_is_gone_was_reaped_meanwhile() {
+        let dir = fake_proc_with_tasks(&[(30, 'Z', Some(&[30]))]);
+        std::fs::remove_dir_all(dir.path().join("30/task")).unwrap();
+        let found = scan(dir.path(), 100);
+        assert_eq!(found.procs.len(), 1);
+        assert!(!found.procs[0].other_threads);
+    }
+
+    /// Runs [`look`] over `scans`, one per pass, reaping every pid it is given. What it
+    /// decided, how many scans it took, and what it reaped.
+    fn look_over(scans: Vec<Scan>) -> (bool, usize, Vec<i32>) {
+        let mut scans = scans.into_iter();
+        let mut taken = 0;
+        let mut reaped = Vec::new();
+        let verdict = look(
+            100,
+            50,
+            &registry(&[], 0),
+            || {
+                taken += 1;
+                scans.next().expect("no more scans than prepared")
+            },
+            |pid| {
+                reaped.push(pid);
+                true
+            },
+        );
+        (verdict, taken, reaped)
+    }
+
+    fn pass(procs: &[Proc]) -> Scan {
+        Scan {
+            procs: procs.to_vec(),
+            complete: true,
+        }
+    }
+
+    const ME: Proc = Proc {
+        pid: 100,
+        ppid: 49,
+        sid: 50,
+        state: b'S',
+        other_threads: false,
+    };
+
+    #[test]
+    fn a_pass_that_reaps_nothing_and_sees_no_survivor_ends_the_look() {
+        assert_eq!(look_over(vec![pass(&[ME])]), (false, 1, vec![]));
+    }
+
+    #[test]
+    fn a_pass_that_reaped_is_followed_by_another() {
+        // An orphan exited: reaped, then nothing else is there.
+        assert_eq!(
+            look_over(vec![pass(&[ME, p(200, 100, 200, b'Z')]), pass(&[ME])]),
+            (false, 2, vec![200])
+        );
+        // The next pass finds what the first one missed.
+        assert_eq!(
+            look_over(vec![
+                pass(&[ME, p(200, 100, 200, b'Z')]),
+                pass(&[ME, p(300, 100, 200, b'S')]),
+            ]),
+            (true, 2, vec![200])
+        );
+    }
+
+    #[test]
+    fn passes_that_keep_reaping_run_out_and_survivors_are_assumed() {
+        // A chain of processes that fork and exit, each seen only once it is a zombie.
+        let (verdict, taken, reaped) = look_over(vec![
+            pass(&[ME, p(200, 100, 200, b'Z')]),
+            pass(&[ME, p(201, 100, 200, b'Z')]),
+            pass(&[ME, p(202, 100, 200, b'Z')]),
+        ]);
+        assert!(verdict);
+        assert_eq!(taken, MAX_PASSES);
+        assert_eq!(reaped, [200, 201, 202]);
+    }
+
+    #[test]
+    fn a_survivor_or_an_incomplete_scan_ends_the_look_with_survivors() {
+        assert_eq!(
+            look_over(vec![pass(&[ME, p(300, 100, 300, b'S')])]),
+            (true, 1, vec![])
+        );
+        let cut = Scan {
+            procs: vec![ME, p(200, 100, 200, b'Z')],
+            complete: false,
+        };
+        assert_eq!(look_over(vec![cut]), (true, 1, vec![200]));
+    }
+
+    #[test]
+    fn a_zombie_waitpid_does_not_take_counts_as_nothing_reaped() {
+        let mut scans = vec![pass(&[ME, p(200, 100, 200, b'Z')])].into_iter();
+        let verdict = look(
+            100,
+            50,
+            &registry(&[], 0),
+            || scans.next().unwrap(),
+            |_| false,
+        );
+        assert!(!verdict);
+    }
+
+    #[test]
+    fn a_refused_subreaper_means_survivors_are_assumed() {
+        assert!(verdict(false, Subreaper::Refused));
+        assert!(!verdict(false, Subreaper::Active));
+        assert!(!verdict(false, Subreaper::NotAsked));
+        assert!(verdict(true, Subreaper::Active));
     }
 }

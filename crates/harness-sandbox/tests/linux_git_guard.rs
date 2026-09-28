@@ -271,6 +271,35 @@ fn orphaned_zombies() -> Vec<i32> {
         .collect()
 }
 
+/// This process's live descendants in another session than its own: what sandboxed commands
+/// left running.
+fn live_descendants_elsewhere() -> Vec<i32> {
+    let (me, my_sid) = me();
+    let all = processes();
+    let mut below = std::collections::BTreeSet::from([me]);
+    // Parents are not always listed before their children: go again until nothing is added.
+    loop {
+        let known = below.len();
+        for process in &all {
+            if below.contains(&process.ppid) {
+                below.insert(process.pid);
+            }
+        }
+        if below.len() == known {
+            break;
+        }
+    }
+    all.iter()
+        .filter(|process| {
+            process.pid != me
+                && below.contains(&process.pid)
+                && !matches!(process.state, b'Z' | b'X')
+                && process.sid != my_sid
+        })
+        .map(|process| process.pid)
+        .collect()
+}
+
 /// The state letter of `pid`, if it exists.
 fn state_of(pid: u32) -> Option<u8> {
     let pid = i32::try_from(pid).unwrap();
@@ -495,6 +524,79 @@ async fn a_detached_job_that_rewrites_config_later_is_undone_before_the_next_com
     .await;
 }
 
+/// A program whose main thread exits at once while a second thread runs on, and appends
+/// `# evil` to `.git/config` a second later. Built with `cc` in `dir`; `None` when that is not
+/// possible here.
+fn leader_that_exits_first(dir: &Path) -> Option<PathBuf> {
+    let source = dir.join("leader-exits.c");
+    std::fs::write(
+        &source,
+        r##"#include <pthread.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static void *later(void *unused) {
+    (void)unused;
+    sleep(1);
+    FILE *config = fopen(".git/config", "a");
+    if (config) {
+        fputs("# evil\n", config);
+        fclose(config);
+    }
+    return 0;
+}
+
+int main(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, 0, later, 0) != 0) {
+        return 1;
+    }
+    pthread_exit(0);
+}
+"##,
+    )
+    .unwrap();
+    let program = dir.join("leader-exits");
+    let built = std::process::Command::new("cc")
+        .arg("-pthread")
+        .arg("-o")
+        .arg(&program)
+        .arg(&source)
+        .output();
+    match built {
+        Ok(output) if output.status.success() => Some(program),
+        Ok(output) => {
+            eprintln!(
+                "skipping: cc could not build the test helper: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("skipping: no C compiler (cc) to build the test helper: {e}");
+            None
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_process_whose_main_thread_exited_still_counts_and_its_change_is_undone() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let Some(helper) = leader_that_exits_first(dir.path()) else {
+        return;
+    };
+    // `/proc/<pid>/stat` shows the main thread: a zombie, by the time the command ends.
+    let script = format!(
+        "'{}' > /dev/null 2>&1 & pid=$!; i=0; \
+         while [ $i -lt 500 ] && ! grep -q '^State:[[:space:]]*Z' /proc/$pid/status; do \
+         i=$((i + 1)); sleep 0.01; done",
+        helper.display()
+    );
+    a_config_rewrite_after_the_command_is_undone_before_the_next(&env, &script).await;
+}
+
 #[tokio::test]
 async fn without_survivors_a_config_change_between_commands_is_left_alone() {
     let _serial = SERIAL.lock().await;
@@ -544,11 +646,15 @@ async fn no_zombies_remain_after_a_detached_job_exits_and_the_next_command_runs(
     .await;
     assert!(output.status.success(), "{}", stderr(&output));
     wait_until("the detached job ran", || env.exists("done")).await;
-    // It was reparented to this process, which has not reaped it yet.
-    wait_until("the detached job is a zombie child of this process", || {
-        !orphaned_zombies().is_empty()
+    wait_until("nothing the command left is still running", || {
+        live_descendants_elsewhere().is_empty()
     })
     .await;
+    // It was reparented to this process, which has not reaped it yet.
+    assert!(
+        !orphaned_zombies().is_empty(),
+        "the detached job is not a zombie child of this process"
+    );
     let (output, _) = run(&sandbox, &env, "true").await;
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(orphaned_zombies(), Vec::<i32>::new());

@@ -29,9 +29,27 @@ pub fn civil_date(unix_secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// Unix seconds as a UTC timestamp, `YYYY-MM-DDTHH:MM:SSZ`.
+pub fn timestamp(unix_secs: u64) -> String {
+    let secs = unix_secs % 86_400;
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
+        civil_date(unix_secs),
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamps_are_utc() {
+        assert_eq!(timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(timestamp(1_790_208_000 + 45_296), "2026-09-24T12:34:56Z");
+    }
 
     #[test]
     fn civil_dates_are_correct() {

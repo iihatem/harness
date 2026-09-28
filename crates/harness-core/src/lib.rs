@@ -8,6 +8,7 @@ pub mod output;
 pub mod permission;
 pub mod provider;
 pub mod retry;
+pub mod session;
 pub mod subprocess;
 pub mod testing;
 pub mod time;

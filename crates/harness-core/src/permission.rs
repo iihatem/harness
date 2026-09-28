@@ -173,4 +173,7 @@ pub trait PermissionPolicy: Send + Sync {
     fn remember(&self, _action: &Action) -> bool {
         false
     }
+
+    /// Switches the approval mode for later checks. Policies without modes ignore it.
+    fn set_mode(&self, _mode: Mode) {}
 }

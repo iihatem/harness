@@ -798,3 +798,16 @@ fn writes_to_harness_metadata_or_a_top_level_head_ask() {
     let e = engine(Mode::Auto, &ws2, true, RuleSet::default());
     assert!(is_ask(&e.check(&write(".harness/config.toml"))));
 }
+
+#[test]
+fn a_mode_switch_changes_later_decisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(Mode::Auto, dir.path(), true, RuleSet::default());
+    let write = Action::Write(dir.path().join("a.txt"));
+    assert_eq!(e.check(&write), Decision::Allow);
+    e.set_mode(Mode::ReadOnly);
+    assert_eq!(e.mode(), Mode::ReadOnly);
+    assert!(is_deny(&e.check(&write)));
+    e.set_mode(Mode::Ask);
+    assert!(is_ask(&e.check(&write)));
+}

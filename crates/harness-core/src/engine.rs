@@ -41,7 +41,8 @@ pub struct EngineConfig {
 }
 
 pub struct PermissionEngine {
-    mode: Mode,
+    /// The approval mode; the frontend may change it between turns (`set_mode`).
+    mode: Mutex<Mode>,
     workspace: PathBuf,
     read_dirs: Vec<PathBuf>,
     /// Raw config rules, exactly as given: used only for bash filtering (`bash_rules`) and
@@ -271,7 +272,7 @@ impl PermissionEngine {
         let confirm_paths = path_rules(&config.rules.confirm, home.as_deref(), true);
         let workspace = resolved(&config.workspace);
         PermissionEngine {
-            mode: config.mode,
+            mode: Mutex::new(config.mode),
             linked_gitdir: linked_gitdir(&workspace),
             workspace,
             read_dirs: config.read_dirs.iter().map(|d| resolved(d)).collect(),
@@ -287,7 +288,7 @@ impl PermissionEngine {
     }
 
     pub fn mode(&self) -> Mode {
-        self.mode
+        *self.mode.lock().expect("mode lock")
     }
 
     /// Rules whose tool is not `bash`, `read`, or `write` (they never match; the CLI warns about them).
@@ -429,13 +430,13 @@ impl PermissionEngine {
         if let Some(rule) = self.deny_confirm_rule(&self.deny_paths, "read", &target, &lexical) {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
-        if self.mode != Mode::FullAccess
+        if self.mode() != Mode::FullAccess
             && let Some(rule) =
                 self.deny_confirm_rule(&self.confirm_paths, "read", &target, &lexical)
         {
             return Decision::Ask(format!("read {} (confirm rule `{rule}`)", target.display()));
         }
-        if self.mode == Mode::FullAccess
+        if self.mode() == Mode::FullAccess
             || target.starts_with(&self.workspace)
             || self.read_dirs.iter().any(|d| target.starts_with(d))
             || self
@@ -454,11 +455,14 @@ impl PermissionEngine {
         if let Some(rule) = self.deny_confirm_rule(&self.deny_paths, "write", &target, &lexical) {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
-        if self.mode == Mode::FullAccess {
+        if self.mode() == Mode::FullAccess {
             return Decision::Allow;
         }
-        if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
-            return Decision::Deny(format!("file writes are not allowed in {} mode", self.mode));
+        if matches!(self.mode(), Mode::Plan | Mode::ReadOnly) {
+            return Decision::Deny(format!(
+                "file writes are not allowed in {} mode",
+                self.mode()
+            ));
         }
         let Ok(inside) = target.strip_prefix(&self.workspace) else {
             return Decision::Ask(format!("write outside the workspace: {}", target.display()));
@@ -473,7 +477,7 @@ impl PermissionEngine {
                 inside.display()
             ));
         }
-        if (self.mode == Mode::Auto && !self.writes_need_approval)
+        if (self.mode() == Mode::Auto && !self.writes_need_approval)
             || self
                 .allow_rule(&self.allow_paths, "write", &target)
                 .is_some()
@@ -506,9 +510,9 @@ impl PermissionEngine {
                 reason,
                 may_deny: true,
                 ..
-            } if self.mode == Mode::FullAccess => Decision::Ask(reason),
-            _ if self.mode == Mode::FullAccess => Decision::Allow,
-            _ if !self.sandbox_available && matches!(self.mode, Mode::Plan | Mode::ReadOnly) => {
+            } if self.mode() == Mode::FullAccess => Decision::Ask(reason),
+            _ if self.mode() == Mode::FullAccess => Decision::Allow,
+            _ if !self.sandbox_available && matches!(self.mode(), Mode::Plan | Mode::ReadOnly) => {
                 Decision::Deny(
                     "shell commands need the OS sandbox in plan and read-only mode".into(),
                 )
@@ -519,7 +523,7 @@ impl PermissionEngine {
             )),
             Verdict::Ask { reason, .. } => Decision::Ask(reason),
             Verdict::Allow => Decision::Allow,
-            Verdict::Unlisted if self.mode == Mode::Ask => {
+            Verdict::Unlisted if self.mode() == Mode::Ask => {
                 Decision::Ask(format!("run `{}`", short(command)))
             }
             Verdict::Unlisted => Decision::Allow,
@@ -562,7 +566,7 @@ impl PermissionEngine {
     /// deny/confirm rule — none of those decisions can be changed by an approval, since they're
     /// checked before the session approvals in `check_write`.
     fn remember_write(&self, path: &Path) -> bool {
-        if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
+        if matches!(self.mode(), Mode::Plan | Mode::ReadOnly) {
             return false;
         }
         let target = resolve_path(&self.workspace, path);
@@ -625,5 +629,9 @@ impl PermissionPolicy for PermissionEngine {
             Action::Write(path) => self.remember_write(path),
             Action::Read(path) => self.remember_read(path),
         }
+    }
+
+    fn set_mode(&self, mode: Mode) {
+        *self.mode.lock().expect("mode lock") = mode;
     }
 }

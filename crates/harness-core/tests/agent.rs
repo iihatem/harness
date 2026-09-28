@@ -481,3 +481,67 @@ async fn a_guard_blocked_command_is_reported_blocked_and_never_rerun() {
         "the tool must run exactly once, and never with ctx.unsandboxed"
     );
 }
+
+#[tokio::test]
+async fn the_system_prompt_and_tools_are_byte_identical_across_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("c1", "echo", json!({"text": "x"})),
+        Script::text("one"),
+        Script::text("two"),
+    ]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    run(&mut agent, "first").await;
+    run(&mut agent, "second").await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    for request in &requests[1..] {
+        assert_eq!(request.system, requests[0].system);
+        assert_eq!(
+            serde_json::to_string(&request.tools).unwrap(),
+            serde_json::to_string(&requests[0].tools).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_mode_change_is_appended_as_a_message_and_the_prompt_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::text("planned nothing yet"),
+        Script::tool_call("c1", "touch", json!({"path": "new.txt"})),
+        Script::text("could not write"),
+    ]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    run(&mut agent, "first").await;
+    agent.set_mode(Mode::Plan);
+    let (_, events) = run(&mut agent, "second").await;
+
+    let requests = provider.requests();
+    assert_eq!(requests[1].system, requests[0].system);
+    let note = requests[1]
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            Message::User { content } if content.contains("approval mode is now plan") => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .expect("the mode change is in the conversation");
+    assert!(note.starts_with("[harness]"), "{note}");
+    // The new mode is enforced: plan mode refuses the write.
+    assert!(!dir.path().join("new.txt").exists());
+    let (output, is_error) = &finished_outputs(&events)[0];
+    assert!(*is_error && output.contains("plan mode"), "{output}");
+}

@@ -16,7 +16,7 @@ use crate::{
     event::{AgentEvent, ErrorKind, TurnEndReason},
     message::{ChatRequest, Message, ToolCall},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
-    permission::{Action, Decision, FsAccess, PermissionPolicy},
+    permission::{Action, Decision, FsAccess, Mode, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
     retry::RetryPolicy,
     tool::{Tool, ToolContext, ToolOutput, ToolRegistry},
@@ -190,6 +190,16 @@ impl Agent {
     /// Invalid tool calls (unknown tool, bad JSON, schema violations) in the current or last turn.
     pub fn invalid_calls_this_turn(&self) -> u32 {
         self.invalid_calls
+    }
+
+    /// Switches the approval mode between turns. The system prompt stays as it is, so providers
+    /// keep reusing their prompt caches; the change is appended to the conversation as a note.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.policy.set_mode(mode);
+        self.ctx.access = mode.fs_access();
+        self.history.push(Message::User {
+            content: mode_note(mode),
+        });
     }
 
     /// Runs one user turn to completion, reporting everything on `events`. Cancelling `cancel` stops the
@@ -555,6 +565,23 @@ impl Agent {
             ..first
         }
     }
+}
+
+/// The note appended to the conversation when the approval mode changes.
+fn mode_note(mode: Mode) -> String {
+    let rules = match mode {
+        Mode::Plan | Mode::ReadOnly => "file edits are refused and shell commands can only read",
+        Mode::Ask => {
+            "file edits and shell commands need the user's approval unless a rule allows them"
+        }
+        Mode::Auto => {
+            "file edits in the workspace and sandboxed shell commands run without approval"
+        }
+        Mode::FullAccess => {
+            "actions run without approval or sandbox, except those a deny rule forbids"
+        }
+    };
+    format!("[harness] The approval mode is now {mode}: {rules}.")
 }
 
 /// A human-readable error message for the user.

@@ -9,6 +9,7 @@
 //! cannot be fully decomposed must be approved (after a best-effort deny scan).
 
 mod argv;
+mod bash32;
 mod destructive;
 mod fallback;
 mod git;

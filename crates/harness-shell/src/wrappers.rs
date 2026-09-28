@@ -284,6 +284,8 @@ fn privileged(name: &str, args: &[Tok]) -> Unwrapped {
 fn shell(args: &[Tok]) -> Option<Unwrapped> {
     let mut has_c = false;
     let mut stdin = false;
+    // `-O`/`+O` sets a `shopt` option, such as extglob, which changes how bash parses.
+    let mut shopt = false;
     let mut i = 0;
     while let Some(Tok::Lit(s)) = args.get(i) {
         if s == "--" || s == "-" {
@@ -299,6 +301,7 @@ fn shell(args: &[Tok]) -> Option<Unwrapped> {
         } else if !s.starts_with("--") {
             has_c |= s.starts_with('-') && s.contains('c');
             stdin |= s.starts_with('-') && s.contains('s');
+            shopt |= s.contains('O');
             // `-o name` / `-O shopt` take the next word.
             i += usize::from(s.contains(['o', 'O']));
         }
@@ -306,6 +309,10 @@ fn shell(args: &[Tok]) -> Option<Unwrapped> {
     match (has_c, args.get(i)) {
         (true, Some(Tok::Lit(src))) => Some(Unwrapped {
             next: vec![Next::Script(src.clone())],
+            opaque: shopt.then(|| {
+                "the shell is started with a `shopt` option, which can change how it reads the command"
+                    .into()
+            }),
             ..Default::default()
         }),
         (true, Some(_)) => Some(opaque(

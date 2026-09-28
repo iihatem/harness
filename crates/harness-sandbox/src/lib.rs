@@ -1,5 +1,7 @@
 //! OS sandboxes for shell commands: Seatbelt (`sandbox-exec`) on macOS and Landlock + seccomp on Linux.
 //! Both implement [`harness_core::tool::CommandSandbox`]; [`detect`] picks the one this host supports.
+//! On Linux, git metadata inside the workspace is protected by read-only mounts where user
+//! namespaces work (the full tier) and by the [`guard`] in either tier.
 
 mod denial;
 pub mod gitmeta;
@@ -15,6 +17,16 @@ pub mod guard;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+// What the Linux full tier mounts over git metadata. Platform-neutral, so it is unit-tested on
+// every host.
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+mod mounts;
 mod policy;
 // The processes sandboxed commands leave running, for the Linux basic tier. Its platform-neutral
 // parts are unit-tested on every host.
@@ -51,7 +63,8 @@ pub use denial::looks_like_sandbox_denial;
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use linux::{
-    LinuxSandbox, landlock_abi, linux_sandbox_available, linux_sandbox_command, watcher_failures,
+    LinuxSandbox, landlock_abi, linux_git_protection, linux_sandbox_available,
+    linux_sandbox_command, watcher_failures,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{Seatbelt, seatbelt_available, seatbelt_command};
@@ -94,7 +107,7 @@ pub fn workspace_is_too_broad(workspace: &Path) -> bool {
 }
 
 /// The OS sandbox this host supports, or `None` when none is usable (the caller must then ask before
-/// every shell command).
+/// every shell command). On Linux this probes the git-protection tier, once per process.
 pub fn detect(settings: SandboxSettings) -> Option<Arc<dyn CommandSandbox>> {
     #[cfg(target_os = "macos")]
     if seatbelt_available() {

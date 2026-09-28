@@ -945,6 +945,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "harness-config",
+ "harness-context",
  "harness-core",
  "harness-providers",
  "harness-sandbox",
@@ -975,6 +976,7 @@ dependencies = [
 name = "harness-context"
 version = "0.1.0"
 dependencies = [
+ "harness-core",
  "hex",
  "sha2",
  "tempfile",

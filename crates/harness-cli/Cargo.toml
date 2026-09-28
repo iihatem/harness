@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 harness-config.workspace = true
+harness-context.workspace = true
 harness-core.workspace = true
 harness-providers.workspace = true
 harness-sandbox.workspace = true

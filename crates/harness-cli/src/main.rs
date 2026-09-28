@@ -1,4 +1,5 @@
 mod ask;
+mod context;
 mod doctor;
 mod models;
 mod prompt;

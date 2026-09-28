@@ -168,7 +168,7 @@ pub async fn run(
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),
-        prompt::system_prompt(&setup.workspace, &prompt::today_utc(), mode, sandboxed),
+        crate::context::system_prompt(&setup, &prompt::base_prompt(mode, sandboxed)),
         output_dir,
     );
     if let Some(steps) = setup.config.max_steps {

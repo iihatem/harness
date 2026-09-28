@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 brush-parser = "=0.4.0"
 harness-config = { path = "crates/harness-config" }
+harness-context = { path = "crates/harness-context" }
 harness-core = { path = "crates/harness-core" }
 harness-providers = { path = "crates/harness-providers" }
 harness-sandbox = { path = "crates/harness-sandbox" }

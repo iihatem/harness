@@ -327,3 +327,33 @@ async fn a_global_commands_model_applies_without_trust() {
     );
     assert_eq!(requested_models(&server).await, ["command-model"]);
 }
+
+// Review C, critical 1, as reproduced: a script passes a hostile title to a command file that
+// puts the argument in double quotes. The title must reach git as data and run nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hostile_argument_in_a_quoted_placeholder_runs_nothing() {
+    let server = MockServer::start().await;
+    answer(&server, "ok").await;
+    for title in [
+        "$(touch PWNED_BY_TITLE)",
+        "`touch PWNED_BY_TITLE`",
+        "\\\"; touch PWNED_BY_TITLE; \\\"",
+        "'; touch PWNED_BY_TITLE; '",
+    ] {
+        let env = Env::new(&server.uri(), "");
+        env.command_file("review.md", "!`git log --oneline --grep \"$1\"`\n");
+        let (env, output) = tokio::task::spawn_blocking(move || {
+            let prompt = format!("/review \"{title}\"");
+            let output = env.cmd().args(["ask", &prompt]).output().unwrap();
+            (env, output)
+        })
+        .await
+        .unwrap();
+        assert!(output.status.success(), "{title}: {output:?}");
+        assert!(
+            !env.ws.path().join("PWNED_BY_TITLE").exists(),
+            "{title} ran: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

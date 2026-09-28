@@ -32,7 +32,10 @@ pub struct Expansion {
 ///
 /// - `$ARGUMENTS` becomes `args`, and `$1` to `$9` its words (see [`split_args`]). When the body
 ///   uses none of them, non-empty arguments are appended as `ARGUMENTS: <args>`.
-/// - `` !`cmd` `` becomes a shell part; placeholders inside it become shell-quoted arguments.
+/// - `` !`cmd` `` becomes a shell part. A placeholder inside it becomes its value quoted for where
+///   it lands, so the value reaches the command as data (see [`substitute`]). When a placeholder
+///   is somewhere that cannot be done, the part is never run: it stays as
+///   `` [not expanded: `cmd`] ``, with a warning.
 /// - `@path` becomes the content of that file when it is inside `workspace` and `policy` lets
 ///   harness read it without asking; other `@` words stay as written.
 ///
@@ -60,15 +63,26 @@ pub fn expand(
             && after.as_bytes()[end] == b'`'
             && end > 0
         {
-            if !text.is_empty() {
-                parts.push(InputPart::Text(std::mem::take(&mut text)));
+            let shell = &after[..end];
+            match substitute(shell, args, &words) {
+                Ok(expanded) => {
+                    if !text.is_empty() {
+                        parts.push(InputPart::Text(std::mem::take(&mut text)));
+                    }
+                    parts.push(InputPart::Shell(expanded));
+                }
+                Err(why) => {
+                    warnings.push(format!(
+                        "/{}: did not run !`{shell}`: {why}, where an argument cannot be quoted safely",
+                        command.name
+                    ));
+                    text.push_str(&format!("[not expanded: `{shell}`]"));
+                }
             }
-            let shell = substitute(&after[..end], args, &words, true);
-            parts.push(InputPart::Shell(shell));
             rest = &after[end + 1..];
             continue;
         }
-        if let Some((value, len)) = placeholder(rest, args, &words, false) {
+        if let Some((value, len)) = placeholder(rest, args, &words) {
             text.push_str(&value);
             rest = &rest[len..];
             continue;
@@ -138,43 +152,210 @@ fn starts_word(body: &str, rest: &str) -> bool {
         .is_none_or(|c| c.is_whitespace() || c == '(')
 }
 
-/// A placeholder at the start of `text`, and how many bytes it takes.
-fn placeholder(text: &str, args: &str, words: &[String], quote: bool) -> Option<(String, usize)> {
-    let value = |raw: &str| {
-        if quote {
-            shell_quote(raw)
-        } else {
-            raw.to_string()
-        }
-    };
+/// A placeholder at the start of `text`, its value, and how many bytes it takes.
+fn placeholder(text: &str, args: &str, words: &[String]) -> Option<(String, usize)> {
     if text.starts_with("$ARGUMENTS") {
-        return Some((value(args.trim()), "$ARGUMENTS".len()));
+        return Some((args.trim().to_string(), "$ARGUMENTS".len()));
     }
     let digit = text.strip_prefix('$')?.chars().next()?;
     let n = digit.to_digit(10).filter(|n| (1..=9).contains(n))? as usize;
     let word = words.get(n - 1).map(String::as_str).unwrap_or("");
-    Some((value(word), 2))
+    Some((word.to_string(), 2))
 }
 
-/// `text` with every placeholder replaced.
-fn substitute(text: &str, args: &str, words: &[String], quote: bool) -> String {
-    let mut out = String::new();
+/// How the shell reads the text at some point of a `!` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quoting {
+    /// Not quoted: a value is written as one single-quoted word, with `'` as `'\''`.
+    Unquoted,
+    /// Inside `'…'`: a value is written as it is, with `'` as `'\''`.
+    Single,
+    /// Inside `"…"` or `$"…"`: `\`, `"`, `$` and backticks in a value are escaped.
+    Double,
+    /// Inside `$'…'`, where backslash escapes apply: no value can be written safely.
+    AnsiC,
+    /// A comment, which runs to the end of the command, where quoting means nothing.
+    Comment,
+}
+
+/// Whether `c` ends an unquoted word.
+fn ends_word(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>')
+}
+
+/// Whether the text after `prev` starts a new word.
+fn word_start(prev: Option<char>) -> bool {
+    prev.is_none_or(ends_word)
+}
+
+/// The byte length of the first character of `text`, or 0.
+fn first_len(text: &str) -> usize {
+    text.chars().next().map_or(0, char::len_utf8)
+}
+
+/// The `!` command `text` with every placeholder replaced by its value, encoded for where it
+/// lands (see [`Quoting`]), so that the command gets the value as data. The shell has no newlines
+/// or backticks here: the command ends at the first of them.
+///
+/// A placeholder is refused, and the whole command with it, where its value cannot be encoded
+/// safely: after a `\` or a `$`, in a comment, inside `$'…'`, `${…}`, `[[ … ]]` or `[…]` within a
+/// word (an array subscript or `$[…]`, which the shell evaluates as arithmetic), and anywhere after
+/// `((` or `$((` (arithmetic), or a `$(` within double quotes (the end of either is not tracked).
+/// The error says which placeholder, and why.
+fn substitute(text: &str, args: &str, words: &[String]) -> Result<String, String> {
+    use Quoting::*;
+    let mut out = String::with_capacity(text.len());
+    let mut quoting = Unquoted;
+    // Set once the quoting can no longer be followed: why every later placeholder is refused.
+    let mut untracked: Option<&str> = None;
+    // Open braces of a `${…}`.
+    let mut braces = 0usize;
+    // Inside `[[ … ]]`, where the shell may evaluate a value as arithmetic.
+    let mut in_test = false;
+    // Inside `[…]` within an unquoted word: an array subscript, or `$[…]`.
+    let mut in_subscript = false;
+    let mut prev: Option<char> = None;
     let mut rest = text;
     while let Some(c) = rest.chars().next() {
-        if let Some((value, len)) = placeholder(rest, args, words, quote) {
-            out.push_str(&value);
+        if let Some((value, len)) = placeholder(rest, args, words) {
+            let name = &rest[..len];
+            let refused = match quoting {
+                _ if untracked.is_some() => untracked,
+                _ if braces > 0 => Some("is inside `${…}`"),
+                Comment => Some("is in a comment"),
+                AnsiC => Some("is inside `$'…'`"),
+                Unquoted | Double if prev == Some('$') => Some("follows a `$`"),
+                _ if in_test => Some("is inside `[[ … ]]`"),
+                Unquoted if in_subscript => Some("is inside `[…]` within a word"),
+                _ => None,
+            };
+            if let Some(why) = refused {
+                return Err(format!("{name} {why}"));
+            }
+            match quoting {
+                Unquoted => {
+                    out.push('\'');
+                    out.push_str(&value.replace('\'', r"'\''"));
+                    out.push('\'');
+                }
+                Single => out.push_str(&value.replace('\'', r"'\''")),
+                Double => {
+                    for ch in value.chars() {
+                        if matches!(ch, '\\' | '"' | '$' | '`') {
+                            out.push('\\');
+                        }
+                        out.push(ch);
+                    }
+                }
+                AnsiC | Comment => unreachable!("refused above"),
+            }
+            // The value is part of a word.
+            prev = Some('\'');
             rest = &rest[len..];
-        } else {
-            out.push(c);
-            rest = &rest[c.len_utf8()..];
+            continue;
         }
+        let after = &rest[c.len_utf8()..];
+        let mut len = c.len_utf8();
+        // What `prev` becomes; an escaped character is part of a word, whatever it is.
+        let mut last = Some(c);
+        if c == '\\' && matches!(quoting, Unquoted | Double) && braces == 0 {
+            if let Some((_, used)) = placeholder(after, args, words) {
+                return Err(format!("{} follows a backslash", &after[..used]));
+            }
+            len += first_len(after);
+            last = Some('\\');
+        } else if braces > 0 {
+            match c {
+                '{' => braces += 1,
+                '}' => braces -= 1,
+                '\'' | '"' | '\\' | '`' => {
+                    untracked = Some("comes after a quote, backslash or backtick inside `${…}`")
+                }
+                '$' if after.starts_with('(') => {
+                    untracked = Some("comes after a `$(` inside `${…}`")
+                }
+                _ => {}
+            }
+        } else {
+            match quoting {
+                Comment => {}
+                Single => {
+                    if c == '\'' {
+                        quoting = Unquoted;
+                    }
+                }
+                AnsiC => match c {
+                    '\\' => len += first_len(after),
+                    '\'' => quoting = Unquoted,
+                    _ => {}
+                },
+                Double => match c {
+                    '"' => quoting = Unquoted,
+                    '$' if after.starts_with('(') => {
+                        untracked = Some("comes after a `$(` inside double quotes")
+                    }
+                    '$' if after.starts_with('{') => {
+                        braces = 1;
+                        len += 1;
+                        last = Some('{');
+                    }
+                    '`' => untracked = Some("comes after a backtick"),
+                    _ => {}
+                },
+                Unquoted => match c {
+                    '\'' => quoting = Single,
+                    '"' => quoting = Double,
+                    '$' if after.starts_with('\'') => {
+                        quoting = AnsiC;
+                        len += 1;
+                        last = Some('\'');
+                    }
+                    '$' if after.starts_with('"') => {
+                        quoting = Double;
+                        len += 1;
+                        last = Some('"');
+                    }
+                    '$' if after.starts_with("((") => {
+                        untracked = Some("comes after `$((` (arithmetic)")
+                    }
+                    '$' if after.starts_with('{') => {
+                        braces = 1;
+                        len += 1;
+                        last = Some('{');
+                    }
+                    // Inside `$(…)` the shell reads quotes as it does outside it.
+                    '#' if word_start(prev) => quoting = Comment,
+                    '(' if after.starts_with('(') && word_start(prev) => {
+                        untracked = Some("comes after `((` (arithmetic)")
+                    }
+                    '[' if after.starts_with('[')
+                        && word_start(prev)
+                        && after[1..].starts_with(char::is_whitespace) =>
+                    {
+                        in_test = true;
+                        len += 1;
+                    }
+                    ']' if in_test
+                        && after.starts_with(']')
+                        && word_start(prev)
+                        && after[1..].chars().next().is_none_or(ends_word) =>
+                    {
+                        in_test = false;
+                        len += 1;
+                    }
+                    '[' if !word_start(prev) => in_subscript = true,
+                    ']' => in_subscript = false,
+                    '`' => untracked = Some("comes after a backtick"),
+                    c if ends_word(c) => in_subscript = false,
+                    _ => {}
+                },
+            }
+        }
+        out.push_str(&rest[..len]);
+        rest = &rest[len..];
+        prev = last;
     }
-    out
-}
-
-/// `text` as one single-quoted shell word.
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
+    Ok(out)
 }
 
 /// The content of the workspace file `token` names, and how many bytes of `token` it used (a

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use harness_context::commands::{
     CustomCommand, Scope,
     expand::{allowed_tools_rules, expand},
+    split_args,
 };
 use harness_core::{
     engine::{EngineConfig, PermissionEngine, RuleSet},
@@ -247,4 +248,168 @@ fn claude_code_tool_names_map_to_harness_rules() {
     );
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("WebFetch"));
+}
+
+// Review C, critical 1: a hostile argument must stay data however the command file quotes its
+// placeholder.
+const HOSTILE: [&str; 13] = [
+    "$(touch P)",
+    "`touch P`",
+    "\"; touch P; \"",
+    "'",
+    "\\",
+    "\n",
+    "a\nb",
+    "$HOME",
+    "'; touch P; '",
+    "\\'; touch P; '",
+    "x\"$(touch P)\"y",
+    "\\\"; touch P; #",
+    "",
+];
+
+/// `word` written so that [`split_args`] reads it back as one argument.
+fn arg(word: &str) -> String {
+    format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The one shell part `body` expands to with `args`.
+fn shell_part(body: &str, args: &str) -> String {
+    match parts(body, args).as_slice() {
+        [Shell(command)] => command.clone(),
+        other => panic!("{body} with {args:?}: {other:?}"),
+    }
+}
+
+/// Runs `command` with `/bin/bash -c` in an empty directory. Returns its stdout, and whether the
+/// directory is still empty afterwards.
+fn run_bash(command: &str) -> (Vec<u8>, bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new("/bin/bash")
+        .arg("-c")
+        .arg(command)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let empty = std::fs::read_dir(dir.path()).unwrap().next().is_none();
+    (out.stdout, empty)
+}
+
+#[test]
+fn quoted_placeholders_are_encoded_for_where_they_land() {
+    let hostile = arg("$(touch P)'`\"\\");
+    assert_eq!(
+        shell_part("!`echo $1`", &hostile),
+        r#"echo '$(touch P)'\''`"\'"#
+    );
+    assert_eq!(
+        shell_part("!`echo \"$1\"`", &hostile),
+        r#"echo "\$(touch P)'\`\"\\""#
+    );
+    assert_eq!(
+        shell_part("!`echo '$1'`", &hostile),
+        r#"echo '$(touch P)'\''`"\'"#
+    );
+    assert_eq!(
+        shell_part("!`echo --x=\"$ARGUMENTS\"`", "a $b"),
+        r#"echo --x="a \$b""#
+    );
+}
+
+#[test]
+fn arguments_reach_a_shell_expansion_byte_for_byte() {
+    for word in HOSTILE {
+        let args = arg(word);
+        assert_eq!(split_args(&args), [word], "{args}");
+        let trimmed_newlines = word.trim_end_matches('\n');
+        for (body, expected) in [
+            ("!`printf %s $1`", word.to_string()),
+            ("!`printf %s \"$1\"`", word.to_string()),
+            ("!`printf %s '$1'`", word.to_string()),
+            ("!`printf %s --x=\"$1\"`", format!("--x={word}")),
+            ("!`printf %s --x=$1`", format!("--x={word}")),
+            ("!`printf %s \"[$1]\" '<$1>'`", format!("[{word}]<{word}>")),
+            ("!`printf %s a#$1`", format!("a#{word}")),
+            ("!`printf %s \\$$1`", format!("${word}")),
+            ("!`printf %s $\"$1\"`", word.to_string()),
+            ("!`printf %s \"${HOME:+}$1\"`", word.to_string()),
+            ("!`[[ -n x ]] && printf %s \"$1\"`", word.to_string()),
+            ("!`[ -n x ] && printf %s $1`", word.to_string()),
+            (
+                "!`x=$(printf %s \"$1\"); printf %s \"$x\"`",
+                trimmed_newlines.to_string(),
+            ),
+        ] {
+            let command = shell_part(body, &args);
+            let (out, empty) = run_bash(&command);
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                expected,
+                "{body} with {word:?} ran {command:?}"
+            );
+            assert!(empty, "{body} with {word:?} created a file: {command:?}");
+        }
+    }
+    // `$ARGUMENTS` is the whole argument text.
+    for text in HOSTILE.iter().map(|w| format!("x {w} y")) {
+        for body in [
+            "!`printf %s $ARGUMENTS`",
+            "!`printf %s \"$ARGUMENTS\"`",
+            "!`printf %s '$ARGUMENTS'`",
+        ] {
+            let command = shell_part(body, &text);
+            let (out, empty) = run_bash(&command);
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                text.trim(),
+                "{body} ran {command:?}"
+            );
+            assert!(empty, "{body} with {text:?} created a file: {command:?}");
+        }
+    }
+}
+
+#[test]
+fn a_placeholder_that_cannot_be_quoted_safely_is_never_run() {
+    for (shell, why) in [
+        (r"echo \$1", "follows a backslash"),
+        (r#"echo "\$1""#, "follows a backslash"),
+        (r#"echo "$(echo $1)""#, "`$(` inside double quotes"),
+        (r#"echo "$(date)" $1"#, "`$(` inside double quotes"),
+        ("echo $$1", "follows a `$`"),
+        (r#"echo "$$1""#, "follows a `$`"),
+        ("echo $'$1'", "inside `$'…'`"),
+        ("echo hi # $1", "in a comment"),
+        ("[[ $1 -eq 1 ]] && echo yes", "inside `[[ … ]]`"),
+        (r#"[[ "$1" -eq 1 ]] && echo yes"#, "inside `[[ … ]]`"),
+        ("echo $(( $1 + 1 ))", "arithmetic"),
+        ("(( $1 )) && echo yes", "arithmetic"),
+        ("echo $[$1]", "inside `[…]`"),
+        ("a[$1]=x", "inside `[…]`"),
+        ("echo ${X:-$1}", "inside `${…}`"),
+        (r#"echo "${X:-$1}""#, "inside `${…}`"),
+        (r#"echo ${X:-"a"} $1"#, "inside `${…}`"),
+    ] {
+        let body = format!("Before !`{shell}` after");
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let got = expand(
+            &command(&body),
+            "\"$(touch P)\"",
+            &ws,
+            &engine(&ws, &[]),
+            false,
+        );
+        assert_eq!(
+            got.input.parts,
+            [text(&format!("Before [not expanded: `{shell}`] after"))],
+            "{shell}"
+        );
+        assert_eq!(got.warnings.len(), 1, "{shell}: {:?}", got.warnings);
+        let warning = &got.warnings[0];
+        assert!(
+            warning.contains("/review") && warning.contains(shell) && warning.contains(why),
+            "{shell}: {warning}"
+        );
+    }
 }

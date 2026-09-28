@@ -443,8 +443,9 @@ impl CommandSandbox for LinuxSandbox {
     /// processes sandboxed commands left running (`SIGTERM`, then `SIGKILL`
     /// after a second; processes in harness's own session, approved
     /// unsandboxed runs included, are left alone), then runs one last check
-    /// of each workspace with them assumed, which undoes what they changed.
-    /// Returns within about three seconds.
+    /// of each workspace, which undoes what they changed where any were seen,
+    /// now or since that workspace's last command, and leaves the user's
+    /// changes alone where none was. Returns within about three seconds.
     fn end_session(&self) -> Option<String> {
         self.watching.stop_all_between();
         let ended = procs::end_survivors(END_GRACE, END_AFTER_KILL);
@@ -469,7 +470,9 @@ impl CommandSandbox for LinuxSandbox {
                 "[harness could not tell whether processes sandboxed commands left are still running, so it checked git metadata once more.]\n",
             );
         }
-        if let Some(report) = self.guards.end_session() {
+        // Some were there, or may still be.
+        let found = ended.signalled > 0 || ended.left;
+        if let Some(report) = self.guards.end_session(found) {
             text.push_str(&report.message);
         }
         (!text.is_empty()).then_some(text)

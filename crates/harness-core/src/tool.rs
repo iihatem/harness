@@ -190,8 +190,9 @@ pub trait CommandSandbox: Send + Sync + std::fmt::Debug {
         let _ = workspace;
     }
     /// Ends the sandbox's session, as harness exits however it exits: on Linux, it ends the
-    /// processes sandboxed commands left running and checks git metadata once more. What it did,
-    /// for stderr, if anything. It returns within a few seconds. The default does nothing.
+    /// processes sandboxed commands left running and checks git metadata once more, undoing what
+    /// they changed (but not the user's changes, where there were none). What it did, for stderr,
+    /// if anything. It returns within a few seconds. The default does nothing.
     fn end_session(&self) -> Option<String> {
         None
     }

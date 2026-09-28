@@ -1038,15 +1038,15 @@ fn a_real_dot_git_the_user_moves_back_is_not_quarantined() {
     assert!(!env.quarantine.exists());
 }
 
-#[test]
-fn when_the_session_ends_what_was_changed_since_the_last_command_is_undone_and_said() {
-    // At exit, once the processes commands left have been ended, one last
-    // check assumes they were there.
-    let env = env();
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+/// A config rewrite and a planted `commondir` after the last command.
+fn changed_after_the_last_command(env: &Env) {
     std::fs::write(env.ws.join(".git/config"), EVIL).unwrap();
     std::fs::write(env.ws.join(".git/commondir"), "/tmp/evil\n").unwrap();
-    let report = env.session.end_session().expect("a report");
+}
+
+/// What `end_session` says, which must undo both changes.
+fn undone_at_exit(env: &Env, report: Option<GuardReport>) {
+    let report = report.expect("a report");
     assert!(!report.blocked, "{}", report.message);
     assert!(
         report.message.starts_with(report::AT_EXIT),
@@ -1067,9 +1067,35 @@ fn when_the_session_ends_what_was_changed_since_the_last_command_is_undone_and_s
 }
 
 #[test]
+fn at_exit_what_survivors_seen_since_the_last_command_changed_is_undone_and_said() {
+    let env = env();
+    env.session.set_survivor_probe(Arc::new(|| true));
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    changed_after_the_last_command(&env);
+    undone_at_exit(&env, env.session.end_session(false));
+}
+
+#[test]
+fn at_exit_what_survivors_found_then_changed_is_undone_and_said() {
+    let env = env();
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    changed_after_the_last_command(&env);
+    undone_at_exit(&env, env.session.end_session(true));
+}
+
+#[test]
+fn at_exit_without_survivors_a_config_change_since_the_last_command_is_the_users() {
+    let env = env();
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    std::fs::write(env.ws.join(".git/config"), EVIL).unwrap();
+    assert_eq!(env.session.end_session(false), None);
+    assert_eq!(read(&env.ws.join(".git/config")), EVIL);
+}
+
+#[test]
 fn a_session_that_ends_with_nothing_changed_has_nothing_to_say() {
     let env = env();
-    assert_eq!(env.session.end_session(), None);
+    assert_eq!(env.session.end_session(true), None);
     assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
-    assert_eq!(env.session.end_session(), None);
+    assert_eq!(env.session.end_session(true), None);
 }

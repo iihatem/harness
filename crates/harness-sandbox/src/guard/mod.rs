@@ -408,10 +408,13 @@ impl GuardSession {
     }
 
     /// As harness exits, once the processes sandboxed commands left running
-    /// have been ended: one last check of each workspace, with such
-    /// processes assumed, so that what they changed is undone. What it and
-    /// the checks between commands found, not said yet, without blocking.
-    pub fn end_session(&self) -> Option<GuardReport> {
+    /// have been ended: one last check of each workspace. Such processes are
+    /// assumed, so that what they changed is undone, only where some were
+    /// seen: `survivors_found` by the caller as it ended them, or since the
+    /// workspace's last command. Where none was, changes since then are the
+    /// user's, and are left alone. What it and the checks between commands
+    /// found, not said yet, without blocking.
+    pub fn end_session(&self, survivors_found: bool) -> Option<GuardReport> {
         let workspaces: Vec<PathBuf> = lock(&self.workspaces).keys().cloned().collect();
         let mut message = String::new();
         for workspace in workspaces {
@@ -430,7 +433,7 @@ impl GuardSession {
                 kept.check(
                     &Tree::new(&workspace),
                     &mut quarantine,
-                    true,
+                    survivors_found,
                     self.max_changes(),
                 );
                 kept.quarantine = Some(quarantine);

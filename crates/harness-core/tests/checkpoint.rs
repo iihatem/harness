@@ -1200,6 +1200,52 @@ fn nested_repositories_are_left_alone() {
     assert_eq!(f.read("empty/g.txt").as_deref(), Some("changed\n"));
 }
 
+// Re-review E, V2: a restore that removes every file of a workspace in a repository's
+// subdirectory must not remove the workspace, nor the empty directories above it: git removes
+// directories it empties, up to its work tree, which is the repository's root.
+#[test]
+fn a_restore_that_empties_a_subdirectory_workspace_keeps_it_and_its_parents() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    git(&f.ws, &["init", "-q"]);
+    f.write("root.txt", "root\n");
+    let ws = f.ws.join("a/b");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let checkpoints = Checkpoints::open(&f.gitdir, &ws, "s1").unwrap();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    std::fs::write(ws.join("new.txt"), "agent\n").unwrap();
+    std::fs::create_dir_all(ws.join("deep")).unwrap();
+    std::fs::write(ws.join("deep/x.txt"), "agent\n").unwrap();
+    checkpoints.restore(&first).unwrap();
+    assert!(ws.is_dir());
+    assert!(!ws.join("new.txt").exists());
+    assert!(!ws.join("deep").exists());
+    assert_eq!(
+        std::fs::metadata(&ws).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+    assert_eq!(f.read("root.txt").as_deref(), Some("root\n"));
+    // It still works: the next turn's snapshot and a rewind to it.
+    std::fs::write(ws.join("again.txt"), "again\n").unwrap();
+    let second = checkpoints.snapshot("turn 2").unwrap();
+    std::fs::remove_file(ws.join("again.txt")).unwrap();
+    checkpoints.restore(&second).unwrap();
+    assert_eq!(f.read("a/b/again.txt").as_deref(), Some("again\n"));
+}
+
+// Re-review E, V2b: at the root, as before, nothing above the files is removed.
+#[test]
+fn a_restore_that_empties_a_root_workspace_keeps_it() {
+    let f = fixture();
+    let checkpoints = f.checkpoints();
+    let first = checkpoints.snapshot("turn 1").unwrap();
+    f.write("new/x.txt", "agent\n");
+    checkpoints.restore(&first).unwrap();
+    assert!(f.ws.is_dir());
+    assert!(!f.ws.join("new").exists());
+}
+
 /// Whether the tests run as root, which permissions do not stop.
 fn is_root() -> bool {
     // SAFETY: `geteuid` cannot fail.

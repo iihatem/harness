@@ -668,7 +668,13 @@ impl Checkpoints {
             let skipped: Vec<&[u8]> = skipped.iter().copied().collect();
             self.build_tree(commit, &skipped, &kept, deadline)?
         };
-        self.git(&["read-tree", "--reset", "-u", &tree], remaining(deadline)?)?;
+        // git removes the directories it empties, up to its work tree: in a repository, that is
+        // the repository's root, so the workspace and the directories above it could go too.
+        let kept_dirs = self.workspace_dirs();
+        let cwd = std::env::current_dir().ok();
+        let read = self.git(&["read-tree", "--reset", "-u", &tree], remaining(deadline)?);
+        self.recreate(&kept_dirs, cwd.as_deref());
+        read?;
         for (path, mode) in &target.modes {
             if then_paths.contains(path.as_slice()) && !skipped.contains(path.as_slice()) {
                 self.set_mode(path, *mode);
@@ -698,6 +704,39 @@ impl Checkpoints {
             });
         }
         Ok(())
+    }
+
+    /// The workspace and the directories between it and the root, outermost first, with their
+    /// permissions.
+    fn workspace_dirs(&self) -> Vec<(PathBuf, u32)> {
+        self.workspace
+            .ancestors()
+            .take_while(|dir| *dir != self.root)
+            .filter_map(|dir| {
+                let meta = std::fs::symlink_metadata(dir).ok()?;
+                meta.is_dir()
+                    .then(|| (dir.to_path_buf(), meta.permissions().mode() & 0o7777))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+
+    /// Makes again, with their permissions, the directories of `dirs` a restore removed. The
+    /// process's working directory, `cwd` before the restore, is set again if it was one of them.
+    fn recreate(&self, dirs: &[(PathBuf, u32)], cwd: Option<&Path>) {
+        for (dir, mode) in dirs {
+            if std::fs::symlink_metadata(dir).is_err() && std::fs::create_dir(dir).is_ok() {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(*mode));
+            }
+        }
+        if let Some(cwd) = cwd
+            && std::env::current_dir().is_err()
+            && cwd.is_dir()
+        {
+            let _ = std::env::set_current_dir(cwd);
+        }
     }
 
     /// Gives the regular file at `path` the permissions `mode`; never follows a symlink there.

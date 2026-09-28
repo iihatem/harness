@@ -424,3 +424,45 @@ async fn a_hostile_argument_in_arithmetic_or_an_array_assignment_runs_nothing() 
         assert!(stderr.contains("did not run"), "{body}: {stderr}");
     }
 }
+
+const SENTINEL: &str = "A'B\"C$D`E\\F;G|H&I(J)K<L>M[N]O{P}Q*R?S~T#U!V%W^X \t=";
+
+// Ruling P3-R5: a command's shell command gets the argument as its parameter, byte for byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_argument_reaches_a_shell_expansion_as_data() {
+    let server = MockServer::start().await;
+    answer(&server, "ok").await;
+    let env = Env::new(&server.uri(), "");
+    env.command_file("show.md", "Got: !`printf '<%s>' \"$1\"`\n");
+    let prompt = format!(
+        "/show \"{}\"",
+        SENTINEL.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let output = tokio::task::spawn_blocking(move || run(env, &["ask", &prompt]))
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        user_messages(&server).await,
+        [format!("Got: <{SENTINEL}>\n")]
+    );
+}
+
+// The prelude never makes a command the command file pre-approves ask.
+#[tokio::test(flavor = "multi_thread")]
+async fn allowed_tools_still_preapprove_a_shell_expansion_that_uses_arguments() {
+    let server = MockServer::start().await;
+    answer(&server, "ok").await;
+    let env = Env::new(&server.uri(), "mode = \"ask\"");
+    env.command_file(
+        "show.md",
+        "---\nallowed-tools: Bash(printf:*)\n---\n!`printf '<%s>' \"$1\"`\n",
+    );
+    let output = tokio::task::spawn_blocking(move || run(env, &["ask", "/show \"a b\""]))
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("blocked"), "{stderr}");
+    assert_eq!(user_messages(&server).await, ["<a b>\n"]);
+}

@@ -33,10 +33,11 @@ pub struct Expansion {
 ///
 /// - `$ARGUMENTS` becomes `args`, and `$1` to `$9` its words (see [`split_args`]). When the body
 ///   uses none of them, non-empty arguments are appended as `ARGUMENTS: <args>`.
-/// - `` !`cmd` `` becomes a shell part. A placeholder inside it becomes its value quoted for where
-///   it lands, so the value reaches the command as data (see [`substitute`]). When a placeholder
-///   is somewhere that cannot be done, the part is never run: it stays as
-///   `` [not expanded: `cmd`] ``, with a warning.
+/// - `` !`cmd` `` becomes a shell part, `cmd` as written. Nothing is filled into it: when it uses
+///   the arguments, [`prelude`] sets them as shell parameters first (ruling P3-R5), so `"$1"` is
+///   the first word as data, as in any script. When it uses them together with a construct where
+///   bash may evaluate a parameter's value ([`evaluates_parameters`]), the part is never run: it
+///   stays as `` [not expanded: `cmd`] ``, with a warning.
 /// - `@path` becomes the content of that file when it is inside `workspace` and `policy` lets
 ///   harness read it without asking; other `@` words stay as written.
 ///
@@ -57,6 +58,9 @@ pub fn expand(
     let mut parts = Vec::new();
     let mut text = String::new();
     let body = command.body.as_str();
+    // Whether a shell part got the prelude, and whether any uses the arguments.
+    let mut with_prelude = false;
+    let mut shell_uses_arguments = false;
     let mut rest = body;
     while !rest.is_empty() {
         if let Some(after) = rest.strip_prefix("!`")
@@ -65,21 +69,30 @@ pub fn expand(
             && end > 0
         {
             let shell = &after[..end];
-            match substitute(shell, args, &words) {
-                Ok(expanded) => {
+            let run = if !uses_shell_arguments(shell) {
+                Ok(shell.to_string())
+            } else if let Some(why) = evaluates_parameters(shell) {
+                Err(why)
+            } else {
+                with_prelude = true;
+                Ok(format!("{}{shell}", prelude(args, &words)))
+            };
+            match run {
+                Ok(run) => {
                     if !text.is_empty() {
                         parts.push(InputPart::Text(std::mem::take(&mut text)));
                     }
-                    parts.push(InputPart::Shell(expanded));
+                    parts.push(InputPart::Shell(run));
                 }
                 Err(why) => {
                     warnings.push(format!(
-                        "/{}: did not run !`{shell}`: {why}, where an argument cannot be quoted safely",
+                        "/{}: did not run !`{shell}`: it uses the command's arguments together with {why}, where bash may run an argument as code",
                         command.name
                     ));
                     text.push_str(&format!("[not expanded: `{shell}`]"));
                 }
             }
+            shell_uses_arguments |= uses_shell_arguments(shell);
             rest = &after[end + 1..];
             continue;
         }
@@ -106,8 +119,9 @@ pub fn expand(
         text.push(c);
         rest = &rest[c.len_utf8()..];
     }
-    let uses_arguments =
-        body.contains("$ARGUMENTS") || (1..=9).any(|n| body.contains(&format!("${n}")));
+    let uses_arguments = shell_uses_arguments
+        || body.contains("$ARGUMENTS")
+        || (1..=9).any(|n| body.contains(&format!("${n}")));
     if !uses_arguments && !args.trim().is_empty() {
         text.truncate(text.trim_end().len());
         text.push_str(&format!("\n\nARGUMENTS: {}", args.trim()));
@@ -115,8 +129,13 @@ pub fn expand(
     if !text.is_empty() {
         parts.push(InputPart::Text(text));
     }
-    let (allow, rule_warnings) = allowed_tools_rules(&command.allowed_tools);
+    let (mut allow, rule_warnings) = allowed_tools_rules(&command.allowed_tools);
     warnings.extend(rule_warnings);
+    // The prelude's `set --` is unlisted, so where the command file pre-approves commands it
+    // must not make them ask. `ARGUMENTS='…'` alone the shell analysis passes over.
+    if with_prelude && allow.iter().any(|rule| rule.starts_with("bash:")) {
+        allow.extend(["bash:set --".to_string(), "bash:set -- *".to_string()]);
+    }
     let typed = format!("/{} {}", command.name, args.trim());
     let model = match &command.model {
         Some(model) if command.scope == Scope::Project && !trusted => {
@@ -164,223 +183,141 @@ fn placeholder(text: &str, args: &str, words: &[String]) -> Option<(String, usiz
     Some((word.to_string(), 2))
 }
 
-/// How the shell reads the text at some point of a `!` command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Quoting {
-    /// Not quoted: a value is written as one single-quoted word, with `'` as `'\''`.
-    Unquoted,
-    /// Inside `'…'`: a value is written as it is, with `'` as `'\''`.
-    Single,
-    /// Inside `"…"` or `$"…"`: `\`, `"`, `$` and backticks in a value are escaped.
-    Double,
-    /// Inside `$'…'`, where backslash escapes apply: no value can be written safely.
-    AnsiC,
-    /// A comment, which runs to the end of the command, where quoting means nothing.
-    Comment,
-}
-
-/// Whether `c` ends an unquoted word.
-fn ends_word(c: char) -> bool {
-    c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>')
-}
-
-/// Whether the text after `prev` starts a new word.
-fn word_start(prev: Option<char>) -> bool {
-    prev.is_none_or(ends_word)
-}
-
-/// The byte length of the first character of `text`, or 0.
-fn first_len(text: &str) -> usize {
-    text.chars().next().map_or(0, char::len_utf8)
-}
-
-/// The `!` command `text` with every placeholder replaced by its value, encoded for where it
-/// lands (see [`Quoting`]), so that the command gets the value as data. The shell has no newlines
-/// or backticks here: the command ends at the first of them.
-///
-/// A placeholder is refused, and the whole command with it, where its value cannot be encoded
-/// safely, since the shell reads it as code or evaluates it as arithmetic: after a `\` or a `$`,
-/// in a comment, inside `$'…'`, `${…}`, `[[ … ]]`, a `[…]` that starts within a word (an array
-/// subscript, up to its matching `]`) or an array assignment `name=(…)`, and anywhere after `((`,
-/// `$((` or `$[` (arithmetic), or a `$(` within double quotes (the end of these is not tracked).
-/// The error says which placeholder, and why.
-///
-/// A command that evaluates what it is given, such as `eval`, `let`, `declare -i`, `trap`, `read`
-/// into a subscript, arithmetic on a variable set from the placeholder, or a placeholder as the
-/// command's name, still does: the value reaches it as data, and what it does with that is the
-/// command file's.
-fn substitute(text: &str, args: &str, words: &[String]) -> Result<String, String> {
-    use Quoting::*;
-    let mut out = String::with_capacity(text.len());
-    let mut quoting = Unquoted;
-    // Set once the quoting can no longer be followed: why every later placeholder is refused.
-    let mut untracked: Option<&str> = None;
-    // Open braces of a `${…}`.
-    let mut braces = 0usize;
-    // Inside `[[ … ]]`, where the shell may evaluate a value as arithmetic.
-    let mut in_test = false;
-    // Open brackets of a `[…]` that started within an unquoted word, such as an array subscript,
-    // which the shell evaluates as arithmetic; spaces do not end it.
-    let mut subscript = 0usize;
-    // Open parentheses of an array assignment, `name=(…)` or `name+=(…)`, whose subscripts the
-    // shell evaluates.
-    let mut array = 0usize;
-    let mut prev: Option<char> = None;
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
-        if let Some((value, len)) = placeholder(rest, args, words) {
-            let name = &rest[..len];
-            let refused = match quoting {
-                _ if untracked.is_some() => untracked,
-                _ if braces > 0 => Some("is inside `${…}`"),
-                Comment => Some("is in a comment"),
-                AnsiC => Some("is inside `$'…'`"),
-                Unquoted | Double if prev == Some('$') => Some("follows a `$`"),
-                _ if in_test => Some("is inside `[[ … ]]`"),
-                _ if subscript > 0 => Some("is inside `[…]` that starts within a word"),
-                _ if array > 0 => Some("is inside an array assignment `=(…)`"),
-                _ => None,
-            };
-            if let Some(why) = refused {
-                return Err(format!("{name} {why}"));
-            }
-            match quoting {
-                Unquoted => {
-                    out.push('\'');
-                    out.push_str(&value.replace('\'', r"'\''"));
-                    out.push('\'');
-                }
-                Single => out.push_str(&value.replace('\'', r"'\''")),
-                Double => {
-                    for ch in value.chars() {
-                        if matches!(ch, '\\' | '"' | '$' | '`') {
-                            out.push('\\');
-                        }
-                        out.push(ch);
-                    }
-                }
-                AnsiC | Comment => unreachable!("refused above"),
-            }
-            // The value is part of a word.
-            prev = Some('\'');
-            rest = &rest[len..];
-            continue;
-        }
-        let after = &rest[c.len_utf8()..];
-        let mut len = c.len_utf8();
-        // What `prev` becomes; an escaped character is part of a word, whatever it is.
-        let mut last = Some(c);
-        if c == '\\' && matches!(quoting, Unquoted | Double) && braces == 0 {
-            if let Some((_, used)) = placeholder(after, args, words) {
-                return Err(format!("{} follows a backslash", &after[..used]));
-            }
-            len += first_len(after);
-            last = Some('\\');
-        } else if braces > 0 {
-            match c {
-                '{' => braces += 1,
-                '}' => braces -= 1,
-                '\'' | '"' | '\\' | '`' => {
-                    untracked = Some("comes after a quote, backslash or backtick inside `${…}`")
-                }
-                '$' if after.starts_with('(') => {
-                    untracked = Some("comes after a `$(` inside `${…}`")
-                }
-                _ => {}
-            }
-        } else {
-            match quoting {
-                Comment => {}
-                Single => {
-                    if c == '\'' {
-                        quoting = Unquoted;
-                    }
-                }
-                AnsiC => match c {
-                    '\\' => len += first_len(after),
-                    '\'' => quoting = Unquoted,
-                    _ => {}
-                },
-                Double => match c {
-                    '"' => quoting = Unquoted,
-                    '$' if after.starts_with('(') => {
-                        untracked = Some("comes after a `$(` inside double quotes")
-                    }
-                    '$' if after.starts_with('[') => {
-                        untracked = Some("comes after `$[` (arithmetic)")
-                    }
-                    '$' if after.starts_with('{') => {
-                        braces = 1;
-                        len += 1;
-                        last = Some('{');
-                    }
-                    '`' => untracked = Some("comes after a backtick"),
-                    _ => {}
-                },
-                Unquoted => match c {
-                    '\'' => quoting = Single,
-                    '"' => quoting = Double,
-                    '$' if after.starts_with('\'') => {
-                        quoting = AnsiC;
-                        len += 1;
-                        last = Some('\'');
-                    }
-                    '$' if after.starts_with('"') => {
-                        quoting = Double;
-                        len += 1;
-                        last = Some('"');
-                    }
-                    '$' if after.starts_with("((") => {
-                        untracked = Some("comes after `$((` (arithmetic)")
-                    }
-                    '$' if after.starts_with('[') => {
-                        untracked = Some("comes after `$[` (arithmetic)")
-                    }
-                    '$' if after.starts_with('{') => {
-                        braces = 1;
-                        len += 1;
-                        last = Some('{');
-                    }
-                    // Inside `$(…)` the shell reads quotes as it does outside it.
-                    '#' if word_start(prev) => quoting = Comment,
-                    '[' if subscript > 0 => subscript += 1,
-                    ']' if subscript > 0 => subscript -= 1,
-                    '(' if array > 0 => array += 1,
-                    ')' if array > 0 => array -= 1,
-                    '=' if after.starts_with('(') => {
-                        array = 1;
-                        len += 1;
-                        last = Some('(');
-                    }
-                    '(' if after.starts_with('(') && word_start(prev) => {
-                        untracked = Some("comes after `((` (arithmetic)")
-                    }
-                    '[' if after.starts_with('[')
-                        && word_start(prev)
-                        && after[1..].starts_with(char::is_whitespace) =>
-                    {
-                        in_test = true;
-                        len += 1;
-                    }
-                    ']' if in_test
-                        && after.starts_with(']')
-                        && word_start(prev)
-                        && after[1..].chars().next().is_none_or(ends_word) =>
-                    {
-                        in_test = false;
-                        len += 1;
-                    }
-                    '[' if !word_start(prev) => subscript = 1,
-                    '`' => untracked = Some("comes after a backtick"),
-                    _ => {}
-                },
-            }
-        }
-        out.push_str(&rest[..len]);
-        rest = &rest[len..];
-        prev = last;
+/// The prelude that gives a `!` command the invocation's arguments (ruling P3-R5):
+/// `ARGUMENTS='<args>'; set -- '<word 1>' '<word 2>' …; `. It is harness's own text, at the top
+/// level of the command, so single quotes with `'` written as `'\''` hold any value as data.
+fn prelude(args: &str, words: &[String]) -> String {
+    let quote = |value: &str| format!("'{}'", value.replace('\'', r"'\''"));
+    let mut prelude = format!("ARGUMENTS={}; set --", quote(args.trim()));
+    for word in words {
+        prelude.push(' ');
+        prelude.push_str(&quote(word));
     }
-    Ok(out)
+    prelude.push_str("; ");
+    prelude
+}
+
+/// Whether the shell text `shell` uses the invocation's arguments: `$1` to `$9`, `$ARGUMENTS`,
+/// `$@`, `$*` or `$#`, also as `${…}`, `${#…}` or `${!…}`.
+fn uses_shell_arguments(shell: &str) -> bool {
+    shell.match_indices('$').any(|(i, _)| {
+        let after = &shell[i + 1..];
+        let after = after.strip_prefix('{').unwrap_or(after);
+        if after.starts_with('#') {
+            return true;
+        }
+        let after = after.strip_prefix('!').unwrap_or(after);
+        after.starts_with(|c: char| matches!(c, '1'..='9' | '@' | '*'))
+            || after.starts_with("ARGUMENTS")
+    })
+}
+
+/// Words that run their operands, or evaluate them as arithmetic, a variable name or a
+/// subscript, and the name the warning gives each.
+const EVALUATING_WORDS: [(&str, &str); 12] = [
+    ("let", "`let`"),
+    ("declare", "`declare`"),
+    ("typeset", "`typeset`"),
+    ("local", "`local`"),
+    ("eval", "`eval`"),
+    ("trap", "`trap`"),
+    ("read", "`read`"),
+    ("source", "`source`"),
+    ("unset", "`unset`"),
+    ("mapfile", "`mapfile`"),
+    ("readarray", "`readarray`"),
+    ("printf", "`printf -v`"),
+];
+
+/// Words after which the next word is a command.
+const COMMAND_PREFIXES: [&str; 12] = [
+    "then", "do", "else", "elif", "if", "while", "until", "!", "time", "command", "builtin", "exec",
+];
+
+/// The first construct in the shell text `shell` where bash may evaluate a parameter's value as
+/// code, arithmetic or a variable name, when there is one. A deliberately coarse, lexical check,
+/// which may find one where bash would not: quotes and backslashes are dropped first, so that
+/// `e''val` and `\eval` are `eval`, and words are split at blanks and `;&|()<>`.
+fn evaluates_parameters(shell: &str) -> Option<&'static str> {
+    let text: String = shell
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    if text.contains("((") {
+        return Some("`((` (arithmetic)");
+    }
+    if text.contains("$[") {
+        return Some("`$[` (arithmetic)");
+    }
+    if text.contains("${!") {
+        return Some("`${!` (indirection)");
+    }
+    if text.contains("=(") {
+        return Some("an array assignment `=(`");
+    }
+    let bytes = text.as_bytes();
+    if (1..bytes.len())
+        .any(|i| bytes[i] == b'[' && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+    {
+        return Some("a subscript `name[`");
+    }
+    if substring_expansion(&text) {
+        return Some("a substring `${…:…}` (arithmetic)");
+    }
+    // Words, and whether each is where a command starts.
+    let mut words: Vec<(&str, bool)> = Vec::new();
+    let mut command_start = true;
+    let mut start = None;
+    for (i, c) in text.char_indices().chain([(text.len(), ';')]) {
+        let separator = c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>');
+        match (separator, start) {
+            (true, Some(s)) => {
+                let word = &text[s..i];
+                words.push((word, command_start));
+                command_start = COMMAND_PREFIXES.contains(&word);
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+        if separator && matches!(c, ';' | '&' | '|' | '(' | ')' | '\n') {
+            command_start = true;
+        }
+    }
+    let has = |w: &str| words.iter().any(|(word, _)| *word == w);
+    for (word, why) in EVALUATING_WORDS {
+        let found = if word == "printf" {
+            has("printf") && words.iter().any(|(w, _)| w.starts_with("-v"))
+        } else {
+            has(word)
+        };
+        if found {
+            return Some(why);
+        }
+    }
+    if words.iter().any(|(word, first)| *word == "." && *first) {
+        return Some("`.` as a command");
+    }
+    let comparisons = ["-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-v"];
+    if has("[[") && comparisons.iter().any(|c| has(c)) {
+        return Some("`[[` with an arithmetic comparison or `-v`");
+    }
+    if (has("[") || has("test")) && has("-v") {
+        return Some("`-v` in a test");
+    }
+    None
+}
+
+/// Whether `text` has a `${name:offset}` or `${name:offset:length}` expansion, whose offset and
+/// length are arithmetic. `${name:-…}`, `${name:=…}`, `${name:?…}` and `${name:+…}` are not.
+fn substring_expansion(text: &str) -> bool {
+    text.match_indices("${").any(|(i, _)| {
+        let inside = &text[i + 2..];
+        let inside = &inside[..inside.find('}').unwrap_or(inside.len())];
+        inside
+            .find(':')
+            .is_some_and(|colon| !inside[colon + 1..].starts_with(['-', '=', '?', '+']))
+    })
 }
 
 /// The content of the workspace file `token` names, and how many bytes of `token` it used (a

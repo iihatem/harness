@@ -36,7 +36,7 @@ Before the first mutating action of each turn (`write`, `edit`, or `bash` in a m
 - **THEN** the files are removed and the subdirectory, and the directories above it, still exist
 
 ### Requirement: Rewind restores code, conversation, or both
-The system SHALL provide `/rewind` (and Esc pressed twice on empty input) listing the session's previous user messages. After the user selects one, the system MUST offer to restore code and conversation, code only, or conversation only, to the state before that message. Restoring code MUST revert modified files, recreate deleted files, and remove files created since that point, including changes made by `bash` and by a slash command's shell parts. A checkpoint MUST be restored only in the directory it was taken for, and code MUST NOT be restored across a turn that changed files while checkpoints were off. A restore MUST NOT write through a symlink, MUST NOT remove the workspace directory, and MUST give files only their owner could read their permissions again.
+The system SHALL provide `/rewind` (and Esc pressed twice on empty input) listing the session's previous user messages. After the user selects one, the system MUST offer to restore code and conversation, code only, or conversation only, to the state before that message. Restoring code MUST revert modified files, recreate deleted files, and remove files created since that point, including changes made by `bash` and by a slash command's shell parts. A checkpoint MUST be restored only in the directory it was taken for, and under the same work tree (a change in the repository's ignore rules for that directory can change it), and code MUST NOT be restored across a turn that changed files while checkpoints were off. A restore MUST NOT write through a symlink, MUST NOT remove the workspace directory, and MUST give files only their owner could read their permissions again.
 
 #### Scenario: Undo a bad refactor
 - **WHEN** the agent modified three files and ran a formatter via `bash`, and the user rewinds code and conversation to before that turn
@@ -53,6 +53,10 @@ The system SHALL provide `/rewind` (and Esc pressed twice on empty input) listin
 #### Scenario: Session continued from another directory
 - **WHEN** a session is continued from a subdirectory of the directory its checkpoints were taken in, and the user rewinds code
 - **THEN** the rewind is refused and no file changes; rewinding the conversation still works
+
+#### Scenario: Ignore rules changed since the checkpoint
+- **WHEN** the repository ignored the workspace when a checkpoint was taken and no longer does (or the reverse), and the user continues the session and rewinds code
+- **THEN** the rewind is refused and no file changes
 
 #### Scenario: Turn without a checkpoint
 - **WHEN** a turn changed files while checkpoints were off, and the user rewinds code to before that turn

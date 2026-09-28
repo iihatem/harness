@@ -26,3 +26,13 @@ fn help_lists_the_sandbox_doctor() {
             "Show which sandbox this system gets, how git metadata is protected, and how to improve it",
         )));
 }
+
+#[test]
+fn help_lists_the_session_flags() {
+    Command::new(env!("CARGO_BIN_EXE_harness"))
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(contains("-c, --continue"))
+        .stdout(contains("--resume [<ID>]"));
+}

@@ -60,6 +60,10 @@ pub enum AgentEvent {
         reason: String,
         delay_ms: u64,
     },
+    /// Something the user should know that did not stop the turn.
+    Warning {
+        message: String,
+    },
     TurnFinished {
         reason: TurnEndReason,
     },

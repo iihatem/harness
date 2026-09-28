@@ -25,6 +25,7 @@ use crate::{
 pub async fn run(
     model_flag: Option<String>,
     mode_flag: Option<Mode>,
+    session: crate::sessions::Choice,
     prompt_text: String,
     json: bool,
 ) -> u8 {
@@ -45,6 +46,13 @@ pub async fn run(
         eprintln!("error: {}", terminal_safe(&message));
         return 2;
     }
+    let session = match crate::sessions::open(&setup, &session) {
+        Ok(session) => session,
+        Err(message) => {
+            eprintln!("error: {}", terminal_safe(&message));
+            return 2;
+        }
+    };
     let Some(model_id) = model_flag.or_else(|| setup.config.model.clone()) else {
         eprintln!("error: no model configured.");
         let found = models::available(&setup).await;
@@ -132,7 +140,7 @@ pub async fn run(
     let sandbox = choice.sandbox;
     // From here on, however `run` is left, the sandbox's session ends: on Linux that ends what
     // sandboxed commands left running, and checks git metadata once more.
-    let session = SessionEnd::new(sandbox.clone());
+    let sandbox_session = SessionEnd::new(sandbox.clone());
     let sandboxed = sandbox.is_some();
     if mode != Mode::FullAccess && !sandboxed && choice.warning.is_none() {
         if sandbox_disabled_by_env {
@@ -195,7 +203,8 @@ pub async fn run(
         Arc::new(NonInteractive),
         config,
         ctx,
-    );
+    )
+    .with_session(session);
 
     let (tx, rx) = mpsc::unbounded_channel();
     let renderer = tokio::spawn(render(rx, json, cancel.clone()));
@@ -213,7 +222,7 @@ pub async fn run(
             terminal_safe_text(&final_text)
         );
     }
-    session.end();
+    sandbox_session.end();
     exit_code(reason, blocked)
 }
 
@@ -423,6 +432,9 @@ async fn render(
             }
             AgentEvent::Error { message, .. } if !json => {
                 eprintln!("error: {}", terminal_safe(message))
+            }
+            AgentEvent::Warning { message } if !json => {
+                eprintln!("warning: {}", terminal_safe(message))
             }
             AgentEvent::TurnFinished {
                 reason: TurnEndReason::StepLimit,

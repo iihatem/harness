@@ -19,6 +19,7 @@ use crate::{
     permission::{Action, Decision, FsAccess, Mode, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
     retry::RetryPolicy,
+    session::{EntryKind, Session},
     tool::{Tool, ToolContext, ToolOutput, ToolRegistry},
     turn::{InputPart, TurnInput, TurnModel},
 };
@@ -119,7 +120,13 @@ pub struct Agent {
     approver: Arc<dyn Approver>,
     config: AgentConfig,
     ctx: ToolContext,
+    /// Where the conversation is saved; its active branch is `history`.
+    session: Session,
     history: Vec<Message>,
+    /// The session entry of each message in `history`.
+    history_ids: Vec<String>,
+    /// Warnings to report at the end of the current (or next) turn.
+    warnings: Vec<String>,
     validators: HashMap<String, jsonschema::Validator>,
     invalid_calls: u32,
     /// Tool-call ids already used in this session, so a missing or repeated id (from a model or
@@ -154,8 +161,11 @@ impl Agent {
             policy,
             approver,
             config,
+            session: Session::in_memory(&ctx.workspace),
             ctx,
             history: Vec::new(),
+            history_ids: Vec::new(),
+            warnings: Vec::new(),
             validators,
             invalid_calls: 0,
             used_call_ids: HashSet::new(),
@@ -183,8 +193,50 @@ impl Agent {
         }
     }
 
+    /// Saves the conversation in `session` from now on, continuing its active branch.
+    pub fn with_session(mut self, session: Session) -> Self {
+        self.session = session;
+        self.load_history();
+        self
+    }
+
+    /// Rebuilds the history from the session's active branch.
+    fn load_history(&mut self) {
+        let (ids, history): (Vec<String>, Vec<Message>) =
+            self.session.messages().into_iter().unzip();
+        for message in &history {
+            if let Message::Assistant { tool_calls, .. } = message {
+                self.used_call_ids
+                    .extend(tool_calls.iter().map(|c| c.id.clone()));
+            }
+        }
+        self.history = history;
+        self.history_ids = ids;
+    }
+
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
     pub fn history(&self) -> &[Message] {
         &self.history
+    }
+
+    /// Adds `message` to the history and saves it in the session. If the session file cannot be
+    /// written, the conversation continues in memory and a warning says so once.
+    fn record(&mut self, message: Message, display: Option<String>, note: bool) {
+        let id = self.session.append(EntryKind::Message {
+            message: message.clone(),
+            display,
+            note,
+        });
+        self.history.push(message);
+        self.history_ids.push(id);
+        if let Some(e) = self.session.take_save_error() {
+            self.warnings.push(format!(
+                "cannot save the session: {e}; the conversation continues but is no longer saved"
+            ));
+        }
     }
 
     pub fn config_mut(&mut self) -> &mut AgentConfig {
@@ -201,9 +253,13 @@ impl Agent {
     pub fn set_mode(&mut self, mode: Mode) {
         self.policy.set_mode(mode);
         self.ctx.access = mode.fs_access();
-        self.history.push(Message::User {
-            content: mode_note(mode),
-        });
+        self.record(
+            Message::User {
+                content: mode_note(mode),
+            },
+            None,
+            true,
+        );
     }
 
     /// Runs one user turn to completion, reporting everything on `events`. Cancelling `cancel` stops the
@@ -239,7 +295,7 @@ impl Agent {
     ) -> TurnEndReason {
         let _ = events.send(AgentEvent::TurnStarted);
         let content = self.user_message(input.parts, events).await;
-        self.history.push(Message::User { content });
+        self.record(Message::User { content }, input.display, false);
         if cancel.is_cancelled() {
             return self.finish(TurnEndReason::Interrupted, events);
         }
@@ -267,20 +323,22 @@ impl Agent {
                 if cancel.is_cancelled() {
                     // Every tool call needs a result, or the next request would be rejected.
                     for skipped in &calls[index..] {
-                        self.history.push(Message::Tool {
+                        let message = Message::Tool {
                             call_id: skipped.id.clone(),
                             content: "interrupted by the user before this tool ran".into(),
                             is_error: true,
-                        });
+                        };
+                        self.record(message, None, false);
                     }
                     return self.finish(TurnEndReason::Interrupted, events);
                 }
                 let output = self.execute(call, events).await;
-                self.history.push(Message::Tool {
+                let message = Message::Tool {
                     call_id: call.id.clone(),
                     content: output.content,
                     is_error: output.is_error,
-                });
+                };
+                self.record(message, None, false);
             }
             if cancel.is_cancelled() {
                 return self.finish(TurnEndReason::Interrupted, events);
@@ -377,14 +435,22 @@ impl Agent {
             content: text.clone(),
             model: model.clone(),
         });
-        self.history.push(Message::Assistant {
+        let message = Message::Assistant {
             content: text,
             tool_calls,
             model,
-        });
+        };
+        self.record(message, None, false);
     }
 
-    fn finish(&self, reason: TurnEndReason, events: &UnboundedSender<AgentEvent>) -> TurnEndReason {
+    fn finish(
+        &mut self,
+        reason: TurnEndReason,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> TurnEndReason {
+        for message in self.warnings.drain(..) {
+            let _ = events.send(AgentEvent::Warning { message });
+        }
         let _ = events.send(AgentEvent::TurnFinished { reason });
         reason
     }

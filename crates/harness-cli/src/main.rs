@@ -4,6 +4,7 @@ mod doctor;
 mod models;
 mod prompt;
 mod sandbox;
+mod sessions;
 mod setup;
 mod slash;
 mod term;
@@ -27,6 +28,18 @@ struct Cli {
     /// Approval mode: plan, read-only, ask, auto, or full-access
     #[arg(long, global = true)]
     mode: Option<Mode>,
+    /// Continue the most recent session in this project
+    #[arg(short = 'c', long = "continue", global = true)]
+    continue_session: bool,
+    /// Resume the session with this id; without an id, list this project's sessions
+    #[arg(
+        long,
+        global = true,
+        value_name = "ID",
+        num_args = 0..=1,
+        conflicts_with = "continue_session"
+    )]
+    resume: Option<Option<String>>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -68,11 +81,17 @@ enum SandboxCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let session = match (&cli.resume, cli.continue_session) {
+        (Some(None), _) => return ExitCode::from(sessions::print_list()),
+        (Some(Some(id)), _) => sessions::Choice::Resume(id.clone()),
+        (None, true) => sessions::Choice::Continue,
+        (None, false) => sessions::Choice::New,
+    };
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the tokio runtime");
     let code = runtime.block_on(async move {
         match cli.command {
             Some(Command::Ask { json, prompt }) => {
-                ask::run(cli.model, cli.mode, prompt.join(" "), json).await
+                ask::run(cli.model, cli.mode, session, prompt.join(" "), json).await
             }
             Some(Command::Models) => models::run().await,
             Some(Command::Trust { yes, revoke }) => trust::run(yes, revoke),

@@ -1,8 +1,11 @@
 //! Linux git-metadata protection end to end: `LinuxSandbox::prepare` runs real commands with
-//! the guard, in the basic tier, and tracks the processes they leave running.
+//! the guard, in the basic tier (forced, so it runs on every Linux host), where it also tracks
+//! the processes commands leave running, and in the full tier (where user namespaces work).
 //!
 //! Like `linux_sandbox.rs`, a test skips when the sandbox or a tool it needs is missing, unless
-//! `HARNESS_REQUIRE_LINUX_SANDBOX=1`.
+//! `HARNESS_REQUIRE_LINUX_SANDBOX=1`. Full-tier tests skip when the probe picks the basic tier,
+//! unless `HARNESS_EXPECT_LINUX_TIER=full` (CI's full-tier job); with
+//! `HARNESS_EXPECT_LINUX_TIER=basic` (the stock job) the probe must pick the basic tier.
 //!
 //! The tests run one at a time ([`SERIAL`]): this process is the "harness" whose descendants the
 //! survivor check looks at, so a process another test left running would count here.
@@ -19,7 +22,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use harness_core::tool::{CommandSandbox, GitProtection, GuardReport};
-use harness_sandbox::{FsAccess, LinuxSandbox, SandboxSettings, linux_sandbox_available};
+use harness_sandbox::{
+    FsAccess, LinuxSandbox, SandboxSettings, linux_git_protection, linux_sandbox_available,
+    subreaper_active,
+};
 
 /// Held by every test for its whole run.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -41,6 +47,13 @@ fn have(name: &str) -> bool {
         .status()
         .is_ok_and(|status| status.success());
     found || !skip_or_require(&format!("{name} is not installed"))
+}
+
+/// The tier CI expects the probe to pick here: `full`, `basic`, or none.
+fn expected_tier() -> Option<String> {
+    std::env::var("HARNESS_EXPECT_LINUX_TIER")
+        .ok()
+        .filter(|tier| !tier.is_empty())
 }
 
 /// A git repository under `$HOME` (not `/tmp`, which the sandbox always makes writable), with a
@@ -112,6 +125,27 @@ impl Env {
         );
         sandbox.start_session(&self.ws);
         sandbox
+    }
+
+    /// A full-tier sandbox whose session has started, or `None` (having skipped) where the probe
+    /// picks the basic tier.
+    fn full(&self) -> Option<LinuxSandbox> {
+        match linux_git_protection() {
+            GitProtection::Full => {
+                let sandbox =
+                    LinuxSandbox::with_git_protection(self.settings(), GitProtection::Full);
+                sandbox.start_session(&self.ws);
+                Some(sandbox)
+            }
+            GitProtection::Basic { reason } => {
+                assert!(
+                    expected_tier().as_deref() != Some("full"),
+                    "HARNESS_EXPECT_LINUX_TIER=full, but the probe picked the basic tier: {reason}"
+                );
+                eprintln!("skipping: user namespaces are unavailable ({reason})");
+                None
+            }
+        }
     }
 
     /// The one entry the quarantine holds for `rel` (relative to the workspace), where every
@@ -316,6 +350,27 @@ impl Drop for Killed {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The tier
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_probe_picks_the_expected_tier() {
+    if !linux_sandbox_available() {
+        skip_or_require("linux sandbox unavailable");
+        return;
+    }
+    let tier = linux_git_protection();
+    if let GitProtection::Basic { reason } = &tier {
+        assert!(!reason.is_empty());
+    }
+    match expected_tier().as_deref() {
+        Some("full") => assert_eq!(tier, GitProtection::Full),
+        Some("basic") => assert!(matches!(tier, GitProtection::Basic { .. }), "{tier:?}"),
+        _ => eprintln!("probe picked {tier:?}"),
     }
 }
 
@@ -703,4 +758,389 @@ async fn the_command_harness_waits_for_is_never_reaped_by_the_guard() {
 async fn a_read_only_command_harness_waits_for_is_never_reaped_either() {
     let _serial = SERIAL.lock().await;
     the_command_harness_waits_for_is_never_reaped(FsAccess::ReadOnly).await;
+}
+
+// ---------------------------------------------------------------------------
+// The full tier: writes fail
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn full_tier_refuses_to_plant_a_hook() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    let (output, report) = run(&sandbox, &env, "echo 'echo pwned' > .git/hooks/pre-commit").await;
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("Read-only file system"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!env.exists(".git/hooks/pre-commit"));
+    assert_eq!(report, None);
+    assert!(sandbox.is_denial(output.status.code(), &stderr(&output)));
+}
+
+#[tokio::test]
+async fn full_tier_refuses_git_config() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    let before = std::fs::read(env.ws.join(".git/config")).unwrap();
+    let (output, _) = run(&sandbox, &env, "git config user.name evil").await;
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read(env.ws.join(".git/config")).unwrap(), before);
+}
+
+#[tokio::test]
+async fn full_tier_pins_dot_git() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    let (output, _) = run(&sandbox, &env, "mv .git moved").await;
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("Device or resource busy"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(env.ws.join(".git").is_dir());
+    assert!(!env.exists("moved"));
+    assert!(sandbox.is_denial(output.status.code(), &stderr(&output)));
+}
+
+#[tokio::test]
+async fn full_tier_refuses_hard_links_across_its_mounts() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    let (output, _) = run(&sandbox, &env, "ln .git/config alias").await;
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("Invalid cross-device link"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!env.exists("alias"));
+}
+
+#[tokio::test]
+async fn full_tier_protects_nested_repositories_harness_and_head() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    assert!(env.git(&["init", "-q", "sub"]).status.success());
+    std::fs::create_dir(env.ws.join(".harness")).unwrap();
+    std::fs::write(env.ws.join(".harness/config.toml"), "mode = \"ask\"\n").unwrap();
+    std::fs::write(env.ws.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    for target in ["sub/.git/config", ".harness/config.toml", "HEAD"] {
+        let before = std::fs::read(env.ws.join(target)).unwrap();
+        let (output, _) = run(&sandbox, &env, &format!("echo evil >> {target}")).await;
+        assert!(!output.status.success(), "{target}");
+        assert!(
+            stderr(&output).contains("Read-only file system"),
+            "{target}: {}",
+            stderr(&output)
+        );
+        assert_eq!(
+            std::fs::read(env.ws.join(target)).unwrap(),
+            before,
+            "{target}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_tier_pins_the_way_to_a_gitdir_a_gitfile_names() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    // A repository whose gitdir is kept apart, in `.seps/one`, named by the gitfile `one/.git`.
+    let separate = env.ws.join(".seps/one");
+    assert!(
+        env.git(&[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            separate.to_str().unwrap(),
+            "one"
+        ])
+        .status
+        .success()
+    );
+    // A submodule's gitdir in `.git/modules`, named by the gitfile `sub/.git`.
+    let module = env.ws.join(".git/modules/sub");
+    std::fs::create_dir_all(module.join("refs")).unwrap();
+    std::fs::create_dir_all(module.join("objects")).unwrap();
+    std::fs::write(module.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(module.join("config"), "[core]\n").unwrap();
+    std::fs::create_dir(env.ws.join("sub")).unwrap();
+    std::fs::write(env.ws.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+    // Moving a directory on the way would let a new gitdir take the path a gitfile names.
+    for (script, error) in [
+        ("mv .seps elsewhere", "Device or resource busy"),
+        ("mv .git/modules .git/elsewhere", "Device or resource busy"),
+        ("mv .seps/one .seps/two", "Device or resource busy"),
+        ("echo evil >> one/.git", "Read-only file system"),
+        ("echo evil >> sub/.git", "Read-only file system"),
+        ("echo evil >> .seps/one/config", "Read-only file system"),
+        (
+            "echo evil >> .git/modules/sub/config",
+            "Read-only file system",
+        ),
+    ] {
+        let (output, _) = run(&sandbox, &env, script).await;
+        assert!(!output.status.success(), "{script}");
+        assert!(
+            stderr(&output).contains(error),
+            "{script}: {}",
+            stderr(&output)
+        );
+    }
+    assert!(env.ws.join(".seps/one").is_dir());
+    assert!(env.ws.join(".git/modules/sub").is_dir());
+    assert!(!env.read("one/.git").contains("evil"));
+    assert!(!env.read("sub/.git").contains("evil"));
+}
+
+#[tokio::test]
+async fn full_tier_covers_a_missing_hooks_directory_with_an_empty_one() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    std::fs::remove_dir_all(env.ws.join(".git/hooks")).unwrap();
+    let (output, report) = run(&sandbox, &env, "echo 'echo pwned' > .git/hooks/pre-commit").await;
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("Read-only file system"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        std::fs::read_dir(env.ws.join(".git/hooks"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(report, None);
+}
+
+#[tokio::test]
+async fn full_tier_allows_commit_checkout_and_stash() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    let script = "set -e; git commit -q --allow-empty -m one; git checkout -q -b topic; \
+                  echo x > f; git add f; git stash -q; git stash pop -q";
+    let (output, report) = run(&sandbox, &env, script).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(report, None);
+    let log = env.git(&["log", "--oneline"]);
+    assert!(String::from_utf8_lossy(&log.stdout).contains("one"));
+}
+
+#[tokio::test]
+async fn full_tier_quarantines_a_new_commondir() {
+    // `commondir` cannot have a placeholder (git refuses an empty one), so the guard handles it.
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    let (output, report) = run(&sandbox, &env, "printf /tmp/elsewhere > .git/commondir").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(report.expect("a report").blocked);
+    assert!(!env.exists(".git/commondir"));
+    env.quarantined(".git/commondir");
+}
+
+#[tokio::test]
+async fn a_working_directory_inside_dot_git_still_sees_the_mounts() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    let (output, _) = run_in(
+        &sandbox,
+        &env.ws,
+        &env.ws.join(".git"),
+        "echo x > hooks/pre-commit",
+    )
+    .await;
+    let output = output.unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("Read-only file system"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!env.exists(".git/hooks/pre-commit"));
+}
+
+#[tokio::test]
+async fn full_tier_mounts_what_an_incomplete_scan_found_and_says_it_was_incomplete() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    // An ignore file that is a symlink cannot be used as git would use it: no scan is complete.
+    std::os::unix::fs::symlink("elsewhere", env.ws.join(".gitignore")).unwrap();
+    let Some(sandbox) = env.full() else { return };
+    let (output, report) = run(&sandbox, &env, "echo 'echo pwned' > .git/hooks/pre-commit").await;
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("Read-only file system"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!env.exists(".git/hooks/pre-commit"));
+    let report = report.expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report
+            .message
+            .contains("harness could not scan the whole workspace"),
+        "{}",
+        report.message
+    );
+    assert_eq!(sandbox.git_protection(), GitProtection::Full);
+}
+
+#[tokio::test]
+async fn full_tier_uses_a_namespace_only_where_there_is_something_to_protect() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    let ours = std::fs::read_link("/proc/self/ns/mnt").unwrap();
+    let theirs = |output: &Output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    std::fs::remove_dir_all(env.ws.join(".git")).unwrap();
+    let (output, _) = run(&sandbox, &env, "readlink /proc/self/ns/mnt").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(theirs(&output), ours, "nothing to protect");
+    assert!(env.git(&["init", "-q"]).status.success());
+    let (output, _) = run(&sandbox, &env, "readlink /proc/self/ns/mnt").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_ne!(theirs(&output), ours, "a repository to protect");
+}
+
+#[tokio::test]
+async fn full_tier_refuses_umount_and_the_harness_process_root() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    if !have("python3") {
+        return;
+    }
+    // `exec` makes python the direct child, so `getppid()` is this test process: outside the
+    // sandbox, where `/proc/<pid>/root` would show `.git/config` without the mounts.
+    let script = format!(
+        r#"exec python3 -c '
+import ctypes, errno, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.umount2(b".git/config", 0) != -1 or ctypes.get_errno() != errno.EPERM:
+    sys.exit("umount2: expected EPERM, got %d" % ctypes.get_errno())
+try:
+    open("/proc/%d/root{}/.git/config" % os.getppid(), "a")
+    sys.exit("opened .git/config through /proc/<pid>/root")
+except PermissionError as e:
+    if e.errno != errno.EACCES:
+        sys.exit("/proc/<pid>/root: expected EACCES, got %d" % e.errno)
+'"#,
+        env.ws.display()
+    );
+    let (output, _) = run(&sandbox, &env, &script).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+/// The namespace and mounts are set up before seccomp is installed, which then refuses to make
+/// more.
+#[tokio::test]
+async fn full_tier_commands_cannot_make_namespaces_or_mounts_of_their_own() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let Some(sandbox) = env.full() else { return };
+    if !have("python3") {
+        return;
+    }
+    let script = r#"exec python3 -c '
+import ctypes, errno, platform, sys
+libc = ctypes.CDLL(None, use_errno=True)
+x86 = platform.machine() == "x86_64"
+AT_FDCWD = -100
+calls = [
+    ("unshare", 272 if x86 else 97, (0x10000000 | 0x00020000,)),
+    ("setns", 308 if x86 else 268, (-1, 0)),
+    ("open_tree", 428, (AT_FDCWD, b".git/hooks", 1)),
+    ("move_mount", 429, (AT_FDCWD, b".git/hooks", AT_FDCWD, b".git/hooks", 0)),
+    ("mount_setattr", 442, (AT_FDCWD, b".git/hooks", 0, None, 0)),
+    ("mount", 165 if x86 else 40, (b".git", b".git/hooks", None, 4096, None)),
+]
+for name, nr, args in calls:
+    rc = libc.syscall(nr, *args)
+    err = ctypes.get_errno()
+    if rc != -1 or err != errno.EPERM:
+        sys.exit("%s: expected EPERM, got rc=%d errno=%d" % (name, rc, err))
+'"#;
+    let (output, _) = run(&sandbox, &env, script).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+/// Where user namespaces are blocked, a full-tier sandbox fails at `unshare` or the id maps;
+/// where they work, at the identity check: `.git/config` is replaced after the plan recorded it.
+/// Either way the command does not run, and the session goes on in the basic tier.
+#[tokio::test]
+async fn a_failed_mount_setup_drops_the_session_to_the_basic_tier() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let sandbox = LinuxSandbox::with_git_protection(env.settings(), GitProtection::Full);
+    sandbox.start_session(&env.ws);
+    let prepared = sandbox
+        .prepare(
+            FsAccess::WorkspaceWrite,
+            &env.ws,
+            "/bin/sh",
+            &["-c", "touch ran"],
+        )
+        .expect("prepare the sandboxed command");
+    let config = env.ws.join(".git/config");
+    std::fs::copy(&config, env.ws.join(".git/config.new")).unwrap();
+    std::fs::rename(env.ws.join(".git/config.new"), &config).unwrap();
+    let guard = prepared.guard.expect("a workspace-write guard");
+    let mut cmd = prepared.command;
+    cmd.current_dir(&env.ws)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Ok(child) = cmd.spawn() {
+        let _ = child.wait_with_output().await;
+        panic!("the command must not run without its mounts");
+    }
+    assert!(!env.exists("ran"));
+    let report = guard.finish().expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report
+            .message
+            .contains("could not set up its read-only mounts"),
+        "{}",
+        report.message
+    );
+    match sandbox.git_protection() {
+        GitProtection::Basic { reason } => {
+            assert!(reason.contains("failed during the session"), "{reason}")
+        }
+        GitProtection::Full => panic!("the session should have dropped to the basic tier"),
+    }
+    assert!(
+        subreaper_active(),
+        "the basic tier tracks the processes commands leave running"
+    );
+    // The next command runs, in the basic tier.
+    let (output, report) = run(&sandbox, &env, "touch ran").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(report, None);
+    assert!(env.exists("ran"));
+    // And its guard puts a changed config back, as the basic tier's does.
+    let before = std::fs::read(&config).unwrap();
+    let (output, report) = run(&sandbox, &env, "git config user.name evil").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(report.expect("a report").blocked);
+    assert_eq!(std::fs::read(&config).unwrap(), before);
+    let changed = std::fs::read_to_string(env.quarantined(".git/config")).unwrap();
+    assert!(changed.contains("evil"), "{changed}");
 }

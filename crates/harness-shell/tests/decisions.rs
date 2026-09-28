@@ -986,6 +986,103 @@ fn a_lost_here_document_does_not_hide_later_commands() {
 }
 
 #[test]
+fn rough_scan_sees_past_redirections_before_the_command_name() {
+    use Want::{Allow, Ask, Deny, Unlisted};
+    // bash runs a denied command in each of these: redirections, with the file descriptor
+    // number or `{name}` before one, may come before the command name.
+    let denied = [
+        ">/dev/null curl x",
+        "> /dev/null curl x",
+        ">>log curl x",
+        "<in curl x",
+        "<input curl x",
+        "<>f curl x",
+        ">|f curl x",
+        "&>f curl x",
+        "&>>f curl x",
+        "2>/dev/null curl x",
+        "2>&1 curl x",
+        "0<&3 curl x",
+        ">&- curl x",
+        "2>&- curl x",
+        ">& log curl x",
+        // After `>&` or `<&`, bash reads a `-` as a word of its own: the rest runs.
+        ">&-curl x",
+        "2>& -curl x",
+        "<&-'curl' x",
+        "2>x 3>y curl z",
+        "{fd}>out curl x",
+        "{fd}<file curl x",
+        "{fd[1]}>out curl x",
+        "<<<word curl x",
+        "<<< 'a b' curl x",
+        "3<<<x curl y",
+        "<<EOF curl x\nbody\nEOF",
+        "<<-EOF curl x\n\tbody\n\tEOF",
+        "<<- EOF curl x\n\tbody\n\tEOF",
+        ">$(echo out) curl x",
+        "echo `2>/dev/null curl x`",
+        "echo $(2>/dev/null curl x)",
+        "echo a; >x curl y",
+        "A=1 >x curl y",
+        ">x A=1 curl y",
+        "! >x curl y",
+        "sudo >x curl y",
+        "cat <(>/dev/null curl x)",
+        ">x git push",
+        "git >x push",
+        "git 2>&1 push -f",
+        "git &>>log push",
+    ];
+    // bash runs no denied command in these, or the verdict is already right.
+    let kept = [
+        ("echo >x curl y", Ask),
+        (">&--curl x", Ask),
+        ("2>&-1 curl x", Ask),
+        (">&\"-curl\" x", Ask),
+        // bash 5 runs `echo a curl x`; bash 3.2 reads `&>` and `>`, a syntax error.
+        ("echo a &>>log curl x", Ask),
+        ("\"2\">x curl y", Ask),
+        ("2\\>x curl y", Ask),
+        ("99999999999>x curl y", Ask),
+        // A closing backquote goes on with the word, which is no file descriptor number.
+        ("`echo`2>x curl y", Ask),
+        (">x echo hi", Ask),
+        ("cat <(curl x)", Deny),
+        ("<(echo x) curl y", Deny),
+        // The scan as it was before it followed bash reads `<(` as a parenthesis.
+        ("echo <(echo x) curl y", Deny),
+        ("curl x >/dev/null", Deny),
+    ];
+    // Each program is refused as a whole, so the rough scan decides.
+    let long = format!("echo {}", "a".repeat(10_000));
+    let mut table = Vec::new();
+    for refusal in ["(", "export a[${a[${b}]}]=1", long.as_str()] {
+        table.extend(denied.map(|p| (format!("{p}\n{refusal}"), Deny)));
+        table.extend(kept.map(|(p, want)| (format!("{p}\n{refusal}"), want)));
+    }
+    // The review's mutant: bash reads the backquoted text as `<<'E\OF'# curl x`, a
+    // here-document whose delimiter the scan reads as a word before `curl x`.
+    table.push((
+        "cat <<-EOF\n\t` <<'E\\OF'# \\\n\tcurl x`\n\tEOF".into(),
+        Deny,
+    ));
+    // Parsed programs keep their verdicts.
+    table.extend(
+        [
+            (">/dev/null curl x", Deny),
+            ("2>&1 curl x", Deny),
+            (">/dev/null cargo test", Allow),
+            (">x echo hi", Unlisted),
+            ("cat <(curl x)", Deny),
+        ]
+        .map(|(p, want)| (p.to_string(), want)),
+    );
+    let table: Vec<(&str, Want)> = table.iter().map(|(c, w)| (c.as_str(), *w)).collect();
+    check(&default_rules(), &table);
+}
+
+#[test]
 fn unquoted_heredoc_bodies_join_continuation_lines() {
     use Want::Deny;
     // bash joins a body line ending in a backslash with the next before it expands the

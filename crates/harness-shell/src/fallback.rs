@@ -39,6 +39,11 @@ pub(crate) struct Rough {
 /// parentheses end a command, and `$(…)`, `<(…)`, `>(…)` and backtick bodies become
 /// commands of their own. Leading keywords and `NAME=value` words are dropped.
 ///
+/// A command of program text with redirections is also read the way bash runs it: without
+/// its redirection operators, their targets, and the file descriptor number or `{NAME}`
+/// before one (see [`Bare`]). A redirection before the command name then does not hide
+/// it: `2>&1 curl x` is also read as `curl x`.
+///
 /// Here-document bodies are split into [`Rough::data`] commands where the scan can tell,
 /// as bash would, where they start and end. Where it cannot, the body is split as program
 /// text, and the text is split again from each line after which bash may end that body
@@ -187,6 +192,24 @@ struct Heredoc {
     level: usize,
 }
 
+/// The command being split, read without its redirections: [`Splitter::words`] as bash runs
+/// them. A redirection's `&` or `|` (`>&`, `<&`, `&>`, `>|`) ends the command as written,
+/// as it always did in this scan, but not this reading. Only extra commands come of it, so
+/// deny rules can only match more.
+#[derive(Default)]
+struct Bare {
+    words: Vec<Tok>,
+    /// A redirection was read: `words` holds this reading, which may differ from the
+    /// command as written. Until then it is the command as written.
+    diverged: bool,
+    /// Words still to drop: the file descriptor number or target of the redirection being
+    /// read.
+    targets: usize,
+    /// The target starts with an unquoted `-` after `>&` or `<&`: bash reads that `-` as a
+    /// word of its own, so the rest of the word is not dropped.
+    dash: bool,
+}
+
 /// An open `${…}` or `$[…]`: a `<<` in it is text, and a newline in it does not start
 /// here-document bodies.
 struct Brace {
@@ -276,6 +299,8 @@ struct Splitter {
     at: usize,
     commands: Vec<Rough>,
     words: Vec<Tok>,
+    /// The command being split, without its redirections.
+    bare: Bare,
     word: String,
     in_word: bool,
     /// The word has `$'…'` text that cannot be decoded.
@@ -324,6 +349,9 @@ struct Splitter {
 
 struct Frame {
     words: Vec<Tok>,
+    /// Kept only once it diverged: the scan as it was before it followed bash opens every
+    /// substitution.
+    bare: Option<Box<Bare>>,
     word: String,
     undecodable: bool,
     quote: Option<char>,
@@ -331,6 +359,8 @@ struct Frame {
     arithmetic: bool,
     braces: Vec<Brace>,
     opener: char,
+    /// Where its text starts, after its opener.
+    start: usize,
     parens: usize,
 }
 
@@ -341,6 +371,7 @@ impl Splitter {
             at,
             commands: Vec::new(),
             words: Vec::new(),
+            bare: Bare::default(),
             word: String::new(),
             in_word: false,
             undecodable: false,
@@ -452,8 +483,18 @@ impl Splitter {
                     }
                 }
                 '<' if self.peek() == Some('<') => {
+                    let redirects = self.redirects();
+                    // After `<<-` and a blank, the `-` is a word of its own, as written.
+                    let dash = self.src.get(self.at + 1) == Some(&'-')
+                        && matches!(self.src.get(self.at + 2), Some(' ' | '\t'));
+                    if redirects {
+                        self.start_redirection();
+                    }
                     self.end_word();
                     self.redirection();
+                    if redirects {
+                        self.bare.targets = 1 + usize::from(dash);
+                    }
                 }
                 // A process substitution.
                 '<' | '>' if !self.legacy && self.peek() == Some('(') => {
@@ -461,6 +502,9 @@ impl Splitter {
                     self.at += 1;
                     self.open('(');
                 }
+                '<' | '>' if self.redirects() => self.redirection_operator(c),
+                '&' if self.peek() == Some('>') && self.redirects() => self.both_outputs(),
+                '{' => self.open_brace(),
                 ' ' | '\t' | '<' | '>' => self.end_word(),
                 '(' => {
                     if self.peek() == Some('(') {
@@ -499,10 +543,144 @@ impl Splitter {
                         self.line_start();
                     }
                 }
-                ';' | '&' | '|' | '{' | '}' => self.end_command(),
+                ';' | '&' | '|' | '}' => self.end_command(),
                 _ => self.push(c),
             },
         }
+    }
+
+    /// Whether a `<` or `>` here may be a redirection operator: outside arithmetic, `${…}`
+    /// and `$[…]`.
+    fn redirects(&self) -> bool {
+        !self.arithmetic && self.arithmetic_commands == 0 && self.braces.is_empty()
+    }
+
+    /// From here the command read without its redirections may differ from the command as
+    /// written.
+    fn diverge(&mut self) {
+        if !self.bare.diverged {
+            self.bare.words.clone_from(&self.words);
+            self.bare.diverged = true;
+        }
+    }
+
+    /// At the `<` or `>` just read, which starts a redirection operator: the word it ends,
+    /// if a file descriptor number, is dropped from the reading without redirections.
+    fn start_redirection(&mut self) {
+        self.diverge();
+        if self.fd_number() {
+            self.bare.targets = 1;
+        }
+    }
+
+    /// Whether the word being read, which the `<` or `>` just read ends, is a file
+    /// descriptor number to bash: unquoted digits that make an `int`, the whole word. The
+    /// word starts after a blank or operator, or the backquote opening the substitution
+    /// it is in; a closing one goes on with the word, like the `)` of a `$(…)`.
+    fn fd_number(&self) -> bool {
+        let op = self.at - 1;
+        let digits = self.src[..op]
+            .iter()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        let start = op - digits;
+        let opened =
+            |i: usize| self.src[i] == '`' && self.stack.last().is_some_and(|f| f.start == start);
+        self.in_word
+            && digits > 0
+            && digits == self.word.len()
+            && start
+                .checked_sub(1)
+                .is_none_or(|i| " \t\n;&|(<>".contains(self.src[i]) || opened(i))
+            && self.word.parse::<i32>().is_ok()
+    }
+
+    /// A redirection operator other than `<<`, `<<-` and `<<<` (see
+    /// [`Splitter::redirection`]), whose `<` or `>` was just read: `<`, `<>`, `<&`, `>`,
+    /// `>>`, `>|` or `>&`. The word after it is its target, except that bash reads an
+    /// unquoted `-` starting the word after `<&` or `>&` as a word of its own.
+    fn redirection_operator(&mut self, c: char) {
+        self.start_redirection();
+        self.end_word();
+        match (c, self.peek()) {
+            (_, Some('>')) => self.at += 1,
+            // As written, the `&` or `|` ends the command.
+            (_, Some('&')) => {
+                self.at += 1;
+                self.end_written();
+                let blanks = self.src[self.at..]
+                    .iter()
+                    .take_while(|c| matches!(c, ' ' | '\t'))
+                    .count();
+                self.bare.dash = self.src.get(self.at + blanks) == Some(&'-');
+            }
+            ('>', Some('|')) => {
+                self.at += 1;
+                self.end_written();
+            }
+            _ => {}
+        }
+        self.bare.targets = 1;
+    }
+
+    /// `&>` or `&>>`, its `&` just read: both outputs are redirected to the word after it.
+    /// As written, the `&` ends the command. (bash 3.2 reads `&>>` as `&>` and `>`, a
+    /// syntax error.)
+    fn both_outputs(&mut self) {
+        self.diverge();
+        self.end_written();
+        self.at += 1;
+        self.next_if_eq('>');
+        self.bare.targets = 1;
+    }
+
+    /// A `{`: it ends a command, as it always did in this scan. But `{NAME}` starting a word,
+    /// followed by a `<` or `>` redirection operator, is to bash 4.1 and later a redirection
+    /// that assigns its file descriptor number to NAME: the reading without redirections
+    /// drops it and goes on. As written, `{` and `}` still end commands, with NAME one of its
+    /// own.
+    fn open_brace(&mut self) {
+        let name = (!self.in_word && self.bare.targets == 0 && self.redirects())
+            .then(|| self.fd_variable())
+            .flatten();
+        let Some(len) = name else {
+            return self.end_command();
+        };
+        self.diverge();
+        self.end_written();
+        let name: String = self.src[self.at..self.at + len].iter().collect();
+        self.words.push(Tok::Lit(name));
+        self.end_written();
+        self.at += len + 1;
+    }
+
+    /// After a `{`: the length of the NAME or `NAME[SUBSCRIPT]` in `{NAME}` when a `<` or
+    /// `>` redirection operator follows it (not a process substitution).
+    fn fd_variable(&self) -> Option<usize> {
+        let rest = &self.src[self.at..];
+        let name = rest
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+            .count();
+        if name == 0 || rest[0].is_ascii_digit() {
+            return None;
+        }
+        let mut len = name;
+        if rest.get(len) == Some(&'[') {
+            let subscript = rest[len + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || "_@*".contains(**c))
+                .count();
+            if subscript == 0 || rest.get(len + 1 + subscript) != Some(&']') {
+                return None;
+            }
+            len += subscript + 2;
+        }
+        let redirection = rest.get(len) == Some(&'}')
+            && matches!(rest.get(len + 1), Some('<' | '>'))
+            && rest.get(len + 2) != Some(&'(');
+        redirection.then_some(len)
     }
 
     /// At the start of a line of program text: a restarted split stops where another split
@@ -856,20 +1034,52 @@ impl Splitter {
             } else {
                 Tok::Lit(word)
             };
+            if self.bare.diverged {
+                if self.bare.targets > 0 {
+                    self.bare.targets -= 1;
+                    if take(&mut self.bare.dash) {
+                        let rest = match &tok {
+                            Tok::Lit(w) => w
+                                .strip_prefix('-')
+                                .filter(|r| !r.is_empty())
+                                .map(|r| Tok::Lit(r.to_owned())),
+                            other => Some(other.clone()),
+                        };
+                        self.bare.words.extend(rest);
+                    }
+                } else {
+                    self.bare.words.push(tok.clone());
+                }
+            }
             self.words.push(tok);
             self.in_word = false;
         }
     }
 
-    /// Ends the command being split. Only commands with words, each once, are kept: every
-    /// split of a long text could otherwise hold one per operator it reads.
+    /// Ends the command being split, as written and without its redirections.
     fn end_command(&mut self) {
+        self.end_written();
+        let bare = take(&mut self.bare);
+        if bare.diverged {
+            self.emit(bare.words);
+        }
+    }
+
+    /// Ends the command being split as written only: a redirection's `&` or `|` does not
+    /// end the command without its redirections.
+    fn end_written(&mut self) {
         self.end_word();
-        let data = matches!(self.text, Text::Body { .. });
-        let mut words = take(&mut self.words);
+        let words = take(&mut self.words);
+        self.emit(words);
+    }
+
+    /// Keeps a command. Only commands with words, each once, are kept: every split of a
+    /// long text could otherwise hold one per operator it reads.
+    fn emit(&mut self, mut words: Vec<Tok>) {
         if words.is_empty() {
             return;
         }
+        let data = matches!(self.text, Text::Body { .. });
         words.shrink_to_fit();
         if self.seen.insert((words.clone(), data)) {
             self.commands.push(Rough { words, data });
@@ -900,6 +1110,9 @@ impl Splitter {
         self.backticks += usize::from(opener == '`');
         self.stack.push(Frame {
             words: take(&mut self.words),
+            bare: Some(take(&mut self.bare))
+                .filter(|b| b.diverged)
+                .map(Box::new),
             word: take(&mut self.word),
             undecodable: take(&mut self.undecodable),
             quote: self.quote.take(),
@@ -907,6 +1120,7 @@ impl Splitter {
             arithmetic: self.arithmetic,
             braces: take(&mut self.braces),
             opener,
+            start: self.at,
             parens: 0,
         });
         self.text = Text::Program;
@@ -930,6 +1144,7 @@ impl Splitter {
         if let Some(f) = self.stack.pop() {
             self.backticks -= usize::from(f.opener == '`');
             self.words = f.words;
+            self.bare = f.bare.map(|b| *b).unwrap_or_default();
             self.word = f.word;
             self.undecodable = f.undecodable;
             self.quote = f.quote;
@@ -1155,12 +1370,14 @@ mod tests {
 
     #[test]
     fn here_document_bodies_are_data() {
-        // A substitution leaves an empty word behind in its enclosing command.
+        // A substitution leaves an empty word behind in its enclosing command. A command is
+        // also read without its here-document operators and their delimiter words.
         let src = "cat <<EOF; a\nb $(c)\nEOF\ncat <<-'X' <<Y\n\tdata $(e)\n\tX\nf\nY\ng\necho $((1<<2))\nh";
         assert_eq!(
             words(&rough_commands(src)),
             [
                 cmd(&["cat", "EOF"], false),
+                cmd(&["cat"], false),
                 cmd(&["a"], false),
                 cmd(&["c"], false),
                 cmd(&["b", ""], true),
@@ -1180,6 +1397,108 @@ mod tests {
                 cmd(&["curl", "x"], false),
                 cmd(&["it's", ""], true),
                 cmd(&["curl", "y"], true),
+            ]
+        );
+    }
+
+    #[test]
+    fn commands_are_also_read_without_their_redirections() {
+        // Each command is kept as written, and is also read as bash runs it: without its
+        // redirection operators, their targets, and the number or `{name}` before one.
+        let cases: [(&str, &[&[&str]]); 6] = [
+            (
+                "2>&1 curl x",
+                &[&["2"], &["1", "curl", "x"], &["curl", "x"]],
+            ),
+            // After `>&` or `<&`, an unquoted `-` is the target, not the rest of its word.
+            (
+                ">&-a b; <& -c d; >&\"-e\" f",
+                &[
+                    &["-a", "b"],
+                    &["a", "b"],
+                    &["-c", "d"],
+                    &["c", "d"],
+                    &["-e", "f"],
+                    &["f"],
+                ],
+            ),
+            (
+                "a {fd}>o <<<s b &>f c",
+                &[
+                    &["a"],
+                    &["fd"],
+                    &["o", "s", "b"],
+                    &["f", "c"],
+                    &["a", "b", "c"],
+                ],
+            ),
+            (
+                "{fd[1]}<>o 0<&3 >|p >>q >&- 3<<<s a",
+                &[
+                    &["fd[1]"],
+                    &["o", "0"],
+                    &["3"],
+                    &["p", "q"],
+                    &["-", "3", "s", "a"],
+                    &["a"],
+                ],
+            ),
+            (
+                "echo a &>>log curl x",
+                &[
+                    &["echo", "a"],
+                    &["log", "curl", "x"],
+                    &["echo", "a", "curl", "x"],
+                ],
+            ),
+            // A quoted or out-of-range number is a word, not a file descriptor.
+            (
+                "\"2\">x a; 99999999999>y b",
+                &[
+                    &["2", "x", "a"],
+                    &["2", "a"],
+                    &["99999999999", "y", "b"],
+                    &["99999999999", "b"],
+                ],
+            ),
+        ];
+        for (src, want) in cases {
+            let want: Vec<_> = want.iter().map(|w| cmd(w, false)).collect();
+            assert_eq!(words(&rough_commands(src)), want, "{src:?}");
+        }
+        // Not redirections to bash: process substitutions, and `<` or `>` in arithmetic or
+        // in `${…}`. (The split as the scan was before it followed bash reads `<(` as `<`
+        // and `(`, and a `<` in `${…}` as a redirection.)
+        assert_eq!(
+            words(&split_bash(
+                "<(a) b; $((1<2)) c; ((d<e)) f; ${x:-<y} z",
+                Text::Program,
+                0
+            )),
+            [
+                cmd(&["a"], false),
+                cmd(&["", "b"], false),
+                cmd(&["1", "2"], false),
+                cmd(&["", "c"], false),
+                cmd(&["d", "e"], false),
+                cmd(&["f"], false),
+                cmd(&["$"], false),
+                cmd(&["x:-", "y"], false),
+                cmd(&["z"], false),
+            ]
+        );
+        // The operator of a here-document is one, `-` included, and its delimiter word is
+        // its target.
+        assert_eq!(
+            words(&rough_commands("<<- EOF a\nx\nEOF\n<<-X b\nX\n<<Y c\nY")),
+            [
+                cmd(&["-", "EOF", "a"], false),
+                cmd(&["a"], false),
+                cmd(&["x"], true),
+                cmd(&["-X", "b"], false),
+                cmd(&["b"], false),
+                cmd(&["Y", "c"], false),
+                cmd(&["c"], false),
             ]
         );
     }
@@ -1228,14 +1547,17 @@ mod tests {
     #[test]
     fn here_documents_bash_may_read_differently_are_program_text() {
         // A `<<` in `${…}` is text, and a body starts after a newline outside it. The scan
-        // as it was before took `b` for data of `<<B`, which only adds a data command.
+        // as it was before took `b` for data of `<<B`, and `B` for its delimiter, which only
+        // adds commands.
         assert_eq!(
             words(&rough_commands("cat <<A ${x:-<<B\n}\na\nA\nb")),
             [
                 cmd(&["cat", "A", "$"], false),
+                cmd(&["cat", "$"], false),
                 cmd(&["x:-", "B"], false),
                 cmd(&["a"], true),
                 cmd(&["b"], false),
+                cmd(&["x:-"], false),
                 cmd(&["b"], true),
             ]
         );
@@ -1246,6 +1568,7 @@ mod tests {
             words(&rough_commands("cat <<$'EOF'\nit's\nEOF\ncurl y")),
             [
                 cmd(&["cat", "EOF"], false),
+                cmd(&["cat"], false),
                 cmd(&["its\nEOF\ncurl y"], false),
                 cmd(&["curl", "y"], false),
                 cmd(&["its"], false),

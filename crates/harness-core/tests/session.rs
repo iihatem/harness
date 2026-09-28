@@ -227,3 +227,85 @@ fn session_files_and_their_folders_are_private() {
     assert_eq!(mode(&project), 0o700);
     assert_eq!(mode(&sessions), 0o700);
 }
+
+/// A session file at `dir/<name>.jsonl` whose first line gives the session id `id`.
+fn session_file(dir: &Path, name: &str, id: &str) -> std::path::PathBuf {
+    let path = dir.join(format!("{name}.jsonl"));
+    let header = serde_json::json!({
+        "id": id,
+        "parent_id": null,
+        "type": "session",
+        "version": 1,
+        "started_at": "2026-01-02T00:00:00Z",
+        "cwd": "/work",
+    });
+    let message = serde_json::json!({
+        "id": "0000000a",
+        "parent_id": id,
+        "type": "message",
+        "message": {"role": "user", "content": "hello"},
+    });
+    std::fs::write(&path, format!("{header}\n{message}\n")).unwrap();
+    path
+}
+
+// Review D I3: the id inside a session file becomes part of paths (the checkpoint index), so
+// it must be the file's own name, and a safe one.
+#[test]
+fn a_session_whose_id_is_not_its_file_name_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = session_file(
+        dir.path(),
+        "20260102T000000Z-cafe",
+        "../../PWNED-by-header-id",
+    );
+    assert!(matches!(
+        Session::open(&path),
+        Err(SessionError::NotASession(_))
+    ));
+    let path = session_file(dir.path(), "20260102T000000Z-beef", "20260102T000000Z-cafe");
+    assert!(matches!(
+        Session::open(&path),
+        Err(SessionError::NotASession(_))
+    ));
+    // Neither is listed, so `-c` never picks one.
+    assert!(session::list(dir.path()).is_empty());
+    let path = session_file(dir.path(), "20260102T000000Z-f00d", "20260102T000000Z-f00d");
+    let (session, _) = Session::open(&path).unwrap();
+    assert_eq!(session.id(), "20260102T000000Z-f00d");
+    drop(session);
+    let listed = session::list(dir.path());
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "20260102T000000Z-f00d");
+}
+
+#[test]
+fn a_session_whose_name_is_not_a_safe_id_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["with space", "dot.ted", &"a".repeat(65)] {
+        let path = session_file(dir.path(), name, name);
+        assert!(
+            matches!(Session::open(&path), Err(SessionError::NotASession(_))),
+            "{name}"
+        );
+    }
+    assert!(session::list(dir.path()).is_empty());
+}
+
+#[test]
+fn session_ids_are_letters_digits_and_dashes() {
+    assert!(session::is_valid_id("20260927T123456Z-1a2b3c4d"));
+    assert!(session::is_valid_id(&"a".repeat(64)));
+    for id in [
+        "",
+        "../x",
+        "/etc/passwd",
+        "a b",
+        "a.b",
+        "a_b",
+        &"a".repeat(65),
+        "é",
+    ] {
+        assert!(!session::is_valid_id(id), "{id}");
+    }
+}

@@ -63,9 +63,9 @@ pub fn open(setup: &Setup, choice: &Choice) -> Result<Session, String> {
             .map(|s| s.path)
             .ok_or("there is no earlier session in this project to continue")?,
         Choice::Resume(id) => {
+            // The id becomes a path: only a valid one is looked up.
             let path = dir.join(format!("{id}.jsonl"));
-            let valid = !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-            if !valid || !path.is_file() {
+            if !session::is_valid_id(id) || !path.is_file() {
                 return Err(format!(
                     "there is no session {id} in this project; run `harness --resume` to list them"
                 ));
@@ -107,8 +107,8 @@ pub fn print_list() -> u8 {
             .collect();
         println!(
             "{}  {}  {}",
-            summary.id,
-            summary.started_at,
+            terminal_safe(&summary.id),
+            terminal_safe(&summary.started_at),
             terminal_safe(&first)
         );
     }

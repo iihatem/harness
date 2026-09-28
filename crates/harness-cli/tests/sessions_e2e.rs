@@ -270,3 +270,34 @@ async fn a_killed_run_keeps_its_completed_turns() {
     );
     drop(env);
 }
+
+// Review D M5: the listing shows the id `--resume` looks up (the file name), and nothing from
+// inside the file reaches the terminal unescaped.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_session_list_shows_file_names_and_escapes_what_the_files_say() {
+    let server = MockServer::start().await;
+    answers(&server, "question", "answer").await;
+    let env = Env::new(&server.uri());
+    let env = tokio::task::spawn_blocking(move || {
+        env.cmd().args(["ask", "a question"]).assert().success();
+        env
+    })
+    .await
+    .unwrap();
+    let file = env.session_files()[0].clone();
+    let id = file.file_stem().unwrap().to_str().unwrap().to_string();
+    let text = std::fs::read_to_string(&file).unwrap();
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let mut header: Value = serde_json::from_str(&lines[0]).unwrap();
+    header["started_at"] = json!("\u{1b}]0;owned\u{7}2026");
+    lines[0] = header.to_string();
+    std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+    let listing = env.cmd().arg("--resume").output().unwrap();
+    assert!(listing.status.success());
+    let listing = String::from_utf8(listing.stdout).unwrap();
+    assert!(
+        !listing.contains('\u{1b}') && !listing.contains('\u{7}'),
+        "{listing:?}"
+    );
+    assert!(listing.starts_with(&format!("{id}  ")), "{listing}");
+}

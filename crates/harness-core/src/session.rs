@@ -160,6 +160,8 @@ impl Session {
             path: path.to_path_buf(),
             source,
         };
+        let not_a_session = || SessionError::NotASession(path.to_path_buf());
+        let file_id = file_id(path).ok_or_else(not_a_session)?;
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -210,14 +212,19 @@ impl Session {
                 path.display()
             ));
         }
+        // The id becomes part of other paths (the checkpoint index), so it must be the file's
+        // own name, which was checked above.
         let Some(Entry {
             id,
             kind: EntryKind::Session { .. },
             ..
         }) = entries.first()
         else {
-            return Err(SessionError::NotASession(path.to_path_buf()));
+            return Err(not_a_session());
         };
+        if id != file_id {
+            return Err(not_a_session());
+        }
         let id = id.clone();
         let leaf = entries.last().map(|e| e.id.clone()).unwrap_or(id.clone());
         let index = entries
@@ -243,6 +250,7 @@ impl Session {
         ))
     }
 
+    /// The session's id, which [`is_valid_id`] accepts.
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -407,7 +415,10 @@ pub fn list(dir: &Path) -> Vec<SessionSummary> {
     out
 }
 
+/// What `--resume` lists about the session file at `path`; `None` when it is not one that
+/// [`Session::open`] would open.
 fn summary(path: &Path) -> Option<SessionSummary> {
+    let id = file_id(path)?;
     let file = File::open(path).ok()?;
     let modified = file.metadata().ok()?.modified().ok()?;
     let mut lines = BufReader::new(file).lines();
@@ -415,6 +426,9 @@ fn summary(path: &Path) -> Option<SessionSummary> {
     let EntryKind::Session { started_at, .. } = header.kind else {
         return None;
     };
+    if header.id != id {
+        return None;
+    }
     let first_message =
         lines.map_while(Result::ok).find_map(|line| {
             match serde_json::from_str::<Entry>(&line).ok()?.kind {
@@ -427,12 +441,25 @@ fn summary(path: &Path) -> Option<SessionSummary> {
             }
         });
     Some(SessionSummary {
-        id: header.id,
+        id: id.to_string(),
         path: path.to_path_buf(),
         started_at,
         first_message,
         modified,
     })
+}
+
+/// The session id a file at `path` must have: its name without `.jsonl`, when that is a valid
+/// id.
+fn file_id(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?.strip_suffix(".jsonl")?;
+    is_valid_id(name).then_some(name)
+}
+
+/// Whether `id` can be a session id: 1 to 64 ASCII letters, digits and dashes. Session ids
+/// become file names and parts of other paths, so nothing else is accepted.
+pub fn is_valid_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// A session id that sorts by start time: `20260927T123456Z-1a2b`.

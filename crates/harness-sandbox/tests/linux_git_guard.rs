@@ -357,6 +357,9 @@ impl Drop for Killed {
 // The tier
 // ---------------------------------------------------------------------------
 
+/// Where the full tier is expected, the probe must find it. Where it is not (user namespaces
+/// blocked), the reason must be the setup step the kernel refused, as the child reported it
+/// (`<step> failed: <error>`), not a misread outcome of a setup that worked.
 #[test]
 fn the_probe_picks_the_expected_tier() {
     if !linux_sandbox_available() {
@@ -367,9 +370,15 @@ fn the_probe_picks_the_expected_tier() {
     if let GitProtection::Basic { reason } = &tier {
         assert!(!reason.is_empty());
     }
-    match expected_tier().as_deref() {
-        Some("full") => assert_eq!(tier, GitProtection::Full),
-        Some("basic") => assert!(matches!(tier, GitProtection::Basic { .. }), "{tier:?}"),
+    match (expected_tier().as_deref(), &tier) {
+        (Some("full"), _) => assert_eq!(tier, GitProtection::Full),
+        (Some("basic"), GitProtection::Basic { reason }) => assert!(
+            reason.contains(" failed: "),
+            "the basic tier here should come from a setup step the kernel refused: {reason}"
+        ),
+        (Some("basic"), GitProtection::Full) => {
+            panic!("HARNESS_EXPECT_LINUX_TIER=basic, but the probe picked the full tier")
+        }
         _ => eprintln!("probe picked {tier:?}"),
     }
 }

@@ -4,11 +4,13 @@
 
 use std::{
     collections::HashSet,
-    io::Read,
     path::{Path, PathBuf},
 };
 
-use crate::project::{discovery_root, repo_root};
+use crate::{
+    project::{discovery_root, repo_root},
+    read::{not_regular, read_regular},
+};
 
 /// Imports nest at most this deep; a top-level instruction file is depth 0.
 pub const MAX_IMPORT_DEPTH: usize = 5;
@@ -150,21 +152,22 @@ impl Loader {
         })
     }
 
-    /// Reads a regular file, at most [`MAX_FILE_BYTES`] of it.
+    /// Reads the regular file `path` resolves to (`real`), at most [`MAX_FILE_BYTES`] of it,
+    /// without following a symlink swapped in since or waiting on anything but a file.
     fn read(&mut self, path: &Path, real: &Path) -> Option<String> {
-        if !std::fs::metadata(real).is_ok_and(|m| m.is_file()) {
-            self.warnings
-                .push(format!("skipped {}: not a regular file", path.display()));
-            return None;
-        }
-        let mut bytes = Vec::new();
-        let read = std::fs::File::open(real)
-            .and_then(|f| f.take(MAX_FILE_BYTES as u64 + 1).read_to_end(&mut bytes));
-        if let Err(e) = read {
-            self.warnings
-                .push(format!("cannot read {}: {e}", path.display()));
-            return None;
-        }
+        let mut bytes = match read_regular(real, MAX_FILE_BYTES as u64 + 1) {
+            Ok(bytes) => bytes,
+            Err(e) if not_regular(&e) => {
+                self.warnings
+                    .push(format!("skipped {}: not a regular file", path.display()));
+                return None;
+            }
+            Err(e) => {
+                self.warnings
+                    .push(format!("cannot read {}: {e}", path.display()));
+                return None;
+            }
+        };
         if bytes.len() > MAX_FILE_BYTES {
             bytes.truncate(MAX_FILE_BYTES);
             self.warnings.push(format!(

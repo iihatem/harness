@@ -6,10 +6,9 @@ pub mod expand;
 pub mod frontmatter;
 pub mod init;
 
-use std::{
-    io::Read,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
+
+use crate::read::{not_regular, read_regular};
 
 /// The built-in commands and what they do, in `/help` order.
 pub const BUILTINS: [(&str, &str); 12] = [
@@ -213,17 +212,27 @@ impl Finder {
             ));
             return;
         }
-        if !std::fs::metadata(&real).is_ok_and(|m| m.is_file()) {
-            return;
-        }
-        let mut bytes = Vec::new();
-        let read = std::fs::File::open(&real)
-            .and_then(|f| f.take(MAX_FILE_BYTES as u64).read_to_end(&mut bytes));
-        if let Err(e) = read {
-            self.commands
-                .warnings
-                .push(format!("cannot read {}: {e}", path.display()));
-            return;
+        let mut bytes = match read_regular(&real, MAX_FILE_BYTES as u64 + 1) {
+            Ok(bytes) => bytes,
+            Err(e) if not_regular(&e) => {
+                self.commands
+                    .warnings
+                    .push(format!("ignored {}: not a regular file", path.display()));
+                return;
+            }
+            Err(e) => {
+                self.commands
+                    .warnings
+                    .push(format!("cannot read {}: {e}", path.display()));
+                return;
+            }
+        };
+        if bytes.len() > MAX_FILE_BYTES {
+            bytes.truncate(MAX_FILE_BYTES);
+            self.commands.warnings.push(format!(
+                "{} is larger than {MAX_FILE_BYTES} bytes; only the start is used",
+                path.display()
+            ));
         }
         let text = String::from_utf8_lossy(&bytes);
         let (front, body) = frontmatter::parse(&text);

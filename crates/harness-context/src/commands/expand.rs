@@ -1,7 +1,7 @@
 //! Expanding a custom command for one invocation: placeholders, file references, shell commands,
 //! and the command's `allowed-tools`.
 
-use std::{io::Read, path::Path};
+use std::path::Path;
 
 use harness_core::{
     engine::RuleSet,
@@ -10,6 +10,7 @@ use harness_core::{
 };
 
 use super::{CustomCommand, Scope, split_args};
+use crate::read::read_regular;
 
 /// Bytes of one referenced file included in the message.
 const MAX_FILE_BYTES: usize = 256 * 1024;
@@ -387,10 +388,8 @@ fn reference(
         ));
         return None;
     }
-    let mut bytes = Vec::new();
-    std::fs::File::open(&path)
-        .and_then(|f| f.take(MAX_FILE_BYTES as u64).read_to_end(&mut bytes))
-        .ok()?;
+    // `path` is resolved through symlinks, so the read may refuse one swapped in since.
+    let bytes = read_regular(&path, MAX_FILE_BYTES as u64).ok()?;
     Some((
         String::from_utf8_lossy(&bytes).into_owned(),
         candidate.len(),

@@ -413,3 +413,14 @@ fn a_placeholder_that_cannot_be_quoted_safely_is_never_run() {
         );
     }
 }
+
+#[test]
+fn a_file_reference_through_a_symlink_inside_the_workspace_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(ws.join("docs")).unwrap();
+    std::fs::write(ws.join("docs/notes.md"), "NOTES").unwrap();
+    std::os::unix::fs::symlink("docs/notes.md", ws.join("notes.md")).unwrap();
+    let got = expand(&command("See @notes.md"), "", &ws, &engine(&ws, &[]), false);
+    assert_eq!(got.input.parts, [text("See NOTES")]);
+}

@@ -319,3 +319,25 @@ fn commands_in_the_home_directory_stay_global_when_it_is_the_project() {
     assert_eq!(found.get("h").unwrap().scope, Scope::Global);
     assert!(found.warnings.is_empty(), "{:?}", found.warnings);
 }
+
+// Review B, minor 3: a command file cut at the size limit says so.
+#[test]
+fn a_command_file_over_the_size_limit_is_cut_with_a_warning() {
+    let (_dir, base) = setup();
+    let mut text = "---\ndescription: big\n---\n".to_string();
+    text.push_str(&"x".repeat(1024 * 1024));
+    write(&base.join("project/.claude/commands/big.md"), &text);
+    let found = discover(&base);
+    let big = found.get("big").unwrap();
+    assert_eq!(big.description.as_deref(), Some("big"));
+    assert_eq!(
+        big.body.len(),
+        1024 * 1024 - "---\ndescription: big\n---\n".len()
+    );
+    assert_eq!(found.warnings.len(), 1, "{:?}", found.warnings);
+    assert!(
+        found.warnings[0].contains("big.md") && found.warnings[0].contains("only the start"),
+        "{:?}",
+        found.warnings
+    );
+}

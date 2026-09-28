@@ -240,11 +240,24 @@ impl GuardSession {
         let mut findings = Findings::default();
         let mut undone = BTreeMap::new();
         let mut earlier = None;
+        let mut baseline = None;
         if let Some(mut kept) = self.take_kept(workspace) {
             let survivors = self.survivors();
             kept.check(&tree, &mut quarantine, survivors, self.max_changes());
             findings.before = kept.found;
+            findings.gone = kept.gone;
             undone = kept.undone;
+            // While processes a command left may still act, what is on disk
+            // now may be theirs, written since that check: the command's
+            // baseline is the kept one.
+            if kept.survivors {
+                baseline = Some(Baseline {
+                    candidates: kept.candidates,
+                    existing: kept.existing,
+                    identities: kept.identities,
+                    detached: kept.detached,
+                });
+            }
             earlier = Some(kept.snapshot);
         }
         // What is still to be moved is new, whatever the scan finds: a
@@ -265,6 +278,12 @@ impl GuardSession {
         let existing: BTreeSet<PathBuf> = candidates
             .iter()
             .filter(|path| !unknown(path) && may_exist(&tree, path))
+            // A name the kept baseline knew of exists only if it did then.
+            .filter(|path| {
+                baseline.as_ref().is_none_or(|baseline| {
+                    !baseline.candidates.contains(*path) || baseline.existing.contains(*path)
+                })
+            })
             .cloned()
             .collect();
         let identities = index
@@ -274,14 +293,17 @@ impl GuardSession {
             .chain(&index.links)
             .map(|path| {
                 // What is still to be put back keeps what it was.
-                let identity = match undone.get(path) {
+                let tracked = match undone.get(path) {
                     Some(Undone {
                         todo: Todo::PutBack(original),
                         ..
-                    }) => original.clone(),
-                    _ => Identity::of(&tree, path),
+                    }) => Tracked::new(original.clone()),
+                    _ => baseline
+                        .as_ref()
+                        .and_then(|baseline| baseline.identities.get(path).cloned())
+                        .unwrap_or_else(|| Tracked::new(Identity::of(&tree, path))),
                 };
-                (path.clone(), Tracked::new(identity))
+                (path.clone(), tracked)
             })
             .collect();
         let top = workspace.join(".git");
@@ -297,6 +319,9 @@ impl GuardSession {
         // is still to be restored or put back keeps its earlier version.
         let mut snapshot = Snapshot::take(&tree, &roots, save_all, unknown);
         if let Some(earlier) = &earlier {
+            if baseline.is_some() {
+                snapshot.adopt_all(earlier);
+            }
             for (path, undone) in &undone {
                 if !matches!(undone.todo, Todo::Move) {
                     snapshot.adopt(earlier, path);
@@ -304,27 +329,40 @@ impl GuardSession {
             }
         }
         findings.incomplete = index.incomplete && self.first_report_of_incomplete(workspace);
+        let adopted = baseline.is_some();
+        let mut state = State {
+            workspace: workspace.to_path_buf(),
+            tree,
+            save_all,
+            index,
+            gitdirs,
+            nested,
+            candidates,
+            existing,
+            identities,
+            detached: baseline
+                .map(|baseline| baseline.detached)
+                .unwrap_or_default(),
+            top_existed,
+            snapshot,
+            quarantine,
+            findings,
+            undone,
+            max_changes: self.max_changes(),
+            finished: false,
+        };
+        if adopted {
+            // What changed since the kept baseline, while this scan ran, is
+            // undone before the command runs, and said as found before it.
+            let findings = &mut state.findings;
+            std::mem::swap(&mut findings.before, &mut findings.after);
+            state.check();
+            let findings = &mut state.findings;
+            std::mem::swap(&mut findings.before, &mut findings.after);
+        }
         GitGuard {
             session: Arc::clone(self),
-            state: Arc::new(Mutex::new(State {
-                workspace: workspace.to_path_buf(),
-                tree,
-                save_all,
-                index,
-                gitdirs,
-                nested,
-                candidates,
-                existing,
-                identities,
-                detached: BTreeSet::new(),
-                top_existed,
-                snapshot,
-                quarantine,
-                findings,
-                undone,
-                max_changes: self.max_changes(),
-                finished: false,
-            })),
+            state: Arc::new(Mutex::new(state)),
         }
     }
 
@@ -350,13 +388,17 @@ impl GuardSession {
     /// last command, taken for the result of a command that has no checks
     /// of its own (a read-only one): said once, without blocking.
     pub fn found_between(&self, workspace: &Path) -> Option<GuardReport> {
-        let found = {
+        let (found, gone) = {
             let mut workspaces = lock(&self.workspaces);
             let kept = workspaces.get_mut(workspace)?.kept.as_mut()?;
-            std::mem::take(&mut kept.found)
+            (
+                std::mem::take(&mut kept.found),
+                std::mem::take(&mut kept.gone),
+            )
         };
         let findings = Findings {
             before: found,
+            gone,
             ..Findings::default()
         };
         findings.report(workspace).map(|report| GuardReport {
@@ -469,6 +511,9 @@ impl GitGuard {
     /// entries, keeps what the checks before the next command compare
     /// against, and says what was done, if anything.
     pub fn finish(self) -> Option<GuardReport> {
+        // Asked before the final check and scan as well as after them: a
+        // process alive now may write while they run, and be gone by the end.
+        let survivors = self.session.survivors();
         let mut state = lock(&self.state);
         state.check();
         let rules = self.session.rules(&state.workspace);
@@ -518,7 +563,7 @@ impl GitGuard {
             .collect();
         state.finished = true;
         state.quarantine.close();
-        let kept = state.keep(self.session.survivors());
+        let kept = state.keep(survivors || self.session.survivors());
         self.session.keep(&state.workspace, kept);
         state.findings.report(&state.workspace)
     }
@@ -687,7 +732,14 @@ impl State {
             ..
         } = self;
         let mut pass = Pass::new(tree, quarantine, undone, *max_changes);
-        check_identities(&mut pass, identities, snapshot, detached, findings);
+        check_identities(
+            &mut pass,
+            identities,
+            snapshot,
+            detached,
+            &mut findings.after,
+            &mut findings.gone,
+        );
         let new: Vec<PathBuf> = candidates
             .difference(existing)
             .filter(|path| pass.exists(path))
@@ -766,9 +818,11 @@ impl State {
             snapshot: std::mem::take(&mut self.snapshot),
             save_all: self.save_all,
             detached: self.detached.clone(),
+            identities: std::mem::take(&mut self.identities),
             survivors,
             undone,
             found: List::default(),
+            gone: BTreeSet::new(),
             quarantine: None,
         }
     }
@@ -781,7 +835,8 @@ fn check_identities(
     identities: &mut BTreeMap<PathBuf, Tracked>,
     snapshot: &Snapshot,
     detached: &mut BTreeSet<PathBuf>,
-    findings: &mut Findings,
+    found: &mut List,
+    gone: &mut BTreeSet<PathBuf>,
 ) {
     for (path, tracked) in identities.iter_mut() {
         let now = pass.identity(path);
@@ -790,13 +845,13 @@ fn check_identities(
         }
         match now {
             Identity::Missing => {
-                findings.gone.insert(path.clone());
+                gone.insert(path.clone());
                 detached.insert(path.clone());
                 tracked.expected = now;
                 continue;
             }
             Identity::Unreachable => {
-                findings.after.push(Some(Finding {
+                found.push(Some(Finding {
                     path: path.clone(),
                     what: What::Unreachable,
                     outcome: pass.unreachable(path),
@@ -808,7 +863,7 @@ fn check_identities(
             Identity::Symlink { .. } | Identity::Inode { .. } => {}
         }
         let (finding, put) = pass.put_back(path, &tracked.original, Some(snapshot));
-        findings.after.push(finding);
+        found.push(finding);
         match put {
             Put::Restored => {
                 detached.remove(path);
@@ -819,7 +874,7 @@ fn check_identities(
                 tracked.expected = Identity::of(pass.tree, path);
             }
             Put::Gone => {
-                findings.gone.insert(path.clone());
+                gone.insert(path.clone());
                 detached.insert(path.clone());
                 tracked.expected = Identity::Missing;
             }
@@ -1268,6 +1323,15 @@ impl<'a> Pass<'a> {
     }
 }
 
+/// The part of [`Kept`] a command's guard starts from while processes the
+/// last command left may still act.
+struct Baseline {
+    candidates: BTreeSet<PathBuf>,
+    existing: BTreeSet<PathBuf>,
+    identities: BTreeMap<PathBuf, Tracked>,
+    detached: BTreeSet<PathBuf>,
+}
+
 /// What the checks until the next command compare against: the state
 /// before the last command, which its guard restored.
 #[derive(Debug)]
@@ -1282,6 +1346,9 @@ struct Kept {
     save_all: bool,
     /// Below these, the snapshot is not compared: see [`State::detached`].
     detached: BTreeSet<PathBuf>,
+    /// What each `.git` entry, gitdir and link was, and is expected to be:
+    /// see [`State::identities`].
+    identities: BTreeMap<PathBuf, Tracked>,
     /// Whether processes a sandboxed command started were running when the
     /// guard finished, or at any check since.
     survivors: bool,
@@ -1289,16 +1356,19 @@ struct Kept {
     undone: BTreeMap<PathBuf, Undone>,
     /// What the checks since found.
     found: List,
+    /// `.git` entries, gitdirs and links the checks since found gone.
+    gone: BTreeSet<PathBuf>,
     /// Where the checks between commands move things.
     quarantine: Option<Quarantine>,
 }
 
 impl Kept {
-    /// Does what the checks left undone first; then moves protected names
-    /// planted since the command ended to quarantine; and, in the basic
-    /// tier if processes the command left running may have changed things,
-    /// or in either tier if restores were left undone, undoes the changes
-    /// to the protected files and gitfiles.
+    /// Does what the checks left undone first; then, if processes the
+    /// command left running may have changed things, puts back or moves a
+    /// `.git` entry, gitdir or link they replaced; moves protected names
+    /// planted since the command ended to quarantine; and, with `save_all`
+    /// if processes may have changed things, or whenever restores were left
+    /// undone, undoes the changes to the protected files and gitfiles.
     fn check(
         &mut self,
         tree: &Tree,
@@ -1320,12 +1390,14 @@ impl Kept {
                     self.found.push(taken);
                 }
                 Todo::PutBack(original) => {
+                    // Put back already, by a check or by the user: a gitfile
+                    // by its content (restoring one makes a new inode),
+                    // anything else by what it is.
                     let settled = match original {
-                        Identity::Symlink { .. } => Identity::of(tree, &path) == *original,
                         Identity::Inode { dir: false, .. } => {
                             self.snapshot.state_of(tree, &path) == Some(None)
                         }
-                        _ => false,
+                        _ => Identity::of(tree, &path) == *original,
                     };
                     if settled {
                         pass.undone.remove(&path);
@@ -1337,6 +1409,19 @@ impl Kept {
                 // With the snapshot, below.
                 Todo::Restore => {}
             }
+        }
+        // While processes a command left may still act, a `.git` entry,
+        // gitdir or link they replace is put back or moved, as during a
+        // command.
+        if self.survivors {
+            check_identities(
+                &mut pass,
+                &mut self.identities,
+                &self.snapshot,
+                &mut self.detached,
+                &mut self.found,
+                &mut self.gone,
+            );
         }
         let new: Vec<PathBuf> = self
             .candidates
@@ -1532,7 +1617,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// What a `.git` entry, gitdir or link was at the start of the command, and
 /// what the guard expects it to be now.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Tracked {
     original: Identity,
     expected: Identity,

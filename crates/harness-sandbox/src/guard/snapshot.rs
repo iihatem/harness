@@ -290,6 +290,25 @@ impl Snapshot {
         }
     }
 
+    /// Takes `from`'s record of every entry it holds in place of this one's,
+    /// as [`adopt`](Self::adopt) does for one: what was added below a
+    /// directory `from` recorded then counts as new.
+    pub(crate) fn adopt_all(&mut self, from: &Snapshot) {
+        let tops: Vec<PathBuf> = from
+            .nodes
+            .keys()
+            .filter(|path| {
+                !path
+                    .parent()
+                    .is_some_and(|above| from.nodes.contains_key(above))
+            })
+            .cloned()
+            .collect();
+        for top in tops {
+            self.adopt(from, &top);
+        }
+    }
+
     /// How the entry at `path` differs from its record: `None` when it is
     /// not recorded, `Some(None)` when it is as recorded.
     pub(crate) fn state_of(&self, tree: &Tree, path: &Path) -> Option<Option<Difference>> {

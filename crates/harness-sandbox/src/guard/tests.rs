@@ -875,3 +875,165 @@ fn what_the_checks_between_commands_found_is_said_once_with_the_next_result() {
         "not said again"
     );
 }
+
+#[test]
+fn a_survivor_that_writes_while_finish_scans_and_then_exits_is_still_undone() {
+    // Alive as `finish` starts; it writes during the scan and is gone by the
+    // time `finish` ends.
+    let env = env();
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let probe = Arc::clone(&alive);
+    env.session.set_survivor_probe(Arc::new(move || {
+        probe.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    let ws = env.ws.clone();
+    let exits = Arc::clone(&alive);
+    lock(&env.session.hooks).after_scan = Some(Box::new(move || {
+        std::fs::write(ws.join(".git/config"), EVIL).unwrap();
+        exits.store(false, std::sync::atomic::Ordering::SeqCst);
+    }));
+    assert_eq!(guard.finish(), None);
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report
+            .message
+            .contains("\n- .git/config: changed; restored the earlier version"),
+        "{}",
+        report.message
+    );
+    assert_eq!(
+        read(&env.ws.join(".git/config")),
+        "[core]\n\tbare = false\n"
+    );
+}
+
+#[test]
+fn what_survivors_change_while_begin_scans_is_undone_at_that_begin() {
+    let env = env();
+    env.session.set_survivor_probe(Arc::new(|| true));
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    // Runs during the next `begin`'s scan, after its first check.
+    let ws = env.ws.clone();
+    lock(&env.session.hooks).after_scan = Some(Box::new(move || {
+        std::fs::write(ws.join(".git/commondir"), "/tmp/evil\n").unwrap();
+        std::fs::write(ws.join(".git/config"), EVIL).unwrap();
+        std::fs::write(ws.join(".git/hooks/post-checkout"), "evil\n").unwrap();
+    }));
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    // Undone before the command runs.
+    assert_eq!(
+        read(&env.ws.join(".git/config")),
+        "[core]\n\tbare = false\n"
+    );
+    assert!(!env.ws.join(".git/commondir").exists());
+    assert!(!env.ws.join(".git/hooks/post-checkout").exists());
+    let report = guard.finish().expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report.message.starts_with(report::BEFORE),
+        "{}",
+        report.message
+    );
+    for line in [
+        "\n- .git/config: changed; restored the earlier version",
+        "\n- .git/commondir: new; moved to ",
+        "\n- .git/hooks/post-checkout: new in a protected directory; moved to ",
+    ] {
+        assert!(report.message.contains(line), "{line}: {}", report.message);
+    }
+}
+
+#[test]
+fn with_survivors_a_dot_git_replaced_by_a_symlink_between_commands_is_quarantined() {
+    let env = env();
+    env.session.set_survivor_probe(Arc::new(|| true));
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    // A survivor swaps the repository for a symlink to a gitdir outside the
+    // workspace.
+    let outside = env.ws.parent().unwrap().join("outside-git");
+    std::fs::rename(env.ws.join(".git"), &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, env.ws.join(".git")).unwrap();
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report
+            .message
+            .contains("\n- .git: moved or replaced; moved to "),
+        "{}",
+        report.message
+    );
+    assert!(std::fs::symlink_metadata(env.ws.join(".git")).is_err());
+}
+
+#[test]
+fn with_survivors_a_repointed_dot_git_symlink_is_put_back_between_commands() {
+    let env = env();
+    std::fs::rename(env.ws.join(".git"), env.ws.join("real")).unwrap();
+    std::os::unix::fs::symlink("real", env.ws.join(".git")).unwrap();
+    env.session.set_survivor_probe(Arc::new(|| true));
+    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    std::fs::remove_file(env.ws.join(".git")).unwrap();
+    std::os::unix::fs::symlink("/tmp", env.ws.join(".git")).unwrap();
+    let handle = env
+        .session
+        .between_commands(&env.ws)
+        .expect("survivors to watch for");
+    handle.check();
+    assert_eq!(
+        std::fs::read_link(env.ws.join(".git")).unwrap(),
+        PathBuf::from("real")
+    );
+    let report = env
+        .session
+        .begin(&env.ws, true, |_| {})
+        .finish()
+        .expect("a report");
+    assert!(
+        report
+            .message
+            .contains("\n- .git: moved or replaced; restored the earlier version"),
+        "{}",
+        report.message
+    );
+}
+
+#[test]
+fn a_real_dot_git_the_user_moves_back_is_not_quarantined() {
+    let env = env();
+    cap(&env, 0);
+    let guard = env.session.begin(&env.ws, true, |_| {});
+    std::fs::rename(env.ws.join(".git"), env.ws.join(".git-away")).unwrap();
+    std::fs::create_dir_all(env.ws.join(".git/hooks")).unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(
+        report.message.contains("\n- .git: moved or replaced]"),
+        "{}",
+        report.message
+    );
+    // The user puts their repository back.
+    std::fs::remove_dir_all(env.ws.join(".git")).unwrap();
+    std::fs::rename(env.ws.join(".git-away"), env.ws.join(".git")).unwrap();
+    uncap(&env);
+    let report = env.session.begin(&env.ws, true, |_| {}).finish();
+    assert!(
+        report
+            .as_ref()
+            .is_none_or(|report| !report.message.contains("- .git: moved or replaced;")),
+        "{report:?}"
+    );
+    assert_eq!(
+        read(&env.ws.join(".git/config")),
+        "[core]\n\tbare = false\n"
+    );
+    assert!(!env.quarantine.exists());
+}

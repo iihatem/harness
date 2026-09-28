@@ -4,25 +4,27 @@
 //! by a thread of its own in the harness process, and an `eventfd(2)` to stop
 //! that thread.
 //!
-//! A watch is added by path, with `IN_ONLYDIR | IN_DONT_FOLLOW`, so the last
-//! component is never a symlink; one higher up is followed. That can only
-//! make the watcher watch the wrong directory, which sets off checks that
-//! find nothing, or misses events, which the checks around each command make
-//! up for: they, not the watcher, decide what to undo, without following a
-//! symlink.
+//! Each directory is opened through the guard's no-follow [`Tree`], from the
+//! workspace, so no symlink on the way is followed, and the watch is added on
+//! that descriptor (`/proc/self/fd/<n>`): it is pinned to the directory that
+//! was looked at, which is what [`Source::add`] says it is.
+//!
+//! A watcher that cannot start (no inotify instance left, say) is counted,
+//! and why is kept, for `harness sandbox doctor` ([`watcher_failures`]).
 
 use std::ffi::CString;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::guard::nofollow::{Kind, Tree};
 use crate::watch::{
-    self, End, IN_IGNORED, IN_MOVE_SELF, IN_Q_OVERFLOW, Lifetime, Source, Target, Wake, Watch,
+    self, End, IN_IGNORED, IN_MOVE_SELF, IN_Q_OVERFLOW, Id, Lifetime, Source, Target, Wake, Watch,
 };
 
 // The bits `crate::watch` acts on, as it spells them.
@@ -33,7 +35,9 @@ const _: () = assert!(
 );
 
 /// What each watch reports: every way an entry in the directory, or the
-/// directory itself, can be created, written, changed, moved or removed.
+/// directory itself, can be created, written, changed, moved or removed. The
+/// watch is added through `/proc/self/fd/<n>`, a link the kernel follows to
+/// the directory the descriptor is for.
 const MASK: u32 = libc::IN_CREATE
     | libc::IN_MODIFY
     | libc::IN_CLOSE_WRITE
@@ -43,8 +47,41 @@ const MASK: u32 = libc::IN_CREATE
     | libc::IN_DELETE
     | libc::IN_DELETE_SELF
     | libc::IN_MOVE_SELF
-    | libc::IN_ONLYDIR
-    | libc::IN_DONT_FOLLOW;
+    | libc::IN_ONLYDIR;
+
+/// How many watchers could not start in this process.
+static FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Why the last one that could not start did not.
+static LAST_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+/// How many watchers of git metadata could not start in this process, and
+/// why the last of them did not: the guard then checked only before and
+/// after each command. For `harness sandbox doctor`.
+pub fn watcher_failures() -> (u64, Option<String>) {
+    let last = LAST_FAILURE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    (FAILURES.load(Ordering::Relaxed), last)
+}
+
+fn record_failure(err: &io::Error) {
+    *LAST_FAILURE.lock().unwrap_or_else(PoisonError::into_inner) = Some(err.to_string());
+    FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The error the next watcher started on this thread fails with.
+    static FAIL_NEXT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Makes the next watcher started on this thread fail with `errno`.
+#[cfg(test)]
+pub(super) fn fail_next_start(errno: i32) {
+    FAIL_NEXT.with(|next| next.set(Some(errno)));
+}
 
 /// Room for many events: one takes 16 bytes plus a name of up to 256.
 const BUF_BYTES: usize = 16 * 1024;
@@ -67,14 +104,27 @@ impl fmt::Debug for Watcher {
 }
 
 impl Watcher {
-    /// Watches what `target` names, and starts the thread. Its watches are in
-    /// place when this returns.
-    pub(super) fn start(target: impl Target, lifetime: Lifetime) -> io::Result<Watcher> {
+    /// Watches what `target` names in the workspace `root`, and starts the
+    /// thread. Its watches are in place when this returns. A watcher that
+    /// cannot start is counted: see [`watcher_failures`].
+    pub(super) fn start(
+        root: &Path,
+        target: impl Target,
+        lifetime: Lifetime,
+    ) -> io::Result<Watcher> {
+        let started = Watcher::spawn(root, target, lifetime);
+        if let Err(err) = &started {
+            record_failure(err);
+        }
+        started
+    }
+
+    fn spawn(root: &Path, target: impl Target, lifetime: Lifetime) -> io::Result<Watcher> {
         let name = match lifetime {
             Lifetime::Command => "harness-watch",
             Lifetime::Between { .. } => "harness-between",
         };
-        let source = Inotify::new()?;
+        let source = Inotify::new(root)?;
         let stop = Arc::clone(&source.stop);
         let watch = Watch::new(source, target, lifetime);
         let thread = std::thread::Builder::new()
@@ -130,15 +180,21 @@ impl Drop for Watcher {
     }
 }
 
-/// An inotify descriptor, and the eventfd that says stop.
+/// An inotify descriptor, the eventfd that says stop, and the workspace the
+/// watched directories are reached from.
 struct Inotify {
     fd: OwnedFd,
     stop: Arc<OwnedFd>,
+    tree: Tree,
     buf: Vec<u8>,
 }
 
 impl Inotify {
-    fn new() -> io::Result<Inotify> {
+    fn new(root: &Path) -> io::Result<Inotify> {
+        #[cfg(test)]
+        if let Some(errno) = FAIL_NEXT.with(std::cell::Cell::take) {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         // SAFETY: takes only flags; returns a new descriptor or -1.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
@@ -157,17 +213,25 @@ impl Inotify {
         Ok(Inotify {
             fd,
             stop,
+            tree: Tree::new(root),
             buf: vec![0; BUF_BYTES],
         })
     }
 }
 
 impl Source for Inotify {
-    fn add(&mut self, dir: &Path) -> Option<i32> {
-        let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
-        // SAFETY: `path` is NUL-terminated and outlives the call.
+    fn add(&mut self, dir: &Path, known: &dyn Fn(Id) -> bool) -> Option<(i32, Id)> {
+        let pinned = self.tree.dir(dir).ok()?;
+        let stat = pinned.stat_self().ok()?;
+        let id = (stat.dev, stat.ino);
+        if stat.kind != Kind::Dir || known(id) {
+            return None;
+        }
+        let path = CString::new(format!("/proc/self/fd/{}", pinned.raw())).ok()?;
+        // SAFETY: `path` is NUL-terminated and outlives the call, and
+        // `pinned` keeps the descriptor it names open until it returns.
         let wd = unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), path.as_ptr(), MASK) };
-        (wd >= 0).then_some(wd)
+        (wd >= 0).then_some((wd, id))
     }
 
     fn remove(&mut self, wd: i32) {
@@ -260,13 +324,15 @@ mod tests {
 
     /// Counts its checks. A change to one of `names`, or to a watched
     /// directory itself, is relevant; with `everything`, any change is. Each
-    /// check runs `on_check` in the first directory.
+    /// check runs `on_check` in the first directory. Records how many checks
+    /// had run when it was told no process is left.
     struct Counting {
         dirs: Vec<PathBuf>,
         names: &'static [&'static str],
         everything: bool,
         checks: Arc<AtomicUsize>,
         on_check: fn(&Path, usize),
+        gone: Arc<Mutex<Option<usize>>>,
     }
 
     impl Counting {
@@ -278,6 +344,7 @@ mod tests {
                 everything: false,
                 checks: Arc::clone(&checks),
                 on_check: |_, _| {},
+                gone: Arc::default(),
             };
             (counting, checks)
         }
@@ -296,13 +363,22 @@ mod tests {
             let n = self.checks.fetch_add(1, Ordering::SeqCst);
             (self.on_check)(&self.dirs[0], n);
         }
+
+        fn survivors_gone(&self) {
+            *self.gone.lock().unwrap() = Some(count(&self.checks));
+        }
+    }
+
+    /// The directory a test watches from.
+    fn root(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().to_path_buf()
     }
 
     #[test]
     fn a_relevant_change_runs_a_check_and_others_do_not() {
         let dir = tempfile::tempdir().unwrap();
         let (target, checks) = Counting::new(&[dir.path()]);
-        let watcher = Watcher::start(target, Lifetime::Command).unwrap();
+        let watcher = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap();
         std::fs::write(dir.path().join("index.lock"), "x").unwrap();
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(count(&checks), 0);
@@ -322,7 +398,7 @@ mod tests {
             std::fs::write(&temp, "saved\n").unwrap();
             std::fs::remove_file(&temp).unwrap();
         };
-        let watcher = Watcher::start(target, Lifetime::Command).unwrap();
+        let watcher = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap();
         std::fs::write(dir.path().join("pre-commit"), "echo pwned\n").unwrap();
         wait_until("the change is checked", || count(&checks) > 0);
         std::thread::sleep(Duration::from_millis(500));
@@ -362,7 +438,7 @@ mod tests {
         let guard = session.begin(&ws, true, |_| {});
         let checks = Arc::new(AtomicUsize::new(0));
         let target = CountingHandle(guard.watch_handle(), Arc::clone(&checks));
-        let watcher = Watcher::start(target, Lifetime::Command).unwrap();
+        let watcher = Watcher::start(&ws, target, Lifetime::Command).unwrap();
         std::fs::write(ws.join(".git/hooks/pre-commit"), "echo pwned\n").unwrap();
         wait_until("the hook is restored", || {
             std::fs::read_to_string(ws.join(".git/hooks/pre-commit")).ok()
@@ -372,8 +448,13 @@ mod tests {
         let settled = count(&checks);
         // The change, its write in a second read, and what the restore did.
         assert!(settled <= 3, "{settled} checks");
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(count(&checks), settled, "the checks set each other off");
+        std::thread::sleep(Duration::from_millis(500));
+        // At most the check of a tick.
+        assert!(
+            count(&checks) <= settled + 1,
+            "the checks set each other off: {settled}, then {}",
+            count(&checks)
+        );
         watcher.stop();
         let report = guard.finish().expect("a report");
         assert!(
@@ -394,7 +475,7 @@ mod tests {
         // relevant change in the directory above it.
         let (mut target, checks) = Counting::new(&[&watched, dir.path()]);
         target.names = &["config", "hooks"];
-        let watcher = Watcher::start(target, Lifetime::Command).unwrap();
+        let watcher = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap();
         let old = dir.path().join("elsewhere");
         std::fs::rename(&watched, &old).unwrap();
         std::fs::create_dir(&watched).unwrap();
@@ -415,6 +496,7 @@ mod tests {
     fn a_watcher_between_commands_ends_by_itself_once_no_process_is_left() {
         let dir = tempfile::tempdir().unwrap();
         let (target, checks) = Counting::new(&[dir.path()]);
+        let gone = Arc::clone(&target.gone);
         let alive = Arc::new(AtomicBool::new(true));
         let lifetime = Lifetime::Between {
             alive: Box::new({
@@ -422,25 +504,61 @@ mod tests {
                 move || alive.load(Ordering::SeqCst)
             }),
         };
-        let watcher = Watcher::start(target, lifetime).unwrap();
-        wait_until("it checks as it starts", || count(&checks) == 1);
+        let watcher = Watcher::start(&root(&dir), target, lifetime).unwrap();
+        wait_until("it checks as it starts", || count(&checks) >= 1);
+        let before = count(&checks);
         std::fs::write(dir.path().join("config"), "x").unwrap();
-        wait_until("a change is checked", || count(&checks) == 2);
+        wait_until("a change is checked", || count(&checks) > before);
         assert!(!watcher.ended());
+        let before_the_end = count(&checks);
         alive.store(false, Ordering::SeqCst);
         let deadline = Instant::now() + watch::TICK + Duration::from_secs(2);
         while !watcher.ended() {
             assert!(Instant::now() < deadline, "the watcher is still running");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(count(&checks), 3, "one last check");
+        let last = count(&checks);
+        assert!(last > before_the_end, "no last check");
+        assert_eq!(
+            *gone.lock().unwrap(),
+            Some(last),
+            "told after the last check"
+        );
+    }
+
+    #[test]
+    fn a_directory_reached_through_a_symlink_is_not_watched() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir(elsewhere.path().join("hooks")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(".git")).unwrap();
+        let (mut target, checks) = Counting::new(&[&dir.path().join(".git/hooks")]);
+        target.everything = true;
+        let watcher = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap();
+        std::fs::write(elsewhere.path().join("hooks/config"), "x").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(count(&checks), 0, "it watched where the symlink points");
+        watcher.stop();
+    }
+
+    #[test]
+    fn a_watcher_that_cannot_start_is_counted_with_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, _) = Counting::new(&[dir.path()]);
+        let (failed, _) = watcher_failures();
+        fail_next_start(libc::EMFILE);
+        let err = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+        let (now, why) = watcher_failures();
+        assert!(now > failed);
+        assert!(why.is_some());
     }
 
     #[test]
     fn stopping_a_watcher_waits_for_its_thread() {
         let dir = tempfile::tempdir().unwrap();
         let (target, checks) = Counting::new(&[dir.path()]);
-        let watcher = Watcher::start(target, Lifetime::Command).unwrap();
+        let watcher = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap();
         watcher.stop();
         std::fs::write(dir.path().join("config"), "x").unwrap();
         std::thread::sleep(Duration::from_millis(100));

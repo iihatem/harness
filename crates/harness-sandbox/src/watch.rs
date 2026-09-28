@@ -14,26 +14,33 @@
 //!
 //! - It watches what [`Target::dirs`] names: each known gitdir, its
 //!   `worktrees` and `modules`, the workspace root, and in the basic tier the
-//!   directories inside protected entries. A directory it cannot watch (the
-//!   per-user watch limit, say) is skipped. After each check it watches what
-//!   has appeared since (a new `hooks/`, say), and a directory deleted or
-//!   moved away (`IN_IGNORED`, `IN_MOVE_SELF`) is dropped, and whatever is
-//!   at its path now watched instead.
+//!   directories inside protected entries. Each is watched as the directory
+//!   it is (its device and inode), reached without following a symlink: a
+//!   directory made anew at a path is watched as well, and one reached under
+//!   two paths once. A directory it cannot watch (the per-user watch limit,
+//!   say) is skipped. After each check it watches what has appeared since (a
+//!   new `hooks/`, say), and a directory deleted or moved away (`IN_IGNORED`,
+//!   `IN_MOVE_SELF`) is dropped.
 //! - An event runs a check when [`Target::relevant`] says so, except for the
 //!   names the guard itself gives files for a moment ([`guards_own`]), so
 //!   that a restore cannot set off check after check. A lost event
 //!   (`IN_Q_OVERFLOW`) always runs one.
-//! - Checks are debounced. The first change is checked at once; while changes
-//!   keep coming, the next check waits until [`DEBOUNCE`] after the last one
-//!   ended, so a burst is checked as it starts and once after it. One watcher
-//!   runs at most [`MAX_CHECKS`] checks, so a process that plants a name again
-//!   and again cannot make the guard's findings grow without bound; the
-//!   checks around each command still run.
+//! - Checks that changes call for are debounced. The first change is checked
+//!   at once; while changes keep coming, the next check waits until
+//!   [`DEBOUNCE`] after the last one ended, so a burst is checked as it
+//!   starts and once after it. Past [`FAST_CHECKS`] of them, each waits twice
+//!   as long as the one before, up to [`TICK`]: a process that plants a name
+//!   again and again gets about a check a tick, and never none. What the
+//!   checks find is coalesced by the guard, one line per path.
+//! - Every [`TICK`] it checks whether or not anything changed, for what
+//!   changes without an event it heeds: a protected file written through a
+//!   hard link under another name, say.
 //! - Between commands ([`Lifetime::Between`]) it checks once as soon as its
 //!   watches are in place, since the previous command's guard finished before
-//!   they were. Every [`TICK`] it asks whether any process the command left
-//!   is still running, which also reaps those that exited; once none is, it
-//!   checks one last time and ends.
+//!   they were. At every tick it first asks whether any process the command
+//!   left is still running, which also reaps those that exited; once none
+//!   is, it checks one last time, tells the target
+//!   ([`Target::survivors_gone`]), and ends.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -54,8 +61,9 @@ pub(crate) const IN_IGNORED: u32 = 0x0000_8000;
 /// How long after a check ends the next one waits, at least.
 pub(crate) const DEBOUNCE: Duration = Duration::from_millis(50);
 
-/// How many checks one watcher runs, at most.
-pub(crate) const MAX_CHECKS: usize = 1_000;
+/// How many checks changes call for that one watcher runs at the full rate:
+/// past them, each waits twice as long as the one before, up to [`TICK`].
+pub(crate) const FAST_CHECKS: usize = 1_000;
 
 /// How often a watcher between commands asks whether any process the last
 /// command left is still running.
@@ -70,6 +78,9 @@ pub(crate) trait Target: Send + 'static {
     fn relevant(&self, dir: &Path, name: Option<&OsStr>) -> bool;
     /// Runs the checks, and undoes what they find.
     fn check(&self);
+    /// Between commands, once no process the last command left is running,
+    /// and a last check has run.
+    fn survivors_gone(&self) {}
 }
 
 impl Target for WatchHandle {
@@ -83,6 +94,10 @@ impl Target for WatchHandle {
 
     fn check(&self) {
         WatchHandle::check(self);
+    }
+
+    fn survivors_gone(&self) {
+        WatchHandle::survivors_gone(self);
     }
 }
 
@@ -148,11 +163,15 @@ pub(crate) enum Wake {
     Timeout,
 }
 
+/// What a directory is: its device and inode numbers.
+pub(crate) type Id = (u64, u64);
+
 /// The kernel side of a watcher: `inotify(7)` on Linux, a stand-in in tests.
 pub(crate) trait Source {
-    /// Starts watching `dir`: its watch descriptor, or `None` when it cannot
-    /// be watched.
-    fn add(&mut self, dir: &Path) -> Option<i32>;
+    /// Starts watching the directory at `dir`, as it is now, unless `known`
+    /// says that directory is watched already: its watch descriptor, and
+    /// what it is. `None` when it cannot be reached or watched, or is known.
+    fn add(&mut self, dir: &Path, known: &dyn Fn(Id) -> bool) -> Option<(i32, Id)>;
     /// Stops watching what `wd` is for.
     fn remove(&mut self, wd: i32);
     /// Waits for events or a stop, up to `timeout` (without one, until either
@@ -192,15 +211,18 @@ pub(crate) struct Watch<S, T> {
     source: S,
     target: T,
     lifetime: Lifetime,
-    /// Each watch descriptor, and the directory it was added for.
-    watched: BTreeMap<i32, PathBuf>,
+    /// Each watch descriptor, the directory it was added for, and what that
+    /// directory was.
+    watched: BTreeMap<i32, (PathBuf, Id)>,
     /// A change that calls for a check came since the last one began.
     pending: bool,
     /// When the last check ended.
     last: Option<Instant>,
-    /// How many more checks it may run.
-    left: usize,
-    /// When to ask next whether processes are left (between commands).
+    /// How long after the last check a change waits for its own.
+    interval: Duration,
+    /// How many checks changes called for so far.
+    called: usize,
+    /// When the next tick comes.
     tick: Option<Instant>,
 }
 
@@ -214,7 +236,8 @@ impl<S: Source, T: Target> Watch<S, T> {
             watched: BTreeMap::new(),
             pending: false,
             last: None,
-            left: MAX_CHECKS,
+            interval: DEBOUNCE,
+            called: 0,
             tick: None,
         };
         watch.resync();
@@ -223,8 +246,8 @@ impl<S: Source, T: Target> Watch<S, T> {
 
     /// Watches until the watcher ends: see the module docs.
     pub(crate) fn run(mut self) -> End {
+        self.tick = Some(self.source.now() + TICK);
         if matches!(self.lifetime, Lifetime::Between { .. }) {
-            self.tick = Some(self.source.now() + TICK);
             // What was changed before the watches were in place.
             self.check();
             if !self.resync() {
@@ -235,9 +258,14 @@ impl<S: Source, T: Target> Watch<S, T> {
             let now = self.source.now();
             if self.tick.is_some_and(|tick| now >= tick) {
                 if !self.alive() {
+                    // Whatever the rate: the last chance to undo what they did.
                     self.check();
+                    self.target.survivors_gone();
                     return End::NoneLeft;
                 }
+                // What changed without an event here: a protected file written
+                // through a hard link under another name, say.
+                self.check();
                 self.tick = Some(self.source.now() + TICK);
                 // What appeared without an event here, or a handle that does
                 // nothing since the next command began.
@@ -249,6 +277,10 @@ impl<S: Source, T: Target> Watch<S, T> {
             let due = self.due(now);
             if due.is_some_and(|due| now >= due) {
                 self.check();
+                self.called += 1;
+                if self.called >= FAST_CHECKS {
+                    self.interval = (self.interval * 2).min(TICK);
+                }
                 if !self.resync() {
                     return End::Inert;
                 }
@@ -270,18 +302,15 @@ impl<S: Source, T: Target> Watch<S, T> {
     }
 
     /// When the check a change called for may run: at once after a quiet
-    /// spell, else [`DEBOUNCE`] after the last check ended. `None` when none
-    /// is called for, or none may run any more.
+    /// spell, else once the interval since the last check ended has passed.
+    /// `None` when none is called for.
     fn due(&self, now: Instant) -> Option<Instant> {
-        (self.pending && self.left > 0).then(|| self.last.map_or(now, |last| last + DEBOUNCE))
+        self.pending
+            .then(|| self.last.map_or(now, |last| last + self.interval))
     }
 
     fn check(&mut self) {
         self.pending = false;
-        let Some(left) = self.left.checked_sub(1) else {
-            return;
-        };
-        self.left = left;
         self.target.check();
         self.last = Some(self.source.now());
     }
@@ -307,10 +336,10 @@ impl<S: Source, T: Target> Watch<S, T> {
                 resync = true;
                 continue;
             }
-            if !self.watched.contains_key(&event.wd) {
+            let Some((dir, _)) = self.watched.get(&event.wd) else {
                 // A watch dropped already.
                 continue;
-            }
+            };
             if event.mask & IN_IGNORED != 0 {
                 // The directory is gone: watch whatever is at its path now.
                 self.watched.remove(&event.wd);
@@ -330,31 +359,26 @@ impl<S: Source, T: Target> Watch<S, T> {
             if name.is_some_and(guards_own) {
                 continue;
             }
-            if let Some(dir) = self.watched.get(&event.wd)
-                && self.target.relevant(dir, name)
-            {
+            if self.target.relevant(dir, name) {
                 self.pending = true;
             }
         }
         resync
     }
 
-    /// Watches each directory the target names that is not watched yet.
-    /// `false` when it names none: its handle does nothing any more.
+    /// Watches each directory the target names that is not watched yet, by
+    /// what it is rather than by its path: a directory made anew at a path
+    /// is another. `false` when it names none: its handle does nothing any
+    /// more.
     fn resync(&mut self) -> bool {
         let dirs = self.target.dirs();
         if dirs.is_empty() {
             return false;
         }
-        let watching: BTreeSet<&PathBuf> = self.watched.values().collect();
-        let new: Vec<PathBuf> = dirs
-            .into_iter()
-            .filter(|dir| !watching.contains(dir))
-            .collect();
-        for dir in new {
-            if let Some(wd) = self.source.add(&dir) {
-                // The same directory under two paths keeps the first.
-                self.watched.entry(wd).or_insert(dir);
+        for dir in dirs {
+            let ids: BTreeSet<Id> = self.watched.values().map(|(_, id)| *id).collect();
+            if let Some((wd, id)) = self.source.add(&dir, &|id| ids.contains(&id)) {
+                self.watched.insert(wd, (dir, id));
             }
         }
         true
@@ -464,6 +488,14 @@ mod tests {
         dirs: Vec<PathBuf>,
         /// When each check ran.
         checks: Vec<Duration>,
+        /// When the target was told no process is left, and how many checks
+        /// had run by then.
+        gone: Option<(Duration, usize)>,
+        /// What each directory is; a path not in it is given a new one.
+        ids: std::collections::BTreeMap<PathBuf, Id>,
+        next_id: u64,
+        /// With no steps left, virtual time runs until this, then it stops.
+        end: Duration,
         /// What a check does besides: the events its own changes cause, say.
         on_check: Option<OnCheck>,
         panic_on_check: bool,
@@ -490,15 +522,27 @@ mod tests {
     struct Fake(Shared, Instant);
 
     impl Source for Fake {
-        fn add(&mut self, dir: &Path) -> Option<i32> {
+        fn add(&mut self, dir: &Path, known: &dyn Fn(Id) -> bool) -> Option<(i32, Id)> {
             let mut world = lock(&self.0);
             if dir.ends_with("unwatchable") {
+                return None;
+            }
+            let id = match world.ids.get(dir) {
+                Some(id) => *id,
+                None => {
+                    world.next_id += 1;
+                    let id = (1, world.next_id);
+                    world.ids.insert(dir.to_path_buf(), id);
+                    id
+                }
+            };
+            if known(id) {
                 return None;
             }
             world.next_wd += 1;
             let wd = world.next_wd;
             world.added.push((wd, dir.to_path_buf()));
-            Some(wd)
+            Some((wd, id))
         }
 
         fn remove(&mut self, wd: i32) {
@@ -528,11 +572,11 @@ mod tests {
                     world.now = now.max(at);
                     Ok(Wake::Events(events))
                 }
-                (None, Some(timeout)) => {
+                (None, Some(timeout)) if now + timeout <= world.end => {
                     world.now = now + timeout;
                     Ok(Wake::Timeout)
                 }
-                (None, None) => Ok(Wake::Stop),
+                (None, _) => Ok(Wake::Stop),
             }
         }
 
@@ -551,6 +595,13 @@ mod tests {
 
         fn relevant(&self, _dir: &Path, name: Option<&OsStr>) -> bool {
             name != Some(OsStr::new("index.lock"))
+        }
+
+        fn survivors_gone(&self) {
+            let mut world = lock(&self.0);
+            let (now, checks) = (world.now, world.checks.len());
+            assert_eq!(world.gone, None, "said twice");
+            world.gone = Some((now, checks));
         }
 
         fn check(&self) {
@@ -575,8 +626,17 @@ mod tests {
         }))
     }
 
+    /// Events at `when`; time runs on until half a second after the last.
     fn at(world: &Shared, when: u64, events: Vec<Event>) {
-        lock(world).steps.push_back(Step::At(ms(when), events));
+        let mut world = lock(world);
+        world.steps.push_back(Step::At(ms(when), events));
+        world.end = world.end.max(ms(when + 500));
+    }
+
+    /// Lets virtual time run until `when`.
+    fn idle_until(world: &Shared, when: u64) {
+        let mut world = lock(world);
+        world.end = world.end.max(ms(when));
     }
 
     fn on_check(world: &Shared, f: impl FnMut(&mut World) + Send + 'static) {
@@ -721,15 +781,96 @@ mod tests {
         assert_eq!(checks.last(), Some(&ms(1000)));
     }
 
-    #[test]
-    fn one_watcher_runs_at_most_max_checks() {
-        let w = world(&DIRS);
-        for n in 0..MAX_CHECKS + 100 {
-            let when = u64::try_from(n).unwrap() * 60;
-            at(&w, when, vec![ev(3, IN_CREATE, "post-checkout")]);
+    /// How many of `checks` fall in `from..to` (in milliseconds).
+    fn within(checks: &[Duration], from: u64, to: u64) -> usize {
+        checks
+            .iter()
+            .filter(|at| (ms(from)..ms(to)).contains(at))
+            .count()
+    }
+
+    /// A name planted every 60 ms from 0 until `until` ms.
+    fn replanted(world: &Shared, until: u64) {
+        for when in (0..until).step_by(60) {
+            at(world, when, vec![ev(3, IN_CREATE, "post-checkout")]);
         }
+    }
+
+    #[test]
+    fn past_its_fast_checks_a_watcher_backs_off_to_about_one_check_a_tick_and_keeps_checking() {
+        let w = world(&DIRS);
+        // The fast checks last about 60 s; then two minutes more.
+        replanted(&w, 180_000);
         assert_eq!(run(&w, Lifetime::Command), End::Stopped);
-        assert_eq!(checks(&w).len(), MAX_CHECKS);
+        let checks = checks(&w);
+        assert!(within(&checks, 0, 10_000) > 150, "{checks:?}");
+        // Backed off: one a tick for the changes, and the tick's own.
+        for from in (100_000..170_000).step_by(10_000) {
+            let n = within(&checks, from, from + 10_000);
+            assert!(
+                (5..=11).contains(&n),
+                "{n} checks from {from} ms: {checks:?}"
+            );
+        }
+        assert!(
+            checks
+                .last()
+                .is_some_and(|last| *last >= ms(180_000) - TICK),
+            "it stopped checking: {:?}",
+            checks.last()
+        );
+    }
+
+    #[test]
+    fn the_last_check_between_commands_runs_though_the_fast_checks_are_spent() {
+        let w = world(&DIRS);
+        replanted(&w, 70_000);
+        idle_until(&w, 81_000);
+        let lifetime = between(&w, |world, _| world.now < ms(80_000));
+        assert_eq!(run(&w, lifetime), End::NoneLeft);
+        let checks = checks(&w);
+        assert_eq!(checks.last(), Some(&ms(80_000)), "{checks:?}");
+        assert_eq!(lock(&w).gone, Some((ms(80_000), checks.len())));
+    }
+
+    #[test]
+    fn while_a_command_runs_it_checks_every_tick_between_changes() {
+        let w = world(&DIRS);
+        idle_until(&w, 7_000);
+        assert_eq!(run(&w, Lifetime::Command), End::Stopped);
+        assert_eq!(checks(&w), [ms(2_000), ms(4_000), ms(6_000)]);
+    }
+
+    #[test]
+    fn a_directory_made_anew_at_its_path_is_watched_as_it_is_now() {
+        let w = world(&DIRS);
+        let watcher = watch(&w, Lifetime::Command);
+        // Removed and made again, its events not read yet.
+        lock(&w)
+            .ids
+            .insert(PathBuf::from("/ws/.git/hooks"), (1, 99));
+        at(&w, 0, vec![ev(2, IN_MOVED_TO, "config")]);
+        assert_eq!(watcher.run(), End::Stopped);
+        assert_eq!(
+            added(&w).last(),
+            Some(&(4, PathBuf::from("/ws/.git/hooks")))
+        );
+    }
+
+    #[test]
+    fn one_directory_under_two_paths_is_watched_once() {
+        let w = world(&["/ws", "/ws/.git", "/ws/.git/worktrees/w/.."]);
+        let git = (1, 42);
+        lock(&w).ids.insert(PathBuf::from("/ws/.git"), git);
+        lock(&w)
+            .ids
+            .insert(PathBuf::from("/ws/.git/worktrees/w/.."), git);
+        at(&w, 0, vec![ev(2, IN_MOVED_TO, "config")]);
+        assert_eq!(run(&w, Lifetime::Command), End::Stopped);
+        assert_eq!(
+            added(&w),
+            [(1, PathBuf::from("/ws")), (2, PathBuf::from("/ws/.git"))]
+        );
     }
 
     #[test]
@@ -797,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn between_commands_it_checks_at_once_then_asks_every_tick_until_none_is_left() {
+    fn between_commands_it_checks_at_once_and_every_tick_until_none_is_left() {
         let w = world(&DIRS);
         let asked = Arc::new(Mutex::new(Vec::new()));
         let alive = {
@@ -809,12 +950,20 @@ mod tests {
             }
         };
         at(&w, 1000, vec![ev(2, IN_MOVED_TO, "config")]);
+        idle_until(&w, 10_000);
         let lifetime = Lifetime::Between {
             alive: Box::new(alive),
         };
         assert_eq!(run(&w, lifetime), End::NoneLeft);
-        assert_eq!(checks(&w), [ms(0), ms(1000), ms(6000)]);
+        // At once, for the change, at each tick, and a last one.
+        let checks = checks(&w);
+        assert_eq!(checks, [ms(0), ms(1000), ms(2000), ms(4000), ms(6000)]);
         assert_eq!(*asked.lock().unwrap(), [ms(2000), ms(4000), ms(6000)]);
+        assert_eq!(
+            lock(&w).gone,
+            Some((ms(6000), 5)),
+            "told after the last check"
+        );
     }
 
     /// Between commands, with `at_tick` run on the world at each tick: whether a process is left.
@@ -835,18 +984,20 @@ mod tests {
     #[test]
     fn between_commands_a_handle_that_does_nothing_any_more_ends_the_watcher_at_the_next_tick() {
         let w = world(&DIRS);
+        idle_until(&w, 5_000);
         // The next command begins without stopping it; processes are still running.
         let lifetime = between(&w, |world, _| {
             world.dirs.clear();
             true
         });
         assert_eq!(run(&w, lifetime), End::Inert);
-        assert_eq!(checks(&w), [ms(0)]);
+        assert_eq!(checks(&w), [ms(0), ms(2_000)]);
     }
 
     #[test]
     fn between_commands_a_directory_that_appeared_quietly_is_watched_at_the_next_tick() {
         let w = world(&DIRS);
+        idle_until(&w, 5_000);
         let lifetime = between(&w, |world, tick| {
             world.dirs.push(PathBuf::from("/ws/.git/worktrees"));
             tick < 2

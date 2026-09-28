@@ -50,7 +50,9 @@ pub use denial::looks_like_sandbox_denial;
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub use linux::{LinuxSandbox, landlock_abi, linux_sandbox_available, linux_sandbox_command};
+pub use linux::{
+    LinuxSandbox, landlock_abi, linux_sandbox_available, linux_sandbox_command, watcher_failures,
+};
 #[cfg(target_os = "macos")]
 pub use macos::{Seatbelt, seatbelt_available, seatbelt_command};
 pub use policy::{FsAccess, SandboxPolicy};

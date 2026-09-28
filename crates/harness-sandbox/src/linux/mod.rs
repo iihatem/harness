@@ -51,8 +51,10 @@
 //! the guard's final checks. When the guard finishes while processes the
 //! command left are running, a watcher between commands takes over for that
 //! workspace, until they are gone or the next workspace-write command there
-//! begins; what it does is reported with that command. A watcher that cannot
-//! start is skipped: the checks around each command still run.
+//! begins. What it does is reported with the next command in that workspace,
+//! a read-only one included, without blocking it. A watcher that cannot start
+//! is skipped, and the next report says so once: the checks around each
+//! command still run.
 
 mod detect;
 mod fdcleanup;
@@ -73,12 +75,13 @@ use tokio::process::Command;
 
 use crate::guard::{GitGuard, GuardSession};
 use crate::procs::{self, Registration};
-use crate::watch::Lifetime;
+use crate::watch::{Lifetime, Target};
 use crate::{FsAccess, SandboxPolicy, SandboxSettings};
 use inotify::Watcher;
 use preexec::PreparedSandbox;
 
 pub use detect::{landlock_abi, linux_sandbox_available};
+pub use inotify::watcher_failures;
 
 /// Builds a [`tokio::process::Command`] for `program`/`args` with `policy`'s
 /// Landlock + seccomp sandbox installed via `pre_exec`.
@@ -151,7 +154,7 @@ pub struct LinuxSandbox {
     settings: SandboxSettings,
     guards: Arc<GuardSession>,
     tier: GitProtection,
-    between: Between,
+    watching: Watching,
 }
 
 impl LinuxSandbox {
@@ -183,7 +186,7 @@ impl LinuxSandbox {
             settings,
             guards,
             tier,
-            between: Between::default(),
+            watching: Watching::default(),
         }
     }
 }
@@ -241,7 +244,8 @@ impl CommandSandbox for LinuxSandbox {
     /// about to be spawned, builds it, and starts its watcher. A read-only
     /// command has no git metadata to guard, but it runs in a session of its
     /// own all the same, so it is registered too; it cannot write to the
-    /// workspace, so the watcher between commands goes on meanwhile.
+    /// workspace, so the watcher between commands goes on meanwhile, and
+    /// what it found so far is reported with it.
     fn prepare(
         &self,
         access: FsAccess,
@@ -253,13 +257,16 @@ impl CommandSandbox for LinuxSandbox {
             let registration = Registration::new();
             return Ok(SandboxedCommand {
                 command: self.command(access, workspace, program, args)?,
-                guard: Some(Box::new(Registered(registration))),
+                guard: Some(Box::new(Registered {
+                    registration,
+                    after: self.after(canonical(workspace)),
+                })),
             });
         }
         let workspace = canonical(workspace);
         // What it would check, `begin` checks, and their checks must not
         // overlap.
-        self.between.stop(&workspace);
+        self.watching.stop_between(&workspace);
         // `begin` asks the probe only when an earlier command left something
         // to check, so orphans are reaped here as well.
         procs::look_and_reap();
@@ -275,8 +282,7 @@ impl CommandSandbox for LinuxSandbox {
                 // Nothing ran; finishing records where things stand for the
                 // next command, and what the checks before this one found is
                 // said with the error.
-                let report = guard.finish();
-                self.between.start(&self.guards, &workspace);
+                let report = self.after(workspace).finished(guard.finish());
                 return Err(match report {
                     Some(report) => {
                         io::Error::new(err.kind(), format!("{err}\n{}", report.message))
@@ -285,25 +291,32 @@ impl CommandSandbox for LinuxSandbox {
                 });
             }
         };
-        // One that cannot start is skipped: the final checks still run.
-        let watcher = Watcher::start(guard.watch_handle(), Lifetime::Command).ok();
+        let watcher = self
+            .watching
+            .start(&workspace, guard.watch_handle(), Lifetime::Command);
         Ok(SandboxedCommand {
             command,
             guard: Some(Box::new(LinuxGuard {
                 guard,
                 registration,
                 watcher,
-                after: After {
-                    guards: Arc::clone(&self.guards),
-                    workspace,
-                    between: self.between.clone(),
-                },
+                after: self.after(workspace),
             })),
         })
     }
 
     fn git_protection(&self) -> GitProtection {
         self.tier.clone()
+    }
+}
+
+impl LinuxSandbox {
+    fn after(&self, workspace: PathBuf) -> After {
+        After {
+            guards: Arc::clone(&self.guards),
+            workspace,
+            watching: self.watching.clone(),
+        }
     }
 }
 
@@ -315,16 +328,57 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The watchers between commands, while processes the last command in their
-/// workspace left are running: at most one per workspace.
+/// The watchers of a sandbox: at most one per workspace between commands,
+/// while processes the last command there left are running; and whether one
+/// could not start, which the next report says once.
 #[derive(Debug, Clone, Default)]
-struct Between(Arc<Mutex<BTreeMap<PathBuf, Watcher>>>);
+struct Watching(Arc<WatchingState>);
 
-impl Between {
+#[derive(Debug, Default)]
+struct WatchingState {
+    between: Mutex<BTreeMap<PathBuf, Watcher>>,
+    note: Mutex<Note>,
+}
+
+/// That a watcher could not start, and why, until a report says so.
+#[derive(Debug, Default)]
+struct Note {
+    unsaid: Option<String>,
+    /// A failure was said since a watcher last started: another is not.
+    said: bool,
+}
+
+impl Watching {
+    /// Watches `target` in `workspace`. `None` when that cannot start, which
+    /// the next report says, once until a watcher starts again.
+    fn start(&self, workspace: &Path, target: impl Target, lifetime: Lifetime) -> Option<Watcher> {
+        match Watcher::start(workspace, target, lifetime) {
+            Ok(watcher) => {
+                lock(&self.0.note).said = false;
+                Some(watcher)
+            }
+            Err(err) => {
+                let mut note = lock(&self.0.note);
+                if !std::mem::replace(&mut note.said, true) {
+                    note.unsaid = Some(format!(
+                        "[harness could not watch git metadata as it changes ({err}), so for now it \
+                         checks it only before and after each command.]\n"
+                    ));
+                }
+                None
+            }
+        }
+    }
+
+    /// What the next report is to say, if anything.
+    fn take_note(&self) -> Option<String> {
+        lock(&self.0.note).unsaid.take()
+    }
+
     /// Stops the watcher between commands in `workspace`, if there is one,
     /// and waits for it.
-    fn stop(&self, workspace: &Path) {
-        let watcher = lock(&self.0).remove(workspace);
+    fn stop_between(&self, workspace: &Path) {
+        let watcher = lock(&self.0.between).remove(workspace);
         if let Some(watcher) = watcher {
             watcher.stop();
         }
@@ -333,18 +387,18 @@ impl Between {
     /// Watches `workspace` until its next command while processes the last
     /// one left are running, if the guard says any are. One that cannot start
     /// is skipped: the checks before the next command still run.
-    fn start(&self, guards: &Arc<GuardSession>, workspace: &Path) {
+    fn start_between(&self, guards: &Arc<GuardSession>, workspace: &Path) {
         let Some(handle) = guards.between_commands(workspace) else {
             return;
         };
         let lifetime = Lifetime::Between {
             alive: Box::new(procs::look_and_reap),
         };
-        let Ok(watcher) = Watcher::start(handle, lifetime) else {
+        let Some(watcher) = self.start(workspace, handle, lifetime) else {
             return;
         };
         let done: Vec<Watcher> = {
-            let mut watchers = lock(&self.0);
+            let mut watchers = lock(&self.0.between);
             let ended: Vec<PathBuf> = watchers
                 .iter()
                 .filter(|(_, watcher)| watcher.ended())
@@ -366,20 +420,58 @@ impl Between {
 struct After {
     guards: Arc<GuardSession>,
     workspace: PathBuf,
-    between: Between,
+    watching: Watching,
+}
+
+impl After {
+    /// `report`, the guard's, with whatever else is to be said; then, while
+    /// processes the command left are running, the watcher between commands
+    /// starts.
+    fn finished(&self, report: Option<GuardReport>) -> Option<GuardReport> {
+        let report = with_note(report, self.watching.take_note());
+        self.watching.start_between(&self.guards, &self.workspace);
+        report
+    }
+}
+
+/// `report` with `note` added, which blocks nothing.
+fn with_note(report: Option<GuardReport>, note: Option<String>) -> Option<GuardReport> {
+    let Some(note) = note else {
+        return report;
+    };
+    Some(match report {
+        Some(report) => GuardReport {
+            message: format!("{}{note}", report.message),
+            ..report
+        },
+        None => GuardReport {
+            message: note,
+            blocked: false,
+        },
+    })
 }
 
 /// A read-only command's place in the registry of the processes harness
-/// waits for: there is nothing to check.
-struct Registered(Registration);
+/// waits for. It has nothing to check, but what the watcher between commands
+/// found so far is reported with it.
+struct Registered {
+    registration: Registration,
+    after: After,
+}
 
 impl CommandGuard for Registered {
     fn started(&mut self, pid: u32) {
-        self.0.started(pid);
+        self.registration.started(pid);
     }
 
     fn finish(self: Box<Self>) -> Option<GuardReport> {
-        None
+        let Registered {
+            registration,
+            after,
+        } = *self;
+        drop(registration);
+        let found = after.guards.found_between(&after.workspace);
+        with_note(found, after.watching.take_note())
     }
 }
 
@@ -417,9 +509,7 @@ impl CommandGuard for LinuxGuard {
             watcher.stop();
         }
         drop(registration);
-        let report = guard.finish();
-        after.between.start(&after.guards, &after.workspace);
-        report
+        after.finished(guard.finish())
     }
 }
 
@@ -430,6 +520,49 @@ mod tests {
 
     fn sandbox() -> LinuxSandbox {
         LinuxSandbox::new(crate::SandboxSettings::default())
+    }
+
+    #[test]
+    fn a_watcher_that_cannot_start_is_said_once_in_the_next_report() {
+        if !linux_sandbox_available() {
+            eprintln!("skipping: linux sandbox unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        let sandbox = LinuxSandbox::with_git_protection(
+            crate::SandboxSettings {
+                quarantine_dir: Some(dir.path().join("quarantine")),
+                ..crate::SandboxSettings::default()
+            },
+            GitProtection::Basic {
+                reason: "forced by the test".into(),
+            },
+        );
+        let finish = |fail: bool| {
+            if fail {
+                inotify::fail_next_start(libc::EMFILE);
+            }
+            let prepared = sandbox
+                .prepare(FsAccess::WorkspaceWrite, &ws, "/bin/true", &[])
+                .expect("prepare");
+            prepared.guard.expect("a guard").finish()
+        };
+        let report = finish(true).expect("a note");
+        assert!(!report.blocked, "{}", report.message);
+        assert!(
+            report
+                .message
+                .contains("harness could not watch git metadata as it changes"),
+            "{}",
+            report.message
+        );
+        let why = io::Error::from_raw_os_error(libc::EMFILE).to_string();
+        assert!(report.message.contains(&why), "{}", report.message);
+        assert_eq!(finish(true), None, "said once");
+        assert_eq!(finish(false), None);
+        assert!(finish(true).is_some(), "said again once one started");
     }
 
     #[test]

@@ -594,27 +594,84 @@ async fn a_hook_planted_again_and_again_gets_a_bounded_report() {
     assert!(output.status.success(), "{}", stderr(&output));
     let report = report.expect("a report");
     assert!(report.blocked, "{}", report.message);
-    // Each check moves the hook planted last: one as the command starts planting, then one at
-    // most every 50 ms, and the final one after it ends.
-    let listed = report
+    // One line, however often it was moved: where the first and the last went, and a count.
+    assert_eq!(
+        report.message.matches("\n- ").count(),
+        1,
+        "{}",
+        report.message
+    );
+    assert!(
+        report
+            .message
+            .contains("\n- .git/hooks/post-checkout: new in a protected directory; moved to "),
+        "{}",
+        report.message
+    );
+    let again: usize = report
         .message
-        .matches("\n- .git/hooks/post-checkout: ")
-        .count();
-    let more: usize = report
-        .message
-        .split("\n- and ")
+        .split(", and ")
         .nth(1)
         .and_then(|rest| rest.split(' ').next())
         .map_or(0, |count| count.parse().unwrap());
-    let found = listed + more;
-    let most = usize::try_from(took.as_millis() / 50).unwrap() + 3;
+    // Each check moves the hook planted last: one as the command starts planting, then one at
+    // most every 50 ms, one each two-second tick, and the final one after it ends.
+    let found = 1 + again;
+    let millis = took.as_millis();
+    let most = usize::try_from(millis / 50 + millis / 2000).unwrap() + 3;
     assert!(
         (2..=most).contains(&found),
         "{found} found in {took:?}, at most {most}: {}",
         report.message
     );
-    assert!(listed <= 50, "{}", report.message);
-    assert!(report.message.len() < 16 * 1024, "{}", report.message);
+    assert!(report.message.len() < 1024, "{}", report.message);
+}
+
+#[tokio::test]
+async fn a_protected_file_written_through_a_hard_link_is_restored_while_the_command_runs() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let before = env.read(".git/config");
+    let sandbox = env.basic();
+    let prepared = sandbox
+        .prepare(
+            FsAccess::WorkspaceWrite,
+            &env.ws,
+            "/bin/sh",
+            &[
+                "-c",
+                "ln .git/config .git/x && echo '# evil' >> .git/x && exec sleep 30",
+            ],
+        )
+        .expect("prepare the sandboxed command");
+    let mut guard = prepared.guard.expect("a workspace-write guard");
+    let mut cmd = prepared.command;
+    cmd.current_dir(&env.ws)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn the sandboxed command");
+    guard.started(child.id().expect("a pid"));
+    // No event names the config: the watcher's tick finds it.
+    wait_until("the config is restored while the command runs", || {
+        env.read_now(".git/config").as_ref() == Some(&before)
+            && env.read_now(".git/x").is_some_and(|x| x.contains("# evil"))
+    })
+    .await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the command should still be running"
+    );
+    child.kill().await.unwrap();
+    let report = guard.finish().expect("a report");
+    assert!(report.blocked, "{}", report.message);
+    assert!(
+        report
+            .message
+            .contains("- .git/config: changed; restored the earlier version"),
+        "{}",
+        report.message
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +760,118 @@ async fn the_watcher_between_commands_ends_once_the_processes_left_are_gone() {
         orphaned_zombies(),
         Vec::<i32>::new(),
         "its last look reaped the job"
+    );
+    // Nothing the command left is running: what changes now is the user's.
+    env.append(".git/config", "# mine\n");
+    let (_, report) = run(&sandbox, &env, "true").await;
+    assert_eq!(report, None);
+    assert!(env.read(".git/config").ends_with("# mine\n"));
+}
+
+#[tokio::test]
+async fn a_protected_file_written_through_a_hard_link_between_commands_is_restored_within_two_ticks()
+ {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let sandbox = env.basic();
+    let before = env.read(".git/config");
+    let (output, report) = run(
+        &sandbox,
+        &env,
+        r##"sh -c 'echo $$ > job.pid; sleep 1; ln .git/config .git/x && echo "# evil" >> .git/x; exec sleep 30' > /dev/null 2>&1 &"##,
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(report, None);
+    let job = Job::from_pid_file(&env, "job.pid").await;
+    wait_until("the job wrote through the link", || {
+        env.read_now(".git/x").is_some_and(|x| x.contains("# evil"))
+    })
+    .await;
+    let written = Instant::now();
+    // No event names the config: the watcher's tick finds it.
+    wait_until("the config is restored", || {
+        env.read_now(".git/config").as_ref() == Some(&before)
+    })
+    .await;
+    // Two ticks of two seconds, and some slack.
+    assert!(
+        written.elapsed() < Duration::from_secs(5),
+        "restored after {:?}",
+        written.elapsed()
+    );
+    assert!(job.alive(), "undone while the job still ran");
+    drop(job);
+    let (_, report) = run(&sandbox, &env, "true").await;
+    let report = report.expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report
+            .message
+            .contains("- .git/config: changed; restored the earlier version"),
+        "{}",
+        report.message
+    );
+}
+
+/// Runs `script` read-only through `sandbox.prepare`, as the bash tool does, and gives its
+/// guard's report.
+async fn run_read_only(sandbox: &LinuxSandbox, env: &Env, script: &str) -> Option<GuardReport> {
+    let prepared = sandbox
+        .prepare(FsAccess::ReadOnly, &env.ws, "/bin/sh", &["-c", script])
+        .expect("prepare the sandboxed command");
+    let mut guard = prepared.guard.expect("a guard that registers the command");
+    let mut cmd = prepared.command;
+    cmd.current_dir(&env.ws)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn the sandboxed command");
+    guard.started(child.id().expect("a pid"));
+    child.wait().await.expect("wait for the command");
+    guard.finish()
+}
+
+#[tokio::test]
+async fn what_the_watcher_between_commands_found_is_said_once_with_a_read_only_command() {
+    let _serial = SERIAL.lock().await;
+    let Some(env) = Env::new() else { return };
+    let sandbox = env.basic();
+    let (output, report) = run(
+        &sandbox,
+        &env,
+        "sh -c 'echo $$ > job.pid; sleep 1; printf /tmp/elsewhere > .git/commondir; \
+         exec sleep 30' > /dev/null 2>&1 &",
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(report, None);
+    let job = Job::from_pid_file(&env, "job.pid").await;
+    wait_until("the watcher between commands moved commondir", || {
+        env.in_quarantine(".git/commondir")
+    })
+    .await;
+    let report = run_read_only(&sandbox, &env, "true")
+        .await
+        .expect("a report");
+    assert!(!report.blocked, "{}", report.message);
+    assert!(
+        report.message.starts_with("[before this command ran"),
+        "{}",
+        report.message
+    );
+    assert!(
+        report.message.contains("- .git/commondir: new; moved to "),
+        "{}",
+        report.message
+    );
+    drop(job);
+    let (_, report) = run(&sandbox, &env, "true").await;
+    assert!(
+        report
+            .as_ref()
+            .is_none_or(|report| !report.message.contains(".git/commondir")),
+        "said again: {report:?}"
     );
 }
 

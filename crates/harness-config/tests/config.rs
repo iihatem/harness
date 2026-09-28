@@ -587,6 +587,14 @@ fn impossible_compaction_settings_are_errors_naming_the_file() {
             "below compaction.threshold_percent",
         ),
         ("[compaction]\nkeep = 5\n", "unknown field"),
+        (
+            "[compaction]\nkeep_recent_percent = 0\n",
+            "keep_recent_percent must be between 1 and 100",
+        ),
+        (
+            "[compaction]\nkeep_recent_percent = 101\n",
+            "keep_recent_percent must be between 1 and 100",
+        ),
     ] {
         std::fs::write(&file, text).unwrap();
         let err = config::load(&file, dir.path(), &TrustStore::default())
@@ -634,4 +642,81 @@ fn a_workspace_without_widening_settings_can_be_trusted() {
         "{}",
         cfg.warnings[0]
     );
+}
+
+// Ruling P3-R4: a project may not make harness compact early (below 50% of the window) unless the
+// workspace is trusted; the global config may.
+#[test]
+fn a_project_compaction_threshold_below_50_needs_trust() {
+    let project = "[compaction]\nthreshold_percent = 30\n";
+    let (cfg, widening) = load_project(None, project, true);
+    assert_eq!(cfg.compaction.threshold(), 0.8);
+    assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
+    let warning = &cfg.warnings[0];
+    for needle in [
+        ".harness/config.toml",
+        "compaction.threshold_percent = 30",
+        "trusted workspace",
+        "harness trust",
+    ] {
+        assert!(warning.contains(needle), "{warning}");
+    }
+    assert_eq!(
+        widening.expect("a low threshold needs trust").items,
+        ["compaction.threshold_percent = 30"]
+    );
+    // Without trust, the global value applies.
+    let (cfg, _) = load_project(
+        Some("[compaction]\nthreshold_percent = 70\n"),
+        project,
+        true,
+    );
+    assert_eq!(cfg.compaction.threshold(), 0.7);
+    // From 50 up, a project's value applies without trust.
+    let (cfg, widening) = load_project(None, "[compaction]\nthreshold_percent = 50\n", true);
+    assert_eq!(cfg.compaction.threshold(), 0.5);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+    assert_eq!(widening, None);
+    // The global config may set any valid value.
+    let (cfg, _) = load_project(
+        Some("[compaction]\nthreshold_percent = 10\nkeep_recent_percent = 5\n"),
+        "",
+        true,
+    );
+    assert_eq!(cfg.compaction.threshold(), 0.1);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+    // An impossible project value is still an error, trusted or not.
+    let (_dir, ws, none) = project_dir("[compaction]\nthreshold_percent = 0\n");
+    let err = config::load(&none, &ws, &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(".harness/config.toml") && err.contains("between 1 and 100"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_trusted_project_may_set_any_valid_compaction_threshold() {
+    let (dir, ws, none) =
+        project_dir("[compaction]\nthreshold_percent = 30\nkeep_recent_percent = 10\n");
+    let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    trust
+        .trust(&ws, &widening_of(&none, &ws).fingerprint)
+        .unwrap();
+    let cfg = config::load(&none, &ws, &trust).unwrap();
+    assert!(cfg.trusted);
+    assert_eq!(cfg.compaction.threshold(), 0.3);
+    assert_eq!(cfg.compaction.keep_recent(), 0.1);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+}
+
+/// A workspace with the project config `project`, and a global config file that does not exist.
+fn project_dir(project: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    std::fs::write(ws.join(".harness/config.toml"), project).unwrap();
+    let none = dir.path().join("none.toml");
+    (dir, ws, none)
 }

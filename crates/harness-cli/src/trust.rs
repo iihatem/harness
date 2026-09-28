@@ -60,7 +60,7 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
         );
     } else {
         println!(
-            "{} contains settings that widen what the agent may do:",
+            "{} contains settings that need trust:",
             config::project_file(&workspace).display()
         );
         for item in &widening.items {

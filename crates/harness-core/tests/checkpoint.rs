@@ -985,6 +985,9 @@ fn snapshots_of_sessions_that_are_gone_are_pruned() {
     std::fs::remove_file(f.ws.join("b.txt")).unwrap();
     let live = Checkpoints::open(&f.gitdir, &f.ws, "live").unwrap();
     let kept = live.snapshot("turn 1").unwrap();
+    // A later snapshot with the same record reuses it; the earlier one must stay reachable.
+    f.write("a.txt", "turn 2\n");
+    live.snapshot("turn 2").unwrap();
     // A session's last snapshot less than a day old may belong to one whose file is not written
     // yet: it stays.
     assert_eq!(live.prune(|id| id == "live").unwrap(), 0);

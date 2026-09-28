@@ -14,6 +14,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -120,6 +121,8 @@ pub struct Checkpoints {
     /// The ref that keeps this session's snapshots reachable.
     reference: String,
     session: String,
+    /// The session's last snapshot, as this process took it.
+    last: Mutex<Option<Last>>,
     timeout: Duration,
     prune_age: Duration,
     restore_timeout: Duration,
@@ -184,6 +187,7 @@ impl Checkpoints {
             record: gitdir.join("records").join(session_id),
             reference: format!("refs/harness/{session_id}"),
             session: session_id.to_string(),
+            last: Mutex::new(None),
             prune_age: PRUNE_AGE,
             timeout: SNAPSHOT_TIMEOUT,
             restore_timeout: RESTORE_TIMEOUT,
@@ -345,10 +349,14 @@ impl Checkpoints {
     fn snapshot_within(&self, message: &str, timeout: Duration) -> Result<String, CheckpointError> {
         let deadline = Instant::now() + timeout;
         match self.snapshot_until(message, deadline) {
-            // The index names objects that were pruned since it was written (it may come from a
-            // session that is gone): start from an empty one.
-            Err(CheckpointError::Git { command, .. }) if command == "write-tree" => {
+            // The index, or the last snapshot, names objects pruned since (the index may come
+            // from a session that is gone; a session whose file could not be written looks gone):
+            // start again from an empty index and what the session's ref says.
+            Err(CheckpointError::Git { command, .. })
+                if command == "write-tree" || command == "commit-tree" =>
+            {
                 let _ = std::fs::remove_file(&self.index);
+                *self.last.lock().expect("last snapshot lock") = None;
                 self.snapshot_until(message, deadline)
             }
             result => result,
@@ -401,6 +409,7 @@ impl Checkpoints {
             deadline,
         )?;
         let protected = self.protected();
+        let held_protected = listed.iter().any(|path| self.is_protected(path));
         let leaving: Vec<Vec<u8>> = ignored
             .iter()
             .map(Vec::as_slice)
@@ -409,6 +418,7 @@ impl Checkpoints {
             .chain(
                 protected
                     .iter()
+                    .filter(|_| held_protected)
                     .map(|path| pathspec("top,literal,icase", path)),
             )
             .collect();
@@ -482,44 +492,54 @@ impl Checkpoints {
             }
         }
         let tree = self.git(&["write-tree"], remaining(deadline)?)?;
-        let previous = self
-            .git(
-                &["rev-parse", "-q", "--verify", &self.reference],
-                remaining(deadline)?,
-            )
-            .ok();
-        let record = self.write_record(&record, previous.as_deref(), deadline)?;
-        let commit = self.git(
-            &[
-                "commit-tree",
-                "--no-gpg-sign",
-                &tree,
-                "-p",
-                &record,
-                "-m",
-                message,
-            ],
-            remaining(deadline)?,
-        )?;
+        let record = record.encode();
+        let last = self.last.lock().expect("last snapshot lock").clone();
+        // The snapshot's first parent holds its record; the snapshot before it is reachable from
+        // there, or, when the record is the same as last time and its commit is reused, is the
+        // second parent.
+        let parents = match last {
+            Some(last) if last.record == record => vec![last.record_commit, last.commit],
+            Some(last) => vec![self.write_record(&record, Some(&last.commit), deadline)?],
+            None => {
+                let previous = self
+                    .git(
+                        &["rev-parse", "-q", "--verify", &self.reference],
+                        remaining(deadline)?,
+                    )
+                    .ok();
+                vec![self.write_record(&record, previous.as_deref(), deadline)?]
+            }
+        };
+        let mut args = vec!["commit-tree", "--no-gpg-sign", &tree];
+        for parent in &parents {
+            args.extend(["-p", parent]);
+        }
+        args.extend(["-m", message]);
+        let commit = self.git(&args, remaining(deadline)?)?;
         self.git(
             &["update-ref", &self.reference, &commit],
             remaining(deadline)?,
         )?;
+        *self.last.lock().expect("last snapshot lock") = Some(Last {
+            commit: commit.clone(),
+            record,
+            record_commit: parents[0].clone(),
+        });
         let _ = std::fs::copy(&self.index, self.gitdir.join("index"));
         Ok(commit)
     }
 
-    /// Stores `record` as the file `record` of a commit of its own, whose parent is `previous`
-    /// (the session's last snapshot), and returns that commit. The snapshot's commit has it as its
-    /// only parent, so its ref keeps every snapshot of the session, and each one's record,
+    /// Stores the encoded `record` as the file `record` of a commit of its own, whose parent is
+    /// `previous` (the session's last snapshot), and returns that commit. The snapshot's commit has
+    /// it as its first parent, so the session's ref keeps every snapshot, and each one's record,
     /// reachable.
     fn write_record(
         &self,
-        record: &Record,
+        record: &[u8],
         previous: Option<&str>,
         deadline: Instant,
     ) -> Result<String, CheckpointError> {
-        std::fs::write(&self.record, record.encode())?;
+        std::fs::write(&self.record, record)?;
         let blob = self.hash_object("blob", &self.record, deadline)?;
         let blob = hex::decode(&blob).map_err(|_| failure("hash-object", blob.as_bytes()))?;
         let mut tree = b"100644 record\0".to_vec();
@@ -554,9 +574,9 @@ impl Checkpoints {
         self.run(cmd, "hash-object", deadline)
     }
 
-    /// The record of the snapshot `commit`.
+    /// The record of the snapshot `commit`, in its first parent.
     fn record_of(&self, commit: &str) -> Result<Record, CheckpointError> {
-        let blob = format!("{commit}^:record");
+        let blob = format!("{commit}^1:record");
         let deadline = Instant::now() + self.restore_timeout;
         match self.git_bytes(&["cat-file", "blob", &blob], deadline) {
             Ok(bytes) => Record::decode(&bytes),
@@ -1136,6 +1156,14 @@ impl Record {
                 .enumerate()
                 .any(|(i, b)| *b == b'/' && self.left_out.contains(&path[..=i]))
     }
+}
+
+/// A snapshot this process took, and its record, encoded, with the commit that holds it.
+#[derive(Debug, Clone)]
+struct Last {
+    commit: String,
+    record: Vec<u8>,
+    record_commit: String,
 }
 
 /// The workspace as the snapshot just taken before a restore holds it.

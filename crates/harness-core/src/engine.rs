@@ -68,16 +68,28 @@ pub struct PermissionEngine {
     /// paths rather than globs, so a literal `*` in an approved path is never treated as a
     /// wildcard over its siblings (a `glob_match` pattern has no escape syntax).
     session_paths: Mutex<HashSet<(&'static str, PathBuf)>>,
+    /// Rules for the current turn only (`set_turn_rules`), such as a command's `allowed-tools`.
+    turn: Mutex<TurnRules>,
 }
 
 /// A single `read:`/`write:` rule, expanded for matching. `display` is exactly what the user
 /// configured (after `~` expansion) — used in every message, so a denial always names the rule
 /// as written, never an internal resolved form. `globs` holds the glob(s) actually compared
 /// against a candidate path: just `display`, or `display` plus its symlink-resolved twin.
+#[derive(Clone)]
 struct PathRule {
     tool: &'static str,
     display: String,
     globs: Vec<String>,
+}
+
+/// Rules added for one turn, and their `read:`/`write:` rules expanded like the config's.
+#[derive(Default)]
+struct TurnRules {
+    rules: RuleSet,
+    allow_paths: Vec<PathRule>,
+    deny_paths: Vec<PathRule>,
+    confirm_paths: Vec<PathRule>,
 }
 
 /// Absolute, symlink-resolved form of `p` (which may not exist yet). If `p` is relative and
@@ -284,6 +296,7 @@ impl PermissionEngine {
             writes_need_approval: config.writes_need_approval,
             session_bash: Mutex::new(Vec::new()),
             session_paths: Mutex::new(HashSet::new()),
+            turn: Mutex::new(TurnRules::default()),
         }
     }
 
@@ -304,15 +317,35 @@ impl PermissionEngine {
             .collect()
     }
 
-    /// Config allow rules plus bash prefixes added by approve-for-session.
+    /// Config allow rules, bash prefixes added by approve-for-session, and the turn's allow rules.
     fn allow_list(&self) -> Vec<String> {
         let session = self.session_bash.lock().expect("session bash lock");
+        let turn = self.turn.lock().expect("turn rules lock");
         self.rules
             .allow
             .iter()
             .chain(session.iter())
+            .chain(turn.rules.allow.iter())
             .cloned()
             .collect()
+    }
+
+    /// Config `read:`/`write:` allow rules plus the turn's.
+    fn allow_paths_now(&self) -> Vec<PathRule> {
+        let turn = self.turn.lock().expect("turn rules lock");
+        [self.allow_paths.as_slice(), &turn.allow_paths].concat()
+    }
+
+    /// Config `read:`/`write:` deny rules plus the turn's.
+    fn deny_paths_now(&self) -> Vec<PathRule> {
+        let turn = self.turn.lock().expect("turn rules lock");
+        [self.deny_paths.as_slice(), &turn.deny_paths].concat()
+    }
+
+    /// Config `read:`/`write:` confirm rules plus the turn's.
+    fn confirm_paths_now(&self) -> Vec<PathRule> {
+        let turn = self.turn.lock().expect("turn rules lock");
+        [self.confirm_paths.as_slice(), &turn.confirm_paths].concat()
     }
 
     /// First allow rule for `tool` matching `target` (the fully resolved path). Case-sensitive,
@@ -427,12 +460,14 @@ impl PermissionEngine {
     fn check_read(&self, path: &Path) -> Decision {
         let target = resolve_path(&self.workspace, path);
         let lexical = lexical_path(&self.workspace, path);
-        if let Some(rule) = self.deny_confirm_rule(&self.deny_paths, "read", &target, &lexical) {
+        if let Some(rule) =
+            self.deny_confirm_rule(&self.deny_paths_now(), "read", &target, &lexical)
+        {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
         if self.mode() != Mode::FullAccess
             && let Some(rule) =
-                self.deny_confirm_rule(&self.confirm_paths, "read", &target, &lexical)
+                self.deny_confirm_rule(&self.confirm_paths_now(), "read", &target, &lexical)
         {
             return Decision::Ask(format!("read {} (confirm rule `{rule}`)", target.display()));
         }
@@ -440,7 +475,7 @@ impl PermissionEngine {
             || target.starts_with(&self.workspace)
             || self.read_dirs.iter().any(|d| target.starts_with(d))
             || self
-                .allow_rule(&self.allow_paths, "read", &target)
+                .allow_rule(&self.allow_paths_now(), "read", &target)
                 .is_some()
             || self.session_path_allowed("read", &target)
         {
@@ -452,7 +487,9 @@ impl PermissionEngine {
     fn check_write(&self, path: &Path) -> Decision {
         let target = resolve_path(&self.workspace, path);
         let lexical = lexical_path(&self.workspace, path);
-        if let Some(rule) = self.deny_confirm_rule(&self.deny_paths, "write", &target, &lexical) {
+        if let Some(rule) =
+            self.deny_confirm_rule(&self.deny_paths_now(), "write", &target, &lexical)
+        {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
         if self.mode() == Mode::FullAccess {
@@ -470,7 +507,8 @@ impl PermissionEngine {
         if let Some(reason) = self.protected_write(&target, &lexical) {
             return Decision::Ask(reason.into());
         }
-        if let Some(rule) = self.deny_confirm_rule(&self.confirm_paths, "write", &target, &lexical)
+        if let Some(rule) =
+            self.deny_confirm_rule(&self.confirm_paths_now(), "write", &target, &lexical)
         {
             return Decision::Ask(format!(
                 "write {} (confirm rule `{rule}`)",
@@ -479,7 +517,7 @@ impl PermissionEngine {
         }
         if (self.mode() == Mode::Auto && !self.writes_need_approval)
             || self
-                .allow_rule(&self.allow_paths, "write", &target)
+                .allow_rule(&self.allow_paths_now(), "write", &target)
                 .is_some()
             || self.session_path_allowed("write", &target)
         {
@@ -488,14 +526,18 @@ impl PermissionEngine {
         Decision::Ask(format!("write {}", inside.display()))
     }
 
-    /// The `Rules` harness-shell needs for `command`: config rules plus session-approved bash
-    /// prefixes, each filtered down to `bash:` patterns with the prefix removed.
+    /// The `Rules` harness-shell needs for `command`: config rules, session-approved bash
+    /// prefixes and the turn's rules, each filtered down to `bash:` patterns with the prefix
+    /// removed.
     fn bash_rules(&self) -> Rules {
         let allow = self.allow_list();
+        let turn = self.turn.lock().expect("turn rules lock");
+        let deny = [self.rules.deny.as_slice(), &turn.rules.deny].concat();
+        let confirm = [self.rules.confirm.as_slice(), &turn.rules.confirm].concat();
         Rules {
             allow: own(patterns(&allow, "bash")),
-            deny: own(patterns(&self.rules.deny, "bash")),
-            confirm: own(patterns(&self.rules.confirm, "bash")),
+            deny: own(patterns(&deny, "bash")),
+            confirm: own(patterns(&confirm, "bash")),
         }
     }
 
@@ -577,10 +619,10 @@ impl PermissionEngine {
             return false;
         }
         if self
-            .deny_confirm_rule(&self.deny_paths, "write", &target, &lexical)
+            .deny_confirm_rule(&self.deny_paths_now(), "write", &target, &lexical)
             .is_some()
             || self
-                .deny_confirm_rule(&self.confirm_paths, "write", &target, &lexical)
+                .deny_confirm_rule(&self.confirm_paths_now(), "write", &target, &lexical)
                 .is_some()
         {
             return false;
@@ -598,10 +640,10 @@ impl PermissionEngine {
         let target = resolve_path(&self.workspace, path);
         let lexical = lexical_path(&self.workspace, path);
         if self
-            .deny_confirm_rule(&self.deny_paths, "read", &target, &lexical)
+            .deny_confirm_rule(&self.deny_paths_now(), "read", &target, &lexical)
             .is_some()
             || self
-                .deny_confirm_rule(&self.confirm_paths, "read", &target, &lexical)
+                .deny_confirm_rule(&self.confirm_paths_now(), "read", &target, &lexical)
                 .is_some()
         {
             return false;
@@ -633,5 +675,16 @@ impl PermissionPolicy for PermissionEngine {
 
     fn set_mode(&self, mode: Mode) {
         *self.mode.lock().expect("mode lock") = mode;
+    }
+
+    fn set_turn_rules(&self, rules: Option<RuleSet>) {
+        let rules = rules.unwrap_or_default();
+        let home = home_dir();
+        *self.turn.lock().expect("turn rules lock") = TurnRules {
+            allow_paths: path_rules(&rules.allow, home.as_deref(), false),
+            deny_paths: path_rules(&rules.deny, home.as_deref(), true),
+            confirm_paths: path_rules(&rules.confirm, home.as_deref(), true),
+            rules,
+        };
     }
 }

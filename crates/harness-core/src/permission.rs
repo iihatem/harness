@@ -7,6 +7,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::RuleSet;
+
 /// Approval mode. See the permissions-sandbox spec for the exact semantics of each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -176,4 +178,8 @@ pub trait PermissionPolicy: Send + Sync {
 
     /// Switches the approval mode for later checks. Policies without modes ignore it.
     fn set_mode(&self, _mode: Mode) {}
+
+    /// Adds rules for the current turn only, or with `None` removes them. They never override
+    /// deny rules, destructive-command confirmation or the sandbox.
+    fn set_turn_rules(&self, _rules: Option<RuleSet>) {}
 }

@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +20,7 @@ use crate::{
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
     retry::RetryPolicy,
     tool::{Tool, ToolContext, ToolOutput, ToolRegistry},
+    turn::{InputPart, TurnInput, TurnModel},
 };
 
 /// Model calls allowed per turn unless configured otherwise.
@@ -125,6 +126,8 @@ pub struct Agent {
     /// provider that doesn't guarantee unique ids) can be rewritten before it collides.
     used_call_ids: HashSet<String>,
     next_call_id: u64,
+    /// The model answering the current turn, when it is not the session's.
+    turn_model: Option<TurnModel>,
 }
 
 impl Agent {
@@ -157,6 +160,7 @@ impl Agent {
             invalid_calls: 0,
             used_call_ids: HashSet::new(),
             next_call_id: 0,
+            turn_model: None,
         }
     }
 
@@ -206,14 +210,39 @@ impl Agent {
     /// turn promptly: in-flight model calls are dropped and running tools are told to stop.
     pub async fn run_turn(
         &mut self,
-        input: String,
+        input: impl Into<TurnInput>,
         events: &UnboundedSender<AgentEvent>,
         cancel: CancellationToken,
     ) -> TurnEndReason {
+        let input = input.into();
         self.ctx.cancel = cancel.clone();
         self.invalid_calls = 0;
+        // Settings that apply to this turn only.
+        self.turn_model = input.model.clone();
+        self.policy.set_turn_rules(Some(input.rules.clone()));
+        let access = self.ctx.access;
+        if input.read_only_shell {
+            self.ctx.access = FsAccess::ReadOnly;
+        }
+        let reason = self.turn(input, events, cancel).await;
+        self.ctx.access = access;
+        self.policy.set_turn_rules(None);
+        self.turn_model = None;
+        reason
+    }
+
+    async fn turn(
+        &mut self,
+        input: TurnInput,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: CancellationToken,
+    ) -> TurnEndReason {
         let _ = events.send(AgentEvent::TurnStarted);
-        self.history.push(Message::User { content: input });
+        let content = self.user_message(input.parts, events).await;
+        self.history.push(Message::User { content });
+        if cancel.is_cancelled() {
+            return self.finish(TurnEndReason::Interrupted, events);
+        }
 
         for _ in 0..self.config.max_steps {
             let reply = match self.call_model(events, &cancel).await {
@@ -258,6 +287,39 @@ impl Agent {
             }
         }
         self.finish(TurnEndReason::StepLimit, events)
+    }
+
+    /// The turn's user message: text parts as they are, and each shell part replaced by the output
+    /// of running it as a `bash` tool call, with the same permission check, approval and sandbox.
+    async fn user_message(
+        &mut self,
+        parts: Vec<InputPart>,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> String {
+        let mut message = String::new();
+        for part in parts {
+            match part {
+                InputPart::Text(text) => message.push_str(&text),
+                InputPart::Shell(command) => {
+                    let mut call = [ToolCall {
+                        id: String::new(),
+                        name: "bash".into(),
+                        arguments: json!({ "command": command }).to_string(),
+                    }];
+                    self.dedupe_call_ids(&mut call);
+                    let output = self.execute(&call[0], events).await;
+                    message.push_str(&shell_part_text(&command, &output));
+                }
+            }
+        }
+        message
+    }
+
+    /// The id of the model answering the current turn.
+    fn model_id(&self) -> &str {
+        self.turn_model
+            .as_ref()
+            .map_or(&self.config.model_id, |model| &model.id)
     }
 
     /// One model call with retries for transient errors. Never retries once output reached the user.
@@ -310,7 +372,7 @@ impl Agent {
         tool_calls: Vec<ToolCall>,
         events: &UnboundedSender<AgentEvent>,
     ) {
-        let model = self.config.model_id.clone();
+        let model = self.model_id().to_string();
         let _ = events.send(AgentEvent::AssistantMessage {
             content: text.clone(),
             model: model.clone(),
@@ -349,13 +411,17 @@ impl Agent {
         reply: &mut ModelReply,
         events: &UnboundedSender<AgentEvent>,
     ) -> Result<(), ProviderError> {
+        let (provider, model) = match &self.turn_model {
+            Some(turn) => (&turn.provider, turn.name.clone()),
+            None => (&self.provider, self.config.model_name.clone()),
+        };
         let request = ChatRequest {
-            model: self.config.model_name.clone(),
+            model,
             system: self.config.system_prompt.clone(),
             messages: self.history.clone(),
             tools: self.tools.specs(),
         };
-        let mut stream = self.provider.stream(request);
+        let mut stream = provider.stream(request);
         while let Some(item) = stream.next().await {
             match item? {
                 ProviderEvent::TextDelta(text) => {
@@ -370,7 +436,7 @@ impl Agent {
                 ProviderEvent::ToolCall(call) => reply.tool_calls.push(call),
                 ProviderEvent::Usage(usage) => {
                     let _ = events.send(AgentEvent::Usage {
-                        model: self.config.model_id.clone(),
+                        model: self.model_id().to_string(),
                         usage,
                     });
                 }
@@ -564,6 +630,18 @@ impl Agent {
             content: format!("{}\n[{note}]", first.content),
             ..first
         }
+    }
+}
+
+/// What a shell part becomes in the user message: the command's output, or, when it did not run
+/// or failed, a note saying so followed by what the tool reported.
+fn shell_part_text(command: &str, output: &ToolOutput) -> String {
+    match output.content.strip_prefix("exit code 0\n") {
+        Some(text) if !output.is_error => text.trim_end_matches('\n').to_string(),
+        _ => format!(
+            "[`{command}` did not run successfully]\n{}",
+            output.content.trim_end_matches('\n')
+        ),
     }
 }
 

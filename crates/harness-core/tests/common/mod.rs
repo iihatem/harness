@@ -152,6 +152,41 @@ impl Tool for GuardBlocked {
     }
 }
 
+/// Stands in for the `bash` tool: reports the command and the sandbox access it would run with.
+pub struct FakeBash;
+#[async_trait]
+impl Tool for FakeBash {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "bash",
+            json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
+        )
+    }
+    fn action(&self, args: &Value, _ctx: &ToolContext) -> Action {
+        Action::Bash(args["command"].as_str().unwrap_or_default().to_string())
+    }
+    async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
+        ToolOutput::ok(format!(
+            "exit code 0\nran `{}` with {:?} access\n",
+            args["command"].as_str().unwrap_or_default(),
+            ctx.access
+        ))
+    }
+}
+
+/// Approves everything, and records the reason of every approval it was asked for.
+#[derive(Default)]
+pub struct Recorder {
+    pub asked: std::sync::Mutex<Vec<String>>,
+}
+#[async_trait]
+impl Approver for Recorder {
+    async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
+        self.asked.lock().unwrap().push(request.reason.clone());
+        ApprovalDecision::Approve
+    }
+}
+
 pub struct AlwaysApprove;
 #[async_trait]
 impl Approver for AlwaysApprove {
@@ -192,6 +227,7 @@ fn build(
         Arc::new(Sleepy),
         Arc::new(Boxed),
         Arc::new(GuardBlocked),
+        Arc::new(FakeBash),
     ]);
     let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode,

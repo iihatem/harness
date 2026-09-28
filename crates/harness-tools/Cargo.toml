@@ -21,3 +21,4 @@ tokio.workspace = true
 nix.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true

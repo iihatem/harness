@@ -811,3 +811,49 @@ fn a_mode_switch_changes_later_decisions() {
     e.set_mode(Mode::Ask);
     assert!(is_ask(&e.check(&write)));
 }
+
+#[test]
+fn turn_allow_rules_preapprove_commands_until_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(Mode::Ask, dir.path(), true, RuleSet::default());
+    assert!(is_ask(&e.check(&bash("openspec status"))));
+    e.set_turn_rules(Some(rules(&["bash:openspec", "bash:openspec *"], &[], &[])));
+    assert_eq!(e.check(&bash("openspec status")), Decision::Allow);
+    assert_eq!(e.check(&bash("openspec")), Decision::Allow);
+    assert!(is_ask(&e.check(&bash("openspecx"))));
+    e.set_turn_rules(None);
+    assert!(is_ask(&e.check(&bash("openspec status"))));
+}
+
+#[test]
+fn turn_allow_rules_never_beat_deny_or_destructive_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(
+        Mode::Ask,
+        dir.path(),
+        true,
+        rules(&[], &["bash:rm -rf*"], &[]),
+    );
+    e.set_turn_rules(Some(rules(&["bash:*"], &[], &[])));
+    assert!(is_deny(&e.check(&bash("rm -rf build"))));
+    assert!(is_ask(&e.check(&bash("git reset --hard HEAD~1"))));
+    assert_eq!(e.check(&bash("cargo build")), Decision::Allow);
+}
+
+#[test]
+fn turn_confirm_rules_make_a_write_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let e = engine(Mode::Auto, &ws, true, RuleSet::default());
+    e.set_turn_rules(Some(rules(&[], &[], &["write:AGENTS.md"])));
+    assert!(is_ask(&e.check(&Action::Write(ws.join("AGENTS.md")))));
+    assert_eq!(
+        e.check(&Action::Write(ws.join("README.md"))),
+        Decision::Allow
+    );
+    e.set_turn_rules(None);
+    assert_eq!(
+        e.check(&Action::Write(ws.join("AGENTS.md"))),
+        Decision::Allow
+    );
+}

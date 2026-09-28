@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use harness_context::commands::{
-    self, Invocation,
+    self, Invocation, Scope,
     frontmatter::{self, Frontmatter},
     parse_invocation, split_args,
 };
@@ -139,6 +139,25 @@ fn the_first_definition_of_a_name_wins() {
     assert_eq!(found.get("z").unwrap().body, "claude global z");
     let names: Vec<&str> = found.custom.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["x", "y", "z"]);
+}
+
+#[test]
+fn each_command_knows_whether_the_project_or_the_user_defined_it() {
+    let (_dir, base) = setup();
+    write(&base.join("project/.claude/commands/p.md"), "project");
+    write(
+        &base.join("project/.opencode/commands/shared.md"),
+        "project",
+    );
+    write(&base.join("config/commands/g.md"), "global");
+    write(&base.join("config/commands/shared.md"), "global");
+    write(&base.join("home/.claude/commands/h.md"), "claude global");
+    let found = discover(&base);
+    assert_eq!(found.get("p").unwrap().scope, Scope::Project);
+    assert_eq!(found.get("g").unwrap().scope, Scope::Global);
+    assert_eq!(found.get("h").unwrap().scope, Scope::Global);
+    // The project's definition wins, and with it the project's scope.
+    assert_eq!(found.get("shared").unwrap().scope, Scope::Project);
 }
 
 #[test]

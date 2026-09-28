@@ -2,6 +2,7 @@
 //! `.claude/commands` and `.opencode/commands` in the project, then from `commands/` in the
 //! harness config directory and `~/.claude/commands`. The first definition of a name wins.
 
+pub mod expand;
 pub mod frontmatter;
 
 use std::{
@@ -30,12 +31,24 @@ const MAX_DEPTH: usize = 8;
 /// Bytes read from one command file.
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 
+/// Where a command file was found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Scope {
+    /// In the project's `.harness/commands`, `.claude/commands` or `.opencode/commands`: it
+    /// comes with the repository, so its `model` applies only in a trusted workspace.
+    #[default]
+    Project,
+    /// In the harness config directory's `commands/` or `~/.claude/commands`: the user's own.
+    Global,
+}
+
 /// A command defined by a Markdown file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomCommand {
     /// The name after `/`: `opsx:propose` for `opsx/propose.md`.
     pub name: String,
     pub path: PathBuf,
+    pub scope: Scope,
     pub description: Option<String>,
     pub argument_hint: Option<String>,
     /// The model for this command's invocations only.
@@ -87,9 +100,12 @@ pub fn discover(project_root: &Path, config_dir: &Path, home: Option<&Path>) -> 
     let project = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
-    let mut dirs: Vec<(PathBuf, PathBuf)> = [".harness", ".claude", ".opencode"]
+    let mut dirs: Vec<(PathBuf, PathBuf, Scope)> = [".harness", ".claude", ".opencode"]
         .iter()
-        .map(|d| (project_root.join(d).join("commands"), project.clone()))
+        .map(|d| {
+            let dir = project_root.join(d).join("commands");
+            (dir, project.clone(), Scope::Project)
+        })
         .collect();
     let mut global = vec![config_dir.join("commands")];
     if let Some(home) = home {
@@ -97,11 +113,12 @@ pub fn discover(project_root: &Path, config_dir: &Path, home: Option<&Path>) -> 
     }
     for dir in global {
         let confine = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-        dirs.push((dir, confine));
+        dirs.push((dir, confine, Scope::Global));
     }
     let mut found = Finder::default();
-    for (dir, confine) in &dirs {
+    for (dir, confine, scope) in &dirs {
         if dir.is_dir() {
+            found.scope = *scope;
             found.walk(dir, confine, &mut Vec::new());
         }
     }
@@ -112,6 +129,8 @@ pub fn discover(project_root: &Path, config_dir: &Path, home: Option<&Path>) -> 
 #[derive(Default)]
 struct Finder {
     commands: Commands,
+    /// The scope of the directory being walked.
+    scope: Scope,
 }
 
 impl Finder {
@@ -193,6 +212,7 @@ impl Finder {
         self.commands.custom.push(CustomCommand {
             name,
             path: path.to_path_buf(),
+            scope: self.scope,
             description: front.description,
             argument_hint: front.argument_hint,
             model: front.model,

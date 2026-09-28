@@ -9,12 +9,13 @@
 //! a special builtin, so a working full tier read as a failed probe.)
 
 use std::ffi::{CStr, CString};
-use std::io;
+use std::fs::{DirBuilder, OpenOptions};
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use harness_core::tool::GitProtection;
 
@@ -179,37 +180,108 @@ fn verdict(exit: Exit, failure: impl FnOnce() -> Option<String>) -> Result<(), S
     }
 }
 
-/// `<temp>/harness-userns-probe-<pid>-<n>/pin/file`, removed on drop.
-struct ProbeDir(PathBuf);
+/// `<temp>/harness-userns-probe-<random>/pin/file`: a directory made anew
+/// (mode 0700) under a random name in the canonical temp directory, never
+/// one that was there already, with `pin` and `pin/file` created in it
+/// exclusively, without following a symlink. On drop it removes what it
+/// made, entry by entry, and nothing else.
+struct ProbeDir {
+    path: PathBuf,
+    pin: bool,
+    file: bool,
+}
+
+/// How many random names [`ProbeDir::create`] tries.
+const PROBE_NAMES: usize = 16;
 
 impl ProbeDir {
-    fn create() -> std::io::Result<ProbeDir> {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        // Removed on drop from here on, whatever fails below.
-        let mut dir = ProbeDir(std::env::temp_dir().join(format!(
-            "harness-userns-probe-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        )));
-        std::fs::create_dir_all(dir.0.join("pin"))?;
-        dir.0 = dir.0.canonicalize()?;
-        std::fs::write(dir.0.join("pin/file"), b"probe")?;
+    fn create() -> io::Result<ProbeDir> {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .or_else(|_| Path::new("/tmp").canonicalize())?;
+        let names = (0..PROBE_NAMES)
+            .map(|_| random_name())
+            .collect::<io::Result<Vec<String>>>()?;
+        ProbeDir::create_in(&base, names)
+    }
+
+    /// In the canonical `base`, under the first of `names` where nothing is:
+    /// `mkdir` never reuses an entry, a symlink included.
+    fn create_in(base: &Path, names: impl IntoIterator<Item = String>) -> io::Result<ProbeDir> {
+        for name in names {
+            let path = base.join(name);
+            match DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return ProbeDir::fill(path),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "every name the probe tried was taken",
+        ))
+    }
+
+    /// Makes `pin` and `pin/file` in the new directory at `path`.
+    fn fill(path: PathBuf) -> io::Result<ProbeDir> {
+        // Removed on drop from here on, as far as it is made.
+        let mut dir = ProbeDir {
+            path,
+            pin: false,
+            file: false,
+        };
+        DirBuilder::new().mode(0o700).create(dir.path.join("pin"))?;
+        dir.pin = true;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir.path.join("pin/file"))?;
+        dir.file = true;
+        file.write_all(b"probe")?;
         Ok(dir)
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 }
 
 impl Drop for ProbeDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // `unlink` and `rmdir`: neither follows a symlink at the name, and
+        // `rmdir` leaves a directory that holds anything it did not make.
+        if self.file {
+            let _ = std::fs::remove_file(self.path.join("pin/file"));
+        }
+        if self.pin {
+            let _ = std::fs::remove_dir(self.path.join("pin"));
+        }
+        let _ = std::fs::remove_dir(&self.path);
     }
+}
+
+/// `harness-userns-probe-` and 16 random hex digits.
+fn random_name() -> io::Result<String> {
+    let mut bytes = [0u8; 8];
+    // SAFETY: `getrandom` writes at most `bytes.len()` bytes into `bytes`.
+    let n = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+    if n != bytes.len() as isize {
+        return Err(if n < 0 {
+            io::Error::last_os_error()
+        } else {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "getrandom gave too few bytes")
+        });
+    }
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!("harness-userns-probe-{hex}"))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     fn failure() -> Option<String> {
@@ -259,11 +331,92 @@ mod tests {
 
     #[test]
     fn no_errno_reads_as_another_outcome() {
-        for errno in 1..=libc::EHWPOISON {
-            assert!(![REFUSED, ALLOWED, NO_SETUP, NO_DIR].contains(&errno_code(errno)));
-        }
+        // `EROFS` is the outcome the probe looks for; every other errno is itself.
         assert_eq!(errno_code(libc::EROFS), REFUSED);
+        for errno in (1..=libc::EHWPOISON).filter(|errno| *errno != libc::EROFS) {
+            assert_eq!(errno_code(errno), errno);
+            assert!(
+                ![REFUSED, ALLOWED, NO_SETUP, NO_DIR].contains(&errno_code(errno)),
+                "{errno}"
+            );
+        }
         assert_eq!(errno_code(10_000), ALLOWED - 1);
+    }
+
+    /// `base`, with a directory and a symlink planted where the probe looks first.
+    fn planted() -> (tempfile::TempDir, PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.join("probe-a")).unwrap();
+        std::fs::write(base.join("probe-a/theirs"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), base.join("probe-b")).unwrap();
+        (dir, base, outside)
+    }
+
+    #[test]
+    fn the_probe_directory_is_made_anew_and_private_never_where_something_was_planted() {
+        let (_dir, base, outside) = planted();
+        let names = ["probe-a", "probe-b", "probe-c"].map(String::from);
+        let probe = ProbeDir::create_in(&base, names).unwrap();
+        assert_eq!(probe.path(), base.join("probe-c"));
+        let mode = std::fs::metadata(probe.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(probe.path().join("pin").is_dir());
+        assert_eq!(
+            std::fs::read(probe.path().join("pin/file")).unwrap(),
+            b"probe"
+        );
+        // What was planted is untouched: nothing was made in it, or through it.
+        assert_eq!(
+            std::fs::read_dir(base.join("probe-a")).unwrap().count(),
+            1,
+            "only its own file"
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        drop(probe);
+        assert!(!base.join("probe-c").exists());
+        assert!(base.join("probe-a/theirs").exists());
+        assert!(
+            std::fs::symlink_metadata(base.join("probe-b"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn with_every_name_taken_there_is_no_probe_directory() {
+        let (_dir, base, outside) = planted();
+        let names = ["probe-a", "probe-b"].map(String::from);
+        assert!(ProbeDir::create_in(&base, names).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_probe_removes_only_what_it_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let probe = ProbeDir::create_in(&base, ["probe".to_string()]).unwrap();
+        std::fs::write(probe.path().join("pin/theirs"), b"x").unwrap();
+        drop(probe);
+        assert!(!base.join("probe/pin/file").exists());
+        assert!(base.join("probe/pin/theirs").exists());
+    }
+
+    #[test]
+    fn probe_directory_names_are_random() {
+        let names: std::collections::BTreeSet<String> =
+            (0..32).map(|_| random_name().unwrap()).collect();
+        assert_eq!(names.len(), 32);
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with("harness-userns-probe-"))
+        );
     }
 
     /// The write test is raw syscalls: no shell decides what a refused write exits with.

@@ -339,6 +339,17 @@ fn arguments_reach_a_shell_expansion_byte_for_byte() {
                 "!`x=$(printf %s \"$1\"); printf %s \"$x\"`",
                 trimmed_newlines.to_string(),
             ),
+            // Placeholders outside arithmetic, subscripts and array assignments are filled in.
+            ("!`printf %s \"$1\" $[ 1 + 1 ]`", format!("{word}2")),
+            ("!`a[ 1 + 1 ]=x; printf %s \"$1\"`", word.to_string()),
+            ("!`a[ b[0] + 1 ]=x; printf %s $1`", word.to_string()),
+            ("!`n=([0]=x [1]=y); printf %s \"$1\"`", word.to_string()),
+            ("!`declare -a n=([0]=x); printf %s $1`", word.to_string()),
+            ("!`n+=(x); printf %s '$1'`", word.to_string()),
+            ("!`printf %s \"a[$1]\"`", format!("a[{word}]")),
+            // After the matching `]`, a placeholder is a word of its own.
+            ("!`printf %s a[ b[0] ] $1`", format!("a[b[0]]{word}")),
+            ("!`printf %s '$[$1]'`", format!("$[{word}]")),
         ] {
             let command = shell_part(body, &args);
             let (out, empty) = run_bash(&command);
@@ -348,6 +359,14 @@ fn arguments_reach_a_shell_expansion_byte_for_byte() {
                 "{body} with {word:?} ran {command:?}"
             );
             assert!(empty, "{body} with {word:?} created a file: {command:?}");
+        }
+        // The rest never reach the shell.
+        for (shell, _) in REFUSED {
+            let got = parts(&format!("!`{shell}`"), &args);
+            assert!(
+                !got.iter().any(|part| matches!(part, Shell(_))),
+                "{shell} with {word:?}: {got:?}"
+            );
         }
     }
     // `$ARGUMENTS` is the whole argument text.
@@ -369,27 +388,52 @@ fn arguments_reach_a_shell_expansion_byte_for_byte() {
     }
 }
 
+/// `!` commands with a placeholder whose value cannot be quoted safely, and why.
+const REFUSED: [(&str, &str); 36] = [
+    (r"echo \$1", "follows a backslash"),
+    (r#"echo "\$1""#, "follows a backslash"),
+    (r#"echo "$(echo $1)""#, "`$(` inside double quotes"),
+    (r#"echo "$(date)" $1"#, "`$(` inside double quotes"),
+    ("echo $$1", "follows a `$`"),
+    (r#"echo "$$1""#, "follows a `$`"),
+    ("echo $'$1'", "inside `$'…'`"),
+    ("echo hi # $1", "in a comment"),
+    ("[[ $1 -eq 1 ]] && echo yes", "inside `[[ … ]]`"),
+    (r#"[[ "$1" -eq 1 ]] && echo yes"#, "inside `[[ … ]]`"),
+    ("echo $(( $1 + 1 ))", "arithmetic"),
+    ("(( $1 )) && echo yes", "arithmetic"),
+    ("echo ${X:-$1}", "inside `${…}`"),
+    (r#"echo "${X:-$1}""#, "inside `${…}`"),
+    (r#"echo ${X:-"a"} $1"#, "inside `${…}`"),
+    // `$[…]` is arithmetic, like `$((…))`, quoted or not (re-review C).
+    ("echo $[$1]", "arithmetic"),
+    ("echo $[ $1 ]", "arithmetic"),
+    ("echo $[ b[0] + $1 ]", "arithmetic"),
+    ("echo $[ 1 ] $1", "arithmetic"),
+    (r#"echo "$[ $1 ]""#, "arithmetic"),
+    (r#"echo "$[ b[0] + $1 ]""#, "arithmetic"),
+    // A subscript lasts to its matching `]`, spaces and nested brackets included.
+    ("a[$1]=x", "inside `[…]`"),
+    ("a[ 1 + $1 ]=x", "inside `[…]`"),
+    ("a[ b[0] + $1 ]=x", "inside `[…]`"),
+    (r#"a["$1"]=x"#, "inside `[…]`"),
+    ("a[ b[c[0]] $1 ]=x", "inside `[…]`"),
+    // Array assignments evaluate their subscripts.
+    ("name=([$1]=x)", "array assignment"),
+    ("name=([k]=$1)", "array assignment"),
+    (r#"name=( "$1" )"#, "array assignment"),
+    ("name+=([$1]=x)", "array assignment"),
+    ("declare -a name=([$1]=x)", "array assignment"),
+    ("local -A m=([$1]=x)", "array assignment"),
+    ("typeset n=( [$1]=x )", "array assignment"),
+    ("n=(a (b) $1)", "array assignment"),
+    ("n=(x) m=([$1]=y)", "array assignment"),
+    (r#"n=(")" $1)"#, "array assignment"),
+];
+
 #[test]
 fn a_placeholder_that_cannot_be_quoted_safely_is_never_run() {
-    for (shell, why) in [
-        (r"echo \$1", "follows a backslash"),
-        (r#"echo "\$1""#, "follows a backslash"),
-        (r#"echo "$(echo $1)""#, "`$(` inside double quotes"),
-        (r#"echo "$(date)" $1"#, "`$(` inside double quotes"),
-        ("echo $$1", "follows a `$`"),
-        (r#"echo "$$1""#, "follows a `$`"),
-        ("echo $'$1'", "inside `$'…'`"),
-        ("echo hi # $1", "in a comment"),
-        ("[[ $1 -eq 1 ]] && echo yes", "inside `[[ … ]]`"),
-        (r#"[[ "$1" -eq 1 ]] && echo yes"#, "inside `[[ … ]]`"),
-        ("echo $(( $1 + 1 ))", "arithmetic"),
-        ("(( $1 )) && echo yes", "arithmetic"),
-        ("echo $[$1]", "inside `[…]`"),
-        ("a[$1]=x", "inside `[…]`"),
-        ("echo ${X:-$1}", "inside `${…}`"),
-        (r#"echo "${X:-$1}""#, "inside `${…}`"),
-        (r#"echo ${X:-"a"} $1"#, "inside `${…}`"),
-    ] {
+    for (shell, why) in REFUSED {
         let body = format!("Before !`{shell}` after");
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().canonicalize().unwrap();

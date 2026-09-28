@@ -391,3 +391,36 @@ async fn a_workspace_with_only_command_files_can_be_trusted() {
         ["test-model", "command-model"]
     );
 }
+
+// Re-review C: `$[ … ]` is arithmetic, where a quoted argument's command substitution still runs.
+// The reviewer's confirmed case (`$[ b[0] + $1 ]`) ran with no approval in `auto` mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hostile_argument_in_arithmetic_or_an_array_assignment_runs_nothing() {
+    let server = MockServer::start().await;
+    answer(&server, "ok").await;
+    for body in [
+        "Total:\n!`echo $[ b[0] + $1 ]`\n",
+        "Total:\n!`echo \"$[ $1 ]\"`\n",
+        "Pairs:\n!`pairs=([$1]=x); echo ok`\n",
+    ] {
+        let env = Env::new(&server.uri(), "");
+        env.command_file("sum.md", body);
+        let (env, output) = tokio::task::spawn_blocking(move || {
+            let output = env
+                .cmd()
+                .args(["ask", "/sum \"$(touch PWNED_ARITH)\""])
+                .output()
+                .unwrap();
+            (env, output)
+        })
+        .await
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !env.ws.path().join("PWNED_ARITH").exists(),
+            "{body} ran the argument: {stderr}"
+        );
+        assert!(output.status.success(), "{body}: {output:?}");
+        assert!(stderr.contains("did not run"), "{body}: {stderr}");
+    }
+}

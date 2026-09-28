@@ -199,10 +199,16 @@ fn first_len(text: &str) -> usize {
 /// or backticks here: the command ends at the first of them.
 ///
 /// A placeholder is refused, and the whole command with it, where its value cannot be encoded
-/// safely: after a `\` or a `$`, in a comment, inside `$'…'`, `${…}`, `[[ … ]]` or `[…]` within a
-/// word (an array subscript or `$[…]`, which the shell evaluates as arithmetic), and anywhere after
-/// `((` or `$((` (arithmetic), or a `$(` within double quotes (the end of either is not tracked).
+/// safely, since the shell reads it as code or evaluates it as arithmetic: after a `\` or a `$`,
+/// in a comment, inside `$'…'`, `${…}`, `[[ … ]]`, a `[…]` that starts within a word (an array
+/// subscript, up to its matching `]`) or an array assignment `name=(…)`, and anywhere after `((`,
+/// `$((` or `$[` (arithmetic), or a `$(` within double quotes (the end of these is not tracked).
 /// The error says which placeholder, and why.
+///
+/// A command that evaluates what it is given, such as `eval`, `let`, `declare -i`, `trap`, `read`
+/// into a subscript, arithmetic on a variable set from the placeholder, or a placeholder as the
+/// command's name, still does: the value reaches it as data, and what it does with that is the
+/// command file's.
 fn substitute(text: &str, args: &str, words: &[String]) -> Result<String, String> {
     use Quoting::*;
     let mut out = String::with_capacity(text.len());
@@ -213,8 +219,12 @@ fn substitute(text: &str, args: &str, words: &[String]) -> Result<String, String
     let mut braces = 0usize;
     // Inside `[[ … ]]`, where the shell may evaluate a value as arithmetic.
     let mut in_test = false;
-    // Inside `[…]` within an unquoted word: an array subscript, or `$[…]`.
-    let mut in_subscript = false;
+    // Open brackets of a `[…]` that started within an unquoted word, such as an array subscript,
+    // which the shell evaluates as arithmetic; spaces do not end it.
+    let mut subscript = 0usize;
+    // Open parentheses of an array assignment, `name=(…)` or `name+=(…)`, whose subscripts the
+    // shell evaluates.
+    let mut array = 0usize;
     let mut prev: Option<char> = None;
     let mut rest = text;
     while let Some(c) = rest.chars().next() {
@@ -227,7 +237,8 @@ fn substitute(text: &str, args: &str, words: &[String]) -> Result<String, String
                 AnsiC => Some("is inside `$'…'`"),
                 Unquoted | Double if prev == Some('$') => Some("follows a `$`"),
                 _ if in_test => Some("is inside `[[ … ]]`"),
-                Unquoted if in_subscript => Some("is inside `[…]` within a word"),
+                _ if subscript > 0 => Some("is inside `[…]` that starts within a word"),
+                _ if array > 0 => Some("is inside an array assignment `=(…)`"),
                 _ => None,
             };
             if let Some(why) = refused {
@@ -295,6 +306,9 @@ fn substitute(text: &str, args: &str, words: &[String]) -> Result<String, String
                     '$' if after.starts_with('(') => {
                         untracked = Some("comes after a `$(` inside double quotes")
                     }
+                    '$' if after.starts_with('[') => {
+                        untracked = Some("comes after `$[` (arithmetic)")
+                    }
                     '$' if after.starts_with('{') => {
                         braces = 1;
                         len += 1;
@@ -319,6 +333,9 @@ fn substitute(text: &str, args: &str, words: &[String]) -> Result<String, String
                     '$' if after.starts_with("((") => {
                         untracked = Some("comes after `$((` (arithmetic)")
                     }
+                    '$' if after.starts_with('[') => {
+                        untracked = Some("comes after `$[` (arithmetic)")
+                    }
                     '$' if after.starts_with('{') => {
                         braces = 1;
                         len += 1;
@@ -326,6 +343,15 @@ fn substitute(text: &str, args: &str, words: &[String]) -> Result<String, String
                     }
                     // Inside `$(…)` the shell reads quotes as it does outside it.
                     '#' if word_start(prev) => quoting = Comment,
+                    '[' if subscript > 0 => subscript += 1,
+                    ']' if subscript > 0 => subscript -= 1,
+                    '(' if array > 0 => array += 1,
+                    ')' if array > 0 => array -= 1,
+                    '=' if after.starts_with('(') => {
+                        array = 1;
+                        len += 1;
+                        last = Some('(');
+                    }
                     '(' if after.starts_with('(') && word_start(prev) => {
                         untracked = Some("comes after `((` (arithmetic)")
                     }
@@ -344,10 +370,8 @@ fn substitute(text: &str, args: &str, words: &[String]) -> Result<String, String
                         in_test = false;
                         len += 1;
                     }
-                    '[' if !word_start(prev) => in_subscript = true,
-                    ']' => in_subscript = false,
+                    '[' if !word_start(prev) => subscript = 1,
                     '`' => untracked = Some("comes after a backtick"),
-                    c if ends_word(c) => in_subscript = false,
                     _ => {}
                 },
             }

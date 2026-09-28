@@ -70,6 +70,15 @@ jobs:
           FROM ubuntu:24.04
           RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
               && rm -rf /var/lib/apt/lists/*
+          # A repository committed here, in a RUN step, sits in a lower, read-only image layer.
+          # The first write under its .git from a running container forces overlayfs to copy it
+          # up: the real check that copy-up doesn't make .git look replaced (Task 4's L1).
+          RUN git init -q /image-repo \
+              && git -C /image-repo config user.email t@example.com \
+              && git -C /image-repo config user.name original \
+              && git -C /image-repo config commit.gpgsign false \
+              && git -C /image-repo commit -q --allow-empty -m first
+          ENV HARNESS_IMAGE_LAYER_REPO=/image-repo
           COPY . /workspace
           WORKDIR /workspace
           EOF

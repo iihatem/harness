@@ -57,11 +57,24 @@ fn expected_tier() -> Option<String> {
         .filter(|tier| !tier.is_empty())
 }
 
+/// A fresh id for a test's own scratch paths under `$HOME`, unique within this process.
+fn test_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// A git repository under `$HOME` (not `/tmp`, which the sandbox always makes writable), with a
-/// commit identity, and a quarantine directory next to it. Both are removed on drop.
+/// commit identity, and a quarantine directory next to it. `quarantine` is always removed on
+/// drop; `ws` is too, unless [`Env::at`] is reusing one that already existed (an image layer's
+/// repository, say).
 struct Env {
     ws: PathBuf,
     quarantine: PathBuf,
+    owns_ws: bool,
 }
 
 impl Env {
@@ -74,17 +87,16 @@ impl Env {
             skip_or_require("$HOME not set");
             return None;
         };
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = format!(
-            "{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
+        let id = test_id();
         let ws = PathBuf::from(&home).join(format!(".harness-guard-test-ws-{id}"));
         let quarantine = PathBuf::from(&home).join(format!(".harness-guard-test-q-{id}"));
         std::fs::create_dir(&ws).unwrap();
         let ws = ws.canonicalize().unwrap();
-        let env = Env { ws, quarantine };
+        let env = Env {
+            ws,
+            quarantine,
+            owns_ws: true,
+        };
         for args in [
             &["init", "-q"][..],
             &["config", "user.email", "t@example.com"],
@@ -97,6 +109,32 @@ impl Env {
             }
         }
         Some(env)
+    }
+
+    /// Uses an existing repository in place, such as one baked into a lower Docker image layer,
+    /// instead of creating a fresh one: see
+    /// [`a_commit_in_a_repository_from_an_image_layer_gets_no_report`]. The repository itself is
+    /// left as it is on drop; only the fresh quarantine directory next to it is removed.
+    fn at(ws: PathBuf) -> Option<Env> {
+        if !linux_sandbox_available() {
+            skip_or_require("linux sandbox unavailable");
+            return None;
+        }
+        if !ws.join(".git").is_dir() {
+            skip_or_require(&format!("{} has no .git directory", ws.display()));
+            return None;
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            skip_or_require("$HOME not set");
+            return None;
+        };
+        let quarantine = PathBuf::from(&home).join(format!(".harness-guard-test-q-{}", test_id()));
+        let ws = ws.canonicalize().unwrap();
+        Some(Env {
+            ws,
+            quarantine,
+            owns_ws: false,
+        })
     }
 
     fn git(&self, args: &[&str]) -> Output {
@@ -252,7 +290,9 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.ws);
+        if self.owns_ws {
+            let _ = std::fs::remove_dir_all(&self.ws);
+        }
         let _ = std::fs::remove_dir_all(&self.quarantine);
     }
 }
@@ -1949,4 +1989,45 @@ for line in open("/proc/self/status"):
 '"#;
     let (output, _) = run(&sandbox, &env, script).await;
     assert!(output.status.success(), "{}", stderr(&output));
+}
+
+// ---------------------------------------------------------------------------
+// Overlayfs: a repository already committed in a lower Docker image layer
+// ---------------------------------------------------------------------------
+
+/// The overlayfs follow-up to Task 4's L1–L3 fix: a directory copied up by overlayfs keeps its
+/// (dev, ino) but gets a new birth time, which must not make the guard think `.git` was replaced.
+/// The guard's other tests all `git init` a fresh repository inside a tempdir, so none of them
+/// ever make the kernel copy anything up. This one instead uses a repository the CI job's
+/// Dockerfile committed in a `RUN` step, so it sits in a lower, read-only image layer; the first
+/// write below `.git` inside the running container forces a real copy-up.
+///
+/// Runs only inside that job, which sets `HARNESS_IMAGE_LAYER_REPO` to the repository's path; a
+/// no-op everywhere else, including the two main Linux jobs.
+#[tokio::test]
+async fn a_commit_in_a_repository_from_an_image_layer_gets_no_report() {
+    let _serial = SERIAL.lock().await;
+    let Some(ws) = std::env::var_os("HARNESS_IMAGE_LAYER_REPO").map(PathBuf::from) else {
+        eprintln!("skipping: HARNESS_IMAGE_LAYER_REPO is not set");
+        return;
+    };
+    let Some(env) = Env::at(ws) else { return };
+    let sandbox = env.basic();
+
+    // The first write under `.git` here is the one overlayfs must copy up.
+    let (output, report) = run(&sandbox, &env, "git commit --allow-empty -m test").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        report, None,
+        "a real commit in the image layer's repository must get no report"
+    );
+    assert!(env.exists(".git"));
+    assert!(!env.in_quarantine(".git"));
+
+    // The guard must still be watching afterwards: a real plant is still caught.
+    let (output, report) = run(&sandbox, &env, "echo 'echo pwned' > .git/hooks/pre-commit").await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(report.expect("a report").blocked);
+    assert!(!env.exists(".git/hooks/pre-commit"));
+    env.quarantined(".git/hooks/pre-commit");
 }

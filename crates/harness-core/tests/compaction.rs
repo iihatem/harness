@@ -229,6 +229,37 @@ async fn reported_usage_counts_toward_the_threshold() {
     assert_eq!(compacted(&events).len(), 1, "{events:?}");
 }
 
+// Review F I3: output tokens, reasoning included, are not sent back to the model, so only the
+// reported input counts; the reply itself is estimated like any other message.
+#[tokio::test]
+async fn reported_output_tokens_do_not_count_toward_the_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::Reply(vec![
+            Ok(ProviderEvent::ReasoningDelta("thinking".into())),
+            Ok(ProviderEvent::TextDelta("short".into())),
+            Ok(ProviderEvent::Usage(Usage {
+                input_tokens: 1_000,
+                output_tokens: 25_500,
+                cached_tokens: 0,
+            })),
+            Ok(ProviderEvent::Finished(FinishReason::Stop)),
+        ]),
+        Script::text("answer"),
+    ]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    agent.config_mut().context_window = 4_000;
+    run(&mut agent, "hi").await;
+    let (_, events) = run(&mut agent, "again").await;
+    assert!(compacted(&events).is_empty(), "{events:?}");
+    assert!(!provider.requests().iter().any(is_summary_request));
+}
+
 #[test]
 fn overflow_errors_are_recognised_by_their_wording() {
     let http = |status: u16, body: &str| ProviderError::Http {

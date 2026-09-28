@@ -176,8 +176,8 @@ pub struct Agent {
     checkpoints: Option<Arc<Checkpoints>>,
     /// Whether the current turn already took its snapshot.
     turn_checkpointed: bool,
-    /// Tokens the provider reported for the last request and its reply, and how many messages
-    /// they covered; `None` until a provider reports usage, and after the history changes.
+    /// Input tokens the provider reported for the last request, and how many messages it had;
+    /// `None` until a provider reports usage, and after the history changes.
     reported_usage: Option<(u64, usize)>,
     validators: HashMap<String, jsonschema::Validator>,
     invalid_calls: u32,
@@ -570,9 +570,10 @@ impl Agent {
             let reply = match self.call_model_compacting(events, &cancel).await {
                 ModelOutcome::Reply(mut reply) => {
                     self.dedupe_call_ids(&mut reply.tool_calls);
+                    // The reported input covers the request; the reply is estimated like any
+                    // later message, since output tokens (reasoning included) are not sent back.
                     if let Some(usage) = reply.usage {
-                        let total = usage.input_tokens + usage.output_tokens;
-                        self.reported_usage = Some((total, self.history.len() + 1));
+                        self.reported_usage = Some((usage.input_tokens, self.history.len()));
                     }
                     reply
                 }

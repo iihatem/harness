@@ -1010,6 +1010,7 @@ fn rough_scan_sees_past_redirections_before_the_command_name() {
         ">&-curl x",
         "2>& -curl x",
         "<&-'curl' x",
+        "2>&-0<input curl x",
         "2>x 3>y curl z",
         "{fd}>out curl x",
         "{fd}<file curl x",

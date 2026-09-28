@@ -570,13 +570,16 @@ impl Splitter {
         self.diverge();
         if self.fd_number() {
             self.bare.targets = 1;
+            self.bare.dash = false;
         }
     }
 
     /// Whether the word being read, which the `<` or `>` just read ends, is a file
     /// descriptor number to bash: unquoted digits that make an `int`, the whole word. The
     /// word starts after a blank or operator, or the backquote opening the substitution
-    /// it is in; a closing one goes on with the word, like the `)` of a `$(…)`.
+    /// it is in; a closing one goes on with the word, like the `)` of a `$(…)`. When it is
+    /// the target of `<&` or `>&` with a leading `-` (see [`Bare::dash`]), the number
+    /// follows that `-`, which bash reads as a word of its own.
     fn fd_number(&self) -> bool {
         let op = self.at - 1;
         let digits = self.src[..op]
@@ -585,15 +588,18 @@ impl Splitter {
             .take_while(|c| c.is_ascii_digit())
             .count();
         let start = op - digits;
+        let dash = usize::from(self.bare.dash && self.bare.targets > 0);
         let opened =
             |i: usize| self.src[i] == '`' && self.stack.last().is_some_and(|f| f.start == start);
+        let boundary = |i: usize| match dash {
+            1 => self.src[i] == '-',
+            _ => " \t\n;&|(<>".contains(self.src[i]) || opened(i),
+        };
         self.in_word
             && digits > 0
-            && digits == self.word.len()
-            && start
-                .checked_sub(1)
-                .is_none_or(|i| " \t\n;&|(<>".contains(self.src[i]) || opened(i))
-            && self.word.parse::<i32>().is_ok()
+            && digits + dash == self.word.len()
+            && start.checked_sub(1).is_none_or(boundary)
+            && self.word[dash..].parse::<i32>().is_ok()
     }
 
     /// A redirection operator other than `<<`, `<<-` and `<<<` (see
@@ -1412,7 +1418,7 @@ mod tests {
             ),
             // After `>&` or `<&`, an unquoted `-` is the target, not the rest of its word.
             (
-                ">&-a b; <& -c d; >&\"-e\" f",
+                ">&-a b; <& -c d; >&\"-e\" f; 2>&-0<i g",
                 &[
                     &["-a", "b"],
                     &["a", "b"],
@@ -1420,6 +1426,9 @@ mod tests {
                     &["c", "d"],
                     &["-e", "f"],
                     &["f"],
+                    &["2"],
+                    &["-0", "i", "g"],
+                    &["g"],
                 ],
             ),
             (

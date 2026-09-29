@@ -69,7 +69,7 @@ pub async fn run(
     let Some(model_id) = model_flag.or_else(|| setup.config.model.clone()) else {
         eprintln!("error: no model configured.");
         let found = models::available(&setup).await;
-        setup.print_credential_warnings();
+        credential_warnings(&setup, &mut notices);
         if found.is_empty() {
             eprintln!(
                 "No local model servers were found. Start Ollama, LM Studio, or llama.cpp, or configure a provider."
@@ -87,7 +87,7 @@ pub async fn run(
         return 2;
     };
     let resolved = registry::resolve(&model_id, &setup.config.providers, setup.keys());
-    setup.print_credential_warnings();
+    credential_warnings(&setup, &mut notices);
     let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(e) => {
@@ -300,6 +300,14 @@ pub async fn run(
     }
     end_run(agent, sandbox_session);
     exit_code(reason, blocked)
+}
+
+/// Prints what the credential store has had to warn about so far, and keeps it for the debug
+/// log.
+fn credential_warnings(setup: &setup::Setup, notices: &mut Notices) {
+    for warning in setup.credentials.take_warnings() {
+        notices.warn(&warning);
+    }
 }
 
 /// Ends the run: first the agent, which releases the session file, then the sandbox's session,

@@ -563,6 +563,32 @@ async fn the_debug_log_holds_the_warnings_printed_at_startup() {
     holds_no_piece_of_a_secret(&run);
 }
 
+// Re-review F, R3: what the credential store warns about while the model is resolved (here, a
+// store choice it does not know) reached stderr only, not the debug log.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_debug_log_holds_the_credential_stores_startup_warnings() {
+    let run = Run::new(
+        vec![sse(&[text("hi"), stop()])],
+        &[("HARNESS_CREDENTIAL_STORE", "files")],
+        &["--debug", "ask", "hi"],
+    )
+    .await;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let warning = "HARNESS_CREDENTIAL_STORE is `files`, which harness does not know";
+    assert_eq!(run.stderr.matches(warning).count(), 1, "{}", run.stderr);
+    let log = run
+        .written()
+        .into_iter()
+        .find(|(name, _)| name.contains("/state/logs/"))
+        .unwrap()
+        .1;
+    assert!(
+        log.lines().any(|line| line.contains(warning)
+            && serde_json::from_str::<Value>(line).unwrap()["type"] == "warning"),
+        "{log}"
+    );
+}
+
 // Review F M6: `--debug` logs a run of `harness ask`; with another command it did nothing,
 // silently. Should the refusal break, `logout` would reach the keychain: only the debug-only test
 // hook keeps it off the real one.

@@ -7,8 +7,8 @@
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
-    io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    io::{Read, Write},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, mpsc},
     time::Duration,
@@ -39,8 +39,27 @@ pub enum CredentialError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{} is damaged: {message}", .path.display())]
-    Damaged { path: PathBuf, message: String },
+    /// A file that cannot be read as what it should hold. Where it is damaged, never what it
+    /// holds there, which can be a secret, and how to recover.
+    #[error("{} is damaged{at}; {recovery}", .path.display())]
+    Damaged {
+        path: PathBuf,
+        /// ` at line <l>, column <c>`, when that is known.
+        at: String,
+        recovery: &'static str,
+    },
+    /// A file harness will not use: a link, or another user's.
+    #[error(
+        "{} {why}; harness uses it only as a regular file of yours: move it aside, or replace a link with the file it points to", .path.display()
+    )]
+    Unsafe { path: PathBuf, why: &'static str },
+    #[error("cannot lock {}: {source}{hint}", .path.display())]
+    Lock {
+        path: PathBuf,
+        source: std::io::Error,
+        /// What to do when the file system cannot lock at all.
+        hint: &'static str,
+    },
     #[error(
         "{keychain} refused to store the new credential for {account} ({refused}) and to remove the older one it may still hold ({kept}), so harness would go on using that one; nothing was stored. Unlock the keychain and try again, or set {STORE_ENV}=file to keep credentials in credentials.json instead"
     )]
@@ -211,14 +230,30 @@ impl SecretStore for KeychainStore {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct CredentialsFile {
     #[serde(default)]
     credentials: BTreeMap<String, String>,
 }
 
-/// `credentials.json` in the data directory: readable and writable by its owner only, rewritten
-/// whole through a temporary file, and locked while it is read and rewritten.
+/// Leaves the secrets out.
+impl std::fmt::Debug for CredentialsFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialsFile")
+            .field("accounts", &self.credentials.keys().collect::<Vec<_>>())
+            .field("secrets", &"[redacted]")
+            .finish()
+    }
+}
+
+/// How to recover from a damaged `credentials.json`.
+const CREDENTIALS_RECOVERY: &str = "fix it, or delete it, which loses the API keys and ChatGPT sign-ins stored in it (not those in the keychain): then store them again with `harness auth add` and `harness login`";
+/// How to recover from a damaged `accounts.toml`.
+const ACCOUNTS_RECOVERY: &str = "fix it, or delete it, which loses only the profiles chosen with `harness auth use`: every provider then uses its default profile";
+
+/// `credentials.json` in the data directory: a regular file of the user's, readable and
+/// writable by its owner only, rewritten whole through a temporary file, and locked while it is
+/// read and rewritten.
 pub struct FileStore {
     path: PathBuf,
 }
@@ -230,69 +265,25 @@ impl FileStore {
         }
     }
 
-    fn io(&self, source: std::io::Error) -> CredentialError {
-        CredentialError::File {
-            path: self.path.clone(),
-            source,
-        }
-    }
-
     /// Locks the file against other harness processes until the returned guard is dropped.
     fn lock(&self) -> Result<File, CredentialError> {
-        let dir = self.path.parent().unwrap_or(Path::new("."));
-        std::fs::create_dir_all(dir).map_err(|e| self.io(e))?;
-        let lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(self.path.with_extension("json.lock"))
-            .map_err(|e| self.io(e))?;
-        lock.lock().map_err(|e| self.io(e))?;
-        Ok(lock)
+        lock(&self.path.with_extension("json.lock"))
     }
 
     fn read(&self) -> Result<CredentialsFile, CredentialError> {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(CredentialsFile::default());
-            }
-            Err(e) => return Err(self.io(e)),
+        let Some(text) = read_own(&self.path, true)? else {
+            return Ok(CredentialsFile::default());
         };
-        // A file someone made readable by others is made private again.
-        if let Ok(metadata) = std::fs::metadata(&self.path)
-            && metadata.permissions().mode() & 0o077 != 0
-        {
-            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| self.io(e))?;
-        }
         serde_json::from_str(&text).map_err(|e| CredentialError::Damaged {
             path: self.path.clone(),
-            message: e.to_string(),
+            at: format!(" at line {}, column {}", e.line(), e.column()),
+            recovery: CREDENTIALS_RECOVERY,
         })
     }
 
     fn write(&self, file: &CredentialsFile) -> Result<(), CredentialError> {
         let text = serde_json::to_string_pretty(file).expect("credentials serialize");
-        let tmp = self
-            .path
-            .with_extension(format!("json.tmp-{}", std::process::id()));
-        let written = (|| {
-            let mut out = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            out.write_all(text.as_bytes())?;
-            out.sync_all()?;
-            std::fs::rename(&tmp, &self.path)
-        })();
-        written.map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            self.io(e)
-        })
+        replace(&self.path, text.as_bytes())
     }
 
     pub fn path(&self) -> &Path {
@@ -315,7 +306,7 @@ impl SecretStore for FileStore {
     }
 
     fn delete(&self, account: &str) -> Result<bool, CredentialError> {
-        if !self.path.exists() {
+        if std::fs::symlink_metadata(&self.path).is_err() {
             return Ok(false);
         }
         let _lock = self.lock()?;
@@ -330,6 +321,161 @@ impl SecretStore for FileStore {
     fn describe(&self) -> String {
         self.path.display().to_string()
     }
+}
+
+/// Makes `dir`, readable only by its owner, when it is not there.
+fn make_dir(dir: &Path) -> Result<(), CredentialError> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|source| CredentialError::File {
+            path: dir.to_path_buf(),
+            source,
+        })
+}
+
+/// Opens `path` as `options` say, without following a symbolic link, and only when it is a
+/// regular file owned by this user. `None` when there is no such file.
+fn open_own(path: &Path, options: &mut OpenOptions) -> Result<Option<File>, CredentialError> {
+    let file = match options.custom_flags(libc::O_NOFOLLOW).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(CredentialError::Unsafe {
+                path: path.to_path_buf(),
+                why: "is a symbolic link",
+            });
+        }
+        Err(source) => {
+            return Err(CredentialError::File {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let metadata = file.metadata().map_err(|source| CredentialError::File {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let why = if !metadata.is_file() {
+        "is not a regular file"
+    } else if metadata.uid() != euid() {
+        "belongs to another user"
+    } else {
+        return Ok(Some(file));
+    };
+    Err(CredentialError::Unsafe {
+        path: path.to_path_buf(),
+        why,
+    })
+}
+
+fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// What `path` holds, or `None` when there is no such file or it holds only whitespace.
+/// `private` makes a file others can read private again first.
+fn read_own(path: &Path, private: bool) -> Result<Option<String>, CredentialError> {
+    let Some(mut file) = open_own(path, OpenOptions::new().read(true))? else {
+        return Ok(None);
+    };
+    let io = |source| CredentialError::File {
+        path: path.to_path_buf(),
+        source,
+    };
+    if private {
+        let mode = file.metadata().map_err(io)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(io)?;
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(io)?;
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Err(CredentialError::Damaged {
+            path: path.to_path_buf(),
+            at: String::new(),
+            recovery: if private {
+                CREDENTIALS_RECOVERY
+            } else {
+                ACCOUNTS_RECOVERY
+            },
+        });
+    };
+    Ok(Some(text).filter(|text| !text.trim().is_empty()))
+}
+
+/// Locks `path`, made readable only by its owner when it is not there, until the returned file
+/// is dropped.
+fn lock(path: &Path) -> Result<File, CredentialError> {
+    if let Some(dir) = path.parent() {
+        make_dir(dir)?;
+    }
+    let file = open_own(
+        path,
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600),
+    )?
+    .ok_or_else(|| CredentialError::File {
+        path: path.to_path_buf(),
+        source: std::io::ErrorKind::NotFound.into(),
+    })?;
+    file.lock().map_err(|source| {
+        let unsupported = source.kind() == std::io::ErrorKind::Unsupported
+            || source.raw_os_error() == Some(libc::ENOLCK);
+        CredentialError::Lock {
+            path: path.to_path_buf(),
+            source,
+            hint: if unsupported {
+                "; harness uses credentials only under a lock, which this file system cannot take: put the data directory on a local disk (XDG_DATA_HOME)"
+            } else {
+                ""
+            },
+        }
+    })?;
+    Ok(file)
+}
+
+/// Replaces `path` with `contents` through a temporary file next to it: one with a name nobody
+/// can guess, made anew (never an existing file or link), readable only by its owner, and synced
+/// before it is renamed over `path`.
+fn replace(path: &Path, contents: &[u8]) -> Result<(), CredentialError> {
+    let io = |source| CredentialError::File {
+        path: path.to_path_buf(),
+        source,
+    };
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!("{name}.tmp-{}", random_hex().map_err(io)?));
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(io)?;
+    let written = out
+        .write_all(contents)
+        .and_then(|()| out.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        io(e)
+    })
+}
+
+/// 16 random hex digits.
+fn random_hex() -> std::io::Result<String> {
+    let mut bytes = [0u8; 8];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -458,17 +604,20 @@ impl Credentials {
     }
 
     fn read_accounts(&self) -> Result<AccountsFile, CredentialError> {
-        match std::fs::read_to_string(&self.accounts) {
-            Ok(text) => toml::from_str(&text).map_err(|e| CredentialError::Damaged {
-                path: self.accounts.clone(),
-                message: e.to_string(),
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AccountsFile::default()),
-            Err(source) => Err(CredentialError::File {
-                path: self.accounts.clone(),
-                source,
-            }),
-        }
+        let Some(text) = read_own(&self.accounts, false)? else {
+            return Ok(AccountsFile::default());
+        };
+        toml::from_str(&text).map_err(|e| CredentialError::Damaged {
+            path: self.accounts.clone(),
+            at: e
+                .span()
+                .map(|span| {
+                    let (line, column) = line_and_column(&text, span.start);
+                    format!(" at line {line}, column {column}")
+                })
+                .unwrap_or_default(),
+            recovery: ACCOUNTS_RECOVERY,
+        })
     }
 
     /// The profile `provider` uses: the one chosen with `harness auth use`, or `default`.
@@ -484,6 +633,8 @@ impl Credentials {
     pub fn use_profile(&self, provider: &str, profile: &str) -> Result<(), CredentialError> {
         check_name("provider", provider)?;
         check_name("profile", profile)?;
+        // Two `harness auth use` at once must not lose one of the choices.
+        let _lock = lock(&self.accounts.with_extension("toml.lock"))?;
         let mut accounts = self.read_accounts()?;
         if profile == DEFAULT_PROFILE {
             accounts.active.remove(provider);
@@ -492,31 +643,8 @@ impl Credentials {
                 .active
                 .insert(provider.to_string(), profile.to_string());
         }
-        let io = |source| CredentialError::File {
-            path: self.accounts.clone(),
-            source,
-        };
         let text = toml::to_string(&accounts).expect("accounts serialize");
-        if let Some(dir) = self.accounts.parent() {
-            std::fs::create_dir_all(dir).map_err(io)?;
-        }
-        let tmp = self
-            .accounts
-            .with_extension(format!("toml.tmp-{}", std::process::id()));
-        let written = (|| {
-            let mut out = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            out.write_all(text.as_bytes())?;
-            std::fs::rename(&tmp, &self.accounts)
-        })();
-        written.map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            io(e)
-        })
+        replace(&self.accounts, text.as_bytes())
     }
 
     /// The credential stored for `provider` under `profile`: from the keychain, or else the
@@ -613,6 +741,14 @@ impl Credentials {
         let in_file = self.file.delete(&account)?;
         Ok(in_keychain? || in_file)
     }
+}
+
+/// The 1-based line and column of byte `offset` in `text`.
+fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
+    let before = &text[..offset.min(text.len())];
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    (line, column)
 }
 
 /// The account name of a provider's profile.

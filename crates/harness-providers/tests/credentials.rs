@@ -496,3 +496,193 @@ fn an_unknown_store_choice_is_a_warning() {
         "{warnings:?}"
     );
 }
+
+fn mode(path: &std::path::Path) -> u32 {
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+// Review B, M1 (probe P6): a `credentials.json` that is a symbolic link is neither read through
+// nor chmodded, nor replaced by a file (leaving the secrets in the link's target).
+#[test]
+fn a_symlinked_credentials_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = dir.path().join("elsewhere.json");
+    std::fs::write(&elsewhere, r#"{"credentials":{"openai/default":"sk-1"}}"#).unwrap();
+    std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, data.join("credentials.json")).unwrap();
+    let creds = Credentials::with_keychain(&data, None);
+    let error = creds
+        .get("openai", DEFAULT_PROFILE)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("symbolic link"), "{error}");
+    assert!(creds.set("openai", DEFAULT_PROFILE, "sk-2").is_err());
+    assert!(creds.remove("openai", DEFAULT_PROFILE).is_err());
+    assert_eq!(mode(&elsewhere), 0o644);
+    assert!(
+        std::fs::symlink_metadata(data.join("credentials.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+// Review B, M1 (probes P4 and P5): the temporary file a rewrite goes through has a name nobody
+// can plant a link or a readable file at in advance.
+#[test]
+fn a_rewrite_never_goes_through_a_planted_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let old_name = |ext: &str| data.join(format!("{ext}.tmp-{}", std::process::id()));
+    let trap = dir.path().join("trap");
+    std::os::unix::fs::symlink(&trap, old_name("credentials.json")).unwrap();
+    let creds = Credentials::with_keychain(&data, None);
+    creds.set("openai", DEFAULT_PROFILE, "sk-secret").unwrap();
+    assert!(!trap.exists());
+    let file = data.join("credentials.json");
+    assert!(std::fs::symlink_metadata(&file).unwrap().is_file());
+    // A stale readable file at the old name does not make the store readable.
+    std::fs::remove_file(old_name("credentials.json")).unwrap();
+    std::fs::write(old_name("credentials.json"), "").unwrap();
+    std::fs::set_permissions(
+        old_name("credentials.json"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    creds.set("openai", "work", "sk-work").unwrap();
+    assert_eq!(mode(&file), 0o600);
+    // The same holds for accounts.toml.
+    std::os::unix::fs::symlink(&trap, old_name("accounts.toml")).unwrap();
+    creds.use_profile("openai", "work").unwrap();
+    assert!(!trap.exists());
+    assert!(
+        std::fs::symlink_metadata(data.join("accounts.toml"))
+            .unwrap()
+            .is_file()
+    );
+}
+
+// Review B, M1 and M10: `accounts.toml` and the lock files are not followed through links
+// either, and a lock file's error names the lock file.
+#[test]
+fn symlinked_accounts_and_lock_files_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::write(&elsewhere, "[active]\nopenai = \"work\"\n").unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, data.join("accounts.toml")).unwrap();
+    let creds = Credentials::with_keychain(&data, None);
+    let error = creds.active_profile("openai").unwrap_err().to_string();
+    assert!(error.contains("accounts.toml"), "{error}");
+    assert!(error.contains("symbolic link"), "{error}");
+    assert!(creds.use_profile("openai", "home").is_err());
+    std::fs::remove_file(data.join("accounts.toml")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, data.join("credentials.json.lock")).unwrap();
+    let error = creds
+        .set("openai", DEFAULT_PROFILE, "sk-1")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("credentials.json.lock"), "{error}");
+    let _ = std::fs::remove_file(data.join("accounts.toml.lock"));
+    std::os::unix::fs::symlink(&elsewhere, data.join("accounts.toml.lock")).unwrap();
+    let error = creds.use_profile("openai", "home").unwrap_err().to_string();
+    assert!(error.contains("accounts.toml.lock"), "{error}");
+}
+
+// Review B, M1: a data directory the store makes is private.
+#[test]
+fn the_data_directory_the_store_makes_is_private() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("share/harness");
+    Credentials::with_keychain(&data, None)
+        .set("openai", DEFAULT_PROFILE, "sk-1")
+        .unwrap();
+    assert_eq!(mode(&data), 0o700);
+}
+
+// Review B, M10: `harness auth use` runs at the same time do not lose each other's choice.
+#[test]
+fn profile_choices_made_at_once_are_all_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().to_path_buf();
+    let rounds = 40;
+    let threads: Vec<_> = ["a", "b", "c", "d"]
+        .into_iter()
+        .map(|provider| {
+            let data = data.clone();
+            std::thread::spawn(move || {
+                let creds = Credentials::with_keychain(&data, None);
+                for round in 0..rounds {
+                    creds.use_profile(provider, &format!("p{round}")).unwrap();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let creds = Credentials::with_keychain(&data, None);
+    for provider in ["a", "b", "c", "d"] {
+        assert_eq!(
+            creds.active_profile(provider).unwrap(),
+            format!("p{}", rounds - 1),
+            "{provider}"
+        );
+    }
+}
+
+// Review B, M2: serde's message quotes the value it could not read, which can be a secret.
+#[test]
+fn a_damaged_credentials_file_never_quotes_what_it_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("credentials.json"),
+        r#"{"credentials": "sk-proj-SECRETVALUE123"}"#,
+    )
+    .unwrap();
+    let error = FileStore::new(dir.path())
+        .get("openai/default")
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("SECRETVALUE"), "{error}");
+    assert!(error.contains("line 1, column"), "{error}");
+    // Review B, M3: it says how to recover, and what that loses.
+    assert!(error.contains("delete"), "{error}");
+    assert!(error.contains("API keys"), "{error}");
+}
+
+// Review B, M3: one line, with the way out.
+#[test]
+fn a_damaged_accounts_file_says_how_to_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("accounts.toml"),
+        "[active]\nchatgpt = work\n",
+    )
+    .unwrap();
+    let creds = Credentials::with_keychain(dir.path(), None);
+    let error = creds.active_profile("chatgpt").unwrap_err().to_string();
+    assert!(error.contains("accounts.toml"), "{error}");
+    assert!(error.contains("line 2"), "{error}");
+    assert!(!error.contains('\n'), "{error}");
+    assert!(error.contains("default profile"), "{error}");
+}
+
+// Review B, M3: an empty file holds nothing; it is not damaged.
+#[test]
+fn empty_files_hold_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("credentials.json"), "").unwrap();
+    std::fs::write(dir.path().join("accounts.toml"), "\n").unwrap();
+    let creds = Credentials::with_keychain(dir.path(), None);
+    assert_eq!(creds.active("openai").unwrap(), None);
+    assert_eq!(creds.active_profile("openai").unwrap(), "default");
+}

@@ -66,6 +66,60 @@ fn secret_looking_environment_variables_are_secrets() {
     );
 }
 
+// Review F M7: the common secret names beyond the four endings, and the password in a URL.
+#[test]
+fn common_secret_names_and_the_passwords_in_urls_are_secrets() {
+    let redactor = Redactor::default();
+    redactor.add_env([
+        ("PULUMI_CONFIG_PASSPHRASE", "passphrase-value-1"),
+        ("MYSQL_PWD", "mysql-pwd-value-2"),
+        ("SMTP_PASS", "smtp-pass-value-3"),
+        ("GOOGLE_CREDENTIALS", "credentials-value-4"),
+        ("API_KEYS", "api-keys-value-5"),
+        ("GITHUB_TOKENS", "tokens-value-6"),
+        ("VAULT_SECRETS", "secrets-value-7"),
+        ("ADMIN_PASSWORDS", "passwords-value-8"),
+        (
+            "DATABASE_URL",
+            "postgres://app:url-password-9@db.internal:5432/app",
+        ),
+        ("HTTPS_PROXY", "http://me:p%40ss-word-10@proxy:8080"),
+        // Not secrets: the working directories, names that only end in the same letters, a URL
+        // without a password, and values too short to tell from ordinary text.
+        ("PWD", "/home/someone/project"),
+        ("OLDPWD", "/home/someone/elsewhere"),
+        ("COMPASS", "north-by-northwest"),
+        ("HOMEPAGE_URL", "https://someone@example.com/some/path"),
+        ("MAX_TOKENS", "4096"),
+    ]);
+    let secrets = [
+        "passphrase-value-1",
+        "mysql-pwd-value-2",
+        "smtp-pass-value-3",
+        "credentials-value-4",
+        "api-keys-value-5",
+        "tokens-value-6",
+        "secrets-value-7",
+        "passwords-value-8",
+        "url-password-9",
+        "p%40ss-word-10",
+        "p@ss-word-10",
+    ];
+    for secret in secrets {
+        assert_eq!(redactor.redact(secret), REDACTED, "{secret}");
+    }
+    for plain in [
+        "/home/someone/project",
+        "/home/someone/elsewhere",
+        "north-by-northwest",
+        "https://someone@example.com/some/path",
+        "4096",
+        "postgres://app:",
+    ] {
+        assert_eq!(redactor.redact(plain), plain);
+    }
+}
+
 // Review F I1: a variable that is not UTF-8 is read, not a panic, and its value is a secret in
 // its lossy form, the form the bash tool's output takes.
 #[test]

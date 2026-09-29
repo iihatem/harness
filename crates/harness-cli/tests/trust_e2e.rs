@@ -115,3 +115,30 @@ fn changing_trusted_settings_needs_trust_again() {
         .success()
         .stderr(contains("harness trust"));
 }
+
+// Re-review of fix wave 4, nit: a repository's directory names reach `harness trust`'s output,
+// so the paths it prints are made terminal-safe like any other text from the repository.
+#[test]
+fn trust_prints_directory_names_terminal_safe() {
+    let env = Env::new(None);
+    std::fs::create_dir(env.ws.path().join(".git")).unwrap();
+    let sub = env.ws.path().join("sub\u{1b}[2J");
+    std::fs::create_dir(&sub).unwrap();
+    let mut trust = env.cmd();
+    let output = trust
+        .current_dir(&sub)
+        .args(["trust", "--yes"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    assert!(stdout.contains("sub\\u{1b}[2J"), "{stdout:?}");
+    let revoke = env
+        .cmd()
+        .current_dir(&sub)
+        .args(["trust", "--revoke"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&revoke.stdout).contains('\u{1b}'));
+}

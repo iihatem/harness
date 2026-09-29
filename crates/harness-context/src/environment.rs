@@ -54,9 +54,13 @@ pub fn capture(cwd: &Path, date: &str) -> Environment {
 const OVERRIDES: [&str; 2] = ["core.fsmonitor=false", "core.hooksPath=/dev/null"];
 
 /// Runs git in `cwd` with [`OVERRIDES`]; `None` when it cannot run or does not finish in time.
+/// In a partial clone, git fetches a missing object from the promisor remote, which runs the
+/// transport the repository's configuration names (`core.sshCommand`, an `ext::` URL, a
+/// credential helper): `GIT_NO_LAZY_FETCH` stops that from git 2.44 on, and
+/// [`status_is_unsafe`] keeps older gits from running `status` there.
 fn run_git(cwd: &Path, args: &[&str]) -> Option<Output> {
     let mut command = Command::new("git");
-    command.arg("-C").arg(cwd);
+    command.arg("-C").arg(cwd).env("GIT_NO_LAZY_FETCH", "1");
     for setting in OVERRIDES {
         command.args(["-c", setting]);
     }
@@ -85,11 +89,12 @@ fn git_state(cwd: &Path) -> GitState {
                         .map(|commit| format!("detached HEAD at {commit}"))
                 })
         });
-    // `status` runs the clean filter of every file whose stat changed, so with a filter driver
-    // the repository's own configuration defines, the answer is left out. Reading the
-    // configuration runs nothing. Submodules are left alone: `status` would run `git status` in
-    // each, with the submodule's own configuration.
-    let dirty = if repository_defines_filters(cwd) {
+    // `status` runs the clean filter of every file whose stat changed, and in a partial clone
+    // fetches missing objects, so when the repository's own configuration defines a filter
+    // driver or makes it a partial clone, the answer is left out. Reading the configuration runs
+    // nothing. Submodules are left alone: `status` would run `git status` in each, with the
+    // submodule's own configuration.
+    let dirty = if status_is_unsafe(cwd) {
         None
     } else {
         git(
@@ -106,21 +111,24 @@ fn git_state(cwd: &Path) -> GitState {
     GitState { head, dirty }
 }
 
-/// Whether the repository's own configuration for `cwd` (its `local` and `worktree` scopes, with
-/// the files they include, which git reports under the including file's scope) defines any
-/// filter driver (`filter.<driver>.clean`, `smudge` or `process`); also when git cannot say, as a
-/// git older than 2.26 cannot (no `--show-scope`). A driver in the user's global or system
-/// configuration, such as git-lfs's, is the user's own program, which their own `git status`
-/// runs as well.
-fn repository_defines_filters(cwd: &Path) -> bool {
+/// Whether `git status` in `cwd` could run a program the repository's own configuration names:
+/// its `local` and `worktree` scopes (with the files they include, which git reports under the
+/// including file's scope) define a filter driver (`filter.<driver>.clean`, `smudge` or
+/// `process`), or make it a partial clone (`extensions.partialClone`, or a `remote.<name>.promisor`
+/// that is not false), whose missing objects git would fetch. Also when git cannot say, as a git
+/// older than 2.26 cannot (no `--show-scope`). A filter driver in the user's global or system
+/// configuration, such as git-lfs's, is the user's own program, which their own `git status` runs
+/// as well.
+fn status_is_unsafe(cwd: &Path) -> bool {
     let Some(output) = run_git(
         cwd,
         &[
             "config",
             "--show-scope",
             "--includes",
+            "-z",
             "--get-regexp",
-            r"^filter\.",
+            r"^(filter\.|extensions\.partialclone$|remote\..*\.promisor$)",
         ],
     ) else {
         return true;
@@ -128,13 +136,40 @@ fn repository_defines_filters(cwd: &Path) -> bool {
     match output.status.code() {
         // No such setting anywhere.
         Some(1) => false,
-        // Each setting's line starts with its scope and a tab. A value with a line break in it
-        // can only add lines, so no setting of the repository's goes unseen.
-        Some(0) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.starts_with("local\t") || line.starts_with("worktree\t")),
+        // `<scope>\0<key>\n<value>\0`, or `<scope>\0<key>\0` for a key without a value (true).
+        Some(0) => {
+            let mut fields = output.stdout.split(|b| *b == 0);
+            while let (Some(scope), Some(setting)) = (fields.next(), fields.next()) {
+                if (scope == b"local" || scope == b"worktree") && counts(setting) {
+                    return true;
+                }
+            }
+            false
+        }
         _ => true,
     }
+}
+
+/// Whether the setting `key\nvalue` (or `key` alone), which the query in [`status_is_unsafe`]
+/// matched, makes `status` unsafe: any filter or `extensions.partialclone` setting, and a
+/// `promisor` that is not false.
+fn counts(setting: &[u8]) -> bool {
+    let setting = String::from_utf8_lossy(setting);
+    let (key, value) = match setting.split_once('\n') {
+        Some((key, value)) => (key, Some(value)),
+        None => (setting.as_ref(), None),
+    };
+    if !(key.starts_with("remote.") && key.ends_with(".promisor")) {
+        return true;
+    }
+    let Some(value) = value else {
+        return true;
+    };
+    let value = value.trim().to_ascii_lowercase();
+    let false_ = value.is_empty()
+        || ["false", "no", "off"].contains(&value.as_str())
+        || value.parse::<i64>() == Ok(0);
+    !false_
 }
 
 /// The branch, or `detached HEAD at <commit>`, read from the `HEAD` file of the repository at
@@ -188,5 +223,46 @@ impl Environment {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The one guard older gits lack: every git call here runs with lazy fetching off (git 2.44
+    // and later honour it), whatever the repository's configuration.
+    #[test]
+    fn every_git_call_runs_with_lazy_fetching_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = run_git(
+            dir.path(),
+            &["-c", "alias.lazy=!printenv GIT_NO_LAZY_FETCH", "lazy"],
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n");
+    }
+
+    #[test]
+    fn a_promisor_that_is_not_false_counts() {
+        for setting in [
+            "remote.origin.promisor\ntrue",
+            "remote.origin.promisor",
+            "remote.my remote.promisor\n1",
+            "remote.origin.promisor\nYes",
+            "extensions.partialclone\norigin",
+            "filter.x.clean\ncat",
+        ] {
+            assert!(counts(setting.as_bytes()), "{setting:?}");
+        }
+        for setting in [
+            "remote.origin.promisor\nfalse",
+            "remote.origin.promisor\nOff",
+            "remote.origin.promisor\nno",
+            "remote.origin.promisor\n0",
+            "remote.origin.promisor\n",
+        ] {
+            assert!(!counts(setting.as_bytes()), "{setting:?}");
+        }
     }
 }

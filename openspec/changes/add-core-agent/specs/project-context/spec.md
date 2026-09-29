@@ -35,7 +35,7 @@ The system SHALL expand `@<path>` import lines (lines holding only the import, o
 - **THEN** it is skipped with a warning and its target is not sent to the model, while a symlink to a file inside that folder is loaded
 
 ### Requirement: Environment information is captured at session start
-The system SHALL include the working directory, operating system, date, and, inside a git repository, the current branch and whether the work tree has uncommitted changes, all captured once when the session starts. Capturing them MUST NOT run any program that the repository's configuration, or a submodule's, names (a file-system monitor, a hook, or a filter driver); when the repository's own configuration (its local or worktree configuration, or a file that includes) defines a filter driver, or git cannot say whether it does, whether there are uncommitted changes MUST be left out. A filter driver in the user's global or system configuration MUST NOT cause that.
+The system SHALL include the working directory, operating system, date, and, inside a git repository, the current branch and whether the work tree has uncommitted changes, all captured once when the session starts. Capturing them MUST NOT run any program that the repository's configuration, or a submodule's, names (a file-system monitor, a hook, a filter driver, or the transport of a partial clone's promisor remote); when the repository's own configuration (its local or worktree configuration, or a file that includes) defines a filter driver or makes the repository a partial clone, or git cannot say whether it does, whether there are uncommitted changes MUST be left out. A filter driver in the user's global or system configuration MUST NOT cause that.
 
 #### Scenario: Dirty git repository
 - **WHEN** the session starts in a repository with uncommitted changes on branch `main`
@@ -44,6 +44,10 @@ The system SHALL include the working directory, operating system, date, and, ins
 #### Scenario: Repository whose configuration names a program
 - **WHEN** the session starts in a repository whose `.git/config` sets `core.fsmonitor` to a script, or defines a clean filter that its `.gitattributes` assigns to a modified file
 - **THEN** the script and the filter never run, the context still states the branch, and with the filter configured it does not say whether there are uncommitted changes
+
+#### Scenario: Partial clone whose promisor remote names a program
+- **WHEN** the session starts in a repository whose `.git/config` makes it a partial clone, with a promisor remote reached through `core.sshCommand` or an `ext::` URL, and `git status` would need an object that is missing
+- **THEN** the program never runs, the context still states the branch, and it does not say whether there are uncommitted changes
 
 #### Scenario: Filter driver in the user's own git configuration
 - **WHEN** the session starts in a repository with uncommitted changes, and the user's global git configuration defines a filter driver (as `git lfs install` does)

@@ -33,11 +33,17 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
     if revoke {
         return match store.revoke(&workspace) {
             Ok(true) => {
-                println!("Revoked trust for {}.", workspace.display());
+                println!(
+                    "Revoked trust for {}.",
+                    terminal_safe(&workspace.display().to_string())
+                );
                 0
             }
             Ok(false) => {
-                println!("{} was not trusted.", workspace.display());
+                println!(
+                    "{} was not trusted.",
+                    terminal_safe(&workspace.display().to_string())
+                );
                 0
             }
             Err(e) => {
@@ -59,17 +65,17 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
         // Trust still matters: a trusted workspace's command files may choose their model.
         println!(
             "No project settings in {} widen what the agent may do. Trusting it lets its command files choose their model, until such settings appear.",
-            workspace.display()
+            terminal_safe(&workspace.display().to_string())
         );
     } else if widening.items.is_empty() {
         println!(
             "No project settings in {} widen what the agent may do.",
-            workspace.display()
+            terminal_safe(&workspace.display().to_string())
         );
     } else {
         println!(
             "{} contains settings that need trust:",
-            config::project_file(&workspace).display()
+            terminal_safe(&config::project_file(&workspace).display().to_string())
         );
         for item in &widening.items {
             println!("  - {}", terminal_safe(item));
@@ -78,8 +84,8 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
     if root != workspace {
         println!(
             "Trusting {} does not cover the command files used there: they come from {}; run `harness trust` there to let them choose their model.",
-            workspace.display(),
-            root.display()
+            terminal_safe(&workspace.display().to_string()),
+            terminal_safe(&root.display().to_string())
         );
     }
     if !yes {
@@ -98,7 +104,10 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
     }
     match store.trust(&workspace, &widening.fingerprint) {
         Ok(()) => {
-            println!("Trusted {}.", workspace.display());
+            println!(
+                "Trusted {}.",
+                terminal_safe(&workspace.display().to_string())
+            );
             0
         }
         Err(e) => {

@@ -240,6 +240,70 @@ fn a_filter_driver_included_by_the_repository_or_in_its_worktree_configuration_n
     }
 }
 
+/// A repository whose own configuration makes it a partial clone, with a staged rename whose old
+/// blob is missing: `git status` must read that blob to find the rename, and would fetch it from
+/// the promisor remote through `transport` (`sshCommand` or `ext`), which runs `script`.
+fn partial_clone_missing_a_blob(transport: &str, script: &Path) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    git(ws, &["init", "-q", "-b", "main"]);
+    let lines: String = (1..=50).map(|n| format!("{n}\n")).collect();
+    std::fs::write(ws.join("a.txt"), lines).unwrap();
+    git(ws, &["add", "a.txt"]);
+    git(ws, &["commit", "-q", "-m", "first"]);
+    let blob = Command::new("git")
+        .arg("-C")
+        .arg(ws)
+        .args(["rev-parse", "HEAD:a.txt"])
+        .output()
+        .unwrap();
+    let blob = String::from_utf8(blob.stdout).unwrap();
+    let blob = blob.trim();
+    git(ws, &["mv", "a.txt", "b.txt"]);
+    let mut changed = std::fs::read_to_string(ws.join("b.txt")).unwrap();
+    changed.push_str("extra\n");
+    std::fs::write(ws.join("b.txt"), changed).unwrap();
+    git(ws, &["add", "b.txt"]);
+    std::fs::remove_file(ws.join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
+    git(ws, &["config", "extensions.partialClone", "origin"]);
+    git(ws, &["config", "remote.origin.promisor", "true"]);
+    let script = script.to_str().unwrap();
+    match transport {
+        "sshCommand" => {
+            git(
+                ws,
+                &["config", "remote.origin.url", "ssh://example.invalid/x"],
+            );
+            git(ws, &["config", "core.sshCommand", script]);
+        }
+        _ => {
+            git(
+                ws,
+                &["config", "remote.origin.url", &format!("ext::{script}")],
+            );
+            git(ws, &["config", "protocol.ext.allow", "always"]);
+        }
+    }
+    dir
+}
+
+// Re-review of fix wave 4, important 1: in a partial clone, `git status` fetches a missing object
+// from the promisor remote, running the transport program the repository's configuration names.
+#[test]
+fn a_partial_clones_transport_never_runs() {
+    for transport in ["sshCommand", "ext"] {
+        let tools = tempfile::tempdir().unwrap();
+        let (script, marker) = marker_script(tools.path(), "transport");
+        let dir = partial_clone_missing_a_blob(transport, &script);
+        let env = environment::capture(dir.path(), "2026-09-27");
+        assert!(!marker.exists(), "{transport}: the transport ran");
+        let git_state = env.git.clone().unwrap();
+        assert_eq!(git_state.head.as_deref(), Some("main"), "{transport}");
+        assert_eq!(git_state.dirty, None, "{transport}");
+        assert!(!env.render().contains("Uncommitted changes"), "{transport}");
+    }
+}
+
 // `git status` runs `git status` in each submodule, with the submodule's own configuration.
 #[test]
 fn a_clean_filter_in_a_submodule_never_runs() {

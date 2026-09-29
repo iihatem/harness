@@ -80,8 +80,8 @@ fn resume_taking_the_prompt_for_its_id_is_explained() {
     }
 }
 
-// Only `ask` continues a session: with another subcommand `-c` and `--resume <id>` were ignored
-// silently.
+// Only `ask` and the interactive session continue a session: with another subcommand `-c` and
+// `--resume <id>` were ignored silently.
 #[test]
 fn session_flags_with_another_subcommand_are_refused() {
     let home = tempfile::tempdir().unwrap();
@@ -108,7 +108,7 @@ fn session_flags_with_another_subcommand_are_refused() {
             .assert()
             .code(2)
             .stderr(contains(format!(
-                "{flag} continues a session, which only `harness ask` does; run `{command}` without it"
+                "{flag} continues a session, which only `harness ask` and `harness` alone do; run `{command}` without it"
             )));
     }
 }
@@ -152,7 +152,7 @@ fn session_flags_with_the_credential_commands_are_refused() {
             .assert()
             .code(2)
             .stderr(contains(format!(
-                "-c/--continue continues a session, which only `harness ask` does; run `{command}` without it"
+                "-c/--continue continues a session, which only `harness ask` and `harness` alone do; run `{command}` without it"
             )));
     }
     assert!(!home.path().join("data/credentials.json").exists());

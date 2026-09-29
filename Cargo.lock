@@ -784,6 +784,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix",
@@ -1362,14 +1363,17 @@ dependencies = [
  "assert_cmd",
  "base64 0.23.1",
  "clap",
+ "crossterm",
  "harness-config",
  "harness-context",
  "harness-core",
  "harness-providers",
  "harness-sandbox",
  "harness-tools",
+ "harness-tui",
  "nix",
  "predicates",
+ "ratatui",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1490,6 +1494,8 @@ dependencies = [
 name = "harness-tui"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "harness-context",
  "harness-core",
  "ignore",
  "nucleo-matcher",
@@ -1499,6 +1505,8 @@ dependencies = [
  "similar 3.2.0",
  "syntect",
  "tempfile",
+ "tokio",
+ "tokio-util",
  "unicode-width",
 ]
 

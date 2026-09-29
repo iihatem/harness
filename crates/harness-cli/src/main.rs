@@ -2,6 +2,7 @@ mod ask;
 mod auth;
 mod context;
 mod doctor;
+mod interactive;
 mod login;
 mod models;
 mod notices;
@@ -10,6 +11,7 @@ mod sandbox;
 mod sessions;
 mod setup;
 mod slash;
+mod start;
 mod term;
 mod trust;
 
@@ -198,8 +200,8 @@ fn main() -> ExitCode {
         }
         Err(e) => e.exit(),
     };
-    // Only `ask` continues a session and has a run to log: with another subcommand `-c`,
-    // `--resume` and `--debug` would do nothing.
+    // Only `ask` and the interactive session continue a session, and only `ask` has a run to
+    // log: with another subcommand `-c`, `--resume` and `--debug` would do nothing.
     if let Some(command) = cli
         .command
         .as_ref()
@@ -212,7 +214,7 @@ fn main() -> ExitCode {
         };
         if let Some(flag) = flag {
             eprintln!(
-                "error: {flag} continues a session, which only `harness ask` does; run `{}` without it",
+                "error: {flag} continues a session, which only `harness ask` and `harness` alone do; run `{}` without it",
                 command_line(command)
             );
             return ExitCode::from(2);
@@ -269,10 +271,7 @@ fn main() -> ExitCode {
             Some(Command::Sandbox {
                 command: SandboxCommand::Doctor,
             }) => doctor::run(),
-            None => {
-                eprintln!("Interactive mode is not available yet; use `harness ask \"...\"`.");
-                2
-            }
+            None => interactive::run(cli.model, cli.mode, session).await,
         }
     });
     ExitCode::from(code)

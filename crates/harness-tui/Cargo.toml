@@ -7,6 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+futures.workspace = true
+harness-context.workspace = true
 harness-core.workspace = true
 ignore.workspace = true
 nucleo-matcher.workspace = true
@@ -15,6 +17,8 @@ ratatui.workspace = true
 serde_json.workspace = true
 similar.workspace = true
 syntect.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]

@@ -108,3 +108,109 @@ fn parameter_value(raw: &str) -> Value {
     let raw = raw.strip_suffix('\n').unwrap_or(raw);
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
+
+/// The keys a call object can start with.
+const CALL_KEYS: [&str; 3] = ["name", "arguments", "parameters"];
+
+/// Watches a reply as it streams, to tell whether it can still become a message that [`recover`]
+/// accepts, so that such text is held back rather than shown, while any other text is shown as it
+/// comes. It errs on the side of showing: a call object whose first key is not one of a call's
+/// is shown, and still recovered at the end.
+#[derive(Debug, Default)]
+pub struct CallWatch {
+    /// Once the text cannot become calls, it never can.
+    ruled_out: bool,
+    /// How far the text has been scanned for the end of a JSON object.
+    scanned: usize,
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+    /// Where the object ends, once it has.
+    end: Option<usize>,
+}
+
+impl CallWatch {
+    /// Whether `text`, the reply so far, can still become calls. Each call passes the text of the
+    /// one before with more appended.
+    pub fn may_be_calls(&mut self, text: &str) -> bool {
+        if !self.ruled_out && !self.check(text) {
+            self.ruled_out = true;
+        }
+        !self.ruled_out
+    }
+
+    fn check(&mut self, text: &str) -> bool {
+        let trimmed = text.trim_start();
+        if trimmed.is_empty() {
+            return true;
+        }
+        if trimmed.starts_with('{') {
+            return self.object(text, text.len() - trimmed.len());
+        }
+        // One `<tool_call>` block after another, with nothing but whitespace between.
+        let mut rest = trimmed;
+        loop {
+            if rest.is_empty() || OPEN.starts_with(rest) {
+                return true;
+            }
+            let Some(inner) = rest.strip_prefix(OPEN) else {
+                return false;
+            };
+            let Some(end) = inner.find(CLOSE) else {
+                return true;
+            };
+            rest = inner[end + CLOSE.len()..].trim_start();
+        }
+    }
+
+    /// For a JSON object starting at `start`: its first key can be a call's, and nothing but
+    /// whitespace follows its end.
+    fn object(&mut self, text: &str, start: usize) -> bool {
+        let body = text[start + 1..].trim_start();
+        if !body.is_empty() {
+            let Some(key) = body.strip_prefix('"') else {
+                return false;
+            };
+            let key_fits = match key.find('"') {
+                Some(end) => CALL_KEYS.contains(&&key[..end]),
+                None => CALL_KEYS.iter().any(|k| k.starts_with(key)),
+            };
+            if !key_fits {
+                return false;
+            }
+        }
+        if self.end.is_none() {
+            self.scan(text, start);
+        }
+        self.end.is_none_or(|end| text[end..].trim().is_empty())
+    }
+
+    /// Scans what was added since the last call for the end of the object at `start`.
+    fn scan(&mut self, text: &str, start: usize) {
+        let from = self.scanned.max(start);
+        for (i, c) in text[from..].char_indices() {
+            if self.in_string {
+                match c {
+                    _ if self.escaped => self.escaped = false,
+                    '\\' => self.escaped = true,
+                    '"' => self.in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => self.in_string = true,
+                '{' | '[' => self.depth += 1,
+                '}' | ']' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    if self.depth == 0 {
+                        self.end = Some(from + i + 1);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.scanned = text.len();
+    }
+}

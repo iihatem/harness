@@ -159,6 +159,22 @@ struct ModelReply {
     emitted: bool,
     /// The token counts the provider reported for this call.
     usage: Option<Usage>,
+    /// How much of `text` was sent as text deltas. With text tool calls on, text that may still
+    /// turn out to be calls is held back, and shown once it cannot (see [`Self::show`]).
+    shown: usize,
+    watch: crate::textcalls::CallWatch,
+}
+
+impl ModelReply {
+    /// Sends the text not shown yet.
+    fn show(&mut self, events: &UnboundedSender<AgentEvent>) {
+        if self.shown < self.text.len() {
+            let text = self.text[self.shown..].to_string();
+            self.shown = self.text.len();
+            self.emitted = true;
+            let _ = events.send(AgentEvent::TextDelta { text });
+        }
+    }
 }
 
 /// Why the conversation is being compacted.
@@ -725,8 +741,9 @@ impl Agent {
                     reply
                 }
                 ModelOutcome::Failed(error, partial) => return self.fail(error, partial, events),
-                ModelOutcome::Interrupted(partial) => {
+                ModelOutcome::Interrupted(mut partial) => {
                     if !partial.text.is_empty() {
+                        partial.show(events);
                         self.push_assistant(partial.text, Vec::new(), events);
                     }
                     return self.finish(TurnEndReason::Interrupted, events);
@@ -745,8 +762,13 @@ impl Agent {
                     reply.tool_calls = calls;
                 }
             }
+            // Text held back in case it was calls, and that was not.
+            reply.show(events);
             let calls = reply.tool_calls.clone();
-            self.push_assistant(reply.text, calls.clone(), events);
+            // A cut-off reply with nothing in it (all reasoning, say) leaves no empty message.
+            if !(cut_off && reply.text.trim().is_empty() && calls.is_empty()) {
+                self.push_assistant(reply.text, calls.clone(), events);
+            }
             if cut_off {
                 self.after_cut_off(&calls, events);
                 continue;
@@ -1205,10 +1227,11 @@ impl Agent {
     fn fail(
         &mut self,
         error: ProviderError,
-        partial: ModelReply,
+        mut partial: ModelReply,
         events: &UnboundedSender<AgentEvent>,
     ) -> TurnEndReason {
         if !partial.text.is_empty() {
+            partial.show(events);
             self.push_assistant(partial.text, Vec::new(), events);
         }
         let _ = events.send(AgentEvent::Error {
@@ -1256,9 +1279,15 @@ impl Agent {
         while let Some(item) = stream.next().await {
             match item? {
                 ProviderEvent::TextDelta(text) => {
-                    reply.emitted = true;
                     reply.text.push_str(&text);
-                    let _ = events.send(AgentEvent::TextDelta { text });
+                    // Tool calls written as text are not shown as text: what may still become
+                    // them waits for the reply's end, or until it cannot.
+                    let held = self.config.text_tool_calls
+                        && reply.shown == 0
+                        && reply.watch.may_be_calls(&reply.text);
+                    if !held {
+                        reply.show(events);
+                    }
                 }
                 ProviderEvent::ReasoningDelta(text) => {
                     reply.emitted = true;

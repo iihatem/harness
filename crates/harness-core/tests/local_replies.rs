@@ -348,3 +348,117 @@ async fn a_text_call_cut_off_is_not_recovered() {
     let (_, events) = run(&mut agent, "go").await;
     assert!(finished_outputs(&events).is_empty());
 }
+
+// Review E M2: a cut-off reply with nothing in it (a model that spent its output reasoning)
+// records no empty assistant message before the note asking it to continue.
+#[tokio::test]
+async fn an_empty_cut_off_reply_leaves_no_empty_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::Reply(vec![
+            Ok(ProviderEvent::ReasoningDelta("Let me think".into())),
+            Ok(ProviderEvent::Finished(FinishReason::Length)),
+        ]),
+        Script::text("The answer."),
+    ]);
+    let mut agent = local_agent(provider.clone(), dir.path());
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    let history = agent.history();
+    assert_eq!(history.len(), 3, "{history:?}");
+    assert!(matches!(&history[1], Message::User { content } if content.starts_with("[harness]")));
+    assert!(matches!(&history[2], Message::Assistant { content, .. } if content == "The answer."));
+    assert!(!events.iter().any(|e| matches!(e,
+        AgentEvent::AssistantMessage { content, .. } if content.is_empty())));
+    // The note and the prompt go out as one user message.
+    let next = &provider.requests()[1].messages;
+    assert_eq!(next.len(), 1, "{next:?}");
+}
+
+/// The text deltas among `events`.
+fn text_deltas(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A reply streamed in these pieces.
+fn pieces(pieces: &[&str]) -> Script {
+    let mut items: Vec<_> = pieces
+        .iter()
+        .map(|p| Ok(ProviderEvent::TextDelta(p.to_string())))
+        .collect();
+    items.push(Ok(ProviderEvent::Finished(FinishReason::Stop)));
+    Script::Reply(items)
+}
+
+// Review E M1: a reply that is tool calls written as text is not also streamed as text, in any
+// of the three forms.
+#[tokio::test]
+async fn a_text_call_is_not_streamed_as_text() {
+    for reply in [
+        pieces(&[
+            "\n<tool_",
+            "call>{\"name\": \"echo\", \"arguments\": {\"text\": ",
+            "\"ran\"}}</tool_call>",
+        ]),
+        pieces(&[
+            "<tool_call>\n<function=echo>\n<parameter=text>\nran",
+            "\n</parameter>\n</function>\n</tool_call>\n",
+        ]),
+        pieces(&[
+            "{\"na",
+            "me\": \"echo\", \"arguments\": {\"text\": \"r}an\"}",
+            "}",
+        ]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![reply, Script::text("done")]);
+        let mut agent = local_agent(provider, dir.path());
+        let (reason, events) = run(&mut agent, "go").await;
+        assert_eq!(reason, TurnEndReason::Completed);
+        assert_eq!(finished_outputs(&events).len(), 1, "{events:?}");
+        assert_eq!(text_deltas(&events), ["done"]);
+    }
+}
+
+// Ordinary text still streams piece by piece. Text that could have been a call is held only
+// until it cannot be one, or until the reply ends, and is then shown whole.
+#[tokio::test]
+async fn ordinary_text_streams_and_held_text_is_shown_once_it_is_text() {
+    let cases: [(Script, &[&str]); 5] = [
+        (pieces(&["Hello", " world"]), &["Hello", " world"]),
+        (pieces(&["<b>bold", "</b>"]), &["<b>bold", "</b>"]),
+        (pieces(&["{\"result\": ", "1}"]), &["{\"result\": ", "1}"]),
+        (
+            pieces(&[
+                "<tool_call>{\"name\":\"echo\",\"arguments\":{\"text\":\"x\"}}</tool_call>",
+                "\nDone",
+                ", really.",
+            ]),
+            &[
+                "<tool_call>{\"name\":\"echo\",\"arguments\":{\"text\":\"x\"}}</tool_call>\nDone",
+                ", really.",
+            ],
+        ),
+        // Names a tool the agent does not have: text, shown when the reply ends.
+        (
+            pieces(&["{\"name\": \"deploy\", ", "\"arguments\": {}}"]),
+            &["{\"name\": \"deploy\", \"arguments\": {}}"],
+        ),
+    ];
+    for (reply, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![reply]);
+        let mut agent = local_agent(provider, dir.path());
+        let (_, events) = run(&mut agent, "go").await;
+        assert_eq!(text_deltas(&events), expected);
+        let shown: String = expected.concat();
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::AssistantMessage { content, .. } if *content == shown)));
+    }
+}

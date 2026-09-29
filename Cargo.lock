@@ -1490,8 +1490,10 @@ dependencies = [
 name = "harness-tui"
 version = "0.1.0"
 dependencies = [
+ "harness-core",
  "pulldown-cmark",
  "ratatui",
+ "serde_json",
  "similar 3.2.0",
  "syntect",
  "unicode-width",

@@ -4,6 +4,8 @@
 
 pub mod diff;
 pub mod highlight;
+pub mod inline;
 pub mod markdown;
 pub mod style;
 pub mod text;
+pub mod transcript;

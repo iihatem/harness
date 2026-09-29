@@ -6,11 +6,12 @@ use common::*;
 use harness_core::agent::{Agent, NonInteractive};
 use harness_core::compaction::{SUMMARY_PREFIX, SUMMARY_SYSTEM, request_tokens};
 use harness_core::event::{AgentEvent, TurnEndReason};
-use harness_core::message::{Message, Usage};
+use harness_core::message::{Message, RequestOptions, Usage};
 use harness_core::permission::Mode;
 use harness_core::provider::{FinishReason, ProviderError, ProviderEvent};
 use harness_core::session::{RewindScope, Session};
 use harness_core::testing::{MockProvider, Script};
+use harness_core::turn::{TurnInput, TurnModel};
 use tokio_util::sync::CancellationToken;
 
 fn overflow() -> Script {
@@ -491,6 +492,60 @@ async fn compacting_again_keeps_the_end_of_the_earlier_summary() {
         .collect();
     assert_eq!(summaries.len(), 2);
     assert!(first_user(&summaries[1].messages).contains("TAIL-REMAINING-WORK"));
+}
+
+// Review A I3: the session's model writes the summary under its profile's request options, so a
+// model whose output the profile limits can still be compacted.
+#[tokio::test]
+async fn the_summary_request_carries_the_configured_request_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, provider) =
+        after_three_turns(dir.path(), vec![Script::text("the summary")]).await;
+    let options = RequestOptions {
+        max_output_tokens: Some(1000),
+        temperature: Some(0.3),
+        reasoning_effort: Some("low".into()),
+    };
+    agent.config_mut().request = options.clone();
+    let (result, _) = compact_now(&mut agent).await;
+    result.unwrap();
+    let request = provider.requests().pop().unwrap();
+    assert!(is_summary_request(&request));
+    assert_eq!(request.options, options);
+}
+
+// A slash command's model keeps the provider's defaults when it writes the summary, as it does
+// for its turn: the options are the session model's.
+#[tokio::test]
+async fn a_turn_models_summary_request_keeps_the_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, session_model) = after_three_turns(dir.path(), vec![]).await;
+    agent.config_mut().request = RequestOptions {
+        max_output_tokens: Some(1000),
+        ..RequestOptions::default()
+    };
+    let command_model = MockProvider::new(vec![Script::text("summary"), Script::text("answer")]);
+    let input = TurnInput {
+        model: Some(TurnModel {
+            provider: command_model.clone(),
+            id: "mock/m2".into(),
+            name: "m2".into(),
+        }),
+        ..TurnInput::from("d".repeat(1_500))
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let reason = agent.run_turn(input, &tx, CancellationToken::new()).await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert_eq!(compacted(&events).len(), 1, "{events:?}");
+    let requests = command_model.requests();
+    assert!(is_summary_request(&requests[0]));
+    assert_eq!(requests[0].options, RequestOptions::default());
+    assert_eq!(session_model.requests().len(), 3);
 }
 
 // Review F I3: output tokens, reasoning included, are not sent back to the model, so only the

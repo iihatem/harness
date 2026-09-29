@@ -996,8 +996,13 @@ impl Agent {
         // model: then it is tried once more with half as much.
         let mut max_tokens = window / 2;
         let summary = loop {
-            let request =
+            let mut request =
                 compaction::summary_request(&model, &self.history[..cut], focus, max_tokens);
+            // The session's model writes it under its profile's options, as it answers turns; a
+            // slash command's model gets the provider's defaults, as for its turn.
+            if self.turn_model.is_none() {
+                request.options = self.config.request.clone();
+            }
             match self.summarize(request, events, cancel).await {
                 Err(CompactError::Overflow(_)) if max_tokens == window / 2 => max_tokens /= 2,
                 result => break result?,

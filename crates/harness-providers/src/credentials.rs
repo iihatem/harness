@@ -39,6 +39,10 @@ pub enum CredentialError {
     /// What the keychain said, or why it could not be used.
     #[error("{0}")]
     Keychain(String),
+    /// A keychain that did not answer within its time limit (it may be waiting to be unlocked),
+    /// and may hold what it was asked about all the same.
+    #[error("{0}")]
+    TimedOut(String),
     #[error("cannot use {}: {source}", .path.display())]
     File {
         path: PathBuf,
@@ -66,7 +70,7 @@ pub enum CredentialError {
         hint: &'static str,
     },
     #[error(
-        "{keychain} refused to store the new credential for {account} ({refused}) and to remove the older one it may still hold ({kept}), so harness would go on using that one; nothing was stored. Unlock the keychain and try again, or keep credentials in credentials.json instead: set {STORE_ENV}=file, and keep it set for every harness run (in your shell profile, say), since without it harness reads the keychain first and would use the older credential again"
+        "{keychain} refused to store the new credential for {account} ({refused}) and to remove the older one it may still hold ({kept}), so harness would go on using that one; nothing was stored. Unlock the keychain and try again, or keep credentials in credentials.json instead: set {STORE_ENV}=file, and keep it set for every harness run (in your shell profile, say), since without it harness reads the keychain first, which still holds the older credential"
     )]
     Stale {
         keychain: String,
@@ -199,7 +203,7 @@ fn within<T: Send + 'static>(
         })?;
     match rx.recv_timeout(limit) {
         Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(CredentialError::Keychain(format!(
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(CredentialError::TimedOut(format!(
             "the keychain did not answer within {} (it may be waiting to be unlocked); to keep credentials in credentials.json instead, set {STORE_ENV}=file and keep it set for every harness run, since without it harness reads the keychain first",
             if limit >= Duration::from_secs(1) {
                 format!("{} s", limit.as_secs())
@@ -299,6 +303,15 @@ impl FileStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// What is stored for `account`, as [`get`](SecretStore::get) says, without making anything
+    /// (the data directory, the lock file) when there is no file.
+    fn peek(&self, account: &str) -> Result<Option<String>, CredentialError> {
+        if std::fs::symlink_metadata(&self.path).is_err() {
+            return Ok(None);
+        }
+        self.get(account)
     }
 }
 
@@ -514,6 +527,20 @@ pub struct RenewalLock {
 /// Connects to a keychain.
 type Connect = Box<dyn Fn() -> Result<Box<dyn SecretStore>, CredentialError> + Send + Sync>;
 
+/// Why no keychain can be used in this run.
+#[derive(Debug)]
+struct Unreachable {
+    why: String,
+    /// Whether it did not answer in time, rather than not being there: it may hold credentials.
+    timed_out: bool,
+}
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
 /// Stored credentials by provider and account profile.
 pub struct Credentials {
     choice: StoreChoice,
@@ -521,7 +548,7 @@ pub struct Credentials {
     /// connection, which a run that needs no stored credential never makes.
     connect: Connect,
     /// The keychain, or why there is none.
-    keychain: OnceLock<Result<Box<dyn SecretStore>, String>>,
+    keychain: OnceLock<Result<Box<dyn SecretStore>, Unreachable>>,
     /// The data directory.
     dir: PathBuf,
     file: FileStore,
@@ -531,6 +558,9 @@ pub struct Credentials {
     /// file (the file chosen): a keychain that refused, or kept an unlock prompt waiting, is
     /// not asked again by each renewal.
     cleared: Mutex<BTreeSet<String>>,
+    /// The accounts this run has read from the file although the keychain holds another copy, or
+    /// from the keychain although the file could not be read: each is warned about once.
+    shadowed: Mutex<BTreeSet<String>>,
 }
 
 impl Credentials {
@@ -598,22 +628,26 @@ impl Credentials {
             accounts: data_dir.join("accounts.toml"),
             warnings: Mutex::new(Vec::new()),
             cleared: Mutex::new(BTreeSet::new()),
+            shadowed: Mutex::new(BTreeSet::new()),
         }
     }
 
     /// The keychain, connected to now if it was not yet, or why there is none.
-    fn keychain(&self) -> Result<&dyn SecretStore, &str> {
-        match self
-            .keychain
-            .get_or_init(|| (self.connect)().map_err(|e| e.to_string()))
-        {
+    fn keychain(&self) -> Result<&dyn SecretStore, &Unreachable> {
+        let connected = self.keychain.get_or_init(|| {
+            (self.connect)().map_err(|e| Unreachable {
+                timed_out: matches!(e, CredentialError::TimedOut(_)),
+                why: e.to_string(),
+            })
+        });
+        match connected {
             Ok(keychain) => Ok(keychain.as_ref()),
-            Err(why) => Err(why),
+            Err(unreachable) => Err(unreachable),
         }
     }
 
     /// The keychain credentials are stored in and read from: none with the file chosen.
-    fn storing_keychain(&self) -> Option<Result<&dyn SecretStore, &str>> {
+    fn storing_keychain(&self) -> Option<Result<&dyn SecretStore, &Unreachable>> {
         (self.choice == StoreChoice::Keychain).then(|| self.keychain())
     }
 
@@ -674,12 +708,13 @@ impl Credentials {
 
     /// The credential stored for `provider` under `profile`: from the keychain, or else the
     /// file (where it went when no keychain could be used). A keychain that cannot be read is an
-    /// error, unless the file holds the credential, which is then used with a warning.
+    /// error, unless the file holds the credential, which is then used with a warning. So is a
+    /// copy in the file that differs from the keychain's: see [`newer`](Self::newer).
     pub fn get(&self, provider: &str, profile: &str) -> Result<Option<String>, CredentialError> {
         let account = account(provider, profile)?;
         if let Some(Ok(keychain)) = self.storing_keychain() {
             match keychain.get(&account) {
-                Ok(Some(secret)) => return Ok(Some(secret)),
+                Ok(Some(secret)) => return Ok(Some(self.newer(keychain, &account, secret))),
                 Ok(None) => {}
                 Err(unreadable) => {
                     let Some(secret) = self.file.get(&account)? else {
@@ -695,6 +730,42 @@ impl Credentials {
             }
         }
         self.file.get(&account)
+    }
+
+    /// The newer of `secret`, the keychain's copy of `account`, and the file's. A keychain that
+    /// stores a credential removes the file's copy, so a different copy in the file was stored
+    /// later: while the keychain could not be reached, or with the file chosen, when the keychain
+    /// kept its older copy. That one is used, with a warning once a run. A file that cannot be
+    /// read leaves the keychain's copy in use, with a warning too.
+    fn newer(&self, keychain: &dyn SecretStore, account: &str, secret: String) -> String {
+        let warn_once = |warning: String| {
+            let first = self
+                .shadowed
+                .lock()
+                .expect("shadowed lock")
+                .insert(account.to_string());
+            if first {
+                self.warn(warning);
+            }
+        };
+        match self.file.peek(account) {
+            Ok(Some(copy)) if copy != secret => {
+                warn_once(format!(
+                    "{} and {} hold different copies of {account}; using the file's, the newer one (it was stored while the keychain could not be reached, or with {STORE_ENV}=file). To keep one copy, store it again in a run that reaches the keychain",
+                    self.file.describe(),
+                    keychain.describe()
+                ));
+                copy
+            }
+            Ok(_) => secret,
+            Err(unreadable) => {
+                warn_once(format!(
+                    "{unreadable}; until then, harness uses the copy of {account} in {}, though the file may hold a newer one",
+                    keychain.describe()
+                ));
+                secret
+            }
+        }
     }
 
     /// Takes the lock under which `provider`'s credential for `profile` is renewed, unless
@@ -802,14 +873,15 @@ impl Credentials {
         secret: &str,
     ) -> Result<String, CredentialError> {
         let account = account(provider, profile)?;
-        // Why the file is used; nothing to say when it was chosen (`HARNESS_CREDENTIAL_STORE`).
+        // Why the file is used, and whether a keychain reached later may hold an older copy;
+        // nothing to say when the file was chosen (`HARNESS_CREDENTIAL_STORE`).
         let why = match self.storing_keychain() {
             Some(Ok(keychain)) => match keychain.set(&account, secret) {
                 Ok(()) => {
                     // An older copy in the file must not outlive this one.
                     if let Err(e) = self.file.delete(&account) {
                         self.warn(format!(
-                            "the credential is in {}, but an older copy of it could not be removed from {} ({e}); remove that file's entry for {account} by hand",
+                            "the credential is in {}, but an older copy of it could not be removed from {} ({e}), and harness uses that copy while it is there; remove that file's entry for {account} by hand",
                             keychain.describe(),
                             self.file.describe()
                         ));
@@ -826,16 +898,22 @@ impl Credentials {
                             kept: kept.to_string(),
                         });
                     }
-                    Some(refused.to_string())
+                    Some((refused.to_string(), false))
                 }
             },
-            Some(Err(why)) => Some(why.to_string()),
+            Some(Err(unreachable)) => Some((unreachable.to_string(), true)),
             None => None,
         };
         self.file.set(&account, secret)?;
-        if let Some(why) = why {
+        if let Some((why, older)) = why {
+            // The file's copy outranks the keychain's there (see `newer`).
+            let older = if older {
+                "; a keychain reached in a later run may still hold an older copy, which harness then passes over for this one"
+            } else {
+                ""
+            };
             self.warn(format!(
-                "no keychain could store it ({why}); it is in {}, readable only by you",
+                "no keychain could store it ({why}); it is in {}, readable only by you{older}",
                 self.file.describe()
             ));
         }
@@ -846,7 +924,8 @@ impl Credentials {
     }
 
     /// Removes the keychain's copy of `account`, just stored in the file (the file chosen), once
-    /// a run. No keychain holds nothing; one that keeps its copy is a warning.
+    /// a run. No keychain holds nothing; one that keeps its copy, or does not answer, is a
+    /// warning.
     fn clear_keychain_copy(&self, account: &str) {
         let first = self
             .cleared
@@ -856,8 +935,16 @@ impl Credentials {
         if !first {
             return;
         }
-        let Ok(keychain) = self.keychain() else {
-            return;
+        let keychain = match self.keychain() {
+            Ok(keychain) => keychain,
+            Err(unreachable) if unreachable.timed_out => {
+                self.warn(format!(
+                    "the credential is in {}, but the keychain did not answer in time, so it may still hold an older copy of {account}; keep {STORE_ENV}=file set, or remove that copy: a run without it would find both, and use this one with a warning",
+                    self.file.describe()
+                ));
+                return;
+            }
+            Err(_) => return,
         };
         if let Err(kept) = keychain.delete(account) {
             self.warn(format!(

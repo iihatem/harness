@@ -5,7 +5,7 @@ Provider authentication manages how the harness obtains, stores, refreshes, and 
 ## ADDED Requirements
 
 ### Requirement: API keys come from the environment or the credential store
-The system SHALL resolve a provider's API key from its configured environment variable first and from the credential store for the active account profile second. `harness auth add <provider>` MUST read the key from standard input, without echoing it on a terminal, and MUST store it in the OS keychain. When no keychain service is available, the key MUST be stored in `credentials.json` in the harness data directory with file mode 0600, never in the configuration directory, and the user MUST be warned. A keychain that refuses a new key MUST NOT leave an older key it holds in use: the older key is removed, or storing fails with an error that says so. When the file is chosen (`HARNESS_CREDENTIAL_STORE=file`), storing a credential MUST also remove an older copy the keychain holds, or warn that it could not and that the variable must stay set; an error that recommends the variable MUST say it must stay set. A credential store that cannot be read MUST be reported as such, naming the file and how to recover, never taken for an empty one.
+The system SHALL resolve a provider's API key from its configured environment variable first and from the credential store for the active account profile second. `harness auth add <provider>` MUST read the key from standard input, without echoing it on a terminal, and MUST store it in the OS keychain. When no keychain service is available, the key MUST be stored in `credentials.json` in the harness data directory with file mode 0600, never in the configuration directory, and the user MUST be warned. A keychain that refuses a new key MUST NOT leave an older key it holds in use: the older key is removed, or storing fails with an error that says so. When the file is chosen (`HARNESS_CREDENTIAL_STORE=file`), storing a credential MUST also remove an older copy the keychain holds, or warn that it could not (the keychain refused, or did not answer in time) and that the variable must stay set; an error that recommends the variable MUST say it must stay set. Since storing in the keychain removes the file's copy, a copy in the file that differs from the keychain's is the newer one, and MUST be used, with a warning. A credential store that cannot be read MUST be reported as such, naming the file and how to recover, never taken for an empty one.
 
 #### Scenario: Environment variable wins
 - **WHEN** both `OPENAI_API_KEY` and a stored key for `openai` exist
@@ -26,6 +26,10 @@ The system SHALL resolve a provider's API key from its configured environment va
 #### Scenario: A rotated key stored in the file
 - **WHEN** the keychain holds a key for `openai`, the user adds a new one with `HARNESS_CREDENTIAL_STORE=file`, and a later run leaves the variable unset
 - **THEN** requests to `openai` use the new key, or storing it warned that the keychain still holds the older one and that the variable must stay set
+
+#### Scenario: A rotated key stored while the keychain cannot be reached
+- **WHEN** the keychain holds a key for `openai`, the user adds a new one in a run that cannot reach the keychain (no session bus, say), and a later run reaches it
+- **THEN** requests to `openai` use the new key, and the later run warns that the two stores hold different copies
 
 ### Requirement: Multiple account profiles per provider
 The system SHALL store credentials per provider and named account profile, with `default` as the unnamed profile. `harness login <provider> --profile <name>` and `harness auth add <provider> --profile <name>` MUST store credentials under that profile, and `harness auth use <provider> <name>` MUST make that profile the active one for the provider.

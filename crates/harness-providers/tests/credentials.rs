@@ -577,7 +577,10 @@ impl SecretStore for Stuck {
 fn keychain_operations_give_up_after_their_time_limit() {
     let limited = TimeLimited::new(Arc::new(Stuck), Duration::from_millis(100));
     let started = Instant::now();
-    let error = limited.get("openai/default").unwrap_err().to_string();
+    let error = limited.get("openai/default").unwrap_err();
+    // Final review, I-2: a keychain that did not answer is told apart from one there is not.
+    assert!(matches!(error, CredentialError::TimedOut(_)), "{error:?}");
+    let error = error.to_string();
     assert!(started.elapsed() < Duration::from_secs(3));
     assert!(error.contains("HARNESS_CREDENTIAL_STORE=file"), "{error}");
     assert!(error.contains("keep it set"), "{error}");
@@ -792,4 +795,151 @@ fn empty_files_hold_nothing() {
     let creds = Credentials::with_keychain(dir.path(), None);
     assert_eq!(creds.active("openai").unwrap(), None);
     assert_eq!(creds.active_profile("openai").unwrap(), "default");
+}
+
+/// A connector to a keychain that cannot be connected to, for `why`.
+fn unreachable(
+    why: fn() -> CredentialError,
+) -> impl Fn() -> Result<Box<dyn SecretStore>, CredentialError> + Send + Sync + 'static {
+    move || Err(why())
+}
+
+fn no_session_bus() -> CredentialError {
+    CredentialError::Keychain("no session bus".into())
+}
+
+fn connection_timed_out() -> CredentialError {
+    CredentialError::TimedOut("the keychain did not answer within 30 s".into())
+}
+
+/// A keychain, as a later run that reaches it finds it: holding `openai`'s older key.
+fn holding_the_older_key() -> Recording {
+    let keychain = Recording::default();
+    keychain
+        .set("openai/default", "sk-OLD-leaked-0123")
+        .unwrap();
+    keychain
+}
+
+/// What a later run in keychain mode, which reaches `keychain`, uses for `openai`, and what it
+/// warns about the first time and the second.
+fn used_later(dir: &std::path::Path, keychain: &Recording) -> (String, Vec<String>, Vec<String>) {
+    let (_, connect) = counting(keychain.clone());
+    let later = Credentials::with_connector(dir, StoreChoice::Keychain, connect);
+    let key = later.active("openai").unwrap().unwrap();
+    let first = later.take_warnings();
+    assert_eq!(
+        later.active("openai").unwrap().as_deref(),
+        Some(key.as_str())
+    );
+    (key, first, later.take_warnings())
+}
+
+// Final review, I-2, probe (a): with the file chosen, a keychain that cannot be connected to
+// cannot have its older copy removed. A later run that reaches it must still use the new key:
+// a keychain that stores a credential removes the file's copy, so a file copy next to a
+// keychain copy is the newer one.
+#[test]
+fn a_key_stored_in_file_mode_without_a_keychain_is_not_shadowed_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = holding_the_older_key();
+    let file_mode =
+        Credentials::with_connector(dir.path(), StoreChoice::File, unreachable(no_session_bus));
+    file_mode
+        .set("openai", DEFAULT_PROFILE, "sk-NEW-rotated-4567")
+        .unwrap();
+    // No keychain at all, as in a container, is nothing to warn about.
+    assert!(file_mode.take_warnings().is_empty());
+    let (key, first, second) = used_later(dir.path(), &keychain);
+    assert_eq!(key, "sk-NEW-rotated-4567");
+    assert_eq!(first.len(), 1, "{first:?}");
+    for part in [
+        "credentials.json",
+        "openai/default",
+        "the recording keychain",
+        "newer",
+    ] {
+        assert!(first[0].contains(part), "{part}: {first:?}");
+    }
+    assert!(!first[0].contains("sk-"), "{first:?}");
+    // Once a run.
+    assert!(second.is_empty(), "{second:?}");
+}
+
+// Final review, I-2: a keychain connection that timed out is not "no keychain": it may hold an
+// older copy it was not asked to remove, which is worth a warning.
+#[test]
+fn a_keychain_connection_that_timed_out_in_file_mode_is_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_mode = Credentials::with_connector(
+        dir.path(),
+        StoreChoice::File,
+        unreachable(connection_timed_out),
+    );
+    file_mode
+        .set("openai", DEFAULT_PROFILE, "sk-NEW-rotated-4567")
+        .unwrap();
+    let warnings = file_mode.take_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    for part in [
+        "did not answer",
+        "older copy",
+        "openai/default",
+        "credentials.json",
+    ] {
+        assert!(warnings[0].contains(part), "{part}: {warnings:?}");
+    }
+    assert!(!warnings[0].contains("sk-"), "{warnings:?}");
+    let (key, _, _) = used_later(dir.path(), &holding_the_older_key());
+    assert_eq!(key, "sk-NEW-rotated-4567");
+}
+
+// Final review, I-2, probe (b): in keychain mode, a run that reaches no keychain stores in the
+// file, and says a keychain reached later may hold an older copy; the later run uses the new key.
+#[test]
+fn a_key_stored_while_no_keychain_is_reachable_is_not_shadowed_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let keychain_mode = Credentials::with_connector(
+        dir.path(),
+        StoreChoice::Keychain,
+        unreachable(no_session_bus),
+    );
+    keychain_mode
+        .set("openai", DEFAULT_PROFILE, "sk-NEW-rotated-4567")
+        .unwrap();
+    let warnings = keychain_mode.take_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    for part in ["no keychain could store it", "no session bus", "older copy"] {
+        assert!(warnings[0].contains(part), "{part}: {warnings:?}");
+    }
+    let (key, first, _) = used_later(dir.path(), &holding_the_older_key());
+    assert_eq!(key, "sk-NEW-rotated-4567");
+    assert_eq!(first.len(), 1, "{first:?}");
+}
+
+// The same copy in both places is nothing to choose between, and a file that cannot be read
+// leaves the keychain's copy in use, with a warning: it may hold a newer one.
+#[test]
+fn a_keychain_copy_is_used_when_the_file_has_no_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = holding_the_older_key();
+    FileStore::new(dir.path())
+        .set("openai/default", "sk-OLD-leaked-0123")
+        .unwrap();
+    let (key, first, _) = used_later(dir.path(), &keychain);
+    assert_eq!(key, "sk-OLD-leaked-0123");
+    assert!(first.is_empty(), "{first:?}");
+    std::fs::write(dir.path().join("credentials.json"), "{not json").unwrap();
+    let (key, first, second) = used_later(dir.path(), &keychain);
+    assert_eq!(key, "sk-OLD-leaked-0123");
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(first[0].contains("credentials.json"), "{first:?}");
+    assert!(second.is_empty(), "{second:?}");
+    // Without a file, nothing is made: no data directory, no lock file.
+    let empty = tempfile::tempdir().unwrap();
+    let data = empty.path().join("data");
+    let (key, first, _) = used_later(&data, &keychain);
+    assert_eq!(key, "sk-OLD-leaked-0123");
+    assert!(first.is_empty(), "{first:?}");
+    assert!(!data.exists());
 }

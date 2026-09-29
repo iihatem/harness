@@ -47,10 +47,14 @@ fn signed_in(
         .set("chatgpt", "default", &stored.to_json())
         .unwrap();
     let redactor = Arc::new(Redactor::default());
-    let auth = ChatGptAuth::load(credentials.clone(), "default", OAuth::new(&server.uri()))
-        .unwrap()
-        .expect("signed in")
-        .with_redactor(redactor.clone());
+    let auth = ChatGptAuth::load(
+        credentials.clone(),
+        "default",
+        OAuth::new(&server.uri()).unwrap(),
+    )
+    .unwrap()
+    .expect("signed in")
+    .with_redactor(redactor.clone());
     (credentials, auth, redactor)
 }
 

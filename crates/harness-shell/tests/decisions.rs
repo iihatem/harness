@@ -260,6 +260,11 @@ fn deny_sees_through_wrappers_and_expansions() {
             ("git --git-dir=.git push", Deny),
             ("eval 'curl x'", Deny),
             ("dash -ec 'curl x'", Deny),
+            ("trap 'curl x' EXIT", Deny),
+            ("compgen -C 'curl x'", Deny),
+            ("compgen -W 'a $(curl x)'", Deny),
+            ("complete -C 'curl x' foo", Deny),
+            ("complete -W '$(curl x)' foo", Deny),
             ("echo a#b; curl x", Deny),
             ("/usr/bin/git -C x push", Deny),
         ],
@@ -501,6 +506,32 @@ fn substitutions_hidden_in_arithmetic_text_ask() {
 }
 
 #[test]
+fn parameter_transforms_ask() {
+    use Want::{Allow, Ask};
+    // `${x@P}` runs prompt expansion of `x`'s value on bash 4.4+, which can run a
+    // command substitution the value holds; every `${…@<letter>}` transform is treated
+    // the same way, since the value is not known statically. An `@` that instead follows
+    // another operator (`${x:-user@host}`) is part of that operator's text, not a
+    // transform.
+    check(
+        &default_rules(),
+        &[
+            ("echo \"${x@P}\"", Ask),
+            ("echo \"${1@P}\"", Ask),
+            ("echo \"${x@Q}\"", Ask),
+            ("echo \"${x@A}\"", Ask),
+            ("echo \"${x@a}\"", Ask),
+            ("echo \"${x@E}\"", Ask),
+            ("echo \"${x@L}\"", Ask),
+            ("echo \"${x@U}\"", Ask),
+            ("echo \"${!x@P}\"", Ask),
+            ("echo \"${x:-user@host}\"", Allow),
+            ("echo \"${x}\"", Allow),
+        ],
+    );
+}
+
+#[test]
 fn alias_definitions_ask() {
     use Want::{Ask, Unlisted};
     check(
@@ -543,6 +574,36 @@ fn quoted_text_that_builtins_evaluate_asks() {
         ),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn trap_and_completion_actions_run_as_nested_shell_text() {
+    use Want::{Allow, Ask, Unlisted};
+    // A literal `trap` action, or a literal `compgen`/`complete` `-C` command or `-W` word
+    // list, is analyzed like `bash -c '…'`: harmless text is unlisted or allowed, and a
+    // denied command inside is caught (see `deny_sees_through_wrappers_and_expansions`).
+    // Text that is not a literal, and `-F` (a shell function this analysis cannot see),
+    // ask instead of running unseen. `trap -p`, `trap -l`, `trap - SIG` and `trap '' SIG`
+    // run nothing and are unaffected.
+    check(
+        &default_rules(),
+        &[
+            ("trap 'echo hi' EXIT", Allow),
+            ("trap 'git status' INT TERM", Allow),
+            ("trap \"$cmd\" EXIT", Ask),
+            ("trap \"echo $1\" EXIT", Ask),
+            ("trap -p", Unlisted),
+            ("trap -l", Unlisted),
+            ("trap - EXIT", Unlisted),
+            ("trap '' EXIT", Unlisted),
+            ("trap", Unlisted),
+            ("compgen -W 'a b c'", Unlisted),
+            ("compgen -W \"$list\"", Ask),
+            ("compgen -C \"$cmd\"", Ask),
+            ("complete -F _myfunc foo", Ask),
+            ("compgen -F _myfunc", Ask),
+        ],
+    );
 }
 
 #[test]

@@ -776,6 +776,16 @@ impl Builder {
                                 arith_marker(&length.value)?;
                             }
                         }
+                        // `${x@P}` prompt-expands the parameter's value on bash 4.4+,
+                        // which runs a command substitution the value holds; every
+                        // `${…@<letter>}` transform is treated the same way, since the
+                        // parameter's run-time value is not known statically. An `@` that
+                        // instead follows another operator (`${x:-user@host}`) is part of
+                        // that operator's text, not a transform, and brush-parser does not
+                        // read it as one.
+                        ParameterExpr::Transform { .. } => scan.opaque.push(
+                            "a `${…@…}` transform evaluates the parameter's value, which this analysis cannot see".into(),
+                        ),
                         _ => {}
                     }
                 }

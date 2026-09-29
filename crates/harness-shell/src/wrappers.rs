@@ -104,6 +104,8 @@ fn unwrap_named(name: &str, args: &[Tok]) -> Option<Unwrapped> {
         "watch" => watch(args),
         "flock" => flock(args).map(|u| unlisted(u, "`flock` runs a command under a lock")),
         "ssh" => Some(ssh(args)),
+        "trap" => trap(args),
+        "compgen" | "complete" => completion_action(name, args),
         _ => None,
     }
 }
@@ -337,6 +339,74 @@ fn eval(args: &[Tok]) -> Option<Unwrapped> {
         },
         None => opaque("`eval` of text only known at run time"),
     })
+}
+
+/// `trap arg sigspec...` sets `arg` as the action that runs, in the same shell, when a
+/// listed signal is caught later. `trap -p`, `trap -l`, `trap - sig` (reset to default) and
+/// `trap '' sig` (ignore) run nothing and are left as ordinary commands.
+fn trap(args: &[Tok]) -> Option<Unwrapped> {
+    match args.first()? {
+        Tok::Lit(s) if matches!(s.as_str(), "-p" | "-l" | "-" | "") => None,
+        Tok::Lit(src) => Some(Unwrapped {
+            next: vec![Next::Script(src.clone())],
+            unknown_cwd: true,
+            ..Default::default()
+        }),
+        _ => Some(opaque(
+            "`trap` sets an action whose text is only known at run time",
+        )),
+    }
+}
+
+/// `compgen`/`complete`'s `-C command` runs `command` as a full command; `-W wordlist`
+/// expands each word of `wordlist` (so a command substitution in it runs); both are
+/// analyzed as nested shell text when literal. `-F function` runs a shell function this
+/// analysis cannot see, so it always asks. Other options take no action text.
+fn completion_action(name: &str, args: &[Tok]) -> Option<Unwrapped> {
+    let mut i = 0;
+    while let Some(tok) = args.get(i) {
+        i += 1;
+        let Some(s) = tok.lit() else { continue };
+        if s == "--" {
+            break;
+        }
+        let Some(rest) = s.strip_prefix('-').filter(|r| !r.is_empty()) else {
+            continue;
+        };
+        let mut chars = rest.chars();
+        let mut opt = None;
+        for c in chars.by_ref() {
+            if "ACWFGXPSo".contains(c) {
+                opt = Some(c);
+                break;
+            }
+        }
+        let Some(opt) = opt else { continue };
+        let attached = chars.as_str();
+        let value = if !attached.is_empty() {
+            Some(Tok::Lit(attached.to_owned()))
+        } else {
+            let v = args.get(i).cloned();
+            i += 1;
+            v
+        };
+        if opt == 'F' {
+            return Some(opaque(&format!(
+                "`{name} -F` runs a shell function whose body this analysis does not see"
+            )));
+        }
+        if opt == 'C' || opt == 'W' {
+            return Some(match value {
+                Some(Tok::Lit(src)) => Unwrapped {
+                    next: vec![Next::Script(src)],
+                    unknown_cwd: true,
+                    ..Default::default()
+                },
+                _ => opaque(&format!("`{name} -{opt}` runs text only known at run time")),
+            });
+        }
+    }
+    None
 }
 
 fn xargs(args: &[Tok]) -> Unwrapped {

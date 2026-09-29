@@ -486,17 +486,29 @@ impl Store {
         let file = self.file.as_mut().expect("opened above");
         let mut text = String::new();
         for entry in &entries[self.written..] {
-            let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
-            match redactor {
-                Some(redactor) => text.push_str(&redactor.redact(&line)),
-                None => text.push_str(&line),
-            }
+            let line = match redactor {
+                Some(redactor) => redacted_line(entry, redactor),
+                None => serde_json::to_string(entry),
+            };
+            text.push_str(&line.map_err(std::io::Error::other)?);
             text.push('\n');
         }
         // One write per batch, so a crash leaves at most one incomplete line.
         file.write_all(text.as_bytes())?;
         self.written = entries.len();
         Ok(())
+    }
+}
+
+/// `entry` as a line of the file, with each string in it redacted, so that a tool call's
+/// arguments (JSON within the entry) are matched too.
+fn redacted_line(entry: &Entry, redactor: &Redactor) -> serde_json::Result<String> {
+    let mut value = serde_json::to_value(entry)?;
+    redactor.redact_value(&mut value);
+    // Read back, so that the fields keep their order.
+    match serde_json::from_value::<Entry>(value.clone()) {
+        Ok(entry) => serde_json::to_string(&entry),
+        Err(_) => serde_json::to_string(&value),
     }
 }
 

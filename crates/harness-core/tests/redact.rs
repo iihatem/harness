@@ -214,3 +214,291 @@ async fn tool_output_files_and_sessions_hold_no_secrets_but_the_model_sees_the_o
             .contains(KEY)
     );
 }
+
+/// What `stream` shows of `pieces`, streamed one after another, then finished.
+fn streamed(redactor: &Arc<Redactor>, pieces: &[&str]) -> String {
+    let mut stream = redactor.stream();
+    let mut shown = String::new();
+    for piece in pieces {
+        shown.push_str(&stream.push(piece));
+    }
+    shown.push_str(&stream.finish());
+    shown
+}
+
+// Review F C1: a secret the model streams in pieces is replaced whole, wherever the pieces split
+// it: at every byte offset, into two pieces and into three.
+#[test]
+fn a_streamed_secret_is_replaced_however_it_is_split() {
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(KEY);
+    let text = format!("Your key is {KEY}, again:{KEY}{KEY}.");
+    let expected = redactor.redact(&text);
+    assert!(!expected.contains("canary"), "{expected}");
+    let n = text.len();
+    for i in 0..=n {
+        let shown = streamed(&redactor, &[&text[..i], &text[i..]]);
+        assert_eq!(shown, expected, "split at {i}");
+        for j in i..=n {
+            let shown = streamed(&redactor, &[&text[..i], &text[i..j], &text[j..]]);
+            assert_eq!(shown, expected, "split at {i} and {j}");
+        }
+    }
+}
+
+#[test]
+fn a_stream_holds_back_only_what_could_still_become_a_secret() {
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(KEY);
+    let mut stream = redactor.stream();
+    assert_eq!(stream.push("nothing secret "), "nothing secret ");
+    assert_eq!(stream.push("here: sk-can"), "here: ");
+    assert_eq!(stream.push("dle"), "sk-candle");
+    assert_eq!(stream.push(" sk-canary-0123"), " ");
+    assert_eq!(stream.push("456789abcdef!"), format!("{REDACTED}!"));
+    assert_eq!(stream.push("sk-"), "");
+    assert_eq!(stream.finish(), "sk-");
+    // After `finish`, the stream starts afresh.
+    assert_eq!(stream.push("more"), "more");
+}
+
+#[test]
+fn a_stream_replaces_secrets_that_overlap_or_hold_other_characters() {
+    let redactor = Arc::new(Redactor::default());
+    for secret in ["abababab", "pässwörd-ünïcode", r#"pa"ss\word-2024"#] {
+        redactor.add(secret);
+    }
+    for text in [
+        "abababababababab ab abababa",
+        "x pässwörd-ünïcode y pässwörd-ünïcod",
+        r#"cmd 'pa"ss\word-2024' and {"a":"pa\"ss\\word-2024"}"#,
+    ] {
+        let expected = redactor.redact(text);
+        let bounds: Vec<usize> = (0..=text.len())
+            .filter(|&i| text.is_char_boundary(i))
+            .collect();
+        for &i in &bounds {
+            for &j in bounds.iter().filter(|&&j| j >= i) {
+                let shown = streamed(&redactor, &[&text[..i], &text[i..j], &text[j..]]);
+                assert_eq!(shown, expected, "{text:?} split at {i} and {j}");
+            }
+        }
+    }
+}
+
+// Review F C1: the deltas of a turn go through one stream each, flushed before any other event,
+// so a secret split across `text_delta` or `reasoning_delta` events is never shown in pieces.
+#[test]
+fn events_show_streamed_secrets_whole_and_flush_before_other_events() {
+    use harness_core::event::{AgentEvent, TurnEndReason};
+    use harness_core::redact::EventRedactor;
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(KEY);
+    let (head, tail) = KEY.split_at(10);
+    let mut events = EventRedactor::new(redactor.clone());
+    let mut shown = Vec::new();
+    for event in [
+        AgentEvent::TurnStarted,
+        AgentEvent::ReasoningDelta {
+            text: format!("the user's key {head}"),
+        },
+        AgentEvent::TextDelta {
+            text: format!("Your key is {head}"),
+        },
+        AgentEvent::ReasoningDelta {
+            text: tail.to_string(),
+        },
+        AgentEvent::TextDelta {
+            text: tail[..3].to_string(),
+        },
+        AgentEvent::TextDelta {
+            text: format!("{}. Done", &tail[3..]),
+        },
+        AgentEvent::TextDelta {
+            text: " sk-".into(),
+        },
+        AgentEvent::AssistantMessage {
+            content: format!("Your key is {KEY}. Done sk-"),
+            model: "mock/m".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "after sk-canary".into(),
+        },
+    ] {
+        shown.extend(events.push(event));
+    }
+    shown.extend(events.finish());
+    let text: String = shown
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let reasoning: String = shown
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ReasoningDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text,
+        format!("Your key is {REDACTED}. Done sk-after sk-canary")
+    );
+    assert_eq!(reasoning, format!("the user's key {REDACTED}"));
+    let lines: Vec<String> = shown
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    for line in &lines {
+        assert!(!line.contains(head), "{line}");
+        assert!(!line.contains(tail), "{line}");
+        assert!(!line.contains(r#""text":"""#), "an empty delta: {line}");
+    }
+    // What the deltas held back comes out before the message that ends them.
+    let message = shown
+        .iter()
+        .position(|e| matches!(e, AgentEvent::AssistantMessage { .. }))
+        .unwrap();
+    assert!(matches!(&shown[message - 1], AgentEvent::TextDelta { text } if text == "sk-"));
+    assert_eq!(
+        shown[message],
+        AgentEvent::AssistantMessage {
+            content: format!("Your key is {REDACTED}. Done sk-"),
+            model: "mock/m".into(),
+        }
+    );
+    assert_eq!(shown[0], AgentEvent::TurnStarted);
+    assert!(!shown.contains(&AgentEvent::TurnFinished {
+        reason: TurnEndReason::Completed
+    }));
+}
+
+const PASSWORD: &str = r#"pa"ss\word-2024"#;
+
+/// Whether `text` holds any part of [`PASSWORD`] that would give it away, in any escaping.
+fn holds_the_password(text: &str) -> bool {
+    text.contains("word-2024")
+}
+
+// Review F I3: a tool call's arguments are JSON inside the event, so a password with `"` or `\`
+// was escaped twice there and never matched. Each string is redacted on its own now.
+#[test]
+fn a_password_in_a_tool_calls_arguments_is_redacted() {
+    use harness_core::event::AgentEvent;
+    let redactor = Redactor::default();
+    redactor.add(PASSWORD);
+    let arguments =
+        serde_json::to_string(&json!({"command": format!("mysql -p'{PASSWORD}'")})).unwrap();
+    let event = redactor.redact_event(&AgentEvent::ToolCallRequested {
+        id: "c1".into(),
+        name: "bash".into(),
+        arguments,
+    });
+    let AgentEvent::ToolCallRequested { arguments, .. } = &event else {
+        panic!("{event:?}");
+    };
+    assert!(!holds_the_password(arguments), "{arguments}");
+    let args: serde_json::Value = serde_json::from_str(arguments).unwrap();
+    assert_eq!(args["command"], format!("mysql -p'{REDACTED}'"));
+    assert!(!holds_the_password(&serde_json::to_string(&event).unwrap()));
+}
+
+#[test]
+fn session_files_hold_no_password_from_a_tool_call() {
+    use harness_core::message::ToolCall;
+    let dir = tempfile::tempdir().unwrap();
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(PASSWORD);
+    let mut session = Session::create(&dir.path().join("sessions"), dir.path());
+    session.set_redactor(redactor);
+    session.append(EntryKind::Message {
+        message: Message::Assistant {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: serde_json::to_string(&json!({"command": format!("echo '{PASSWORD}'")}))
+                    .unwrap(),
+            }],
+            model: "mock/m".into(),
+        },
+        display: None,
+        note: false,
+    });
+    let saved = std::fs::read_to_string(session.path().unwrap()).unwrap();
+    assert!(!holds_the_password(&saved), "{saved}");
+    assert!(saved.contains(REDACTED), "{saved}");
+}
+
+// Review F M5: a secret that is also a field name, an event's type or another of harness's own
+// words replaced them, which broke the NDJSON and session formats. Only values are redacted,
+// and the words that name what a record is are left alone.
+#[test]
+fn a_secret_that_is_one_of_harnesss_own_words_breaks_no_record() {
+    use harness_core::event::{AgentEvent, ErrorKind, TurnEndReason};
+    let redactor = Arc::new(Redactor::default());
+    for word in [
+        "text_delta",
+        "arguments",
+        "tool_call_requested",
+        "completed",
+        "provider",
+        "assistant",
+        "tool_calls",
+        "conversation",
+    ] {
+        redactor.add(word);
+    }
+    for event in [
+        AgentEvent::TextDelta {
+            text: "some text".into(),
+        },
+        AgentEvent::ToolCallRequested {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        },
+        AgentEvent::TurnFinished {
+            reason: TurnEndReason::Completed,
+        },
+        AgentEvent::Error {
+            kind: ErrorKind::Provider,
+            message: "it failed".into(),
+        },
+    ] {
+        assert_eq!(redactor.redact_event(&event), event);
+    }
+    // Values are still redacted.
+    assert_eq!(
+        redactor.redact_event(&AgentEvent::TextDelta {
+            text: "a text_delta b".into()
+        }),
+        AgentEvent::TextDelta {
+            text: format!("a {REDACTED} b")
+        }
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::create(&dir.path().join("sessions"), dir.path());
+    session.set_redactor(redactor);
+    session.append(EntryKind::Message {
+        message: Message::Assistant {
+            content: "the assistant speaks".into(),
+            tool_calls: vec![],
+            model: "mock/m".into(),
+        },
+        display: None,
+        note: false,
+    });
+    let path = session.path().unwrap().to_path_buf();
+    drop(session);
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains(&format!("the {REDACTED} speaks")), "{saved}");
+    let (reopened, warnings) = Session::open(&path).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(reopened.messages().iter().any(|(_, m)| matches!(
+        m,
+        Message::Assistant { content, .. } if content == &format!("the {REDACTED} speaks")
+    )));
+}

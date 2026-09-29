@@ -3,7 +3,14 @@
 //! of environment variables whose names mark them as secrets. What the model is sent is left as
 //! it is, so a file it reads and writes back keeps its real contents.
 
-use std::{ffi::OsStr, sync::RwLock};
+use std::{
+    ffi::OsStr,
+    sync::{Arc, RwLock},
+};
+
+use serde_json::Value;
+
+use crate::event::AgentEvent;
 
 /// What a secret is replaced with.
 pub const REDACTED: &str = "[redacted]";
@@ -26,6 +33,15 @@ pub const SECRET_NAME_ENDINGS: [&str; 12] = [
     "_PASS",
     "_PWD",
 ];
+
+/// The fields of harness's events and session entries whose values are harness's own words for
+/// what the record is (`"type": "text_delta"`, `"role": "assistant"`, an error's `kind`, a
+/// rewind's `scope`), never data. [`Redactor::redact_value`] leaves them alone, so that a secret
+/// that happens to be one of those words does not break the record.
+pub const WORD_FIELDS: [&str; 4] = ["type", "role", "kind", "scope"];
+
+/// What an event that could not be shown without a secret is replaced with.
+const LEFT_OUT: &str = "an event was left out because it could not be shown without a secret";
 
 /// The secrets to keep out of what harness writes. Shared, and added to as tokens are refreshed.
 #[derive(Default)]
@@ -94,6 +110,173 @@ impl Redactor {
             }
         }
         text
+    }
+
+    /// A stream for text that arrives in pieces, such as a model's streamed reply: a secret split
+    /// across pieces is replaced whole.
+    pub fn stream(self: &Arc<Self>) -> StreamRedactor {
+        StreamRedactor {
+            redactor: self.clone(),
+            pending: String::new(),
+        }
+    }
+
+    /// Redacts each string in `value`, one of harness's own records (an event or a session
+    /// entry) as JSON. Each string is matched on its own, so text that holds JSON, such as a tool
+    /// call's arguments, is matched in the form the secret takes inside it. Object keys and the
+    /// values of the [`WORD_FIELDS`] are left alone.
+    pub fn redact_value(&self, value: &mut Value) {
+        match value {
+            Value::String(text) => {
+                let redacted = self.redact(text);
+                if redacted != *text {
+                    *text = redacted;
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|item| self.redact_value(item)),
+            Value::Object(fields) => {
+                for (name, field) in fields.iter_mut() {
+                    if !(WORD_FIELDS.contains(&name.as_str()) && field.is_string()) {
+                        self.redact_value(field);
+                    }
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+
+    /// `event` with each string in it redacted (see [`redact_value`](Self::redact_value)). The
+    /// text of a delta is matched on its own: [`EventRedactor`] also finds secrets split across
+    /// deltas.
+    pub fn redact_event(&self, event: &AgentEvent) -> AgentEvent {
+        // They hold nothing but harness's words for how the turn went.
+        if matches!(
+            event,
+            AgentEvent::TurnStarted | AgentEvent::TurnFinished { .. }
+        ) {
+            return event.clone();
+        }
+        let mut value = serde_json::to_value(event).expect("events serialize");
+        self.redact_value(&mut value);
+        serde_json::from_value(value).unwrap_or_else(|_| AgentEvent::Warning {
+            message: LEFT_OUT.into(),
+        })
+    }
+
+    /// Where a stream may cut `text` without splitting a secret: before the longest end of
+    /// `text` that could still become a secret as more text arrives, and before any secret that
+    /// the cut would otherwise run through.
+    fn hold_from(&self, text: &str) -> usize {
+        let secrets = self.secrets.read().expect("secrets lock");
+        let bytes = text.as_bytes();
+        let mut from = text.len();
+        for secret in secrets.iter() {
+            // An end as long as the secret is either the secret, or cannot become it.
+            let earliest = text.len().saturating_sub(secret.len() - 1);
+            if let Some(start) =
+                (earliest..from).find(|&i| secret.as_bytes().starts_with(&bytes[i..]))
+            {
+                from = start;
+            }
+        }
+        // A secret that is already whole is held back with what follows, never cut.
+        while let Some(start) = secrets
+            .iter()
+            .flat_map(|secret| {
+                text.match_indices(secret.as_str())
+                    .map(|(i, found)| i..i + found.len())
+            })
+            .filter(|found| found.start < from && found.end > from)
+            .map(|found| found.start)
+            .min()
+        {
+            from = start;
+        }
+        from
+    }
+}
+
+/// Redacts text that arrives in pieces (see [`Redactor::stream`]). It holds back only the end of
+/// the text so far that could still become a secret, and shows everything before it, redacted.
+#[derive(Debug)]
+pub struct StreamRedactor {
+    redactor: Arc<Redactor>,
+    /// Text received and not yet shown.
+    pending: String,
+}
+
+impl StreamRedactor {
+    /// Adds `piece`, and returns what can be shown now, redacted. It can be empty.
+    pub fn push(&mut self, piece: &str) -> String {
+        self.pending.push_str(piece);
+        let held = self.redactor.hold_from(&self.pending);
+        let held = self.pending.split_off(held);
+        let ready = std::mem::replace(&mut self.pending, held);
+        self.redactor.redact(&ready)
+    }
+
+    /// Everything held back, redacted: the text has ended. The stream then starts afresh.
+    pub fn finish(&mut self) -> String {
+        self.redactor.redact(&std::mem::take(&mut self.pending))
+    }
+}
+
+/// Redacts a turn's events for a frontend to show or write: the strings of each event, and the
+/// text of the deltas across events, through one stream for the reply's text and one for its
+/// reasoning. What the streams hold back comes out, as deltas, before the next event of another
+/// kind and at [`finish`](Self::finish).
+#[derive(Debug)]
+pub struct EventRedactor {
+    redactor: Arc<Redactor>,
+    text: StreamRedactor,
+    reasoning: StreamRedactor,
+}
+
+impl EventRedactor {
+    pub fn new(redactor: Arc<Redactor>) -> EventRedactor {
+        EventRedactor {
+            text: redactor.stream(),
+            reasoning: redactor.stream(),
+            redactor,
+        }
+    }
+
+    /// The events to show for `event`, redacted: none while all of a delta's text is held back.
+    pub fn push(&mut self, event: AgentEvent) -> Vec<AgentEvent> {
+        match event {
+            AgentEvent::TextDelta { text } => {
+                delta(self.text.push(&text), |text| AgentEvent::TextDelta { text })
+            }
+            AgentEvent::ReasoningDelta { text } => delta(self.reasoning.push(&text), |text| {
+                AgentEvent::ReasoningDelta { text }
+            }),
+            other => {
+                let mut shown = self.finish();
+                shown.push(self.redactor.redact_event(&other));
+                shown
+            }
+        }
+    }
+
+    /// What the streams still hold back, as deltas: the events have ended, or an event of
+    /// another kind follows.
+    pub fn finish(&mut self) -> Vec<AgentEvent> {
+        let mut shown = delta(self.reasoning.finish(), |text| AgentEvent::ReasoningDelta {
+            text,
+        });
+        shown.extend(delta(self.text.finish(), |text| AgentEvent::TextDelta {
+            text,
+        }));
+        shown
+    }
+}
+
+/// A delta of `text`, unless there is none.
+fn delta(text: String, event: impl FnOnce(String) -> AgentEvent) -> Vec<AgentEvent> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![event(text)]
     }
 }
 

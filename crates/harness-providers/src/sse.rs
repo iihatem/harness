@@ -192,7 +192,8 @@ pub async fn send(
 /// A failure on the network, with its cause ("connection refused"), which reqwest's own message
 /// leaves out, and with the URL's host and path only: its query, fragment and credentials are
 /// left out, since a key can be kept there. A `local` server that cannot be connected to is
-/// asked after: it may not have been started.
+/// asked after: it may not have been started. A redirect refused (see [`crate::http::client`]) is
+/// a [`ProviderError::Protocol`] error, which is not retried.
 pub fn network_error(mut error: reqwest::Error, local: bool) -> ProviderError {
     if let Some(url) = error.url_mut() {
         url.set_query(None);
@@ -200,15 +201,10 @@ pub fn network_error(mut error: reqwest::Error, local: bool) -> ProviderError {
         let _ = url.set_username("");
         let _ = url.set_password(None);
     }
-    let mut text = error.to_string();
-    let mut cause = std::error::Error::source(&error);
-    while let Some(error) = cause {
-        let said = error.to_string();
-        if !text.contains(&said) {
-            text.push_str(": ");
-            text.push_str(&said);
-        }
-        cause = error.source();
+    let mut text = crate::http::describe(&error);
+    // A redirect harness refused would be refused again.
+    if error.is_redirect() {
+        return ProviderError::Protocol(text);
     }
     if local
         && error.is_connect()

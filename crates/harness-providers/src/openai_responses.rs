@@ -379,7 +379,9 @@ pub struct OpenAiResponses {
 impl OpenAiResponses {
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
         OpenAiResponses {
-            client: reqwest::Client::new(),
+            client: crate::http::client()
+                .build()
+                .expect("an HTTP client builds"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth: Auth::Key(api_key),
             no_summaries: Default::default(),
@@ -393,7 +395,9 @@ impl OpenAiResponses {
         auth: std::sync::Arc<crate::chatgpt::auth::ChatGptAuth>,
     ) -> Self {
         OpenAiResponses {
-            client: reqwest::Client::new(),
+            client: crate::http::client()
+                .build()
+                .expect("an HTTP client builds"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth: Auth::ChatGpt(auth),
             no_summaries: Default::default(),

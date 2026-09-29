@@ -353,7 +353,9 @@ pub struct AnthropicMessages {
 impl AnthropicMessages {
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
         AnthropicMessages {
-            client: reqwest::Client::new(),
+            client: crate::http::client()
+                .build()
+                .expect("an HTTP client builds"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
         }

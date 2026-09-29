@@ -207,7 +207,7 @@ impl OAuth {
             reqwest::header::HeaderValue::from_static(ORIGINATOR),
         );
         Ok(OAuth {
-            client: reqwest::Client::builder()
+            client: crate::http::client()
                 .timeout(Duration::from_secs(30))
                 .user_agent(concat!("harness/", env!("CARGO_PKG_VERSION")))
                 .default_headers(headers)
@@ -311,7 +311,7 @@ impl OAuth {
                 .json(&json!({"device_auth_id": device.device_auth_id, "user_code": device.user_code}))
                 .send()
                 .await
-                .map_err(|e| OAuthError::Network(e.to_string()))?;
+                .map_err(|e| OAuthError::Network(crate::http::describe(&e)))?;
             let status = response.status().as_u16();
             // Not approved yet (403, 404), or the server cannot say now (429, 5xx).
             let not_yet = matches!(status, 403 | 404);
@@ -376,12 +376,12 @@ fn form(pairs: &[(&str, &str)]) -> String {
 
 /// The JSON of a successful response.
 async fn read(response: reqwest::Result<reqwest::Response>) -> Result<Value, OAuthError> {
-    let response = response.map_err(|e| OAuthError::Network(e.to_string()))?;
+    let response = response.map_err(|e| OAuthError::Network(crate::http::describe(&e)))?;
     let status = response.status();
     let text = response
         .text()
         .await
-        .map_err(|e| OAuthError::Network(e.to_string()))?;
+        .map_err(|e| OAuthError::Network(crate::http::describe(&e)))?;
     if !status.is_success() {
         let value: Value = serde_json::from_str(&text).unwrap_or_default();
         let code = [&value["error"], &value["error"]["code"], &value["code"]]

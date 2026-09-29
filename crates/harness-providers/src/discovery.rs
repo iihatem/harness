@@ -49,7 +49,7 @@ impl std::fmt::Debug for Endpoint {
 /// Anthropic's listing is read page by page, up to [`MAX_PAGES`]; OpenAI's is narrowed to the
 /// models that can answer a turn.
 pub async fn list_models(endpoints: &[Endpoint], timeout: Duration) -> Vec<DiscoveredModel> {
-    let Ok(client) = reqwest::Client::builder().timeout(timeout).build() else {
+    let Ok(client) = crate::http::client().timeout(timeout).build() else {
         return Vec::new();
     };
     let probes = endpoints.iter().map(|endpoint| {

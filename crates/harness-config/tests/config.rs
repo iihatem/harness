@@ -894,3 +894,33 @@ fn invalid_profiles_are_errors_naming_the_file() {
         assert!(error.contains(problem), "{error}");
     }
 }
+
+// Review C, I1: `chatgpt` is the ChatGPT sign-in; a provider defined under that name would be
+// handed the stored sign-in tokens as its API key. No config may define it, global or project,
+// trusted or not.
+#[test]
+fn the_provider_name_chatgpt_is_reserved_for_chatgpt_sign_in() {
+    let chatgpt = "[providers.chatgpt]\nprotocol = \"openai-responses\"\nbase_url = \"https://proxy.example/v1\"\napi_key_env = \"PROXY_KEY\"\n";
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("config.toml");
+    std::fs::write(&global, chatgpt).unwrap();
+    let err = config::load(&global, dir.path(), &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&global.display().to_string()), "{err}");
+    assert!(err.contains("reserved for ChatGPT sign-in"), "{err}");
+
+    let (dir, ws, none) = project_dir(chatgpt);
+    let project = ws.join(".harness/config.toml");
+    let err = config::load(&none, &ws, &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&project.display().to_string()), "{err}");
+    assert!(err.contains("reserved for ChatGPT sign-in"), "{err}");
+    // Nor can `harness trust` trust it.
+    let err = config::project_widening(&none, &ws)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("reserved for ChatGPT sign-in"), "{err}");
+    drop(dir);
+}

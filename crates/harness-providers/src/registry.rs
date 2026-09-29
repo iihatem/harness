@@ -154,6 +154,10 @@ pub fn is_claude_subscription_token(key: &str) -> bool {
 /// variable, else the stored key. A provider without a key variable takes no key, and nothing
 /// stored is looked up for it.
 fn api_key(name: &str, key_env: Option<&str>, secrets: &impl Secrets) -> Option<String> {
+    // What is stored for `chatgpt` is a sign-in, which is never sent as a key.
+    if name == CHATGPT {
+        return None;
+    }
     let var = key_env?;
     secrets
         .env(var)
@@ -195,7 +199,8 @@ pub fn resolve(
         .split_once('/')
         .filter(|(p, m)| !p.is_empty() && !m.is_empty())
         .ok_or_else(|| ResolveError::BadId(model_id.to_string()))?;
-    if name == CHATGPT && !providers.contains_key(name) {
+    // `chatgpt` is always the signed-in account: configuration cannot define it.
+    if name == CHATGPT {
         return chatgpt(model_id, model, &secrets);
     }
     let (protocol, base_url, key_env) = if let Some(cfg) = providers.get(name) {
@@ -320,6 +325,7 @@ pub fn configured_endpoints(
 ) -> Vec<Endpoint> {
     let mut endpoints: Vec<Endpoint> = providers
         .iter()
+        .filter(|(name, _)| *name != CHATGPT)
         .filter_map(|(name, cfg)| {
             let api_key = api_key(name, cfg.api_key_env.as_deref(), &secrets);
             if cfg.api_key_env.is_some() && api_key.is_none() {

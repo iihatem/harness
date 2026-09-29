@@ -289,13 +289,28 @@ pub fn parse_file(path: &Path) -> Result<Option<ConfigFile>, ConfigError> {
             });
         }
     };
-    toml::from_str(&text)
-        .map(Some)
-        .map_err(|e| ConfigError::Parse {
+    let file: ConfigFile = toml::from_str(&text).map_err(|e| ConfigError::Parse {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    if let Some(name) = file
+        .providers
+        .keys()
+        .find(|name| RESERVED_PROVIDERS.contains(&name.as_str()))
+    {
+        return Err(ConfigError::Parse {
             path: path.to_path_buf(),
-            message: e.to_string(),
-        })
+            message: format!(
+                "[providers.{name}]: the name `{name}` is reserved for ChatGPT sign-in (`harness login {name}`); give this provider another name"
+            ),
+        });
+    }
+    Ok(Some(file))
 }
+
+/// Provider names no config may define: `chatgpt` is the account signed in with `harness login
+/// chatgpt`, whose stored tokens a provider defined under that name would be handed as its key.
+pub const RESERVED_PROVIDERS: [&str; 1] = ["chatgpt"];
 
 /// Project settings that widen what the agent may do, and a fingerprint of them. Trust is granted to a
 /// fingerprint, that of the empty set included, so any change to these settings needs trust again.

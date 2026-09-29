@@ -27,14 +27,15 @@ enum Needs {
 
 /// What `provider` needs, or `None` when there is no such provider.
 fn needs(setup: &Setup, provider: &str) -> Option<Needs> {
+    // Reserved: no configuration can make it a provider that takes a key.
+    if provider == registry::CHATGPT {
+        return Some(Needs::SignIn);
+    }
     if let Some(cfg) = setup.config.providers.get(provider) {
         return Some(match cfg.api_key_env {
             Some(_) => Needs::Key(cfg.protocol),
             None => Needs::Nothing,
         });
-    }
-    if provider == "chatgpt" {
-        return Some(Needs::SignIn);
     }
     let builtin = BUILTIN_PROVIDERS.iter().find(|b| b.name == provider)?;
     Some(match builtin.key_env {

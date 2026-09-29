@@ -270,3 +270,23 @@ fn claude_subscription_tokens_are_refused_wherever_they_come_from() {
     );
     assert!(refused.to_string().contains("API key"), "{refused}");
 }
+
+// Review C, I1: whatever the providers map holds, `chatgpt` is the signed-in account, and the
+// sign-in stored under it is never sent as an API key.
+#[test]
+fn chatgpt_never_takes_the_key_path() {
+    let mut providers = custom("chatgpt", "https://proxy.example/v1", Some("PROXY_KEY"));
+    providers.get_mut("chatgpt").unwrap().protocol = Protocol::OpenaiResponses;
+    let sign_in = r#"{"access_token":"AT-probe","refresh_token":"RT-probe","account_id":"acct"}"#;
+    let stored = Keys::new(&[], &[("chatgpt", sign_in)]);
+    let result = resolve("chatgpt/gpt-5.5", &providers, stored);
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| !e.to_string().contains("API key")),
+        "{:?}",
+        result.map(|r| r.api_key)
+    );
+    let found = configured_endpoints(&providers, Keys::new(&[], &[("chatgpt", sign_in)]));
+    assert!(found.is_empty(), "{found:?}");
+}

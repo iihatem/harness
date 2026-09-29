@@ -251,3 +251,25 @@ async fn claude_subscription_credentials_are_never_used() {
     assert!(server.received_requests().await.unwrap().is_empty());
     drop(env);
 }
+
+// Review C, I1: a `[providers.chatgpt]` definition is refused, so no command can hand the stored
+// ChatGPT sign-in to it as a key, and `auth add chatgpt` cannot overwrite that sign-in.
+#[test]
+fn a_config_cannot_define_the_chatgpt_provider() {
+    let chatgpt = "[providers.chatgpt]\nprotocol = \"openai-responses\"\nbase_url = \"http://127.0.0.1:9/v1\"\napi_key_env = \"PROXY_KEY\"\n";
+    let env = Env::new("http://127.0.0.1:9", chatgpt);
+    for args in [
+        &["auth", "add", "chatgpt"][..],
+        &["--model", "chatgpt/gpt-5.5", "ask", "hi"],
+        &["models"],
+    ] {
+        env.cmd()
+            .args(args)
+            .write_stdin("sk-proxy\n")
+            .assert()
+            .code(2)
+            .stderr(contains("config.toml"))
+            .stderr(contains("reserved for ChatGPT sign-in"));
+    }
+    assert!(!env.credentials().exists());
+}

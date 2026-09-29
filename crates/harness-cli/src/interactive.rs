@@ -80,6 +80,22 @@ pub async fn run(
         eprintln!("error: {message}");
         return 2;
     }
+    // Before the configuration loads, so that settings trusted now apply at once.
+    if let (Ok(workspace), Ok(paths)) = (
+        std::env::current_dir().and_then(|d| d.canonicalize()),
+        harness_config::paths::Paths::from_process_env(),
+    ) {
+        let asked = crate::trust::first_use(
+            &workspace,
+            &paths,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+        );
+        if let Err(e) = asked {
+            eprintln!("error: {}", terminal_safe(&e.to_string()));
+            return 1;
+        }
+    }
     let setup = match setup::load() {
         Ok(setup) => Arc::new(setup),
         Err(message) => {

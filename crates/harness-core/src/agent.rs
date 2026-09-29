@@ -1002,6 +1002,9 @@ impl Agent {
             // slash command's model gets the provider's defaults, as for its turn.
             if self.turn_model.is_none() {
                 request.options = self.config.request.clone();
+                let input =
+                    compaction::request_tokens(&request.system, &request.tools, &request.messages);
+                request.output_room = Some(window.saturating_sub(input));
             }
             match self.summarize(request, events, cancel).await {
                 Err(CompactError::Overflow(_)) if max_tokens == window / 2 => max_tokens /= 2,
@@ -1221,14 +1224,24 @@ impl Agent {
         reply: &mut ModelReply,
         events: &UnboundedSender<AgentEvent>,
     ) -> Result<(), ProviderError> {
-        // A slash command's model gets the provider's defaults: the options are the session
-        // model's.
-        let (provider, model, options) = match &self.turn_model {
-            Some(turn) => (&turn.provider, turn.name.clone(), RequestOptions::default()),
+        // A slash command's model gets the provider's defaults: the options, and the window, are
+        // the session model's.
+        let (provider, model, options, output_room) = match &self.turn_model {
+            Some(turn) => (
+                &turn.provider,
+                turn.name.clone(),
+                RequestOptions::default(),
+                None,
+            ),
             None => (
                 &self.provider,
                 self.config.model_name.clone(),
                 self.config.request.clone(),
+                Some(
+                    self.config
+                        .context_window
+                        .saturating_sub(self.estimated_tokens()),
+                ),
             ),
         };
         let request = ChatRequest {
@@ -1237,6 +1250,7 @@ impl Agent {
             messages: request_messages(&self.history),
             tools: self.tools.specs(),
             options,
+            output_room,
         };
         let mut stream = provider.stream(request);
         while let Some(item) = stream.next().await {

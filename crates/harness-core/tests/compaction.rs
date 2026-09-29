@@ -512,6 +512,9 @@ async fn the_summary_request_carries_the_configured_request_options() {
     let request = provider.requests().pop().unwrap();
     assert!(is_summary_request(&request));
     assert_eq!(request.options, options);
+    // Review A M5: and within the room the window leaves.
+    let input = request_tokens(&request.system, &request.tools, &request.messages);
+    assert_eq!(request.output_room, Some(2_000 - input));
 }
 
 // A slash command's model keeps the provider's defaults when it writes the summary, as it does
@@ -545,6 +548,7 @@ async fn a_turn_models_summary_request_keeps_the_defaults() {
     let requests = command_model.requests();
     assert!(is_summary_request(&requests[0]));
     assert_eq!(requests[0].options, RequestOptions::default());
+    assert_eq!(requests[0].output_room, None);
     assert_eq!(session_model.requests().len(), 3);
 }
 

@@ -15,6 +15,9 @@ use crate::sse::{self, EventParser};
 pub const API_VERSION: &str = "2023-06-01";
 /// `max_tokens` when the profile sets no output limit: the protocol requires one.
 pub const DEFAULT_MAX_TOKENS: u64 = 16_384;
+/// `max_tokens` is never fitted below this, however little room the window has left: a request
+/// that does not fit then is refused as too long, which leads to compaction.
+pub const MIN_MAX_TOKENS: u64 = 1_024;
 
 /// Builds a streaming Messages request body. Consecutive messages of one role become one message:
 /// tool results are user content here, so a note or prompt after them joins their message.
@@ -92,7 +95,7 @@ pub fn request_body(req: &ChatRequest) -> Value {
         .collect();
     let mut body = json!({
         "model": req.model,
-        "max_tokens": req.options.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        "max_tokens": max_tokens(req),
         "messages": messages,
         "stream": true,
     });
@@ -117,6 +120,14 @@ pub fn request_body(req: &ChatRequest) -> Value {
         body["temperature"] = json!(temperature);
     }
     body
+}
+
+/// The output limit: the profile's or the default, within the room the window has left after the
+/// input (input plus `max_tokens` must fit the window), but not below [`MIN_MAX_TOKENS`].
+fn max_tokens(req: &ChatRequest) -> u64 {
+    let limit = req.options.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    req.output_room
+        .map_or(limit, |room| limit.min(room.max(MIN_MAX_TOKENS)))
 }
 
 /// A text block, or none for text that is empty or only whitespace, which the API rejects.

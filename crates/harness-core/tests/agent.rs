@@ -566,3 +566,40 @@ async fn the_configured_request_options_reach_the_provider() {
     run(&mut agent, "hi").await;
     assert_eq!(provider.requests()[0].options, options);
 }
+
+// Review A M5 (decision 4): an output limit is sent only as large as the window leaves room for
+// after the input, which the agent estimates; a slash command's model, whose window harness
+// does not know, gets none.
+#[tokio::test]
+async fn the_room_left_in_the_window_reaches_the_provider() {
+    use harness_core::compaction::request_tokens;
+    use harness_core::turn::{TurnInput, TurnModel};
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::text("ok")]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    agent.config_mut().context_window = 20_000;
+    run(&mut agent, "hi").await;
+    let request = &provider.requests()[0];
+    let input = request_tokens(&request.system, &request.tools, &request.messages);
+    assert_eq!(request.output_room, Some(20_000 - input));
+
+    let command_model = MockProvider::new(vec![Script::text("ok")]);
+    let input = TurnInput {
+        model: Some(TurnModel {
+            provider: command_model.clone(),
+            id: "mock/m2".into(),
+            name: "m2".into(),
+        }),
+        ..TurnInput::from("again")
+    };
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_turn(input, &tx, tokio_util::sync::CancellationToken::new())
+        .await;
+    assert_eq!(command_model.requests()[0].output_room, None);
+}

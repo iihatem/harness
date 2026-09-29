@@ -346,7 +346,7 @@ fn conversation() -> ChatRequest {
             description: "Read".into(),
             parameters: json!({"type": "object"}),
         }],
-        options: RequestOptions::default(),
+        ..ChatRequest::default()
     }
 }
 

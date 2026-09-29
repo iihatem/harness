@@ -61,4 +61,8 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub options: RequestOptions,
+    /// Tokens the model's context window has left after this request's input, as the agent
+    /// estimates them; `None` when it does not know the window. An adapter that must send an
+    /// output limit keeps it within this, since input and output share the window.
+    pub output_room: Option<u64>,
 }

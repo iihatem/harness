@@ -4,7 +4,7 @@
 use harness_core::message::{ChatRequest, Message, RequestOptions, ToolCall, ToolSpec, Usage};
 use harness_core::provider::{FinishReason, ProviderError, ProviderEvent};
 use harness_providers::anthropic_messages::{
-    DEFAULT_MAX_TOKENS, MessagesStreamParser, request_body,
+    DEFAULT_MAX_TOKENS, MIN_MAX_TOKENS, MessagesStreamParser, request_body,
 };
 use serde_json::json;
 
@@ -281,7 +281,7 @@ fn request(messages: Vec<Message>) -> ChatRequest {
             description: "Read".into(),
             parameters: json!({"type": "object"}),
         }],
-        options: RequestOptions::default(),
+        ..ChatRequest::default()
     }
 }
 
@@ -599,4 +599,27 @@ fn profile_options_reach_the_request() {
     assert_eq!(body["temperature"], 0.2);
     // Extended thinking is not requested in M1.
     assert!(body.get("thinking").is_none());
+}
+
+// Review A M5 (decision 4): input plus `max_tokens` must fit the window, or the API refuses the
+// request. `max_tokens` is the smaller of the profile's limit (or the default) and the room the
+// window has left, but never below a floor: with less room than that, a request that is refused
+// as too long leads to compaction.
+#[test]
+fn max_tokens_fits_the_room_left_in_the_window() {
+    let sent = |limit: Option<u64>, room: Option<u64>| {
+        let mut req = request(vec![Message::User {
+            content: "hi".into(),
+        }]);
+        req.options.max_output_tokens = limit;
+        req.output_room = room;
+        request_body(&req)["max_tokens"].as_u64().unwrap()
+    };
+    assert_eq!(sent(None, None), DEFAULT_MAX_TOKENS);
+    assert_eq!(sent(None, Some(100_000)), DEFAULT_MAX_TOKENS);
+    assert_eq!(sent(None, Some(9_000)), 9_000);
+    assert_eq!(sent(None, Some(100)), MIN_MAX_TOKENS);
+    assert_eq!(sent(Some(4_096), Some(100_000)), 4_096);
+    assert_eq!(sent(Some(4_096), Some(2_000)), 2_000);
+    assert_eq!(sent(Some(512), Some(100)), 512);
 }

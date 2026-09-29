@@ -2,7 +2,8 @@
 //! included, since raw mode also turns off XON/XOFF flow control), bracketed paste (a paste
 //! arrives as one event), and, where the terminal supports it, disambiguated keys (so
 //! Shift+Enter differs from Enter). They are undone in reverse order when harness leaves, or
-//! hands the terminal to an editor.
+//! hands the terminal to an editor. Full-screen views (the pickers) use the terminal's
+//! alternate screen, which gives the inline screen back as it was when they close.
 
 use std::{
     io::{self, Write},
@@ -12,12 +13,16 @@ use std::{
     },
 };
 
-use ratatui::crossterm::{
-    event::{
-        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+use ratatui::{
+    backend::CrosstermBackend,
+    crossterm::{
+        event::{
+            DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+            PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        },
+        queue,
+        terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     },
-    queue, terminal,
 };
 
 /// Turns the terminal's raw mode on and off.
@@ -143,5 +148,29 @@ fn leave(out: &mut impl Write, raw: &mut impl RawMode, keyboard: bool) -> io::Re
 impl<W: Write, R: RawMode> Drop for Modes<W, R> {
     fn drop(&mut self) {
         let _ = self.suspend();
+    }
+}
+
+/// A terminal's alternate screen, for full-screen views on `B`: a blank screen of its own,
+/// which gives the normal screen back as it was, cursor included, when left. What harness wrote
+/// to the normal screen, and the scrollback, are untouched meanwhile.
+pub trait AltScreen<B> {
+    fn enter(&mut self, backend: &mut B) -> io::Result<()>;
+    fn leave(&mut self, backend: &mut B) -> io::Result<()>;
+}
+
+/// The real terminal's alternate screen (`ESC [ ? 1049 h`, and `l` to leave), through
+/// crossterm.
+pub struct CrosstermAltScreen;
+
+impl<W: Write> AltScreen<CrosstermBackend<W>> for CrosstermAltScreen {
+    fn enter(&mut self, backend: &mut CrosstermBackend<W>) -> io::Result<()> {
+        queue!(backend, EnterAlternateScreen)?;
+        backend.flush()
+    }
+
+    fn leave(&mut self, backend: &mut CrosstermBackend<W>) -> io::Result<()> {
+        queue!(backend, LeaveAlternateScreen)?;
+        backend.flush()
     }
 }

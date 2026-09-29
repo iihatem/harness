@@ -18,6 +18,7 @@ harness-core.workspace = true
 harness-providers.workspace = true
 harness-sandbox.workspace = true
 harness-tools.workspace = true
+nix = { workspace = true, features = ["term"] }
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

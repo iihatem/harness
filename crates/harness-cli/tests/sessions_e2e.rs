@@ -49,6 +49,7 @@ impl Env {
         let mut cmd = Command::new(BIN);
         cmd.current_dir(self.ws.path())
             .env("HARNESS_HOME", self.home.path())
+            .env("HARNESS_CREDENTIAL_STORE", "file")
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_STATE_HOME");
@@ -218,6 +219,7 @@ async fn a_killed_run_keeps_its_completed_turns() {
     let mut child = std::process::Command::new(BIN)
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
+        .env("HARNESS_CREDENTIAL_STORE", "file")
         .args(["-c", "ask", "three"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -321,6 +323,7 @@ async fn a_run_killed_during_a_tool_call_can_be_continued() {
     let mut child = std::process::Command::new(BIN)
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
+        .env("HARNESS_CREDENTIAL_STORE", "file")
         .args(["--mode", "full-access", "ask", "start the long job"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

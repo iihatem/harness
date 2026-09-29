@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use harness_config::config::{Protocol, ProviderConfig};
-use harness_providers::registry::{ResolveError, configured_endpoints, local_endpoints, resolve};
+use harness_providers::registry::{
+    ResolveError, Secrets, configured_endpoints, local_endpoints, resolve,
+};
 
 fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
     let map: HashMap<String, String> = pairs
@@ -177,4 +179,94 @@ fn builtin_anthropic_speaks_the_messages_protocol_with_its_key() {
     );
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].protocol, Protocol::AnthropicMessages);
+}
+
+/// Environment variables and stored keys, as the CLI gives them.
+struct Keys {
+    env: HashMap<String, String>,
+    stored: HashMap<String, String>,
+}
+
+impl Keys {
+    fn new(env: &[(&str, &str)], stored: &[(&str, &str)]) -> Keys {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        Keys {
+            env: map(env),
+            stored: map(stored),
+        }
+    }
+}
+
+impl Secrets for Keys {
+    fn env(&self, var: &str) -> Option<String> {
+        self.env.get(var).cloned()
+    }
+
+    fn stored(&self, provider: &str) -> Option<String> {
+        self.stored.get(provider).cloned()
+    }
+}
+
+// Spec: "Environment variable wins".
+#[test]
+fn the_environment_wins_over_a_stored_key() {
+    let none = BTreeMap::new();
+    let stored = Keys::new(&[], &[("openai", "sk-stored")]);
+    let r = resolve("openai/gpt-5", &none, stored).unwrap();
+    assert_eq!(r.api_key.as_deref(), Some("sk-stored"));
+    let both = Keys::new(&[("OPENAI_API_KEY", "sk-env")], &[("openai", "sk-stored")]);
+    let r = resolve("openai/gpt-5", &none, both).unwrap();
+    assert_eq!(r.api_key.as_deref(), Some("sk-env"));
+    let found = configured_endpoints(&none, Keys::new(&[], &[("openai", "sk-stored")]));
+    assert_eq!(found[0].api_key.as_deref(), Some("sk-stored"));
+}
+
+// A local server has no key variable: nothing stored is looked up for it, so a request to it
+// never reads the keychain.
+#[test]
+fn a_provider_without_a_key_variable_takes_no_stored_key() {
+    let providers = custom("local", "http://127.0.0.1:8000/v1", None);
+    let r = resolve("local/m", &providers, Keys::new(&[], &[("local", "k")])).unwrap();
+    assert_eq!(r.api_key, None);
+    let r = resolve(
+        "ollama/m",
+        &BTreeMap::new(),
+        Keys::new(&[], &[("ollama", "k")]),
+    )
+    .unwrap();
+    assert_eq!(r.api_key, None);
+}
+
+#[test]
+fn a_missing_key_says_how_to_add_one() {
+    let error = resolve("openai/gpt-5", &BTreeMap::new(), env(&[])).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "provider `openai` needs an API key: set $OPENAI_API_KEY or run `harness auth add openai`"
+    );
+}
+
+// Spec: "A subscription token in the environment".
+#[test]
+fn claude_subscription_tokens_are_refused_wherever_they_come_from() {
+    let none = BTreeMap::new();
+    let refused = ResolveError::SubscriptionToken {
+        provider: "anthropic".into(),
+    };
+    let from_env = env(&[("ANTHROPIC_API_KEY", "sk-ant-oat01-abc")]);
+    assert_eq!(
+        resolve("anthropic/claude-sonnet-4-5", &none, from_env).err(),
+        Some(refused.clone())
+    );
+    let stored = Keys::new(&[], &[("anthropic", "sk-ant-oat01-abc")]);
+    assert_eq!(
+        resolve("anthropic/claude-sonnet-4-5", &none, stored).err(),
+        Some(refused.clone())
+    );
+    assert!(refused.to_string().contains("API key"), "{refused}");
 }

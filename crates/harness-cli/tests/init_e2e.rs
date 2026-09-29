@@ -71,6 +71,7 @@ fn cmd(home: &TempDir, ws: &TempDir) -> Command {
     let mut cmd = Command::new(BIN);
     cmd.current_dir(ws.path())
         .env("HARNESS_HOME", home.path())
+        .env("HARNESS_CREDENTIAL_STORE", "file")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_STATE_HOME");

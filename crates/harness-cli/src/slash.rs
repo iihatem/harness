@@ -17,7 +17,7 @@ use harness_core::{
 };
 use harness_providers::registry;
 
-use crate::{context::home, setup, setup::Setup, term::terminal_safe};
+use crate::{context::home, setup::Setup, term::terminal_safe};
 
 /// The project's custom commands when `prompt` is a slash command, printing a warning for each
 /// command file that was ignored. `None` for ordinary prompts.
@@ -100,7 +100,7 @@ pub fn turn_input(
         input.parts.push(InputPart::Text(piped.to_string()));
     }
     if let Some(model) = expansion.model {
-        match registry::resolve(&model, &setup.config.providers, setup::env) {
+        match registry::resolve(&model, &setup.config.providers, setup.keys()) {
             Ok(resolved) => {
                 eprintln!("{}", runs_on(&command.name, &resolved.id));
                 input.model = Some(TurnModel {

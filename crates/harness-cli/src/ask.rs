@@ -72,7 +72,7 @@ pub async fn run(
         );
         return 2;
     };
-    let resolved = match registry::resolve(&model_id, &setup.config.providers, setup::env) {
+    let resolved = match registry::resolve(&model_id, &setup.config.providers, setup.keys()) {
         Ok(resolved) => resolved,
         Err(e) => {
             eprintln!("error: {}", terminal_safe(&e.to_string()));

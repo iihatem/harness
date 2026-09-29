@@ -1,4 +1,5 @@
 mod ask;
+mod auth;
 mod context;
 mod doctor;
 mod models;
@@ -57,6 +58,19 @@ enum Command {
     },
     /// List models from local servers and configured providers
     Models,
+    /// Store API keys and choose account profiles
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    /// Remove a provider's stored credentials
+    Logout {
+        /// The provider, e.g. openai
+        provider: String,
+        /// The account profile (default: the one the provider uses)
+        #[arg(long)]
+        profile: Option<String>,
+    },
     /// Review the workspace's project settings that widen what the agent may do, and trust them
     Trust {
         /// Trust without asking (for scripts)
@@ -70,6 +84,25 @@ enum Command {
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Store an API key for a provider, read from standard input (typed without echo, or piped)
+    Add {
+        /// The provider, e.g. openai
+        provider: String,
+        /// The account profile to store it under
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
+    /// Make a stored account profile the one a provider uses
+    Use {
+        /// The provider, e.g. openai
+        provider: String,
+        /// The account profile
+        profile: String,
     },
 }
 
@@ -118,6 +151,13 @@ fn command_line(command: &Command) -> &'static str {
     match command {
         Command::Ask { .. } => "harness ask",
         Command::Models => "harness models",
+        Command::Auth {
+            command: AuthCommand::Add { .. },
+        } => "harness auth add",
+        Command::Auth {
+            command: AuthCommand::Use { .. },
+        } => "harness auth use",
+        Command::Logout { .. } => "harness logout",
         Command::Trust { .. } => "harness trust",
         Command::Sandbox { .. } => "harness sandbox doctor",
     }
@@ -177,6 +217,15 @@ fn main() -> ExitCode {
                 ask::run(cli.model, cli.mode, session, prompt.join(" "), json).await
             }
             Some(Command::Models) => models::run().await,
+            Some(Command::Auth {
+                command: AuthCommand::Add { provider, profile },
+            }) => auth::add(&provider, &profile),
+            Some(Command::Auth {
+                command: AuthCommand::Use { provider, profile },
+            }) => auth::use_profile(&provider, &profile),
+            Some(Command::Logout { provider, profile }) => {
+                auth::logout(&provider, profile.as_deref())
+            }
             Some(Command::Trust { yes, revoke }) => trust::run(yes, revoke),
             Some(Command::Sandbox {
                 command: SandboxCommand::Doctor,

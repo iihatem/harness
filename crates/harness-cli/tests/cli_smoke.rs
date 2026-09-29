@@ -51,6 +51,7 @@ fn resume_without_an_id_before_a_subcommand_is_an_error() {
         Command::new(env!("CARGO_BIN_EXE_harness"))
             .args(args)
             .env("HARNESS_HOME", home.path())
+            .env("HARNESS_CREDENTIAL_STORE", "file")
             .assert()
             .code(2)
             .stderr(contains("--resume needs an id"));
@@ -69,6 +70,7 @@ fn resume_taking_the_prompt_for_its_id_is_explained() {
         Command::new(env!("CARGO_BIN_EXE_harness"))
             .args(args)
             .env("HARNESS_HOME", home.path())
+            .env("HARNESS_CREDENTIAL_STORE", "file")
             .assert()
             .code(2)
             .stderr(contains("--resume needs an id, followed by the prompt"));
@@ -99,10 +101,53 @@ fn session_flags_with_another_subcommand_are_refused() {
         Command::new(env!("CARGO_BIN_EXE_harness"))
             .args(args)
             .env("HARNESS_HOME", home.path())
+            .env("HARNESS_CREDENTIAL_STORE", "file")
             .assert()
             .code(2)
             .stderr(contains(format!(
                 "{flag} continues a session, which only `harness ask` does; run `{command}` without it"
             )));
     }
+}
+
+// Spec: "Help output" lists the credential commands.
+#[test]
+fn help_lists_the_credential_commands() {
+    Command::new(env!("CARGO_BIN_EXE_harness"))
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(contains("auth").and(contains("logout")));
+    Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["auth", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("add").and(contains("use")));
+    Command::new(env!("CARGO_BIN_EXE_harness"))
+        .args(["auth", "add", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--profile").and(contains("standard input")));
+}
+
+#[test]
+fn session_flags_with_the_credential_commands_are_refused() {
+    let home = tempfile::tempdir().unwrap();
+    for (args, command) in [
+        (&["-c", "auth", "add", "openai"][..], "harness auth add"),
+        (&["auth", "use", "openai", "work", "-c"], "harness auth use"),
+        (&["logout", "openai", "--continue"], "harness logout"),
+    ] {
+        Command::new(env!("CARGO_BIN_EXE_harness"))
+            .args(args)
+            .env("HARNESS_HOME", home.path())
+            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .write_stdin("sk-never-stored")
+            .assert()
+            .code(2)
+            .stderr(contains(format!(
+                "-c/--continue continues a session, which only `harness ask` does; run `{command}` without it"
+            )));
+    }
+    assert!(!home.path().join("data/credentials.json").exists());
 }

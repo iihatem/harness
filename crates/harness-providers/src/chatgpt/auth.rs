@@ -28,8 +28,9 @@ pub const PROVIDER: &str = "chatgpt";
 pub const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 /// Refresh the access token when it expires within this long.
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
-/// How long a renewal waits for another process's to finish before going on without the lock.
-const RENEWAL_WAIT: Duration = Duration::from_secs(60);
+/// How long a renewal waits for another process's to finish before going on without the lock:
+/// longer than one can take (each keychain operation, and the refresh, give up after 30 s).
+const RENEWAL_WAIT: Duration = Duration::from_secs(180);
 
 pub struct ChatGptAuth {
     oauth: OAuth,

@@ -48,7 +48,7 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 - [x] 3.5 Checkpoints: shadow-repository snapshots, rewind of code/conversation/both, undo last rewind, degradation; verify the checkpoints scenarios as tests
 - [x] 3.6 Compaction (automatic, `/compact`, overflow retry) and `/init`; verify the compaction scenarios with the mock provider (on-demand compaction is an API here; the interactive `/compact` command comes with the terminal UI in 5.7)
 
-## 4. P4 Providers (plan written after P3)
+## 4. P4 Providers (`docs/superpowers/plans/2026-09-28-m1-p4-providers.md`)
 
 - [ ] 4.1 OpenAI Responses adapter; verify with recorded SSE fixtures
 - [ ] 4.2 Anthropic Messages adapter; verify with recorded SSE fixtures

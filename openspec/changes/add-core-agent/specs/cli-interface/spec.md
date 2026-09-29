@@ -86,7 +86,7 @@ It MUST NOT change system files itself.
 - **THEN** it reports the basic tier, the reason, and the commands that would enable the full tier
 
 ### Requirement: Management subcommands
-The system SHALL provide `harness models`, `harness login <provider>`, `harness logout <provider>`, `harness auth add <provider>`, `harness auth use <provider> <profile>`, `harness trust [--yes] [--revoke]`, and `harness sandbox doctor`, with `--profile` accepted by `login`, `logout`, and `auth add`, and the flags `--model`, `--mode`, `-c`, and `--resume`.
+The system SHALL provide `harness models`, `harness login <provider>`, `harness logout <provider>`, `harness auth add <provider>`, `harness auth use <provider> <profile>`, `harness trust [--yes] [--revoke]`, and `harness sandbox doctor`, with `--profile` accepted by `login`, `logout`, and `auth add`, `--device` accepted by `login`, and the flags `--model`, `--mode`, `-c`, `--resume`, and `--debug`. `harness auth add` MUST read the key from standard input. `--debug` MUST write the run's event stream to a log file in the state directory and print its path.
 
 #### Scenario: Help output
 - **WHEN** the user runs `harness --help`

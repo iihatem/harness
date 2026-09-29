@@ -37,14 +37,18 @@ The system SHALL store conversation history in a provider-neutral form so that t
 - **THEN** the next request to the new model includes the prior user messages, assistant replies, and tool results
 
 ### Requirement: Model profiles tune behaviour per model
-The system SHALL resolve a model profile for the active model from user configuration, then built-in profiles, then protocol defaults, matching profile keys as globs against model ids. A profile MUST be able to set the context window, minimum context, maximum output tokens, temperature, reasoning effort, text tool-call parsing, and whether the model is local. The system MUST ship built-in profiles for common open-weight coding model families.
+The system SHALL resolve a model profile for the active model from user configuration, then built-in profiles, then protocol defaults, matching profile keys as globs against model ids without regard to case. Each setting MUST be resolved on its own, and within one layer the matching key with the most characters other than `*` and `?` MUST win. A profile MUST be able to set the context window, minimum context, maximum output tokens, temperature, reasoning effort, text tool-call parsing, and whether the model is local. The system MUST ship built-in profiles for common open-weight coding model families. Profiles in a project's configuration MUST apply only in a trusted workspace.
 
 #### Scenario: User profile overrides built-in
 - **WHEN** a built-in profile sets temperature 0.7 for `ollama/qwen3-coder*` and the user's config sets temperature 0.2 for the same glob
 - **THEN** requests to `ollama/qwen3-coder:30b` use temperature 0.2
 
+#### Scenario: The most specific key wins
+- **WHEN** the user's config sets `context_window = 65536` for `ollama/*` and `context_window = 16384` for `ollama/qwen3-coder*`
+- **THEN** `ollama/qwen3-coder:30b` uses a 16,384-token window and `ollama/llama3.1` a 65,536-token window
+
 ### Requirement: Effective context is detected and checked
-The system SHALL determine a model's effective context window as the smaller of the size the serving local server reports it is actually running with and the profile's context window, fall back to 8192 tokens with a warning when neither is known, and warn the user with a remediation hint when the effective window is below the profile's minimum context (default 32,768 tokens).
+The system SHALL determine a model's effective context window as the smaller of the size the serving local server reports it is actually running with and the profile's context window, fall back to 8192 tokens with a warning when neither is known, and warn the user with a remediation hint when the effective window is below the profile's minimum context (default 32,768 tokens). It MUST ask llama.cpp's `/props`, Ollama's running models (loading the model first when it is not loaded) and LM Studio's loaded model instances, and a server that does not answer in time MUST count as not reporting.
 
 #### Scenario: Ollama running with a small context
 - **WHEN** Ollama reports the loaded model runs with a 4,096-token context and the profile's minimum is 32,768
@@ -63,7 +67,7 @@ The system SHALL validate each tool call's arguments against the tool's JSON sch
 - **THEN** no file is read, the model receives an error result, and the turn's invalid-call count increases by one
 
 ### Requirement: Tool calls written as text are recovered
-When text tool-call parsing is enabled for the active model (the default for local providers), the system SHALL treat an assistant message that contains no native tool calls and consists of `<tool_call>` blocks, or solely of a JSON object with `name` and `arguments` fields, as tool calls. Recovered calls MUST go through the same validation and permission checks as native calls. Text that merely contains such structures alongside other prose MUST NOT be treated as a tool call.
+When text tool-call parsing is enabled for the active model (the default for local providers), the system SHALL treat an assistant message that contains no native tool calls and consists of `<tool_call>` blocks, or solely of a JSON object with `name` and `arguments` (or `parameters`) fields, naming available tools, as tool calls. Recovered calls MUST go through the same validation and permission checks as native calls. Text that merely contains such structures alongside other prose MUST NOT be treated as a tool call.
 
 #### Scenario: Local model emits a tagged tool call as text
 - **WHEN** a local model replies only with `<tool_call>{"name":"read","arguments":{"path":"src/lib.rs"}}</tool_call>`
@@ -74,11 +78,15 @@ When text tool-call parsing is enabled for the active model (the default for loc
 - **THEN** no tool call is executed
 
 ### Requirement: Truncated output is detected
-When the provider reports that output stopped because it reached the output-token limit, the system SHALL NOT execute any partial tool call from that output, and MUST tell the model its output was cut off and ask it to continue in smaller steps.
+When the provider reports that output stopped because it reached the output-token limit, the system SHALL NOT execute any partial tool call from that output, and MUST tell the model its output was cut off and ask it to continue in smaller steps. Each tool call of that output MUST receive an error result saying so; output without tool calls MUST be kept and followed by a note asking the model to continue. The turn MUST go on within its step limit.
 
 #### Scenario: Write call cut off
 - **WHEN** a `write` call's arguments are cut off by the output limit
 - **THEN** no file is written and the model receives a message that its output was truncated
+
+#### Scenario: Answer cut off
+- **WHEN** a reply without tool calls stops at the output limit
+- **THEN** the reply is kept, the model is asked to continue where it stopped, and its next reply finishes the turn
 
 ### Requirement: The user chooses a default model on first use
 When no model is configured or given on the command line, interactive mode SHALL show the model picker listing discovered and credentialed models and save the selection as the global default. If no models are available, interactive mode MUST guide the user to sign in or configure a provider. `harness ask` MUST NOT pick a model implicitly: it MUST exit with code 2 and a message listing any available models and how to set a default.

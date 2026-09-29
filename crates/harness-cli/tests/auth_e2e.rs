@@ -195,9 +195,15 @@ async fn auth_add_refuses_what_it_cannot_store() {
         env.add("ollama", None, "k")
             .code(2)
             .stderr(contains("needs no API key"));
+        // A build without sign-in says it has none (no_sign_in_e2e.rs).
+        let sign_in = if cfg!(feature = "chatgpt-login") {
+            "harness login chatgpt"
+        } else {
+            "made without ChatGPT sign-in"
+        };
         env.add("chatgpt", None, "k")
             .code(2)
-            .stderr(contains("harness login chatgpt"));
+            .stderr(contains(sign_in));
         env.add("mock", Some("../x"), "k").code(2);
         assert!(!env.credentials().exists());
     })

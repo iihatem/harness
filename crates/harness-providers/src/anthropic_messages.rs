@@ -74,11 +74,17 @@ pub fn request_body(req: &ChatRequest) -> Value {
             }
         }
     }
-    if let Some(block) = messages
-        .last_mut()
-        .and_then(|(_, content)| content.last_mut())
-    {
-        block["cache_control"] = json!({"type": "ephemeral"});
+    // The cache is looked up only about 20 blocks back from a breakpoint, and one step with many
+    // calls adds more: the previous request's last message, where that request wrote the cache,
+    // is marked too. With the system prompt, that is three of the four breakpoints allowed.
+    let users: Vec<usize> = (0..messages.len())
+        .filter(|&i| messages[i].0 == "user")
+        .collect();
+    let previous = users.iter().rev().nth(1).copied();
+    for i in previous.into_iter().chain(messages.len().checked_sub(1)) {
+        if let Some(block) = messages[i].1.last_mut() {
+            block["cache_control"] = json!({"type": "ephemeral"});
+        }
     }
     let messages: Vec<Value> = messages
         .into_iter()
@@ -143,7 +149,39 @@ fn tool_use_id(id: &str) -> String {
 struct PartialCall {
     id: String,
     name: String,
+    /// The input its start event gave, which some compatible servers send whole.
+    input: Option<String>,
     arguments: String,
+}
+
+/// The token counts a stream reported, as the server gave them: in `message_start`, and updated
+/// by `message_delta`.
+#[derive(Debug, Default)]
+struct Counts {
+    input: Option<u64>,
+    cache_writes: u64,
+    cache_reads: u64,
+    output: u64,
+}
+
+impl Counts {
+    fn update(&mut self, usage: &Value) {
+        let count = |key: &str| usage[key].as_u64();
+        self.input = count("input_tokens").or(self.input);
+        self.cache_writes = count("cache_creation_input_tokens").unwrap_or(self.cache_writes);
+        self.cache_reads = count("cache_read_input_tokens").unwrap_or(self.cache_reads);
+        self.output = count("output_tokens").unwrap_or(self.output);
+    }
+
+    /// The usage, when the server said how much was sent. Input is everything sent: uncached,
+    /// written to the cache, and read from it.
+    fn usage(&self) -> Option<Usage> {
+        Some(Usage {
+            input_tokens: self.input? + self.cache_writes + self.cache_reads,
+            output_tokens: self.output,
+            cached_tokens: self.cache_reads,
+        })
+    }
 }
 
 /// Turns Messages stream events into [`ProviderEvent`]s. Tool calls are buffered by content block
@@ -151,7 +189,7 @@ struct PartialCall {
 #[derive(Debug, Default)]
 pub struct MessagesStreamParser {
     calls: BTreeMap<u64, PartialCall>,
-    usage: Option<Usage>,
+    counts: Counts,
     finish: Option<FinishReason>,
     done: bool,
 }
@@ -162,18 +200,7 @@ impl MessagesStreamParser {
             .map_err(|e| ProviderError::Protocol(format!("{e} in event: {data}")))?;
         let mut out = Vec::new();
         match event["type"].as_str().unwrap_or_default() {
-            "message_start" => {
-                let usage = &event["message"]["usage"];
-                let count = |key: &str| usage[key].as_u64().unwrap_or(0);
-                // Input is everything sent: uncached, written to the cache, and read from it.
-                self.usage = Some(Usage {
-                    input_tokens: count("input_tokens")
-                        + count("cache_creation_input_tokens")
-                        + count("cache_read_input_tokens"),
-                    output_tokens: count("output_tokens"),
-                    cached_tokens: count("cache_read_input_tokens"),
-                });
-            }
+            "message_start" => self.counts.update(&event["message"]["usage"]),
             "content_block_start" => {
                 let block = &event["content_block"];
                 if block["type"] == "tool_use" {
@@ -181,6 +208,10 @@ impl MessagesStreamParser {
                     let call = self.calls.entry(index).or_default();
                     call.id = block["id"].as_str().unwrap_or_default().to_string();
                     call.name = block["name"].as_str().unwrap_or_default().to_string();
+                    call.input = block
+                        .get("input")
+                        .filter(|input| input.as_object().is_some_and(|o| !o.is_empty()))
+                        .map(Value::to_string);
                 }
             }
             "content_block_delta" => {
@@ -214,16 +245,12 @@ impl MessagesStreamParser {
                     self.finish = Some(match reason {
                         "end_turn" | "stop_sequence" => FinishReason::Stop,
                         "tool_use" => FinishReason::ToolCalls,
-                        "max_tokens" => FinishReason::Length,
+                        // Stopped at the end of the context window: cut off, as at its limit.
+                        "max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
                         other => FinishReason::Other(other.to_string()),
                     });
                 }
-                if let (Some(usage), Some(output)) = (
-                    self.usage.as_mut(),
-                    event["usage"]["output_tokens"].as_u64(),
-                ) {
-                    usage.output_tokens = output;
-                }
+                self.counts.update(&event["usage"]);
             }
             "message_stop" => out.extend(self.finish()),
             "error" => return Err(stream_error(&event["error"])),
@@ -239,19 +266,20 @@ impl MessagesStreamParser {
         }
         self.done = true;
         let mut out: Vec<ProviderEvent> = self
-            .usage
-            .take()
+            .counts
+            .usage()
             .map(ProviderEvent::Usage)
             .into_iter()
             .collect();
+        // Deltas, when they came, are the input; else what the start event gave, if anything.
         out.extend(std::mem::take(&mut self.calls).into_values().map(|call| {
             ProviderEvent::ToolCall(ToolCall {
                 id: call.id,
                 name: call.name,
-                arguments: if call.arguments.trim().is_empty() {
-                    "{}".into()
-                } else {
+                arguments: if !call.arguments.trim().is_empty() {
                     call.arguments
+                } else {
+                    call.input.unwrap_or_else(|| "{}".into())
                 },
             })
         }));

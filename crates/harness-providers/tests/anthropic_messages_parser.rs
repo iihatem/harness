@@ -125,6 +125,144 @@ fn finish_is_idempotent() {
     assert!(parser.finish().is_empty());
 }
 
+/// The events a parser yields for these payloads, then what `finish` still has.
+fn events_of(payloads: &[serde_json::Value]) -> Vec<ProviderEvent> {
+    let mut parser = MessagesStreamParser::default();
+    let mut events: Vec<ProviderEvent> = payloads
+        .iter()
+        .flat_map(|p| parser.push(&p.to_string()).unwrap())
+        .collect();
+    events.extend(parser.finish());
+    events
+}
+
+fn start(usage: Option<serde_json::Value>) -> serde_json::Value {
+    let mut message = json!({"id": "msg_1", "type": "message", "role": "assistant",
+        "content": [], "model": "claude", "stop_reason": null});
+    if let Some(usage) = usage {
+        message["usage"] = usage;
+    }
+    json!({"type": "message_start", "message": message})
+}
+
+fn stop_with(reason: &str, usage: serde_json::Value) -> serde_json::Value {
+    json!({"type": "message_delta", "delta": {"stop_reason": reason}, "usage": usage})
+}
+
+fn usage_of(events: &[ProviderEvent]) -> Vec<Usage> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Usage(usage) => Some(*usage),
+            _ => None,
+        })
+        .collect()
+}
+
+// Review A M3: a compatible server that gives no usage at the start reports none, not a request
+// of 0 tokens, which would stop proactive compaction; counts a `message_delta` carries update
+// what the start said.
+#[test]
+fn usage_is_taken_from_where_the_server_gives_it() {
+    let stop = json!({"type": "message_stop"});
+    let none = events_of(&[
+        start(None),
+        stop_with("end_turn", json!({"output_tokens": 5})),
+        stop.clone(),
+    ]);
+    assert!(usage_of(&none).is_empty(), "{none:?}");
+    let at_the_end = events_of(&[
+        start(None),
+        stop_with(
+            "end_turn",
+            json!({"input_tokens": 5000, "cache_read_input_tokens": 1000, "output_tokens": 20}),
+        ),
+        stop.clone(),
+    ]);
+    assert_eq!(
+        usage_of(&at_the_end),
+        [Usage {
+            input_tokens: 6000,
+            output_tokens: 20,
+            cached_tokens: 1000,
+        }]
+    );
+    let updated = events_of(&[
+        start(Some(
+            json!({"input_tokens": 25, "cache_creation_input_tokens": 100,
+            "cache_read_input_tokens": 2000, "output_tokens": 1}),
+        )),
+        stop_with("end_turn", json!({"input_tokens": 30, "output_tokens": 15})),
+        stop,
+    ]);
+    assert_eq!(
+        usage_of(&updated),
+        [Usage {
+            input_tokens: 2130,
+            output_tokens: 15,
+            cached_tokens: 2000,
+        }]
+    );
+}
+
+// Review A M4: a compatible server can give a call's whole input in its start event, with no
+// deltas; deltas, when they come, are the input.
+#[test]
+fn a_tool_uses_input_in_its_start_event_is_kept() {
+    let tool = |input: serde_json::Value| {
+        json!({"type": "content_block_start", "index": 0,
+        "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read", "input": input}})
+    };
+    let delta = |json: &str| {
+        json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": json}})
+    };
+    let stop = json!({"type": "message_stop"});
+    let arguments = |events: Vec<ProviderEvent>| {
+        events
+            .into_iter()
+            .find_map(|e| match e {
+                ProviderEvent::ToolCall(call) => Some(call.arguments),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        arguments(events_of(&[
+            tool(json!({"path": "src/lib.rs"})),
+            stop.clone()
+        ])),
+        r#"{"path":"src/lib.rs"}"#
+    );
+    assert_eq!(
+        arguments(events_of(&[
+            tool(json!({"path": "old"})),
+            delta(""),
+            delta(r#"{"path": "new"}"#),
+            stop.clone()
+        ])),
+        r#"{"path": "new"}"#
+    );
+    assert_eq!(arguments(events_of(&[tool(json!({})), stop])), "{}");
+}
+
+// Review A M5: a model that stops at the end of its window was cut off, as at `max_tokens`.
+#[test]
+fn stopping_at_the_context_window_is_a_cut_off() {
+    let events = events_of(&[
+        start(Some(json!({"input_tokens": 10, "output_tokens": 1}))),
+        stop_with(
+            "model_context_window_exceeded",
+            json!({"output_tokens": 100}),
+        ),
+        json!({"type": "message_stop"}),
+    ]);
+    assert_eq!(
+        events.last(),
+        Some(&ProviderEvent::Finished(FinishReason::Length))
+    );
+}
+
 fn call(id: &str, arguments: &str) -> ToolCall {
     ToolCall {
         id: id.into(),
@@ -218,6 +356,63 @@ fn tool_results_and_the_next_prompt_share_one_user_message() {
                 "cache_control": {"type": "ephemeral"}},
         ]})
     );
+}
+
+/// The blocks of `body` marked as prompt-cache breakpoints, as (message index, block index).
+fn breakpoints(body: &serde_json::Value) -> Vec<(usize, usize)> {
+    let mut marked = Vec::new();
+    for (m, message) in body["messages"].as_array().unwrap().iter().enumerate() {
+        for (b, block) in message["content"].as_array().unwrap().iter().enumerate() {
+            if block.get("cache_control").is_some() {
+                marked.push((m, b));
+            }
+        }
+    }
+    marked
+}
+
+// Review A M6: the cache is looked up only about 20 blocks back from a breakpoint, and a step
+// with many parallel calls adds more. The previous request's last message is marked too, where
+// that request wrote the cache, so it is found whatever came since.
+#[test]
+fn the_previous_requests_end_is_a_cache_breakpoint_too() {
+    let calls: Vec<ToolCall> = (0..12)
+        .map(|i| call(&format!("t{i}"), r#"{"path":"a"}"#))
+        .collect();
+    let mut messages = vec![
+        Message::User {
+            content: "first".into(),
+        },
+        Message::Assistant {
+            content: "Done.".into(),
+            tool_calls: vec![],
+            model: "anthropic/claude-sonnet-4-5".into(),
+        },
+        Message::User {
+            content: "read all twelve".into(),
+        },
+        Message::Assistant {
+            content: "Reading.".into(),
+            tool_calls: calls.clone(),
+            model: "anthropic/claude-sonnet-4-5".into(),
+        },
+    ];
+    messages.extend(calls.iter().map(|c| Message::Tool {
+        call_id: c.id.clone(),
+        content: "A".into(),
+        is_error: false,
+    }));
+    let body = request_body(&request(messages));
+    // The request before this one ended with "read all twelve".
+    assert_eq!(breakpoints(&body), [(2, 0), (4, 11)]);
+    assert_eq!(body["messages"][2]["content"][0]["text"], "read all twelve");
+    // With the system prompt, three of the four breakpoints the API allows.
+    assert!(body["system"][0].get("cache_control").is_some());
+    // A first request has one message to mark.
+    let first = request_body(&request(vec![Message::User {
+        content: "hi".into(),
+    }]));
+    assert_eq!(breakpoints(&first), [(0, 0)]);
 }
 
 /// Whether a tool-use id fits the API's pattern, `^[a-zA-Z0-9_-]+$`.

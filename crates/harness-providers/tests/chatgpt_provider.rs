@@ -680,3 +680,35 @@ async fn only_a_refused_refresh_token_means_signing_in_again() {
     assert!(error.is_retryable(), "{error}");
     assert!(!error.to_string().contains("harness login"), "{error}");
 }
+
+// Re-review B+C, R4: after `harness logout` elsewhere, a running session must not go on renewing
+// and using the account. It ends at its next renewal, as Codex's does, naming the profile.
+#[tokio::test]
+async fn a_profile_signed_out_elsewhere_ends_the_session_at_its_next_renewal() {
+    let server = MockServer::start().await;
+    mock_refresh(&server, "rt-1", &access_token("renewed", 7200), "rt-2").await;
+    let old = access_token("old", 60);
+    let signed = Signed::in_profile(&tokens(&old, "rt-1"), "work");
+    let auth = signed.auth(&server);
+    assert!(
+        signed
+            .another_process()
+            .credentials
+            .remove("chatgpt", "work")
+            .unwrap()
+    );
+    let error = auth.current().await.unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("signed out"), "{text}");
+    assert!(text.contains("profile `work`"), "{text}");
+    assert!(
+        text.contains("`harness login chatgpt --profile work`"),
+        "{text}"
+    );
+    assert!(!error.is_retryable(), "{text}");
+    // Every later request ends the same way, a 401 included, and nothing is refreshed or stored.
+    assert!(auth.current().await.is_err());
+    assert!(auth.after_unauthorized(&old).await.is_err());
+    assert!(refreshes(&server).await.is_empty());
+    assert_eq!(signed.credentials.get("chatgpt", "work").unwrap(), None);
+}

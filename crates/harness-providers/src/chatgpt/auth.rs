@@ -5,8 +5,9 @@
 //! processes (a file in the data directory, one per profile), and reads the stored tokens again
 //! once it holds it: another process may have renewed them already. A renewal keeps the session's
 //! account: when the profile has since been signed in to another account, the session goes on
-//! with its own and leaves that sign-in alone. Fresh tokens are used even when they cannot be
-//! stored, with a warning, and storing them is tried again at the next renewal.
+//! with its own and leaves that sign-in alone. When the profile has been signed out since, the
+//! session ends at its next renewal. Fresh tokens are used even when they cannot be stored, with a
+//! warning, and storing them is tried again at the next renewal.
 
 use std::{
     sync::Arc,
@@ -135,10 +136,11 @@ impl ChatGptAuth {
 
     /// Replaces the session's tokens, whose access token `used` is no good: with the stored
     /// tokens when another process has renewed them, else with refreshed ones, which are then
-    /// stored.
+    /// stored. A profile signed out since (`harness logout` in another run) ends the session.
     async fn renew(&self, session: &mut Session, used: &str) -> Result<(), ProviderError> {
         let _lock = self.lock().await;
         match self.read_store().await {
+            Ok(None) => return Err(self.signed_out()),
             Ok(now) => {
                 self.take_in(session, now);
             }
@@ -198,6 +200,19 @@ impl ChatGptAuth {
         }
     }
 
+    /// The error that ends a session whose profile has been signed out.
+    fn signed_out(&self) -> ProviderError {
+        ProviderError::Http {
+            status: 401,
+            body: format!(
+                "signed out of ChatGPT (profile `{}`) since this session started; run `{}` to sign in again",
+                self.profile,
+                login_command(PROVIDER, &self.profile)
+            ),
+            retry_after: None,
+        }
+    }
+
     /// What the store holds for the profile now. The keychain may take a while to answer.
     async fn read_store(&self) -> Result<Option<Tokens>, CredentialError> {
         let (credentials, profile) = (self.credentials.clone(), self.profile.clone());
@@ -213,7 +228,7 @@ impl ChatGptAuth {
             return false;
         }
         session.seen = now.clone();
-        // Signed out elsewhere: this session goes on with its own tokens.
+        // Signed out elsewhere after a renewal found the profile signed in: nothing to take in.
         let Some(theirs) = now else {
             return false;
         };

@@ -1573,17 +1573,21 @@ fn request_messages(history: &[Message]) -> Vec<Message> {
 /// A human-readable error message for the user.
 fn describe(error: &ProviderError) -> String {
     // An exhausted quota says when it resets, whatever `Retry-After` asks.
+    let quoted = |body: &str| -> String { body.chars().take(500).collect() };
     if error.is_quota_exhausted() {
         let resets = error
             .resets_at()
             .map(|at| format!("; it resets at {}", crate::time::timestamp(at)))
             .unwrap_or_default();
-        let body: String = match error {
-            ProviderError::Http { body, .. } => body.chars().take(500).collect(),
+        let said = match error {
+            ProviderError::Http { status, body, .. } => format!("HTTP {status}: {}", quoted(body)),
+            ProviderError::Reported { body, .. } => {
+                format!("the provider reported: {}", quoted(body))
+            }
             _ => String::new(),
         };
         return format!(
-            "the provider's usage limit is reached{resets}. Switch models with --model (or /model in the terminal UI). HTTP 429: {body}"
+            "the provider's usage limit is reached{resets}. Switch models with --model (or /model in the terminal UI). {said}"
         );
     }
     if let Some(wait) = error.retry_after()
@@ -1601,15 +1605,22 @@ fn describe(error: &ProviderError) -> String {
         } => format!(
             "{message}: the local server may still be loading the model, or reading a long prompt on a CPU. harness does not retry, since a retry would start that work over; check the server (its log, and whether the model fits in memory and runs on the GPU), or use a smaller context or model"
         ),
-        ProviderError::Http { status: 429, .. } => {
+        ProviderError::Http { status: 429, .. } | ProviderError::Reported { status: 429, .. } => {
             format!(
                 "{error}. The provider is rate limiting; try again later or switch models with --model."
             )
         }
-        ProviderError::Http { status, body, .. } => {
-            let body: String = body.chars().take(500).collect();
-            format!("HTTP {status}: {body}")
+        ProviderError::Http { status, body, .. } => format!("HTTP {status}: {}", quoted(body)),
+        ProviderError::Reported {
+            status,
+            body,
+            retry_after,
+        } => ProviderError::Reported {
+            status: *status,
+            body: quoted(body),
+            retry_after: *retry_after,
         }
+        .to_string(),
         other => other.to_string(),
     }
 }

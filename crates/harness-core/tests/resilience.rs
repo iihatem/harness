@@ -431,3 +431,52 @@ async fn a_hosted_first_data_timeout_is_retried_once() {
     assert_eq!(reason, TurnEndReason::Completed);
     assert_eq!(retries(&events).len(), 4);
 }
+
+// Re-review A, N2: an error the provider reports inside the stream is described as what it is,
+// not as an HTTP status that was never received; it is retried, or not, as that status would be.
+#[tokio::test(start_paused = true)]
+async fn an_error_reported_in_the_stream_is_described_as_such() {
+    let dir = tempfile::tempdir().unwrap();
+    let overloaded = || {
+        Script::error(ProviderError::Reported {
+            status: 529,
+            body: "overloaded_error: Overloaded".into(),
+            retry_after: None,
+        })
+    };
+    let provider = MockProvider::new((0..5).map(|_| overloaded()).collect());
+    let mut overloads = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
+    let (reason, events) = run(&mut overloads, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert_eq!(retries(&events).len(), 4);
+    let message = error_message(&events);
+    assert!(
+        message.contains("the provider reported an overload"),
+        "{message}"
+    );
+    assert!(!message.contains("HTTP"), "{message}");
+
+    let quota = ProviderError::Reported {
+        status: 429,
+        body: USAGE_LIMIT.to_string(),
+        retry_after: None,
+    };
+    assert!(quota.is_quota_exhausted());
+    assert!(!quota.is_retryable());
+    assert_eq!(quota.resets_at(), Some(1_790_208_000));
+    let provider = MockProvider::new(vec![Script::error(quota)]);
+    let mut limited = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
+    let (_, events) = run(&mut limited, "go").await;
+    let message = error_message(&events);
+    assert!(message.contains("usage limit"), "{message}");
+    assert!(message.contains("2026-09-24T00:00:00Z"), "{message}");
+    assert!(!message.contains("HTTP"), "{message}");
+
+    let slow_down = ProviderError::Reported {
+        status: 429,
+        body: "slow_down: wait".into(),
+        retry_after: Some(Duration::from_secs(3)),
+    };
+    assert!(slow_down.is_retryable());
+    assert_eq!(slow_down.retry_after(), Some(Duration::from_secs(3)));
+}

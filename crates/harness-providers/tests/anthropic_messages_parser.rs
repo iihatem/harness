@@ -94,10 +94,17 @@ fn a_reply_stopped_by_max_tokens_finishes_with_length() {
 fn an_overloaded_error_in_the_stream_can_be_retried() {
     let error = parse("overloaded.sse").unwrap_err();
     assert!(
-        matches!(error, ProviderError::Http { status: 529, .. }),
+        matches!(error, ProviderError::Reported { status: 529, .. }),
         "{error:?}"
     );
     assert!(error.is_retryable());
+    // Re-review A, N2: described as what the provider reported, not an HTTP status it never sent.
+    assert!(
+        error
+            .to_string()
+            .starts_with("the provider reported an overload: "),
+        "{error}"
+    );
 }
 
 #[test]

@@ -183,10 +183,12 @@ fn server_errors_and_rate_limits_in_the_stream_can_be_retried() {
             "error": {"code": code, "message": "try again"}}});
         let error = parser.push(&data.to_string()).unwrap_err();
         assert!(
-            matches!(error, ProviderError::Http { status: s, .. } if s == status),
+            matches!(error, ProviderError::Reported { status: s, .. } if s == status),
             "{error:?}"
         );
         assert!(error.is_retryable());
+        // Re-review A, N2: no HTTP status was received.
+        assert!(!error.to_string().contains("HTTP"), "{error}");
     }
     let mut parser = ResponsesStreamParser::default();
     let data = json!({"type": "error", "code": "invalid_prompt", "message": "bad prompt"});
@@ -211,7 +213,7 @@ fn an_overloaded_server_or_a_slow_down_in_the_stream_is_retried() {
         let error = failed(json!({"code": code, "message": "busy"}));
         assert_eq!(
             error,
-            ProviderError::Http {
+            ProviderError::Reported {
                 status,
                 body: format!("{code}: busy"),
                 retry_after: None,
@@ -229,8 +231,12 @@ fn a_nested_error_event_keeps_its_code() {
         "error": {"type": "server_error", "code": "server_is_overloaded", "message": "busy"}});
     let error = parser.push(&data.to_string()).unwrap_err();
     assert!(
-        matches!(error, ProviderError::Http { status: 503, .. }),
+        matches!(error, ProviderError::Reported { status: 503, .. }),
         "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "the provider reported an overload: server_is_overloaded: busy"
     );
     let mut parser = ResponsesStreamParser::default();
     let data = json!({"type": "error", "error": {"code": "context_length_exceeded",

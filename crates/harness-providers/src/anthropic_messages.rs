@@ -336,7 +336,7 @@ fn stream_error(error: &Value) -> ProviderError {
         "rate_limit_error" => 429,
         _ => return ProviderError::InStream(text),
     };
-    ProviderError::Http {
+    ProviderError::Reported {
         status,
         body: text,
         retry_after: None,

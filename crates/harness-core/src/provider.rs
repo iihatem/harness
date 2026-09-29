@@ -41,6 +41,15 @@ pub enum ProviderError {
     },
     #[error("invalid provider response: {0}")]
     Protocol(String),
+    /// An error the provider reported inside a response stream that stands for an HTTP error:
+    /// it is treated as `status`, retried or not as that status would be, though no such status
+    /// was received.
+    #[error("the provider reported {}: {body}", reported(*.status, .body))]
+    Reported {
+        status: u16,
+        body: String,
+        retry_after: Option<Duration>,
+    },
     /// An error the provider reported inside a response stream.
     #[error("provider error: {0}")]
     InStream(String),
@@ -55,8 +64,11 @@ impl ProviderError {
         match self {
             ProviderError::Network(_) => true,
             ProviderError::NoStart { local, .. } => !local,
-            ProviderError::Http { status: 429, .. } => !self.is_quota_exhausted(),
-            ProviderError::Http { status, .. } => (500..600).contains(status),
+            ProviderError::Http { status: 429, .. }
+            | ProviderError::Reported { status: 429, .. } => !self.is_quota_exhausted(),
+            ProviderError::Http { status, .. } | ProviderError::Reported { status, .. } => {
+                (500..600).contains(status)
+            }
             ProviderError::Protocol(_) | ProviderError::InStream(_) => false,
         }
     }
@@ -65,35 +77,21 @@ impl ProviderError {
     /// `usage_limit_reached` and `usage_not_included`, or OpenAI's `insufficient_quota`, and the
     /// credit and spend limits Codex counts as quotas too.
     pub fn is_quota_exhausted(&self) -> bool {
-        let ProviderError::Http {
-            status: 429, body, ..
-        } = self
-        else {
-            return false;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
-            return false;
-        };
-        let error = &value["error"];
-        [&error["type"], &error["code"]].iter().any(|v| {
-            matches!(
-                v.as_str(),
-                Some(
-                    "usage_limit_reached"
-                        | "usage_not_included"
-                        | "insufficient_quota"
-                        | "credit_balance_exhausted"
-                        | "organization_spend_limit_exceeded"
-                        | "project_spend_limit_exceeded"
-                )
-            )
-        })
+        match self {
+            ProviderError::Http {
+                status: 429, body, ..
+            }
+            | ProviderError::Reported {
+                status: 429, body, ..
+            } => reports_quota(body),
+            _ => false,
+        }
     }
 
     /// When an exhausted limit resets, in seconds since the Unix epoch, if the provider said:
     /// `resets_at`, or `resets_in_seconds` from now.
     pub fn resets_at(&self) -> Option<u64> {
-        let ProviderError::Http { body, .. } = self else {
+        let (ProviderError::Http { body, .. } | ProviderError::Reported { body, .. }) = self else {
             return None;
         };
         let value: serde_json::Value = serde_json::from_str(body).ok()?;
@@ -146,9 +144,41 @@ impl ProviderError {
 
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
-            ProviderError::Http { retry_after, .. } => *retry_after,
+            ProviderError::Http { retry_after, .. }
+            | ProviderError::Reported { retry_after, .. } => *retry_after,
             _ => None,
         }
+    }
+}
+
+/// Whether an error response's `body` reports an exhausted quota or plan limit.
+fn reports_quota(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let error = &value["error"];
+    [&error["type"], &error["code"]].iter().any(|v| {
+        matches!(
+            v.as_str(),
+            Some(
+                "usage_limit_reached"
+                    | "usage_not_included"
+                    | "insufficient_quota"
+                    | "credit_balance_exhausted"
+                    | "organization_spend_limit_exceeded"
+                    | "project_spend_limit_exceeded"
+            )
+        )
+    })
+}
+
+/// What an error reported in a stream and treated as HTTP `status`, with `body`, stands for.
+fn reported(status: u16, body: &str) -> &'static str {
+    match status {
+        429 if reports_quota(body) => "a usage limit",
+        429 => "a rate limit",
+        503 | 529 => "an overload",
+        _ => "a server error",
     }
 }
 

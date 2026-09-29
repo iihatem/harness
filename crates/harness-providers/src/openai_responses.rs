@@ -281,7 +281,7 @@ fn stream_error(error: &Value) -> ProviderError {
         | "organization_spend_limit_exceeded"
         | "project_spend_limit_exceeded" => {
             // As the HTTP form's body, so that it reads as an exhausted quota, with its reset time.
-            return ProviderError::Http {
+            return ProviderError::Reported {
                 status: 429,
                 body: json!({ "error": error }).to_string(),
                 retry_after: None,
@@ -296,7 +296,7 @@ fn stream_error(error: &Value) -> ProviderError {
         "rate_limit_exceeded" | "slow_down" => 429,
         _ => 500,
     };
-    ProviderError::Http {
+    ProviderError::Reported {
         status,
         retry_after: requested_wait(message),
         body: text,

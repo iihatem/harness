@@ -19,6 +19,11 @@ jobs:
           - os: ubuntu-24.04
             tier: full
     runs-on: ${{ matrix.os }}
+    env:
+      # Line tables keep backtraces readable at a fraction of full debug info's size; with
+      # clippy and the test binaries in one target directory, full debug info filled the
+      # Linux runner's disk.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install

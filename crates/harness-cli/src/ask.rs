@@ -15,8 +15,7 @@ use harness_core::{
     tool::{CommandSandbox, ToolContext},
 };
 use harness_providers::{
-    profiles,
-    registry::{self, BUILTIN_PROVIDERS},
+    profiles, registry,
     window::{self, LOAD_TIMEOUT, PROBE_TIMEOUT},
 };
 use tokio::sync::mpsc;
@@ -217,15 +216,6 @@ pub async fn run(
         eprintln!("warning: {}", terminal_safe(warning));
     }
     let context_window = window.tokens;
-    if !profile.local
-        && crate::sessions::held_only_locally(&session, |id| model_is_local(&setup, id))
-    {
-        eprintln!(
-            "warning: this conversation ran on local models so far; continuing it on {} sends it, tool output included, to {}",
-            terminal_safe(&resolved.id),
-            terminal_safe(provider)
-        );
-    }
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),
@@ -298,26 +288,6 @@ pub async fn run(
     }
     end_run(agent, sandbox_session);
     exit_code(reason, blocked)
-}
-
-/// Whether model `id` runs on a server of the user's own, by its provider's address and its
-/// profile.
-fn model_is_local(setup: &setup::Setup, id: &str) -> bool {
-    let provider = id.split('/').next().unwrap_or_default();
-    let base_url = match setup.config.providers.get(provider) {
-        Some(cfg) => cfg.base_url.clone(),
-        None => BUILTIN_PROVIDERS
-            .iter()
-            .find(|b| b.name == provider)
-            .map(|b| b.base_url.to_string())
-            .unwrap_or_default(),
-    };
-    profiles::resolve(
-        id,
-        profiles::is_local(id, &base_url),
-        &setup.config.profiles,
-    )
-    .local
 }
 
 /// Ends the run: first the agent, which releases the session file, then the sandbox's session,

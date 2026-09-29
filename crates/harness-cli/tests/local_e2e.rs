@@ -1,5 +1,5 @@
 //! Local models in `harness ask`: the window the server really runs the model with, and a
-//! conversation held on local models that is continued on a hosted one.
+//! conversation held on local models that is continued on a hosted one (which says nothing).
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -83,10 +83,10 @@ async fn ollamas_small_running_context_is_used_and_explained() {
     .unwrap();
 }
 
-// Decision 14: continuing a conversation held on local models with a hosted model sends what it
-// holds, tool output included, to that provider: harness says so.
+// Decision 14: continuing a conversation held on local models with a hosted model says nothing
+// about it (the behaviour before P4); harness does not flag it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_local_conversation_continued_on_a_hosted_model_is_flagged() {
+async fn a_local_conversation_continued_on_a_hosted_model_prints_no_warning() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(answer("ok"))
@@ -98,12 +98,13 @@ async fn a_local_conversation_continued_on_a_hosted_model_is_flagged() {
         "[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{uri}/v1\"\n[providers.cloud]\nprotocol = \"openai-chat\"\nbase_url = \"{uri}/v1\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n[profiles.\"cloud/*\"]\ncontext_window = 200000\nlocal = false\n",
         uri = server.uri()
     ));
-    let flagged = "ran on local models so far; continuing it on cloud/big sends it";
+    let flagged = "ran on local models so far; continuing it on";
     tokio::task::spawn_blocking(move || {
         env.cmd()
             .args(["--model", "mock/small", "ask", "one"])
             .assert()
-            .success();
+            .success()
+            .stderr(contains(flagged).not());
         env.cmd()
             .args(["-c", "--model", "mock/small", "ask", "two"])
             .assert()
@@ -113,9 +114,7 @@ async fn a_local_conversation_continued_on_a_hosted_model_is_flagged() {
             .args(["-c", "--model", "cloud/big", "ask", "three"])
             .assert()
             .success()
-            .stderr(contains(flagged))
-            .stderr(contains("tool output included, to cloud"));
-        // Once a hosted model has answered in it, the conversation has left the machine already.
+            .stderr(contains(flagged).not());
         env.cmd()
             .args(["-c", "--model", "cloud/big", "ask", "four"])
             .assert()

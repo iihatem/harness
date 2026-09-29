@@ -61,7 +61,7 @@ The spec settles what P4 does; these settle how, where it is silent. Task 1 writ
 11. **Effective context.** Only `ollama`, `lmstudio` and `llamacpp` are asked (by name, wherever they run, when they speak Chat Completions), each question limited to one second. Ollama lists only loaded models, so a model it has not loaded is loaded first with an empty `/api/generate` (up to 120 seconds, stopped by Ctrl+C), which the first request would do anyway. An LM Studio model that is not loaded counts as unknown. Harness uses the smaller of the server's value and the profile's; with neither, 8,192 tokens and one warning. A window below the profile's `min_context` (32,768 by default) is warned about with that server's fix. *Alternative:* never load a model to ask (misses the common first run, when nothing is loaded yet).
 12. **Text tool calls must name a tool the agent has**, besides being the whole message (`<tool_call>` blocks with only whitespace around them, or one JSON object with `name` and `arguments`, or `parameters` as Llama 3.1 writes). A recovered call is saved as a call, without the wrapper text, and validated and permission-checked like a native one. *Alternative:* recover any name and let validation report an unknown tool (more recoveries, and more false ones).
 13. **A reply cut off at the output limit** runs none of its tool calls: each gets an error result saying so and asking for smaller steps. A reply without calls is kept and followed by a note (`[harness] Your last reply was cut off…`) asking the model to continue. The turn goes on within its step limit, and a warning says what happened. A cut-off reply is not searched for text tool calls.
-14. **Continuing a local conversation on a hosted model warns (the product decision P3's review left open).** When every answer in the conversation so far came from local models and the model now answering is not local, harness warns that the conversation, tool output included, now goes to that provider. Headless runs cannot ask, so they warn and go on. *Alternatives:* say nothing, as today; or refuse unless a flag confirms it (P5 could ask interactively).
+14. **Continuing a local conversation on a hosted model says nothing (the product decision P3's review left open).** The maintainer chose the plan's first alternative over the plan's original proposal, which would have warned that the conversation, tool output included, now goes to that provider when every answer so far came from local models and the model now answering is not local: say nothing, the behaviour before P4. *Alternative not chosen:* refuse unless a flag confirms it (P5 could ask interactively). Decision 10's "local means a local server" logic is unaffected: text tool calls and profiles still use it.
 15. **Secrets are redacted where harness writes, not in what the model sees.** Secrets are the keys and tokens providers are given (added as they are resolved or refreshed) and the values of environment variables whose names end in `KEY`, `TOKEN`, `SECRET` or `PASSWORD`, eight characters or longer, in their plain and JSON-escaped forms. They are replaced by `[redacted]` in session files, tool-output files, the debug log, NDJSON and everything harness prints. Redacting what the model sees would change a file the model reads and writes back. The name rule has false positives (`LESSKEY` holds a path), which only hide text. *Alternative:* also redact tool output before the model sees it, which keeps keys from reaching the provider, at that cost.
 16. **`--debug` writes the event stream**, redacted, to `$XDG_STATE_HOME/harness/logs/<run>.log` (mode `0600`) and prints the path; it logs no HTTP traffic. The spec's "Debug logging" scenario needed a log to check.
 17. **An exhausted quota is not retried.** A 429 that reports `usage_limit_reached`, `usage_not_included` or `insufficient_quota` fails the turn at once with the reset time when the provider gives it (`resets_at`, or `resets_in_seconds`), and suggests `--model` (or `/model` in the terminal UI). Other 429s are still retried.
@@ -10534,17 +10534,17 @@ EOF
 
 ---
 
-### Task 8: The window local servers really run, and local conversations going hosted
+### Task 8: The window local servers really run
 
 **Files:**
 - Create: `crates/harness-providers/src/window.rs`, `crates/harness-providers/tests/window.rs`, `crates/harness-cli/tests/local_e2e.rs`
-- Modify: `crates/harness-providers/src/lib.rs`, `crates/harness-cli/src/ask.rs`, `crates/harness-cli/src/sessions.rs`
+- Modify: `crates/harness-providers/src/lib.rs`, `crates/harness-cli/src/ask.rs`
 
 **Interfaces:**
-- Consumes: `profiles::{ModelProfile, FALLBACK_CONTEXT_WINDOW, is_local, resolve}` (Task 7), `BUILTIN_PROVIDERS` (Task 2).
+- Consumes: `profiles::{ModelProfile, FALLBACK_CONTEXT_WINDOW, is_local, resolve}` (Task 7).
 - Produces:
   - `harness_providers::window::{PROBE_TIMEOUT (1 s), LOAD_TIMEOUT (120 s), Server { Ollama, LlamaCpp, LmStudio }, running_context, Window { tokens: u64, warnings: Vec<String> }, effective_window}`: `Server::of(provider, &providers) -> Option<Server>`, `running_context(server, base_url, model, probe: Duration, load: Duration) -> Option<u64>` (async), `effective_window(id, &ModelProfile, running: Option<u64>, server: Option<Server>) -> Window`.
-  - In the CLI: `sessions::held_only_locally(&Session, is_local: impl Fn(&str) -> bool) -> bool`; `ask` asks the server, warns, uses `Window::tokens`, and warns when a local conversation continues on a hosted model (decision 14). The unknown-window warning moves from Task 7's helper into `effective_window`, with the same words.
+  - In the CLI: `ask` asks the server, warns, and uses `Window::tokens`. The unknown-window warning moves from Task 7's helper into `effective_window`, with the same words. Continuing a local conversation on a hosted model says nothing (decision 14, the maintainer's later choice); there is no `sessions::held_only_locally`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -10802,7 +10802,7 @@ Create `crates/harness-cli/tests/local_e2e.rs`:
 
 ```rust
 //! Local models in `harness ask`: the window the server really runs the model with, and a
-//! conversation held on local models that is continued on a hosted one.
+//! conversation held on local models that is continued on a hosted one (which says nothing).
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -10886,10 +10886,10 @@ async fn ollamas_small_running_context_is_used_and_explained() {
     .unwrap();
 }
 
-// Decision 14: continuing a conversation held on local models with a hosted model sends what it
-// holds, tool output included, to that provider: harness says so.
+// Decision 14: continuing a conversation held on local models with a hosted model says nothing
+// about it (the behaviour before P4); harness does not flag it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_local_conversation_continued_on_a_hosted_model_is_flagged() {
+async fn a_local_conversation_continued_on_a_hosted_model_prints_no_warning() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(answer("ok"))
@@ -10901,12 +10901,13 @@ async fn a_local_conversation_continued_on_a_hosted_model_is_flagged() {
         "[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{uri}/v1\"\n[providers.cloud]\nprotocol = \"openai-chat\"\nbase_url = \"{uri}/v1\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n[profiles.\"cloud/*\"]\ncontext_window = 200000\nlocal = false\n",
         uri = server.uri()
     ));
-    let flagged = "ran on local models so far; continuing it on cloud/big sends it";
+    let flagged = "ran on local models so far; continuing it on";
     tokio::task::spawn_blocking(move || {
         env.cmd()
             .args(["--model", "mock/small", "ask", "one"])
             .assert()
-            .success();
+            .success()
+            .stderr(contains(flagged).not());
         env.cmd()
             .args(["-c", "--model", "mock/small", "ask", "two"])
             .assert()
@@ -10916,9 +10917,7 @@ async fn a_local_conversation_continued_on_a_hosted_model_is_flagged() {
             .args(["-c", "--model", "cloud/big", "ask", "three"])
             .assert()
             .success()
-            .stderr(contains(flagged))
-            .stderr(contains("tool output included, to cloud"));
-        // Once a hosted model has answered in it, the conversation has left the machine already.
+            .stderr(contains(flagged).not());
         env.cmd()
             .args(["-c", "--model", "cloud/big", "ask", "four"])
             .assert()
@@ -11172,46 +11171,12 @@ mod sse;
 pub mod window;
 ```
 
-- [ ] **Step 4: Use the window, and flag local conversations going hosted**
+- [ ] **Step 4: Use the window**
 
-In `crates/harness-cli/src/sessions.rs`:
-
-Replace:
-
-```rust
-    }
-}
-
-/// Opens the session to run in, printing any warnings about its file. Errors are user-facing
-/// messages (exit code 2).
-pub fn open(setup: &Setup, choice: &Choice) -> Result<Session, String> {
-```
-
-with:
-
-```rust
-    }
-}
-
-/// Whether every assistant message of `session` so far came from a model `is_local` says runs
-/// locally, so that continuing it on a hosted model sends it off the machine for the first time.
-/// A session without answers holds nothing to send.
-pub fn held_only_locally(session: &Session, is_local: impl Fn(&str) -> bool) -> bool {
-    let models: Vec<String> = session
-        .messages()
-        .into_iter()
-        .filter_map(|(_, message)| match message {
-            harness_core::message::Message::Assistant { model, .. } => Some(model),
-            _ => None,
-        })
-        .collect();
-    !models.is_empty() && models.iter().all(|model| is_local(model))
-}
-
-/// Opens the session to run in, printing any warnings about its file. Errors are user-facing
-/// messages (exit code 2).
-pub fn open(setup: &Setup, choice: &Choice) -> Result<Session, String> {
-```
+`crates/harness-cli/src/sessions.rs` is not touched by this task. An earlier draft of this plan
+added `sessions::held_only_locally` here so `ask` could warn when a local conversation continues
+on a hosted model (decision 14); the maintainer chose "say nothing", the behaviour before P4, so
+that helper and its call site do not exist.
 
 In `crates/harness-cli/src/ask.rs`, the window replaces Task 7's `context_window` helper, and Ctrl+C while a model loads exits 130:
 
@@ -11234,8 +11199,7 @@ with:
     tool::{CommandSandbox, ToolContext},
 };
 use harness_providers::{
-    profiles,
-    registry::{self, BUILTIN_PROVIDERS},
+    profiles, registry,
     window::{self, LOAD_TIMEOUT, PROBE_TIMEOUT},
 };
 use tokio::sync::mpsc;
@@ -11276,19 +11240,15 @@ with:
         eprintln!("warning: {}", terminal_safe(warning));
     }
     let context_window = window.tokens;
-    if !profile.local
-        && crate::sessions::held_only_locally(&session, |id| model_is_local(&setup, id))
-    {
-        eprintln!(
-            "warning: this conversation ran on local models so far; continuing it on {} sends it, tool output included, to {}",
-            terminal_safe(&resolved.id),
-            terminal_safe(provider)
-        );
-    }
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),
 ```
+
+Decision 14 (the maintainer's later choice) says nothing when a local conversation continues on a
+hosted model: there is no warning here, no `sessions::held_only_locally`, and no `model_is_local`
+helper. Replace (3 of 3) below only drops the superseded `context_window` helper; it adds nothing
+in its place.
 
 Replace (3 of 3):
 
@@ -11317,26 +11277,6 @@ with:
 
 ```rust
     exit_code(reason, blocked)
-}
-
-/// Whether model `id` runs on a server of the user's own, by its provider's address and its
-/// profile.
-fn model_is_local(setup: &setup::Setup, id: &str) -> bool {
-    let provider = id.split('/').next().unwrap_or_default();
-    let base_url = match setup.config.providers.get(provider) {
-        Some(cfg) => cfg.base_url.clone(),
-        None => BUILTIN_PROVIDERS
-            .iter()
-            .find(|b| b.name == provider)
-            .map(|b| b.base_url.to_string())
-            .unwrap_or_default(),
-    };
-    profiles::resolve(
-        id,
-        profiles::is_local(id, &base_url),
-        &setup.config.profiles,
-    )
-    .local
 }
 
 /// Ends the run: first the agent, which releases the session file, then the sandbox's session,

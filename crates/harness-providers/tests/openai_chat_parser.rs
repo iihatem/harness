@@ -192,6 +192,7 @@ fn request_body_maps_messages_and_tools() {
             description: "Read".into(),
             parameters: json!({"type": "object"}),
         }],
+        ..ChatRequest::default()
     };
     let body = request_body(&req);
     assert_eq!(body["model"], "qwen3:14b");
@@ -225,6 +226,7 @@ fn request_body_omits_empty_tools() {
         system: String::new(),
         messages: vec![],
         tools: vec![],
+        ..ChatRequest::default()
     };
     assert!(request_body(&req).get("tools").is_none());
 }

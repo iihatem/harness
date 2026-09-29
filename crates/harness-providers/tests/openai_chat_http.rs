@@ -17,6 +17,7 @@ fn request() -> ChatRequest {
         system: "s".into(),
         messages: vec![],
         tools: vec![],
+        ..ChatRequest::default()
     }
 }
 

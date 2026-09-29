@@ -13,11 +13,14 @@ use sha2::{Digest, Sha256};
 
 use crate::trust::TrustStore;
 
-/// Wire protocol spoken by a configured provider. P4 adds `openai-responses` and `anthropic-messages`.
+/// Wire protocol spoken by a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Protocol {
+    /// `POST /chat/completions`: Ollama, LM Studio, llama.cpp, OpenRouter and most others.
     OpenaiChat,
+    /// `POST /responses`: OpenAI API keys and ChatGPT sign-in.
+    OpenaiResponses,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

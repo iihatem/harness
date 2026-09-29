@@ -16,7 +16,7 @@ use crate::{
     checkpoint::{CheckpointError, Checkpoints},
     compaction::{self, CompactionConfig},
     event::{AgentEvent, ErrorKind, TurnEndReason},
-    message::{ChatRequest, Message, ToolCall, Usage},
+    message::{ChatRequest, Message, RequestOptions, ToolCall, Usage},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
     permission::{Action, Decision, FsAccess, Mode, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
@@ -78,6 +78,8 @@ pub struct AgentConfig {
     /// The model's context window in tokens.
     pub context_window: u64,
     pub compaction: CompactionConfig,
+    /// Output limit, temperature and reasoning effort for every request to the session's model.
+    pub request: RequestOptions,
 }
 
 impl AgentConfig {
@@ -97,6 +99,7 @@ impl AgentConfig {
             retry: RetryPolicy::default(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             compaction: CompactionConfig::default(),
+            request: RequestOptions::default(),
         }
     }
 }
@@ -1145,15 +1148,22 @@ impl Agent {
         reply: &mut ModelReply,
         events: &UnboundedSender<AgentEvent>,
     ) -> Result<(), ProviderError> {
-        let (provider, model) = match &self.turn_model {
-            Some(turn) => (&turn.provider, turn.name.clone()),
-            None => (&self.provider, self.config.model_name.clone()),
+        // A slash command's model gets the provider's defaults: the options are the session
+        // model's.
+        let (provider, model, options) = match &self.turn_model {
+            Some(turn) => (&turn.provider, turn.name.clone(), RequestOptions::default()),
+            None => (
+                &self.provider,
+                self.config.model_name.clone(),
+                self.config.request.clone(),
+            ),
         };
         let request = ChatRequest {
             model,
             system: self.config.system_prompt.clone(),
             messages: request_messages(&self.history),
             tools: self.tools.specs(),
+            options,
         };
         let mut stream = provider.stream(request);
         while let Some(item) = stream.next().await {

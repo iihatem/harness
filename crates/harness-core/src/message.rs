@@ -43,12 +43,22 @@ pub struct Usage {
     pub cached_tokens: u64,
 }
 
+/// Settings a model profile gives each request. `None` leaves the provider's default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestOptions {
+    pub max_output_tokens: Option<u64>,
+    pub temperature: Option<f64>,
+    /// For models that reason: `minimal`, `low`, `medium` or `high`, as the provider names it.
+    pub reasoning_effort: Option<String>,
+}
+
 /// Everything a provider needs for one model call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatRequest {
     /// Model name as the provider knows it (without the `<provider>/` prefix).
     pub model: String,
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
+    pub options: RequestOptions,
 }

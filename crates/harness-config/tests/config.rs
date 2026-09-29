@@ -771,3 +771,19 @@ fn an_ignored_low_threshold_takes_a_keep_share_it_cannot_hold_with_it() {
     assert_eq!(cfg.compaction.threshold(), 0.8);
     assert_eq!(cfg.compaction.keep_recent(), 0.25);
 }
+
+#[test]
+fn providers_may_use_the_responses_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(
+        &file,
+        "[providers.oa]\nprotocol = \"openai-responses\"\nbase_url = \"https://x.example/v1\"\n",
+    )
+    .unwrap();
+    let parsed = config::parse_file(&file).unwrap().unwrap();
+    assert_eq!(
+        parsed.providers["oa"].protocol,
+        config::Protocol::OpenaiResponses
+    );
+}

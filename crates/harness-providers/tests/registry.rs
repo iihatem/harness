@@ -120,3 +120,35 @@ fn local_endpoints_cover_the_three_servers() {
         .collect();
     assert_eq!(names, ["ollama", "lmstudio", "llamacpp"]);
 }
+
+#[test]
+fn builtin_openai_speaks_the_responses_protocol_with_its_key() {
+    let r = resolve(
+        "openai/gpt-5",
+        &BTreeMap::new(),
+        env(&[("OPENAI_API_KEY", "k")]),
+    )
+    .unwrap();
+    assert_eq!(r.model, "gpt-5");
+    assert_eq!(r.protocol, Protocol::OpenaiResponses);
+    assert_eq!(r.base_url, "https://api.openai.com/v1");
+    assert_eq!(
+        resolve("openai/gpt-5", &BTreeMap::new(), env(&[])).err(),
+        Some(ResolveError::MissingKey {
+            provider: "openai".into(),
+            var: "OPENAI_API_KEY".into()
+        })
+    );
+    let found = configured_endpoints(&BTreeMap::new(), env(&[("OPENAI_API_KEY", "k")]));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].provider, "openai");
+}
+
+#[test]
+fn configured_providers_may_speak_the_responses_protocol() {
+    let mut providers = custom("azure", "https://x.example/openai/v1", Some("AZ_KEY"));
+    providers.get_mut("azure").unwrap().protocol = Protocol::OpenaiResponses;
+    let r = resolve("azure/gpt-5", &providers, env(&[("AZ_KEY", "k")])).unwrap();
+    assert_eq!(r.protocol, Protocol::OpenaiResponses);
+    assert_eq!(r.base_url, "https://x.example/openai/v1");
+}

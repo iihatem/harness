@@ -545,3 +545,24 @@ async fn a_mode_change_is_appended_as_a_message_and_the_prompt_stays() {
     let (output, is_error) = &finished_outputs(&events)[0];
     assert!(*is_error && output.contains("plan mode"), "{output}");
 }
+
+#[tokio::test]
+async fn the_configured_request_options_reach_the_provider() {
+    use harness_core::message::RequestOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::text("ok")]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let options = RequestOptions {
+        max_output_tokens: Some(1000),
+        temperature: Some(0.3),
+        reasoning_effort: Some("low".into()),
+    };
+    agent.config_mut().request = options.clone();
+    run(&mut agent, "hi").await;
+    assert_eq!(provider.requests()[0].options, options);
+}

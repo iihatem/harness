@@ -1,12 +1,12 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::collections::BTreeMap;
 
-use eventsource_stream::Eventsource;
-use futures::StreamExt;
 use harness_core::{
     message::{ChatRequest, Message, ToolCall, Usage},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent, ProviderStream},
 };
 use serde_json::{Value, json};
+
+use crate::sse::{self, EventParser};
 
 /// Builds a streaming Chat Completions request body.
 pub fn request_body(req: &ChatRequest) -> Value {
@@ -183,6 +183,25 @@ impl OpenAiChat {
     }
 }
 
+impl EventParser for ChatStreamParser {
+    fn push(&mut self, data: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
+        ChatStreamParser::push(self, data)
+    }
+
+    fn finish(&mut self) -> Vec<ProviderEvent> {
+        ChatStreamParser::finish(self)
+    }
+
+    fn is_done(&self) -> bool {
+        ChatStreamParser::is_done(self)
+    }
+
+    /// Some servers omit the trailing `[DONE]`: a `finish_reason` already ends the reply.
+    fn may_end(&self) -> bool {
+        self.is_done() || self.saw_finish_reason()
+    }
+}
+
 impl Provider for OpenAiChat {
     fn stream(&self, request: ChatRequest) -> ProviderStream {
         let mut http = self
@@ -192,47 +211,6 @@ impl Provider for OpenAiChat {
         if let Some(key) = &self.api_key {
             http = http.bearer_auth(key);
         }
-        // The if/else keeps `response` used entirely within one branch: `Response::text` takes
-        // `self` by value, so reading the error body and then still using `response` for the
-        // success-path byte stream (as one flat sequence with an early-return `?` in between)
-        // does not borrow-check, even though the `?` diverges before the byte-stream line runs.
-        Box::pin(async_stream::try_stream! {
-            let response = http.send().await.map_err(|e| ProviderError::Network(e.to_string()))?;
-            let status = response.status();
-            if status.is_success() {
-                let mut parser = ChatStreamParser::default();
-                let mut events = response.bytes_stream().eventsource();
-                while let Some(event) = events.next().await {
-                    let event = event.map_err(|e| ProviderError::Network(e.to_string()))?;
-                    for item in parser.push(&event.data)? {
-                        yield item;
-                    }
-                    if parser.is_done() {
-                        break;
-                    }
-                }
-                // The byte stream ended without `[DONE]`. That's fine if we already saw a
-                // `finish_reason` (some servers omit the trailing `[DONE]`), but otherwise the
-                // connection dropped mid-reply and must not be mistaken for a normal completion.
-                if !parser.is_done() && !parser.saw_finish_reason() {
-                    Err::<(), ProviderError>(ProviderError::Network(
-                        "stream ended before the response finished".into(),
-                    ))?;
-                }
-                for item in parser.finish() {
-                    yield item;
-                }
-            } else {
-                let retry_after = response
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    .map(Duration::from_secs);
-                let body = response.text().await.unwrap_or_default();
-                // `?` on an `Err` ends the stream with this error.
-                Err::<(), ProviderError>(ProviderError::Http { status: status.as_u16(), body, retry_after })?;
-            }
-        })
+        sse::events(sse::send(http), ChatStreamParser::default())
     }
 }

@@ -13,6 +13,7 @@ pub mod retry;
 pub mod session;
 pub mod subprocess;
 pub mod testing;
+pub mod textcalls;
 pub mod time;
 pub mod tokens;
 pub mod tool;

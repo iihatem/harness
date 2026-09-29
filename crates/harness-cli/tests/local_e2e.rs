@@ -6,7 +6,7 @@ use predicates::prelude::*;
 use predicates::str::contains;
 use serde_json::json;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
@@ -127,6 +127,42 @@ async fn a_local_conversation_continued_on_a_hosted_model_is_flagged() {
             .assert()
             .success()
             .stderr(contains(flagged).not());
+    })
+    .await
+    .unwrap();
+}
+
+// Spec: "Local model emits a tagged tool call as text": a model on a local server gets text tool
+// calls by default.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_models_tagged_tool_call_runs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .and(body_string_contains("pub fn add"))
+        .respond_with(answer("It defines add."))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(answer(
+            r#"<tool_call>{"name": "read", "arguments": {"path": "src/lib.rs"}}</tool_call>"#,
+        ))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let env = Env::new(&format!(
+        "model = \"mock/qwen\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n",
+        server.uri()
+    ));
+    std::fs::create_dir(env.ws.path().join("src")).unwrap();
+    std::fs::write(env.ws.path().join("src/lib.rs"), "pub fn add() {}\n").unwrap();
+    tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .args(["ask", "what is in lib.rs?"])
+            .assert()
+            .success()
+            .stdout(contains("It defines add."));
     })
     .await
     .unwrap();

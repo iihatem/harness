@@ -30,6 +30,12 @@ use crate::{
 /// Model calls allowed per turn unless configured otherwise.
 pub const DEFAULT_MAX_STEPS: u32 = 50;
 
+/// The result of each tool call of a reply the output limit cut off: the call is not run.
+pub const CUT_OFF_CALL: &str = "not run: your reply was cut off at the output-token limit, so this call may be incomplete. Continue in smaller steps: write a large file in parts (write the start, then add the rest with edit), and make one change per call.";
+
+/// The note after a reply without tool calls that the output limit cut off.
+pub const CUT_OFF_REPLY: &str = "[harness] Your last reply was cut off at the output-token limit. Continue exactly where it stopped, in smaller steps.";
+
 /// What the rewind list says about effects a rewind cannot undo.
 pub const REWIND_LIMITS: &str = "Rewinding restores files in the workspace only: network calls, databases, pushed commits, files outside the workspace, and what is inside nested git repositories and submodules stay as they are. Files that checkpoints leave out (git-ignored files, files over 10 MB, node_modules and target) are neither restored nor removed.";
 
@@ -80,6 +86,8 @@ pub struct AgentConfig {
     pub compaction: CompactionConfig,
     /// Output limit, temperature and reasoning effort for every request to the session's model.
     pub request: RequestOptions,
+    /// Run tool calls the model writes as text (`textcalls`): for local models.
+    pub text_tool_calls: bool,
 }
 
 impl AgentConfig {
@@ -100,6 +108,7 @@ impl AgentConfig {
             context_window: DEFAULT_CONTEXT_WINDOW,
             compaction: CompactionConfig::default(),
             request: RequestOptions::default(),
+            text_tool_calls: false,
         }
     }
 }
@@ -144,7 +153,6 @@ impl Approver for NonInteractive {
 struct ModelReply {
     text: String,
     tool_calls: Vec<ToolCall>,
-    #[allow(dead_code)] // read in P4 (truncation)
     finish: Option<FinishReason>,
     /// Whether any output was already shown to the user (then the call must not be retried).
     emitted: bool,
@@ -709,8 +717,25 @@ impl Agent {
                     return self.finish(TurnEndReason::Interrupted, events);
                 }
             };
+            let mut reply = reply;
+            let cut_off = reply.finish == Some(FinishReason::Length);
+            // A cut-off text call lacks its end, so it is not looked for.
+            if reply.tool_calls.is_empty() && !cut_off && self.config.text_tool_calls {
+                let tools = &self.tools;
+                if let Some(mut calls) =
+                    crate::textcalls::recover(&reply.text, |name| tools.get(name).is_some())
+                {
+                    self.dedupe_call_ids(&mut calls);
+                    reply.text.clear();
+                    reply.tool_calls = calls;
+                }
+            }
             let calls = reply.tool_calls.clone();
             self.push_assistant(reply.text, calls.clone(), events);
+            if cut_off {
+                self.after_cut_off(&calls, events);
+                continue;
+            }
             if calls.is_empty() {
                 return self.finish(TurnEndReason::Completed, events);
             }
@@ -740,6 +765,34 @@ impl Agent {
             }
         }
         self.finish(TurnEndReason::StepLimit, events)
+    }
+
+    /// After a reply the output limit cut off: its tool calls get results saying they were not
+    /// run, or, without calls, a note asks the model to go on. The turn goes on either way.
+    fn after_cut_off(&mut self, calls: &[ToolCall], events: &UnboundedSender<AgentEvent>) {
+        let message = if calls.is_empty() {
+            self.record(
+                Message::User {
+                    content: CUT_OFF_REPLY.into(),
+                },
+                None,
+                true,
+            );
+            "the model's reply was cut off at its output limit; asking it to continue"
+        } else {
+            for call in calls {
+                let result = Message::Tool {
+                    call_id: call.id.clone(),
+                    content: CUT_OFF_CALL.into(),
+                    is_error: true,
+                };
+                self.record(result, None, false);
+            }
+            "the model's reply was cut off at its output limit, so its tool calls were not run"
+        };
+        let _ = events.send(AgentEvent::Warning {
+            message: message.into(),
+        });
     }
 
     /// The turn's user message: text parts as they are, and each shell part replaced by the output

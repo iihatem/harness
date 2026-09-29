@@ -222,6 +222,7 @@ pub async fn run(
     );
     config.context_window = context_window;
     config.request = profile.request_options();
+    config.text_tool_calls = profile.text_tool_calls;
     if let Some(steps) = setup.config.max_steps {
         config.max_steps = steps;
     }

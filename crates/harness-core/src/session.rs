@@ -501,9 +501,17 @@ impl Store {
 }
 
 /// `entry` as a line of the file, with each string in it redacted, so that a tool call's
-/// arguments (JSON within the entry) are matched too.
+/// arguments (JSON within the entry) are matched too. A reply of the model is redacted as a whole
+/// message, whose edges can be parts of secrets (see [`Redactor::redact_message`]).
 fn redacted_line(entry: &Entry, redactor: &Redactor) -> serde_json::Result<String> {
     let mut value = serde_json::to_value(entry)?;
+    if let EntryKind::Message {
+        message: Message::Assistant { content, .. },
+        ..
+    } = &entry.kind
+    {
+        value["message"]["content"] = redactor.redact_message(content).into();
+    }
     redactor.redact_value(&mut value);
     // Read back, so that the fields keep their order.
     match serde_json::from_value::<Entry>(value.clone()) {

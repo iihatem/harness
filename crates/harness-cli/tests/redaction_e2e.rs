@@ -329,6 +329,35 @@ async fn no_secret_is_printed_in_plain_mode() {
     holds_no_piece_of_a_secret(&run);
 }
 
+// Re-review F, R1 (probe P5): a reply cut off at the output limit inside the key, then the reply
+// that continues it where it stopped. Neither part of the key is written anywhere, in either mode,
+// though the model is sent both as it wrote them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_split_across_a_cut_off_reply_and_its_continuation_is_written_nowhere() {
+    let (head, tail) = KEY.split_at(14);
+    let length = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]});
+    let replies = || {
+        vec![
+            sse(&[text("Your key is "), text(head), length.clone()]),
+            sse(&[
+                text(&tail[..4]),
+                text(&format!("{} is the rest.", &tail[4..])),
+                stop(),
+            ]),
+        ]
+    };
+    let json = Run::new(replies(), &[], &["--debug", "ask", "--json", "say the key"]).await;
+    assert_eq!(json.code, Some(0), "{}", json.stderr);
+    json.wrote(&["/data/sessions/", "/state/logs/"]);
+    holds_no_piece_of_a_secret(&json);
+    let seen = String::from_utf8_lossy(&json.requests[1].body);
+    assert!(seen.contains(&format!("Your key is {head}")), "{seen}");
+    let plain = Run::new(replies(), &[], &["--debug", "ask", "say the key"]).await;
+    assert_eq!(plain.code, Some(0), "{}", plain.stderr);
+    assert_eq!(plain.stdout, "[redacted] is the rest.\n");
+    holds_no_piece_of_a_secret(&plain);
+}
+
 /// The model runs a command that quotes [`PASSWORD`], then tries to write it outside the
 /// workspace, which is blocked (and shown on stderr in plain mode), then says it is done.
 fn password_replies() -> Vec<ResponseTemplate> {

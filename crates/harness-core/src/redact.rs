@@ -113,21 +113,131 @@ impl Redactor {
         text
     }
 
+    /// `text`, a whole message as it is recorded (a reply of the model), redacted: each secret in
+    /// it, and an edge of it that is part of a secret. A reply cut off at the output limit in the
+    /// middle of a secret ends with the secret's start, and the reply that continues it starts
+    /// with the rest: an end of the message that a secret starts with, or a start that a secret
+    /// ends with, is replaced too when it is at least [`MIN_SECRET_LEN`] bytes long.
+    pub fn redact_message(&self, text: &str) -> String {
+        let lead = self.lead_len(text);
+        let rest = &text[lead..];
+        let tail = self.tail_from(rest);
+        edged(lead > 0, self.redact(&rest[..tail]), tail < rest.len())
+    }
+
     /// Where the secrets are in `text`: the byte range of each occurrence, overlapping ones
     /// included, in order.
     pub fn occurrences(&self, text: &str) -> Vec<Range<usize>> {
+        occurrences(&self.secrets.read().expect("secrets lock"), text)
+    }
+
+    /// The secrets in `text` near byte `at`, which [`occurrences`](Self::occurrences) finds
+    /// within the longest secret's length of it: every secret that runs through `at` among them.
+    /// Only that much of `text` is searched, however long it is.
+    pub fn occurrences_around(&self, text: &str, at: usize) -> Vec<Range<usize>> {
         let secrets = self.secrets.read().expect("secrets lock");
-        let mut found = Vec::new();
-        for secret in secrets.iter() {
-            let mut from = 0;
-            while let Some(i) = text[from..].find(secret.as_str()) {
-                let start = from + i;
-                found.push(start..start + secret.len());
-                from = start + text[start..].chars().next().map_or(1, char::len_utf8);
+        let longest = secrets.first().map_or(0, String::len);
+        let start = floor_boundary(text, at.saturating_sub(longest));
+        let end = ceil_boundary(text, at.saturating_add(longest).min(text.len()));
+        occurrences(&secrets, &text[start..end])
+            .into_iter()
+            .map(|found| found.start + start..found.end + start)
+            .collect()
+    }
+
+    /// `at`, a cut of `text`, moved back (`back`) or forward past each secret that runs through
+    /// it, so that the cut runs through none: never by more than the longest secret's length,
+    /// which a secret that overlaps itself (`00000000` in a run of zeros) would otherwise take
+    /// the cut through the whole text.
+    pub fn clear_cut(&self, text: &str, at: usize, back: bool) -> usize {
+        let near = self.occurrences_around(text, at);
+        let mut at = at;
+        loop {
+            let crossing = near
+                .iter()
+                .filter(|found| found.start < at && found.end > at);
+            let next = if back {
+                crossing.map(|found| found.start).min()
+            } else {
+                crossing.map(|found| found.end).max()
+            };
+            match next {
+                Some(next) => at = next,
+                None => return at,
             }
         }
-        found.sort_by_key(|found| (found.start, found.end));
-        found
+    }
+
+    /// How much of the start of `text` is the end of a secret: the longest start of at least
+    /// [`MIN_SECRET_LEN`] bytes that a secret ends with (a whole secret is not an end of one), and
+    /// any secret that starts in it and runs on past it. 0 when there is none.
+    fn lead_len(&self, text: &str) -> usize {
+        let lead = {
+            let secrets = self.secrets.read().expect("secrets lock");
+            let bytes = text.as_bytes();
+            secrets
+                .iter()
+                .filter_map(|secret| {
+                    let longest = (secret.len() - 1).min(text.len());
+                    (MIN_SECRET_LEN..=longest).rev().find(|&k| {
+                        text.is_char_boundary(k) && secret.as_bytes().ends_with(&bytes[..k])
+                    })
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        if lead == 0 {
+            return 0;
+        }
+        self.clear_cut(text, lead, false)
+    }
+
+    /// Where the end of `text` that is the start of a secret begins: the longest end of at least
+    /// [`MIN_SECRET_LEN`] bytes that a secret starts with (a whole secret is not a start of one),
+    /// moved back over any secret that runs into it. `text.len()` when there is none.
+    fn tail_from(&self, text: &str) -> usize {
+        if text.len() < MIN_SECRET_LEN {
+            return text.len();
+        }
+        let from = {
+            let secrets = self.secrets.read().expect("secrets lock");
+            let bytes = text.as_bytes();
+            let latest = text.len() - MIN_SECRET_LEN;
+            secrets
+                .iter()
+                .filter_map(|secret| {
+                    let earliest = (text.len() + 1).saturating_sub(secret.len());
+                    (earliest..=latest).find(|&i| {
+                        text.is_char_boundary(i) && secret.as_bytes().starts_with(&bytes[i..])
+                    })
+                })
+                .min()
+                .unwrap_or(text.len())
+        };
+        if from == text.len() {
+            return from;
+        }
+        self.clear_cut(text, from, true)
+    }
+
+    /// Whether more text after `text`, the start of a message, could make it a longer end of a
+    /// secret of at least [`MIN_SECRET_LEN`] bytes than it is.
+    fn could_end_a_secret(&self, text: &str) -> bool {
+        let secrets = self.secrets.read().expect("secrets lock");
+        secrets.iter().any(|secret| {
+            // Where in the secret such an end would start.
+            let latest = secret
+                .len()
+                .saturating_sub(MIN_SECRET_LEN.max(text.len() + 1));
+            (1..=latest).any(|i| secret.is_char_boundary(i) && secret[i..].starts_with(text))
+        })
+    }
+
+    /// `text`, the end of a message whose start was shown already, redacted as
+    /// [`redact_message`](Self::redact_message) redacts the end of one.
+    fn redact_end(&self, text: &str) -> String {
+        let tail = self.tail_from(text);
+        edged(false, self.redact(&text[..tail]), tail < text.len())
     }
 
     /// A stream for text that arrives in pieces, such as a model's streamed reply: a secret split
@@ -136,6 +246,7 @@ impl Redactor {
         StreamRedactor {
             redactor: self.clone(),
             pending: String::new(),
+            started: false,
         }
     }
 
@@ -162,12 +273,17 @@ impl Redactor {
     /// text of a delta is matched on its own: [`EventRedactor`] also finds secrets split across
     /// deltas.
     pub fn redact_event(&self, event: &AgentEvent) -> AgentEvent {
-        // They hold nothing but harness's words for how the turn went.
-        if matches!(
-            event,
-            AgentEvent::TurnStarted | AgentEvent::TurnFinished { .. }
-        ) {
-            return event.clone();
+        match event {
+            // They hold nothing but harness's words for how the turn went.
+            AgentEvent::TurnStarted | AgentEvent::TurnFinished { .. } => return event.clone(),
+            // A reply is a whole message: its edges can be parts of secrets.
+            AgentEvent::AssistantMessage { content, model } => {
+                return AgentEvent::AssistantMessage {
+                    content: self.redact_message(content),
+                    model: self.redact(model),
+                };
+            }
+            _ => {}
         }
         let mut value = serde_json::to_value(event).expect("events serialize");
         self.redact_value(&mut value);
@@ -209,28 +325,55 @@ impl Redactor {
     }
 }
 
-/// Redacts text that arrives in pieces (see [`Redactor::stream`]). It holds back only the end of
-/// the text so far that could still become a secret, and shows everything before it, redacted.
+/// Redacts text that arrives in pieces (see [`Redactor::stream`]), a message: what it shows adds
+/// up to [`Redactor::redact_message`] of the whole. It holds back only the end of the text so far
+/// that could still become a secret, and the start of the text while it could still be the end
+/// of one, and shows everything else, redacted.
 #[derive(Debug)]
 pub struct StreamRedactor {
     redactor: Arc<Redactor>,
     /// Text received and not yet shown.
     pending: String,
+    /// Whether the start of the text has been shown.
+    started: bool,
 }
 
 impl StreamRedactor {
     /// Adds `piece`, and returns what can be shown now, redacted. It can be empty.
     pub fn push(&mut self, piece: &str) -> String {
         self.pending.push_str(piece);
+        let mut shown = String::new();
+        if !self.started {
+            if self.redactor.could_end_a_secret(&self.pending) {
+                return shown;
+            }
+            let lead = self.redactor.lead_len(&self.pending);
+            // A secret that may start within that end of one is waited for too.
+            if lead > 0 && self.redactor.hold_from(&self.pending) < lead {
+                return shown;
+            }
+            if lead > 0 {
+                shown.push_str(REDACTED);
+                self.pending.drain(..lead);
+            }
+            self.started = true;
+        }
         let held = self.redactor.hold_from(&self.pending);
         let held = self.pending.split_off(held);
         let ready = std::mem::replace(&mut self.pending, held);
-        self.redactor.redact(&ready)
+        shown.push_str(&self.redactor.redact(&ready));
+        shown
     }
 
-    /// Everything held back, redacted: the text has ended. The stream then starts afresh.
+    /// Everything held back, redacted: the text, a message, has ended. The stream then starts
+    /// afresh, with the next message.
     pub fn finish(&mut self) -> String {
-        self.redactor.redact(&std::mem::take(&mut self.pending))
+        let text = std::mem::take(&mut self.pending);
+        if std::mem::replace(&mut self.started, false) {
+            self.redactor.redact_end(&text)
+        } else {
+            self.redactor.redact_message(&text)
+        }
     }
 }
 
@@ -285,6 +428,52 @@ impl EventRedactor {
         }));
         shown
     }
+}
+
+/// Where `secrets` are in `text`: the byte range of each occurrence, overlapping ones included,
+/// in order.
+fn occurrences(secrets: &[String], text: &str) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
+    for secret in secrets {
+        let mut from = 0;
+        while let Some(i) = text[from..].find(secret.as_str()) {
+            let start = from + i;
+            found.push(start..start + secret.len());
+            from = start + text[start..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    found.sort_by_key(|found| (found.start, found.end));
+    found
+}
+
+/// `middle`, after [`REDACTED`] when `lead` and before it when `tail`: a message whose edges
+/// were parts of secrets.
+fn edged(lead: bool, middle: String, tail: bool) -> String {
+    let mut text = String::new();
+    if lead {
+        text.push_str(REDACTED);
+    }
+    text.push_str(&middle);
+    if tail {
+        text.push_str(REDACTED);
+    }
+    text
+}
+
+/// The char boundary at or before `i` in `s`.
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// The char boundary at or after `i` in `s`.
+fn ceil_boundary(s: &str, mut i: usize) -> usize {
+    while !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 /// A delta of `text`, unless there is none.

@@ -120,6 +120,10 @@ const CALL_KEYS: [&str; 3] = ["name", "arguments", "parameters"];
 pub struct CallWatch {
     /// Once the text cannot become calls, it never can.
     ruled_out: bool,
+    /// In the `<tool_call>` form: where the text after the last whole block starts.
+    blocks: usize,
+    /// Where the search for the open block's end goes on from.
+    close_from: usize,
     /// How far the text has been scanned for the end of a JSON object.
     scanned: usize,
     depth: u32,
@@ -147,19 +151,39 @@ impl CallWatch {
         if trimmed.starts_with('{') {
             return self.object(text, text.len() - trimmed.len());
         }
-        // One `<tool_call>` block after another, with nothing but whitespace between.
-        let mut rest = trimmed;
+        self.tagged(text)
+    }
+
+    /// For the `<tool_call>` form: one block after another, with nothing but whitespace between.
+    /// Only what was added since the last call is searched.
+    fn tagged(&mut self, text: &str) -> bool {
         loop {
+            let after = &text[self.blocks..];
+            let start = self.blocks + (after.len() - after.trim_start().len());
+            let rest = &text[start..];
             if rest.is_empty() || OPEN.starts_with(rest) {
                 return true;
             }
-            let Some(inner) = rest.strip_prefix(OPEN) else {
+            if !rest.starts_with(OPEN) {
                 return false;
-            };
-            let Some(end) = inner.find(CLOSE) else {
-                return true;
-            };
-            rest = inner[end + CLOSE.len()..].trim_start();
+            }
+            let inner = start + OPEN.len();
+            let from = self.close_from.max(inner);
+            match text[from..].find(CLOSE) {
+                Some(end) => {
+                    self.blocks = from + end + CLOSE.len();
+                    self.close_from = self.blocks;
+                }
+                None => {
+                    // The end tag may arrive split: search again from just before the end.
+                    let mut resume = text.len().saturating_sub(CLOSE.len() - 1).max(inner);
+                    while !text.is_char_boundary(resume) {
+                        resume -= 1;
+                    }
+                    self.close_from = resume;
+                    return true;
+                }
+            }
         }
     }
 
@@ -212,5 +236,56 @@ impl CallWatch {
             }
         }
         self.scanned = text.len();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether a watch fed `text` in pieces of `size` characters says it may be calls after every
+    /// piece.
+    fn held_throughout(text: &str, size: usize) -> Vec<bool> {
+        let mut watch = CallWatch::default();
+        let chars: Vec<char> = text.chars().collect();
+        let mut sent = String::new();
+        chars
+            .chunks(size)
+            .map(|piece| {
+                sent.extend(piece);
+                watch.may_be_calls(&sent)
+            })
+            .collect()
+    }
+
+    // Whatever the pieces a reply streams in, a message `recover` accepts is held from its first
+    // piece to its last, and text around one is let go once it is there.
+    #[test]
+    fn a_call_is_held_however_it_is_split() {
+        let known = |_: &str| true;
+        for text in [
+            "\n<tool_call>\n{\"name\": \"echo\", \"arguments\": {\"text\": \"é</tool_call\"}}\n</tool_call>\n<tool_call>{\"name\":\"read\",\"arguments\":{}}</tool_call>",
+            "<tool_call>\n<function=write>\n<parameter=content>\nlet s = \"日本\";\n</parameter>\n</function>\n</tool_call>",
+            " {\"name\": \"echo\", \"arguments\": {\"text\": \"}{ \\\" ]\"}} ",
+        ] {
+            assert!(recover(text, known).is_some(), "{text:?}");
+            for size in 1..=9 {
+                let held = held_throughout(text, size);
+                assert!(held.iter().all(|h| *h), "{text:?} in pieces of {size}");
+            }
+        }
+        for call in [
+            "<tool_call>{\"name\":\"read\",\"arguments\":{}}</tool_call>",
+            "{\"name\": \"read\", \"arguments\": {}}",
+        ] {
+            let text = format!("{call} then prose");
+            let held = held_throughout(&text, 1);
+            // Held through the call and the space after it; let go at the prose.
+            assert!(held[..=call.len()].iter().all(|h| *h), "{text:?}");
+            assert!(!held[call.len() + 1], "{text:?}");
+        }
+        for text in ["Hello", "<b>", "```", "{\"result\": 1}", "[1]"] {
+            assert!(!held_throughout(text, 1).last().unwrap(), "{text:?}");
+        }
     }
 }

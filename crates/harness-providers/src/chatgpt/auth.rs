@@ -298,7 +298,8 @@ fn expiring(tokens: &Tokens) -> bool {
 /// A failed refresh as the provider's error. Only the sign-in server refusing the refresh token
 /// (a 401, `invalid_grant`, or a refresh token that expired, was used, or was revoked) means
 /// signing in again, and reads as the 401 it stands for; a server that cannot answer now (a 5xx,
-/// a 429, no connection) can be retried, with the same tokens, as Codex does.
+/// a 429, no connection) can be retried, with the same tokens, as Codex does. Any other failure
+/// keeps the tokens too, but retrying does not help: it says to sign in again should it persist.
 fn refresh_error(error: OAuthError, profile: &str) -> ProviderError {
     const SIGNED_OUT: [&str; 4] = [
         "invalid_grant",
@@ -306,6 +307,8 @@ fn refresh_error(error: OAuthError, profile: &str) -> ProviderError {
         "refresh_token_reused",
         "refresh_token_invalidated",
     ];
+    let login = login_command(PROVIDER, profile);
+    let persists = format!("; if this persists, run `{login}` to sign in again");
     match error {
         OAuthError::Network(message) => ProviderError::Network(format!(
             "cannot reach the sign-in server to renew the ChatGPT sign-in: {message}"
@@ -319,17 +322,25 @@ fn refresh_error(error: OAuthError, profile: &str) -> ProviderError {
             ProviderError::Http {
                 status: 401,
                 body: format!(
-                    "the ChatGPT sign-in has ended (the sign-in server answered HTTP {status}: {body}); run `{}` to sign in again",
-                    login_command(PROVIDER, profile)
+                    "the ChatGPT sign-in has ended (the sign-in server answered HTTP {status}: {body}); run `{login}` to sign in again"
                 ),
                 retry_after: None,
             }
         }
-        OAuthError::Rejected { status, body, .. } => ProviderError::Http {
-            status,
-            body: format!("the sign-in server could not renew the ChatGPT sign-in now: {body}"),
-            retry_after: None,
-        },
-        other => ProviderError::Protocol(format!("cannot renew the ChatGPT sign-in: {other}")),
+        OAuthError::Rejected { status, body, .. } => {
+            // As `ProviderError::is_retryable` has it.
+            let retryable = status == 429 || (500..600).contains(&status);
+            ProviderError::Http {
+                status,
+                body: format!(
+                    "the sign-in server could not renew the ChatGPT sign-in now: {body}{}",
+                    if retryable { "" } else { persists.as_str() }
+                ),
+                retry_after: None,
+            }
+        }
+        other => ProviderError::Protocol(format!(
+            "cannot renew the ChatGPT sign-in: {other}{persists}"
+        )),
     }
 }

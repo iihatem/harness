@@ -712,3 +712,33 @@ async fn a_profile_signed_out_elsewhere_ends_the_session_at_its_next_renewal() {
     assert!(refreshes(&server).await.is_empty());
     assert_eq!(signed.credentials.get("chatgpt", "work").unwrap(), None);
 }
+
+// Re-review B+C, R5: a refusal that retrying will not fix says what to do should it persist; one
+// that retrying may fix does not (see `only_a_refused_refresh_token_means_signing_in_again`).
+#[tokio::test]
+async fn a_refresh_failing_for_an_unknown_reason_says_what_to_do_if_it_persists() {
+    for (status, body) in [
+        (400, json!({"error": "unsupported_something"})),
+        (403, json!({})),
+        // A 200 without a token.
+        (200, json!({"token_type": "Bearer"})),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body.clone()))
+            .mount(&server)
+            .await;
+        let before = tokens(&access_token("old", 60), "rt-1");
+        let signed = Signed::in_profile(&before, "work");
+        let error = signed.auth(&server).current().await.unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("if this persists"), "{status} {body}: {text}");
+        assert!(
+            text.contains("`harness login chatgpt --profile work`"),
+            "{status} {body}: {text}"
+        );
+        assert!(!error.is_retryable(), "{status} {body}: {text}");
+        assert_eq!(signed.stored(), before);
+    }
+}

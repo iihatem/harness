@@ -17,6 +17,7 @@ async-stream.workspace = true
 base64 = { workspace = true, optional = true }
 eventsource-stream.workspace = true
 futures.workspace = true
+globset.workspace = true
 harness-config.workspace = true
 harness-core.workspace = true
 keyring-core.workspace = true

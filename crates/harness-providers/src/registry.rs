@@ -84,7 +84,8 @@ pub const BUILTIN_PROVIDERS: [Builtin; 7] = [
 /// The built-in provider a ChatGPT account answers for.
 pub const CHATGPT: &str = "chatgpt";
 
-const LOCAL_PROVIDERS: [&str; 3] = ["ollama", "lmstudio", "llamacpp"];
+/// The local model servers harness finds on its own.
+pub const LOCAL_PROVIDERS: [&str; 3] = ["ollama", "lmstudio", "llamacpp"];
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResolveError {

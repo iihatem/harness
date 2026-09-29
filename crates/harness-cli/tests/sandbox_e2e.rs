@@ -95,7 +95,8 @@ impl Env {
         std::fs::create_dir_all(env.home.path().join("config")).unwrap();
         std::fs::write(
             env.home.path().join("config/config.toml"),
-            format!("model = \"mock/m\"\n{extra_config}\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{server_uri}/v1\"\n"),
+            // A known window, so that the only warnings are the sandbox's.
+            format!("model = \"mock/m\"\n{extra_config}\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{server_uri}/v1\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n"),
         )
         .unwrap();
         let git = StdCommand::new("git")

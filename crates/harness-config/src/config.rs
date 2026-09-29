@@ -132,8 +132,99 @@ impl CompactionSettings {
     }
 }
 
+/// `[profiles."<glob>"]`: settings for the models whose ids match the glob (resolved in
+/// `harness_providers::profiles`).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileSettings {
+    /// The model's context window, in tokens.
+    pub context_window: Option<u64>,
+    /// The smallest window worth running agentic turns in; below it harness warns.
+    pub min_context: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub temperature: Option<f64>,
+    pub reasoning_effort: Option<String>,
+    /// Whether tool calls the model writes as text are run.
+    pub text_tool_calls: Option<bool>,
+    /// Whether the model runs on a server of the user's own.
+    pub local: Option<bool>,
+}
+
+impl ProfileSettings {
+    /// These settings with `other`'s over them.
+    pub fn overlaid(&self, other: &ProfileSettings) -> ProfileSettings {
+        ProfileSettings {
+            context_window: other.context_window.or(self.context_window),
+            min_context: other.min_context.or(self.min_context),
+            max_output_tokens: other.max_output_tokens.or(self.max_output_tokens),
+            temperature: other.temperature.or(self.temperature),
+            reasoning_effort: other
+                .reasoning_effort
+                .clone()
+                .or_else(|| self.reasoning_effort.clone()),
+            text_tool_calls: other.text_tool_calls.or(self.text_tool_calls),
+            local: other.local.or(self.local),
+        }
+    }
+
+    /// The settings that are set, as `key = value`, for listings and fingerprints.
+    fn describe(&self) -> String {
+        let mut set = Vec::new();
+        let mut number = |key: &str, value: Option<u64>| {
+            if let Some(value) = value {
+                set.push(format!("{key} = {value}"));
+            }
+        };
+        number("context_window", self.context_window);
+        number("min_context", self.min_context);
+        number("max_output_tokens", self.max_output_tokens);
+        if let Some(t) = self.temperature {
+            set.push(format!("temperature = {t}"));
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            set.push(format!("reasoning_effort = {effort:?}"));
+        }
+        if let Some(on) = self.text_tool_calls {
+            set.push(format!("text_tool_calls = {on}"));
+        }
+        if let Some(local) = self.local {
+            set.push(format!("local = {local}"));
+        }
+        set.join(", ")
+    }
+
+    /// What is wrong with the profile under `key`, if anything.
+    fn problem(&self, key: &str) -> Option<String> {
+        if let Err(e) = globset::Glob::new(key) {
+            return Some(format!("profiles.{key:?} is not a valid glob: {e}"));
+        }
+        for (name, value) in [
+            ("context_window", self.context_window),
+            ("min_context", self.min_context),
+            ("max_output_tokens", self.max_output_tokens),
+        ] {
+            if value == Some(0) {
+                return Some(format!("profiles.{key:?}: {name} must be at least 1"));
+            }
+        }
+        if self.temperature.is_some_and(|t| !(0.0..=2.0).contains(&t)) {
+            return Some(format!(
+                "profiles.{key:?}: temperature must be between 0 and 2"
+            ));
+        }
+        None
+    }
+}
+
+/// The first problem with any of `profiles`.
+fn profiles_problem(profiles: &BTreeMap<String, ProfileSettings>) -> Option<String> {
+    profiles
+        .iter()
+        .find_map(|(key, profile)| profile.problem(key))
+}
+
 /// One `config.toml` file as written by the user.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     pub model: Option<String>,
@@ -147,6 +238,8 @@ pub struct ConfigFile {
     pub sandbox: SandboxConfig,
     #[serde(default)]
     pub compaction: CompactionSettings,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ProfileSettings>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -161,7 +254,7 @@ pub enum ConfigError {
 }
 
 /// The merged, effective configuration plus warnings about settings that were ignored.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Config {
     pub model: Option<String>,
     pub mode: Option<Mode>,
@@ -175,6 +268,8 @@ pub struct Config {
     pub writable_roots: Vec<PathBuf>,
     pub allow_localhost: bool,
     pub linux_git_protection: LinuxGitProtection,
+    /// Model profiles by model-id glob: the global config's, with a trusted project's over them.
+    pub profiles: BTreeMap<String, ProfileSettings>,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -275,6 +370,11 @@ fn widening(project: &ConfigFile, baseline: Baseline) -> Widening {
     if let Some(true) = project.sandbox.allow_localhost {
         items.push("sandbox.allow_localhost = true".to_string());
     }
+    // They choose output limits, reasoning effort and context budgets (paid requests), and
+    // whether text is run as tool calls.
+    for (key, profile) in &project.profiles {
+        items.push(format!("profiles.{key:?}: {}", profile.describe()));
+    }
     if project.sandbox.linux_git_protection == Some(LinuxGitProtection::BestEffort)
         && baseline.linux_git_protection == LinuxGitProtection::Required
     {
@@ -318,6 +418,7 @@ pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening
         .compaction
         .out_of_range()
         .or_else(|| global_compaction.overlaid(&project.compaction).problem())
+        .or_else(|| profiles_problem(&project.profiles))
     {
         return Err(ConfigError::Parse { path, message });
     }
@@ -343,7 +444,11 @@ pub fn load(
     let mut cfg = Config::default();
     let global = parse_file(global_file)?;
     let baseline = Baseline::new(global.as_ref(), workspace);
-    if let Some(message) = global.as_ref().and_then(|g| g.compaction.problem()) {
+    if let Some(message) = global.as_ref().and_then(|g| {
+        g.compaction
+            .problem()
+            .or_else(|| profiles_problem(&g.profiles))
+    }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
             message,
@@ -363,13 +468,18 @@ pub fn load(
         cfg.writable_roots = expand_all(&global.sandbox.writable_roots, base, home);
         cfg.allow_localhost = global.sandbox.allow_localhost.unwrap_or(false);
         cfg.linux_git_protection = global.sandbox.linux_git_protection.unwrap_or_default();
+        cfg.profiles = global.profiles;
     }
     let path = project_file(workspace);
     let project = parse_file(&path)?;
     let widening = widening(project.as_ref().unwrap_or(&ConfigFile::default()), baseline);
     cfg.trusted = trust.is_trusted(workspace, &widening.fingerprint);
     if let Some(project) = project {
-        if let Some(message) = project.compaction.out_of_range() {
+        if let Some(message) = project
+            .compaction
+            .out_of_range()
+            .or_else(|| profiles_problem(&project.profiles))
+        {
             return Err(ConfigError::Parse { path, message });
         }
         cfg.deny.extend(project.permissions.deny.iter().cloned());
@@ -450,6 +560,10 @@ pub fn load(
                 }
                 if let Some(protection) = project.sandbox.linux_git_protection {
                     cfg.linux_git_protection = protection;
+                }
+                for (key, profile) in &project.profiles {
+                    let merged = cfg.profiles.entry(key.clone()).or_default();
+                    *merged = merged.overlaid(profile);
                 }
             } else {
                 let items: Vec<&str> = widening_items.iter().map(|item| item.as_str()).collect();

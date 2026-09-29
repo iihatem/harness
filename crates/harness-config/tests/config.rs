@@ -803,3 +803,94 @@ fn providers_may_use_the_messages_protocol() {
         config::Protocol::AnthropicMessages
     );
 }
+
+#[test]
+fn model_profiles_are_read_from_the_global_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    std::fs::write(
+        &global,
+        "[profiles.\"ollama/qwen3-coder*\"]\ncontext_window = 65536\ntemperature = 0.2\ntext_tool_calls = false\n\n[profiles.\"openai/*\"]\nreasoning_effort = \"high\"\nmax_output_tokens = 8000\n",
+    )
+    .unwrap();
+    let cfg = config::load(&global, dir.path(), &TrustStore::default()).unwrap();
+    let qwen = &cfg.profiles["ollama/qwen3-coder*"];
+    assert_eq!(qwen.context_window, Some(65_536));
+    assert_eq!(qwen.temperature, Some(0.2));
+    assert_eq!(qwen.text_tool_calls, Some(false));
+    assert_eq!(qwen.local, None);
+    let openai = &cfg.profiles["openai/*"];
+    assert_eq!(openai.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(openai.max_output_tokens, Some(8000));
+}
+
+// A project's profiles choose output limits, reasoning effort and context budgets, which cost
+// paid requests, and whether text runs as tool calls: they need trust.
+#[test]
+fn a_projects_model_profiles_need_trust() {
+    let global = "[profiles.\"ollama/*\"]\ncontext_window = 32768\ntemperature = 0.5\n";
+    let project = "[profiles.\"ollama/*\"]\ntemperature = 0.1\n[profiles.\"openai/*\"]\nreasoning_effort = \"high\"\n";
+    let (cfg, widening) = load_project(Some(global), project, true);
+    assert_eq!(cfg.profiles.len(), 1);
+    assert_eq!(cfg.profiles["ollama/*"].temperature, Some(0.5));
+    let widening = widening.expect("profiles widen");
+    assert_eq!(
+        widening.items,
+        [
+            "profiles.\"ollama/*\": temperature = 0.1",
+            "profiles.\"openai/*\": reasoning_effort = \"high\""
+        ]
+    );
+    assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
+    assert!(cfg.warnings[0].contains("profiles"), "{:?}", cfg.warnings);
+
+    // Trusted, a project's fields go over the global profile's.
+    let dir = tempfile::tempdir().unwrap();
+    let global_file = dir.path().join("global.toml");
+    std::fs::write(&global_file, global).unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    std::fs::write(ws.join(".harness/config.toml"), project).unwrap();
+    let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    trust
+        .trust(&ws, &widening_of(&global_file, &ws).fingerprint)
+        .unwrap();
+    let cfg = config::load(&global_file, &ws, &trust).unwrap();
+    assert_eq!(cfg.profiles["ollama/*"].temperature, Some(0.1));
+    assert_eq!(cfg.profiles["ollama/*"].context_window, Some(32_768));
+    assert_eq!(
+        cfg.profiles["openai/*"].reasoning_effort.as_deref(),
+        Some("high")
+    );
+}
+
+#[test]
+fn invalid_profiles_are_errors_naming_the_file() {
+    for (text, problem) in [
+        (
+            "[profiles.\"ollama/[qwen\"]\ntemperature = 0.2\n",
+            "not a valid glob",
+        ),
+        (
+            "[profiles.\"ollama/*\"]\ncontext_window = 0\n",
+            "context_window",
+        ),
+        (
+            "[profiles.\"ollama/*\"]\ntemperature = 3.0\n",
+            "temperature",
+        ),
+        (
+            "[profiles.\"ollama/*\"]\ncontxt_window = 1\n",
+            "contxt_window",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        std::fs::write(&global, text).unwrap();
+        let error = config::load(&global, dir.path(), &TrustStore::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("global.toml"), "{error}");
+        assert!(error.contains(problem), "{error}");
+    }
+}

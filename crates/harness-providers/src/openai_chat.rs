@@ -36,6 +36,16 @@ pub fn request_body(req: &ChatRequest) -> Value {
         "stream_options": {"include_usage": true},
         "messages": messages,
     });
+    // `max_tokens`, which local servers read, rather than OpenAI's newer name.
+    if let Some(tokens) = req.options.max_output_tokens {
+        body["max_tokens"] = json!(tokens);
+    }
+    if let Some(temperature) = req.options.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(effort) = &req.options.reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
     if !req.tools.is_empty() {
         body["tools"] = Value::Array(
             req.tools

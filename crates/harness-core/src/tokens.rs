@@ -1,7 +1,8 @@
 //! Rough token counts. harness has no tokenizer for most models, so it counts about four bytes
 //! per token, which is close for English text and code.
 
-/// The context window assumed for every model until model profiles report the real one.
+/// The context window an agent starts with; `harness ask` sets the model's own, from its profile
+/// and its server.
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 32_768;
 
 /// Estimated tokens in `text`: its length in bytes divided by four, rounded up.

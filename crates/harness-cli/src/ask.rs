@@ -13,7 +13,7 @@ use harness_core::{
     permission::{FsAccess, Mode},
     tool::{CommandSandbox, ToolContext},
 };
-use harness_providers::registry;
+use harness_providers::{profiles, registry};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -180,12 +180,21 @@ pub async fn run(
         );
     }
     let ctx = tool_context(&setup.workspace, sandbox, mode.fs_access()).await;
+    let local = profiles::is_local(&resolved.id, &resolved.base_url);
+    let profile = profiles::resolve(&resolved.id, local, &setup.config.profiles);
+    let context_window = context_window(&resolved.id, &profile);
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),
-        crate::context::system_prompt(&setup, &prompt::base_prompt(mode, sandboxed)),
+        crate::context::system_prompt(
+            &setup,
+            &prompt::base_prompt(mode, sandboxed),
+            context_window,
+        ),
         output_dir,
     );
+    config.context_window = context_window;
+    config.request = profile.request_options();
     if let Some(steps) = setup.config.max_steps {
         config.max_steps = steps;
     }
@@ -238,6 +247,20 @@ pub async fn run(
     }
     end_run(agent, sandbox_session);
     exit_code(reason, blocked)
+}
+
+/// The context window of model `id`, from its profile; when no profile knows it, the fallback,
+/// with a warning that says how to set it.
+fn context_window(id: &str, profile: &profiles::ModelProfile) -> u64 {
+    profile.context_window.unwrap_or_else(|| {
+        eprintln!(
+            "warning: the context window of {} is unknown; assuming {} tokens. Set it with `context_window` under [profiles.\"{}\"] in config.toml",
+            terminal_safe(id),
+            profiles::FALLBACK_CONTEXT_WINDOW,
+            terminal_safe(id)
+        );
+        profiles::FALLBACK_CONTEXT_WINDOW
+    })
 }
 
 /// Ends the run: first the agent, which releases the session file, then the sandbox's session,

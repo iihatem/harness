@@ -1,6 +1,8 @@
 //! The Responses stream parser and request body, against fixtures built from the documented
 //! streaming examples (`tests/fixtures/openai-responses/`).
 
+use std::time::Duration;
+
 use harness_core::message::{ChatRequest, Message, RequestOptions, ToolCall, ToolSpec, Usage};
 use harness_core::provider::{FinishReason, ProviderError, ProviderEvent};
 use harness_providers::openai_responses::{ResponsesStreamParser, request_body};
@@ -135,6 +137,108 @@ fn server_errors_and_rate_limits_in_the_stream_can_be_retried() {
         error,
         ProviderError::InStream("invalid_prompt: bad prompt".into())
     );
+}
+
+/// The error a `response.failed` event with `error` ends the stream with.
+fn failed(error: serde_json::Value) -> ProviderError {
+    let mut parser = ResponsesStreamParser::default();
+    let data = json!({"type": "response.failed", "response": {"status": "failed", "error": error}});
+    parser.push(&data.to_string()).unwrap_err()
+}
+
+// Review A I1: OpenAI's overload and slow-down codes are transient, as Codex treats them.
+#[test]
+fn an_overloaded_server_or_a_slow_down_in_the_stream_is_retried() {
+    for (code, status) in [("server_is_overloaded", 503), ("slow_down", 429)] {
+        let error = failed(json!({"code": code, "message": "busy"}));
+        assert_eq!(
+            error,
+            ProviderError::Http {
+                status,
+                body: format!("{code}: busy"),
+                retry_after: None,
+            }
+        );
+        assert!(error.is_retryable(), "{code}");
+    }
+}
+
+// Review A I1: an `error` event can carry its details under `error`, where Codex reads them.
+#[test]
+fn a_nested_error_event_keeps_its_code() {
+    let mut parser = ResponsesStreamParser::default();
+    let data = json!({"type": "error", "sequence_number": 3,
+        "error": {"type": "server_error", "code": "server_is_overloaded", "message": "busy"}});
+    let error = parser.push(&data.to_string()).unwrap_err();
+    assert!(
+        matches!(error, ProviderError::Http { status: 503, .. }),
+        "{error:?}"
+    );
+    let mut parser = ResponsesStreamParser::default();
+    let data = json!({"type": "error", "error": {"code": "context_length_exceeded",
+        "message": "Your input exceeds the context window of this model."}});
+    let error = parser.push(&data.to_string()).unwrap_err();
+    assert!(error.is_context_overflow(), "{error:?}");
+    assert!(!error.is_retryable());
+}
+
+// Review A I1: as in Codex, a code harness does not know is worth another try; the ones known to
+// be final are not retried.
+#[test]
+fn unknown_codes_in_the_stream_are_retried_and_known_final_ones_are_not() {
+    for error in [
+        json!({"code": "something_new", "message": "try later"}),
+        json!({"message": "An error occurred while processing your request."}),
+        json!(null),
+    ] {
+        let error = failed(error);
+        assert!(error.is_retryable(), "{error:?}");
+    }
+    for code in ["context_length_exceeded", "invalid_prompt"] {
+        let error = failed(json!({"code": code, "message": "no"}));
+        assert!(matches!(error, ProviderError::InStream(_)), "{error:?}");
+        assert!(!error.is_retryable(), "{code}");
+    }
+}
+
+// Review A I1: "try again in N s" in a rate limit's message is how long to wait, as Codex reads it.
+#[test]
+fn the_wait_a_stream_error_names_becomes_its_retry_after() {
+    for (message, wait) in [
+        (
+            "Rate limit reached for gpt-5 in organization org-AAA on tokens per min (TPM): Limit 30000, Used 22999, Requested 12528. Please try again in 11.054s. Visit https://platform.openai.com/account/rate-limits to learn more.",
+            Some(Duration::from_millis(11_054)),
+        ),
+        ("Please try again in 28ms.", Some(Duration::from_millis(28))),
+        ("Try again in 35 seconds", Some(Duration::from_secs(35))),
+        ("Rate limit reached.", None),
+        ("try again in a moment", None),
+    ] {
+        let error = failed(json!({"code": "rate_limit_exceeded", "message": message}));
+        assert_eq!(error.retry_after(), wait, "{message}");
+        assert!(error.is_retryable());
+    }
+}
+
+// Review A M11: an exhausted quota reported in the stream reads as one (decision 17): not retried,
+// with its reset time.
+#[test]
+fn an_exhausted_quota_in_the_stream_is_reported_as_one() {
+    for code in [
+        "insufficient_quota",
+        "usage_limit_reached",
+        "usage_not_included",
+    ] {
+        let error = failed(
+            json!({"code": code, "message": "You exceeded your current quota",
+            "resets_at": 1_900_000_000u64}),
+        );
+        assert!(error.is_quota_exhausted(), "{error:?}");
+        assert!(!error.is_retryable(), "{code}");
+        assert_eq!(error.resets_at(), Some(1_900_000_000));
+    }
+    let error = failed(json!({"code": "insufficient_quota", "message": "You exceeded your quota"}));
+    assert!(error.is_quota_exhausted() && error.resets_at().is_none());
 }
 
 #[test]

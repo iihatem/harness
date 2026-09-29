@@ -2,7 +2,7 @@
 //! ChatGPT sign-in. Requests are stateless: each carries the whole conversation with
 //! `store: false`, so nothing on the server has to outlive a model switch.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use harness_core::{
     message::{ChatRequest, Message, ToolCall, Usage},
@@ -168,7 +168,11 @@ impl ResponsesStreamParser {
                 out.extend(self.finish());
             }
             "response.failed" => return Err(stream_error(&event["response"]["error"])),
-            "error" => return Err(stream_error(&event)),
+            // The details are at the top level, or nested under `error` (where Codex reads them).
+            "error" => {
+                let error = event.get("error").filter(|e| e.is_object());
+                return Err(stream_error(error.unwrap_or(&event)));
+            }
             _ => {}
         }
         Ok(out)
@@ -231,27 +235,81 @@ impl EventParser for ResponsesStreamParser {
     }
 }
 
-/// The error an `error` event or a failed response reports. Server errors and rate limits are
-/// worth retrying, as their HTTP forms are.
+/// The error an `error` event or a failed response reports, classified by its code as Codex
+/// classifies it (`codex-api/src/sse/responses_error.rs`):
+/// - an exhausted quota is a 429 whose body names it, which is not retried and says when the
+///   quota resets;
+/// - a context overflow, and a prompt or content refused, are final;
+/// - an overloaded server is retried like a 503, and a rate limit or a request to slow down like a
+///   429, waiting as long as the message asks ("try again in 11.054s");
+/// - any other code, or none, is retried like a server error.
 fn stream_error(error: &Value) -> ProviderError {
     let code = error["code"].as_str().unwrap_or_default();
     let message = error["message"].as_str().unwrap_or_default();
     let text = match (code, message) {
-        ("", "") => error.to_string(),
+        ("", "") if error.is_object() => error.to_string(),
+        ("", "") => "the response failed without saying why".to_string(),
         ("", message) => message.to_string(),
         (code, "") => code.to_string(),
         (code, message) => format!("{code}: {message}"),
     };
     let status = match code {
-        "server_error" => 500,
-        "rate_limit_exceeded" => 429,
-        _ => return ProviderError::InStream(text),
+        "insufficient_quota"
+        | "usage_limit_reached"
+        | "usage_not_included"
+        | "credit_balance_exhausted"
+        | "organization_spend_limit_exceeded"
+        | "project_spend_limit_exceeded" => {
+            // As the HTTP form's body, so that it reads as an exhausted quota, with its reset time.
+            return ProviderError::Http {
+                status: 429,
+                body: json!({ "error": error }).to_string(),
+                retry_after: None,
+            };
+        }
+        "context_length_exceeded"
+        | "invalid_prompt"
+        | "cyber_policy"
+        | "bio_policy"
+        | "misalignment_policy_violation" => return ProviderError::InStream(text),
+        "server_is_overloaded" => 503,
+        "rate_limit_exceeded" | "slow_down" => 429,
+        _ => 500,
     };
     ProviderError::Http {
         status,
+        retry_after: requested_wait(message),
         body: text,
-        retry_after: None,
     }
+}
+
+/// The wait a message asks for, as in "Please try again in 11.054s", "in 28ms" or "in 35
+/// seconds".
+fn requested_wait(message: &str) -> Option<Duration> {
+    const PHRASE: &str = "try again in";
+    let start = message.to_ascii_lowercase().find(PHRASE)? + PHRASE.len();
+    let rest = message[start..].trim_start();
+    let number = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(rest.len());
+    let (whole, fraction) = rest[..number]
+        .split_once('.')
+        .unwrap_or((&rest[..number], ""));
+    if whole.is_empty() || fraction.contains('.') {
+        return None;
+    }
+    // In nanoseconds, from the digits, so that 11.054 is exactly 11,054 ms.
+    let digits: String = format!("{whole}{fraction:0<9.9}");
+    let nanos: u128 = digits.parse().ok()?;
+    let unit = rest[number..].trim_start().to_ascii_lowercase();
+    let nanos = if unit.starts_with("ms") {
+        nanos / 1_000
+    } else if unit.starts_with('s') {
+        nanos
+    } else {
+        return None;
+    };
+    Some(Duration::from_nanos(u64::try_from(nanos).ok()?))
 }
 
 /// How requests are authorized.

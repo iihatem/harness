@@ -7,11 +7,11 @@ use std::{
 };
 
 use harness_config::config;
-use harness_context::{commands::Commands, project::project_root};
-use harness_core::{engine::PermissionEngine, permission::Mode};
+use harness_context::project::project_root;
+use harness_core::permission::Mode;
 use harness_providers::registry;
 use harness_tui::{
-    app::{Host, Options, Prepared},
+    app::{Host, Options},
     approval::{ChannelApprover, Requests},
     inline::InlineTerminal,
     input::{Startup, TerminalInput, Unanswered, ask_at_startup},
@@ -26,10 +26,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     context::home,
+    host::CliHost,
     notices::Notices,
     sessions, setup,
-    setup::Setup,
-    slash::{self, Message},
     start::{self, Request, Started},
     term::terminal_safe,
 };
@@ -55,42 +54,6 @@ pub fn unfit_terminal(term: Option<&str>, size: Option<(u16, u16)>) -> Option<&'
         );
     }
     None
-}
-
-/// Expands the project's custom commands and `/init` for the session.
-struct CliHost {
-    setup: Arc<Setup>,
-    commands: Commands,
-    policy: Arc<PermissionEngine>,
-}
-
-impl Host for CliHost {
-    fn is_command(&self, name: &str) -> bool {
-        self.commands.get(name).is_some()
-    }
-
-    fn take_warnings(&self) -> Vec<String> {
-        self.setup.credentials.take_warnings()
-    }
-
-    fn prepare(&mut self, typed: &str) -> Prepared {
-        let expanded =
-            slash::turn_input(typed, "", Some(&self.commands), &self.setup, &*self.policy);
-        let mut prepared = Prepared {
-            input: expanded.input,
-            notes: Vec::new(),
-            warnings: Vec::new(),
-        };
-        // Redacted, as `harness ask` prints them.
-        let redacted = |text: String| self.setup.redactor.redact(&text);
-        for message in expanded.messages {
-            match message {
-                Message::Warning(text) => prepared.warnings.push(redacted(text)),
-                Message::Note(text) => prepared.notes.push(redacted(text)),
-            }
-        }
-        prepared
-    }
 }
 
 /// What the interactive session does before the async runtime starts, while harness is one
@@ -192,6 +155,7 @@ pub async fn run(
         policy,
         window_note,
         write_mode_warning,
+        writable,
     }) = start::start(
         Request {
             setup: &setup,
@@ -232,6 +196,7 @@ pub async fn run(
         setup: setup.clone(),
         commands,
         policy,
+        writable,
     };
     let notifications = setup.config.notifications;
     let redactor = setup.redactor.clone();
@@ -372,9 +337,10 @@ async fn terminal_session(
 mod tests {
     use super::*;
 
+    use crate::setup::Setup;
     use harness_config::{config::Config, paths::Paths, trust::TrustStore};
     use harness_core::{
-        engine::{EngineConfig, RuleSet},
+        engine::{EngineConfig, PermissionEngine, RuleSet},
         redact::Redactor,
     };
     use harness_providers::credentials::Credentials;
@@ -421,6 +387,7 @@ mod tests {
             setup,
             commands,
             policy,
+            writable: Vec::new(),
         };
         assert!(host.is_command("deploy"));
         let prepared = host.prepare("/deploy");

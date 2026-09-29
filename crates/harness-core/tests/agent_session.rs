@@ -303,3 +303,59 @@ async fn a_call_without_a_result_earlier_on_is_answered_and_compaction_keeps_the
     );
     assert_eq!(kept.len(), 4, "{:?}", agent.history());
 }
+
+// `/new` and `/resume`: the agent continues in another session, with the same model, mode and
+// system prompt, and the session it leaves is free for another process.
+#[tokio::test]
+async fn the_agent_can_continue_in_another_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let provider = MockProvider::new(vec![
+        Script::text("first answer"),
+        Script::text("fresh answer"),
+        Script::text("back again"),
+    ]);
+    let first = Session::create(&sessions, dir.path());
+    let first_path = first.path().unwrap().to_path_buf();
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    )
+    .with_session(first);
+    run(&mut agent, "first question").await;
+    agent.start_session(Session::create(&sessions, dir.path()), None);
+    assert!(agent.history().is_empty());
+    assert!(agent.rewind_points().is_empty());
+    assert!(
+        Session::open(&first_path).is_ok(),
+        "the first session is free"
+    );
+    run(&mut agent, "fresh question").await;
+    let sent = provider.requests().last().unwrap().messages.clone();
+    assert_eq!(
+        sent,
+        [Message::User {
+            content: "fresh question".into()
+        }]
+    );
+    let (first, _) = Session::open(&first_path).unwrap();
+    agent.start_session(first, None);
+    let points: Vec<String> = agent.rewind_points().into_iter().map(|p| p.text).collect();
+    assert_eq!(points, ["first question"]);
+    run(&mut agent, "and again").await;
+    let sent = provider.requests().last().unwrap().messages.clone();
+    assert_eq!(
+        sent.first(),
+        Some(&Message::User {
+            content: "first question".into()
+        })
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content.contains("fresh question")))
+    );
+    assert_eq!(session::list(&sessions).len(), 2);
+}

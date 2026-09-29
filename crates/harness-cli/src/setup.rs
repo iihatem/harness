@@ -83,7 +83,17 @@ pub fn load() -> Result<Setup, String> {
         .and_then(|dir| dir.canonicalize())
         .map_err(|e| format!("cannot determine the working directory: {e}"))?;
     let paths = Paths::from_process_env().map_err(|e| e.to_string())?;
-    let credentials = Arc::new(Credentials::open(&paths.data_dir, env));
+    load_in(workspace, paths, env)
+}
+
+/// Loads the configuration for `workspace`, with `paths`, as [`load`] does; the credential store
+/// reads its settings (`HARNESS_CREDENTIAL_STORE`) from `store_env`.
+pub fn load_in(
+    workspace: PathBuf,
+    paths: Paths,
+    store_env: impl Fn(&str) -> Option<String>,
+) -> Result<Setup, String> {
+    let credentials = Arc::new(Credentials::open(&paths.data_dir, store_env));
     let redactor = Arc::new(known_secrets(&credentials));
     let redacted = |message: String| redactor.redact(&message);
     let trust = TrustStore::load(&paths.data_dir).map_err(|e| redacted(e.to_string()))?;

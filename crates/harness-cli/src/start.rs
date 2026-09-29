@@ -47,6 +47,8 @@ pub struct Started {
     /// What the modes that write lack, for an interactive session that did not start in one to
     /// say when it first switches to one.
     pub write_mode_warning: Option<String>,
+    /// Where sandboxed commands can write, which a session's checkpoints must stay out of.
+    pub writable: Vec<std::path::PathBuf>,
 }
 
 /// A new run's id: its start time and the process id.
@@ -225,6 +227,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         &setup.workspace,
     );
     let checkpoints = crate::sessions::checkpoints(setup, &session, &writable, notices);
+    let writable_roots = writable;
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin(),
@@ -245,6 +248,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         policy,
         window_note: window_note.into(),
         write_mode_warning,
+        writable: writable_roots,
     })
 }
 

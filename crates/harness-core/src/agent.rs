@@ -493,6 +493,27 @@ impl Agent {
         &self.session
     }
 
+    /// Continues in `session` from now on, as `/new` and `/resume` do: its active branch becomes
+    /// the conversation, and `checkpoints` its snapshots. The model, the mode, the tools and the
+    /// system prompt stay as they are, so providers keep their prompt caches. The session left
+    /// is released, for another process to continue.
+    pub fn start_session(&mut self, session: Session, checkpoints: Option<Arc<Checkpoints>>) {
+        self.session = session;
+        if let Some(redactor) = &self.redactor {
+            self.session.set_redactor(redactor.clone());
+        }
+        self.checkpoints = checkpoints;
+        self.turn_checkpointed = false;
+        self.message_recorded = true;
+        self.held_entries.clear();
+        self.invalid_calls = 0;
+        self.used_call_ids.clear();
+        self.turn_model = None;
+        self.auto_compaction_paused = false;
+        self.stats = Stats::default();
+        self.load_history(true);
+    }
+
     /// The user messages on the active branch, oldest first, for the rewind list. Notes from
     /// harness are left out.
     pub fn rewind_points(&self) -> Vec<RewindPoint> {

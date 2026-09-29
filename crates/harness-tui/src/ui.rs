@@ -10,9 +10,10 @@ use std::{
 use futures::{FutureExt, Stream, StreamExt};
 use harness_core::{
     agent::{Agent, ContextUsage, RewindPoint},
+    checkpoint::Checkpoints,
     event::AgentEvent,
     redact::{EventRedactor, Redactor},
-    session::RewindScope,
+    session::{RewindScope, Session},
     turn::TurnInput,
 };
 use ratatui::{backend::Backend, crossterm::event::Event};
@@ -20,7 +21,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    app::{Action, App, Done, Host, Options},
+    app::{Action, App, Done, Host, Options, SessionView},
     approval::{Reply, Requests},
     inline::{CursorReport, InlineTerminal},
     input::{CursorQuery, Timed},
@@ -91,6 +92,11 @@ enum Job {
         scope: RewindScope,
     },
     UndoRewind,
+    StartSession {
+        session: Box<Session>,
+        checkpoints: Option<Arc<Checkpoints>>,
+        resumed: bool,
+    },
 }
 
 /// What the task that owns the agent says after each job: where the context goes now, and how
@@ -99,6 +105,8 @@ struct Update {
     context: ContextUsage,
     /// What the conversation can be rewound to, and whether the last rewind can be undone.
     rewind: (Vec<RewindPoint>, bool),
+    /// The session the agent continues in.
+    session: String,
     done: Option<Done>,
 }
 
@@ -155,6 +163,7 @@ where
         let agent = agent.with_steering(app.steering());
         app.set_context(agent.context_usage());
         app.set_rewind(agent.rewind_points(), agent.can_undo_rewind());
+        app.set_session_id(agent.session().id());
         let runner = tokio::spawn(async move {
             let mut agent = agent;
             while let Some(job) = queue.recv().await {
@@ -179,10 +188,26 @@ where
                         let result = agent.undo_rewind().await;
                         Some(Done::UndidRewind(result.map_err(|e| e.to_string())))
                     }
+                    Job::StartSession {
+                        session,
+                        checkpoints,
+                        resumed,
+                    } => {
+                        agent.start_session(*session, checkpoints);
+                        let view = SessionView {
+                            id: agent.session().id().to_string(),
+                            history: agent.history().to_vec(),
+                        };
+                        Some(Done::Session {
+                            resumed,
+                            result: Ok(view),
+                        })
+                    }
                 };
                 let _ = updates_tx.send(Update {
                     context: agent.context_usage(),
                     rewind: (agent.rewind_points(), agent.can_undo_rewind()),
+                    session: agent.session().id().to_string(),
                     done,
                 });
             }
@@ -317,6 +342,26 @@ where
             }
             Action::UndoRewind => {
                 self.send_job(Job::UndoRewind);
+                Flow::Continue
+            }
+            Action::OpenSession(id) => {
+                let resumed = id.is_some();
+                match self.app.host().open_session(id.as_deref()) {
+                    Ok(opened) => {
+                        for message in opened.warnings {
+                            self.show(AgentEvent::Warning { message });
+                        }
+                        self.send_job(Job::StartSession {
+                            session: Box::new(opened.session),
+                            checkpoints: opened.checkpoints,
+                            resumed,
+                        });
+                    }
+                    Err(why) => self.app.on_done(Done::Session {
+                        resumed,
+                        result: Err(why),
+                    }),
+                }
                 Flow::Continue
             }
             Action::Compact(focus) => {
@@ -535,6 +580,7 @@ where
         self.app.set_context(update.context);
         let (points, can_undo) = update.rewind;
         self.app.set_rewind(points, can_undo);
+        self.app.set_session_id(&update.session);
         if let Some(done) = update.done {
             self.app.on_done(done);
         }

@@ -12,10 +12,12 @@ use std::{
 use harness_context::commands::{is_builtin, parse_invocation};
 use harness_core::{
     agent::{ApprovalDecision, ApprovalRequest, ContextUsage, REWIND_LIMITS, RewindPoint},
+    checkpoint::Checkpoints,
     event::{AgentEvent, TurnEndReason},
+    message::Message,
     permission::Mode,
     redact::Redactor,
-    session::RewindScope,
+    session::{RewindScope, Session, SessionSummary},
     turn::{Steering, TurnInput},
 };
 use ratatui::{
@@ -44,7 +46,7 @@ pub const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TYPED_PAST: &str = "your typing went to your message; the prompt takes keys once you pause";
 
 /// Built-in commands that come with the rest of the terminal UI, and where.
-const LATER: [(&str, &str); 4] = [
+const LATER: [(&str, &str); 2] = [
     (
         "model",
         "with the model picker; for now, start harness with --model <provider>/<model>",
@@ -52,11 +54,6 @@ const LATER: [(&str, &str); 4] = [
     (
         "login",
         "with sign-in inside the session; for now, run `harness login <provider>` or `harness auth add <provider>` in a shell",
-    ),
-    ("new", "with the session picker"),
-    (
-        "resume",
-        "with the session picker; start harness with -c or --resume <id>",
     ),
 ];
 
@@ -106,6 +103,8 @@ enum Pick {
     Mode,
     /// The message to rewind to, one per item: `None` undoes the last rewind.
     Rewind(Vec<Option<RewindPoint>>),
+    /// The session to resume, one id per item.
+    Session(Vec<String>),
     /// What to restore to before this message.
     RewindScope(RewindPoint),
 }
@@ -119,6 +118,28 @@ pub enum Done {
     Rewound(Result<(), String>),
     /// Undoing the last rewind.
     UndidRewind(Result<(), String>),
+    /// A new session (`/new`), or another one (`/resume`), that the agent continues in now.
+    Session {
+        resumed: bool,
+        result: Result<SessionView, String>,
+    },
+}
+
+/// A session the agent is to continue in, as the host opened it.
+pub struct OpenedSession {
+    pub session: Session,
+    /// Its checkpoints; `None` when they cannot work here.
+    pub checkpoints: Option<Arc<Checkpoints>>,
+    /// What opening it had to warn about.
+    pub warnings: Vec<String>,
+}
+
+/// A session the agent continues in now, for the app to show.
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    pub id: String,
+    /// Its conversation, oldest first.
+    pub history: Vec<Message>,
 }
 
 /// A slash command expanded for a turn.
@@ -140,6 +161,15 @@ pub trait Host: Send {
     /// that could not be stored. Each warning is given once.
     fn take_warnings(&self) -> Vec<String> {
         Vec::new()
+    }
+    /// This project's sessions, the most recently used first.
+    fn sessions(&self) -> Vec<SessionSummary> {
+        Vec::new()
+    }
+    /// Opens a new session (`None`), or this project's session `id`, for the agent to continue
+    /// in. Errors say why it cannot be.
+    fn open_session(&self, _id: Option<&str>) -> Result<OpenedSession, String> {
+        Err("this session cannot change".into())
     }
 }
 
@@ -183,6 +213,8 @@ pub enum Action {
     Rewind { entry: String, scope: RewindScope },
     /// Undo the last rewind.
     UndoRewind,
+    /// Continue in a new session (`None`), or in this project's session with this id.
+    OpenSession(Option<String>),
     /// Stop the running turn.
     Interrupt,
     /// Leave harness.
@@ -260,6 +292,13 @@ pub struct App {
     rewinding: Option<(String, RewindScope)>,
     /// When Esc was last pressed on empty input.
     last_esc: Option<Instant>,
+    /// The id of the session the agent continues in.
+    session_id: String,
+    /// The mode the session started in, which the system prompt describes.
+    start_mode: Mode,
+    /// The agent continues in another session, whose conversation may not say the mode: the
+    /// next turn tells the model.
+    mode_note_pending: bool,
 }
 
 impl App {
@@ -303,7 +342,15 @@ impl App {
             can_undo_rewind: false,
             rewinding: None,
             last_esc: None,
+            session_id: String::new(),
+            start_mode: options.mode,
+            mode_note_pending: false,
         }
+    }
+
+    /// The id of the session the agent continues in.
+    pub fn set_session_id(&mut self, id: &str) {
+        self.session_id = id.to_string();
     }
 
     /// What the conversation can be rewound to: `points`, oldest first, and whether the last
@@ -352,6 +399,7 @@ impl App {
                         .push_error(&format!("the rewind failed: {why}"), width),
                 }
             }
+            Done::Session { resumed, result } => self.session_started(resumed, result),
             Done::UndidRewind(Ok(())) => self.transcript.push_note("undid the last rewind", width),
             Done::UndidRewind(Err(why)) => self
                 .transcript
@@ -588,13 +636,82 @@ impl App {
         self.context = context;
     }
 
-    /// Asks for a turn. In a session that started in plan mode, the agent is told to plan first.
+    /// Asks for a turn. In a session that started in plan mode, the agent is told to plan first;
+    /// in a session continued after `/new` or `/resume`, it is told the mode when that may not be
+    /// what the conversation says.
     fn run(&mut self, input: TurnInput) -> Option<Action> {
         self.running = true;
-        if std::mem::take(&mut self.plan_note_pending) && self.mode == Mode::Plan {
-            return Some(Action::RunIn(Mode::Plan, input));
+        let plan_note = std::mem::take(&mut self.plan_note_pending) && self.mode == Mode::Plan;
+        if std::mem::take(&mut self.mode_note_pending) || plan_note {
+            return Some(Action::RunIn(self.mode, input));
         }
         Some(Action::Run(input))
+    }
+
+    /// The agent continues in another session now, or could not.
+    fn session_started(&mut self, resumed: bool, result: Result<SessionView, String>) {
+        let width = self.width;
+        let view = match result {
+            Ok(view) => view,
+            Err(why) => {
+                let what = if resumed {
+                    "resume the session"
+                } else {
+                    "start a new session"
+                };
+                self.transcript
+                    .push_error(&format!("could not {what}: {why}"), width);
+                return;
+            }
+        };
+        self.session_id = view.id.clone();
+        self.last_reply.clear();
+        // Up recalls this session's messages.
+        let inputs = self.rewind_points.iter().map(|p| p.text.clone()).collect();
+        self.editor.set_history(inputs);
+        if !resumed {
+            self.transcript
+                .push_note("started a new session; /resume goes back to another", width);
+            self.mode_note_pending = self.mode != self.start_mode;
+            self.plan_note_pending = self.mode == Mode::Plan;
+            return;
+        }
+        self.transcript
+            .push_note(&format!("resumed session {}", view.id), width);
+        self.recap(&view.history);
+        self.mode_note_pending = true;
+    }
+
+    /// What a resumed conversation ended with: the last message the user typed and the replies
+    /// to it.
+    fn recap(&mut self, history: &[Message]) {
+        let width = self.width;
+        let typed = |m: &Message| matches!(m, Message::User { content } if !content.starts_with("[harness]"));
+        let Some(last) = history.iter().rposition(typed) else {
+            return;
+        };
+        let earlier = history[..last].iter().filter(|m| typed(m)).count();
+        if earlier > 0 {
+            self.transcript.push_note(
+                &format!(
+                    "… {earlier} earlier message{} in this session",
+                    if earlier == 1 { "" } else { "s" }
+                ),
+                width,
+            );
+        }
+        let theme = self.theme();
+        for message in &history[last..] {
+            match message {
+                Message::User { content } if typed(message) => {
+                    self.transcript.push_user(content, width)
+                }
+                Message::Assistant { content, .. } if !content.trim().is_empty() => self
+                    .transcript
+                    .push_lines(crate::markdown::render(content, width, &theme), width),
+                _ => {}
+            }
+        }
     }
 
     /// The plan waiting for the user's choice.
@@ -940,7 +1057,18 @@ impl App {
         let width = self.width;
         match name {
             "quit" => return self.quit(),
-            "mode" | "compact" | "rewind" if !self.between_turns(name) => {}
+            "mode" | "compact" | "rewind" | "new" | "resume" if !self.between_turns(name) => {}
+            "new" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                self.working = Some("starting a new session".into());
+                return Some(Action::OpenSession(None));
+            }
+            "resume" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return self.resume(args);
+            }
             "rewind" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
@@ -1063,6 +1191,11 @@ impl App {
                     None
                 }
             },
+            Pick::Session(ids) => {
+                let id = ids.into_iter().nth(index)?;
+                self.working = Some("resuming the session".into());
+                Some(Action::OpenSession(Some(id)))
+            }
             Pick::RewindScope(point) => {
                 let scope = SCOPES.get(index)?.0;
                 self.working = Some("rewinding".into());
@@ -1073,6 +1206,47 @@ impl App {
                 })
             }
         }
+    }
+
+    /// `/resume`: with an id, continues that session; alone, opens the session picker.
+    fn resume(&mut self, id: &str) -> Option<Action> {
+        let width = self.width;
+        if id == self.session_id {
+            self.transcript
+                .push_note(&format!("already in session {id}"), width);
+            return None;
+        }
+        if !id.is_empty() {
+            self.working = Some("resuming the session".into());
+            return Some(Action::OpenSession(Some(id.to_string())));
+        }
+        let sessions: Vec<SessionSummary> = self
+            .host
+            .sessions()
+            .into_iter()
+            .filter(|s| s.id != self.session_id)
+            .collect();
+        if sessions.is_empty() {
+            self.transcript
+                .push_note("there is no other session in this project yet", width);
+            return None;
+        }
+        let items = sessions
+            .iter()
+            .map(|s| {
+                let first = s.first_message.as_deref().map(first_line);
+                Item::new(
+                    first.as_deref().unwrap_or("(no message)"),
+                    &format!("{} · {}", s.started_at, s.id),
+                )
+            })
+            .collect();
+        let ids = sessions.into_iter().map(|s| s.id).collect();
+        self.open_picker(
+            Pick::Session(ids),
+            Picker::new("Resume which session?", items),
+        );
+        None
     }
 
     /// Esc on empty input: pressed twice within [`REWIND_WINDOW`], opens the rewind list.

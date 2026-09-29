@@ -30,7 +30,7 @@ The system SHALL end a response stream that sends nothing for 300 seconds with a
 - **THEN** after 300 seconds without data the request fails with a retryable network error, and a headless run does not hang
 
 ### Requirement: Reasoning summaries are streamed
-The system SHALL ask OpenAI's reasoning models for reasoning summaries (`summary: "auto"`) on the Responses protocol, keeping the API's default reasoning effort unless the model's profile sets one, and stream the summaries as reasoning. Reasoning models MUST include the `gpt-5*` family except `gpt-5-chat*`, the `o1`, `o3` and `o4` series, every model on ChatGPT's backend, and any model whose profile sets a reasoning effort. A refusal MUST reach the user as the reply's text.
+The system SHALL ask OpenAI's reasoning models for reasoning summaries (`summary: "auto"`) on the Responses protocol, keeping the API's default reasoning effort unless the model's profile sets one, and stream the summaries as reasoning. Reasoning models MUST include the `gpt-5*` family except `gpt-5-chat*`, the `o1`, `o3` and `o4` series, every model on ChatGPT's backend, and any model whose profile sets a reasoning effort. When the API refuses summaries (as it does to an organization it has not verified), the request MUST be sent again without them, and they MUST NOT be asked for again in that session. A refusal MUST reach the user as the reply's text.
 
 #### Scenario: GPT-5 without a profile effort
 - **WHEN** a turn runs on `openai/gpt-5` and no profile sets `reasoning_effort`

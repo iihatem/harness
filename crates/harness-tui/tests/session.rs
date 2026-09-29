@@ -88,6 +88,8 @@ fn options(dir: &Path) -> Options {
         history: Vec::new(),
         instruction_files: Vec::new(),
         window_note: None,
+        default_mode: Mode::Auto,
+        text_editor: None,
     }
 }
 

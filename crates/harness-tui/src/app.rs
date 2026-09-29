@@ -25,6 +25,7 @@ use crate::{
     approval::{Answered, Prompt, Reply},
     complete::{self, Completer, Offer},
     editor::{Edit, Editor},
+    plan::{Choice, PlanChoice, TextEditor},
     status::{self, Totals},
     style::Theme,
     text::{sanitize, wrap},
@@ -83,6 +84,10 @@ pub struct Options {
     pub instruction_files: Vec<(String, u64)>,
     /// Said next to the context window in `/context`, such as where its size comes from.
     pub window_note: Option<String>,
+    /// The mode Build switches to when the session started in plan mode.
+    pub default_mode: Mode,
+    /// Opens a plan in the user's editor.
+    pub text_editor: Option<Box<dyn TextEditor>>,
 }
 
 /// What the session should do after a key.
@@ -92,6 +97,10 @@ pub enum Action {
     Run(TurnInput),
     /// Switch the approval mode.
     SetMode(Mode),
+    /// Switch the approval mode, then start a turn.
+    RunIn(Mode, TurnInput),
+    /// Open the plan in the user's editor.
+    EditPlan(String),
     /// Stop the running turn.
     Interrupt,
     /// Leave harness.
@@ -133,6 +142,15 @@ pub struct App {
     steering: Steering,
     /// Send-now input the agent has not taken yet.
     sent_now: Vec<String>,
+    /// The turn's last reply, which in plan mode is the plan.
+    last_reply: String,
+    /// The mode to go back to when a plan is built.
+    mode_before_plan: Option<Mode>,
+    default_mode: Mode,
+    /// The session started in plan mode, and the agent has not been told to plan yet.
+    plan_note_pending: bool,
+    /// A plan waiting for the user's choice.
+    plan_choice: Option<PlanChoice>,
     workspace: std::path::PathBuf,
     width: usize,
 }
@@ -159,6 +177,11 @@ impl App {
             queued: VecDeque::new(),
             steering: Steering::new(),
             sent_now: Vec::new(),
+            last_reply: String::new(),
+            mode_before_plan: None,
+            default_mode: options.default_mode,
+            plan_note_pending: options.mode == Mode::Plan,
+            plan_choice: None,
             workspace: options.workspace,
             width,
         }
@@ -228,6 +251,10 @@ impl App {
     /// Takes in an event from the agent.
     pub fn on_event(&mut self, event: &AgentEvent) {
         match event {
+            AgentEvent::TurnStarted => self.last_reply.clear(),
+            AgentEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
+                self.last_reply = content.clone();
+            }
             AgentEvent::TurnFinished { reason } => self.turn_ended(*reason),
             AgentEvent::Usage { model, usage } => self.totals.add(model, usage),
             AgentEvent::Steered { text } => {
@@ -244,6 +271,15 @@ impl App {
     /// interruption, both go back into the editor instead, for the user to look at again.
     fn turn_ended(&mut self, reason: TurnEndReason) {
         self.running = false;
+        if reason == TurnEndReason::Completed
+            && self.mode == Mode::Plan
+            && !self.last_reply.trim().is_empty()
+        {
+            self.plan_choice = Some(PlanChoice {
+                plan: self.last_reply.clone(),
+                edited: false,
+            });
+        }
         let left = self.steering.take();
         self.sent_now.clear();
         if reason == TurnEndReason::Interrupted {
@@ -264,7 +300,7 @@ impl App {
 
     /// The next queued input, once no turn runs.
     pub fn next_queued(&mut self) -> Option<Action> {
-        if self.busy() || self.prompt.is_some() {
+        if self.busy() || self.prompt.is_some() || self.plan_choice.is_some() {
             return None;
         }
         let (shown, full) = self.queued.pop_front()?;
@@ -276,10 +312,68 @@ impl App {
         self.context = context;
     }
 
-    /// Asks for a turn.
+    /// Asks for a turn. In a session that started in plan mode, the agent is told to plan first.
     fn run(&mut self, input: TurnInput) -> Option<Action> {
         self.running = true;
+        if std::mem::take(&mut self.plan_note_pending) && self.mode == Mode::Plan {
+            return Some(Action::RunIn(Mode::Plan, input));
+        }
         Some(Action::Run(input))
+    }
+
+    /// The plan waiting for the user's choice.
+    pub fn plan_choice(&self) -> Option<&PlanChoice> {
+        self.plan_choice.as_ref()
+    }
+
+    /// A plan choice was made.
+    fn choose(&mut self, choice: Choice) -> Option<Action> {
+        let width = self.width;
+        match choice {
+            Choice::KeepPlanning => {
+                self.plan_choice = None;
+                self.transcript
+                    .push_note("still planning: say what to change", width);
+                None
+            }
+            Choice::Edit => {
+                let plan = self.plan_choice.as_ref()?.plan.clone();
+                Some(Action::EditPlan(plan))
+            }
+            Choice::Build => {
+                let choice = self.plan_choice.take()?;
+                let mode = self.mode_before_plan.take().unwrap_or(self.default_mode);
+                self.mode = mode;
+                self.transcript
+                    .push_note(&format!("switched to {mode} mode"), width);
+                self.transcript.push_user("Build the plan", width);
+                self.running = true;
+                let input = TurnInput {
+                    parts: vec![harness_core::turn::InputPart::Text(choice.build_message())],
+                    display: Some("Build the plan".into()),
+                    plan: Some(choice.plan),
+                    ..TurnInput::default()
+                };
+                Some(Action::RunIn(mode, input))
+            }
+        }
+    }
+
+    /// The plan came back from the user's editor.
+    pub fn plan_edited(&mut self, edited: std::io::Result<String>) {
+        let width = self.width;
+        match edited {
+            Ok(plan) => {
+                self.transcript.push_note("the edited plan:", width);
+                let theme = self.theme();
+                self.transcript
+                    .push_lines(crate::markdown::render(&plan, width, &theme), width);
+                self.plan_choice = Some(PlanChoice { plan, edited: true });
+            }
+            Err(e) => self
+                .transcript
+                .push_error(&format!("could not edit the plan: {e}"), width),
+        }
     }
 
     /// Takes in a paste.
@@ -311,6 +405,10 @@ impl App {
             let interrupt = answered == Answered::Interrupt;
             self.answer(answered);
             return interrupt.then_some(Action::Interrupt);
+        }
+        if let Some(choice) = &self.plan_choice {
+            let choice = choice.key(key)?;
+            return self.choose(choice);
         }
         if ctrl && key.code == KeyCode::Char('d') && self.editor.is_empty() {
             return Some(Action::Quit);
@@ -346,6 +444,12 @@ impl App {
     }
 
     fn switch_mode(&mut self, mode: Mode) -> Option<Action> {
+        if mode == Mode::Plan && self.mode != Mode::Plan {
+            self.mode_before_plan = Some(self.mode);
+        } else if mode != Mode::Plan {
+            self.mode_before_plan = None;
+        }
+        self.plan_note_pending = false;
         self.mode = mode;
         self.transcript
             .push_note(&format!("switched to {mode} mode"), self.width);
@@ -589,6 +693,12 @@ impl App {
         below.extend(wrap(&self.status(), width, &[], &[]));
         if let Some(prompt) = &self.prompt {
             let mut lines = prompt.render(width, rows.saturating_sub(below.len()), &theme);
+            lines.extend(below);
+            let skip = lines.len().saturating_sub(rows);
+            return (lines.split_off(skip), None);
+        }
+        if let Some(choice) = &self.plan_choice {
+            let mut lines = choice.render(width, &theme);
             lines.extend(below);
             let skip = lines.len().saturating_sub(rows);
             return (lines.split_off(skip), None);

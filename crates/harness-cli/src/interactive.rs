@@ -11,6 +11,7 @@ use harness_tui::{
     app::{Host, Options, Prepared},
     approval::{ChannelApprover, Requests},
     inline::InlineTerminal,
+    plan::ExternalEditor,
     style::Theme,
     terminal::{CrosstermRawMode, Modes},
     ui::Ui,
@@ -155,6 +156,13 @@ pub async fn run(
         history,
         instruction_files: crate::context::instruction_files(&setup),
         window_note: Some("assumed until model profiles report the model's own".into()),
+        // Where Build goes when the session started in plan mode.
+        default_mode: setup
+            .config
+            .mode
+            .filter(|m| !matches!(m, Mode::Plan | Mode::ReadOnly))
+            .unwrap_or_else(|| config::default_mode(&setup.workspace)),
+        text_editor: None,
     };
     let host = CliHost {
         setup: setup.clone(),
@@ -176,14 +184,17 @@ pub async fn run(
 async fn terminal_session(
     agent: harness_core::agent::Agent,
     host: Box<dyn Host>,
-    options: Options,
+    mut options: Options,
     approvals: Requests,
 ) -> std::io::Result<()> {
     // Asked before any events are read: both queries read the terminal's answer from stdin.
     let keyboard = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     let (column, row) = crossterm::cursor::position().unwrap_or((0, 0));
     let top = if column == 0 { row } else { row + 1 };
-    let _modes = Modes::enter(std::io::stdout(), CrosstermRawMode, keyboard)?;
+    // The editor for plans owns the terminal's modes, so they are undone while it runs, and
+    // when the session ends.
+    let modes = Modes::enter(std::io::stdout(), CrosstermRawMode, keyboard)?;
+    options.text_editor = Some(Box::new(ExternalEditor::from_env(modes)));
     let term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)?;
     let ui = Ui::start(agent, host, term, options, approvals);
     ui.run(EventStream::new()).await

@@ -63,6 +63,8 @@ fn start(provider: Arc<MockProvider>, dir: &Path, system: &str) -> Ui<TestBacken
         history: Vec::new(),
         instruction_files: vec![("AGENTS.md".into(), 2_000)],
         window_note: Some("assumed".into()),
+        default_mode: Mode::Auto,
+        text_editor: None,
     };
     let term = InlineTerminal::new(TestBackend::new(70, 20), 0).unwrap();
     let mut ui = Ui::start(

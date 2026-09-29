@@ -61,6 +61,8 @@ fn start(provider: Arc<MockProvider>, dir: &Path, mode: Mode) -> Ui<TestBackend>
         history: Vec::new(),
         instruction_files: Vec::new(),
         window_note: None,
+        default_mode: Mode::Auto,
+        text_editor: None,
     };
     let term = InlineTerminal::new(TestBackend::new(100, 20), 0).unwrap();
     let mut ui = Ui::start(

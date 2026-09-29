@@ -17,6 +17,7 @@ use crate::{
     app::{Action, App, Host, Options},
     approval::{Reply, Requests},
     inline::InlineTerminal,
+    plan::TextEditor,
 };
 
 /// Whether the session goes on.
@@ -29,7 +30,7 @@ pub enum Flow {
 /// Work for the task that owns the agent.
 enum Job {
     Turn {
-        input: TurnInput,
+        input: Box<TurnInput>,
         cancel: CancellationToken,
     },
     SetMode(harness_core::permission::Mode),
@@ -49,6 +50,7 @@ pub struct Ui<B: Backend> {
     runner: Option<JoinHandle<()>>,
     /// Cancels the running turn.
     cancel: Option<CancellationToken>,
+    text_editor: Option<Box<dyn TextEditor>>,
 }
 
 impl<B> Ui<B>
@@ -62,9 +64,10 @@ where
         agent: Agent,
         host: Box<dyn Host>,
         term: InlineTerminal<B>,
-        options: Options,
+        mut options: Options,
         approvals: Requests,
     ) -> Self {
+        let text_editor = options.text_editor.take();
         let (jobs, mut queue) = mpsc::unbounded_channel::<Job>();
         let (events_tx, events) = mpsc::unbounded_channel();
         let (contexts_tx, contexts) = mpsc::unbounded_channel();
@@ -77,7 +80,7 @@ where
             while let Some(job) = queue.recv().await {
                 match job {
                     Job::Turn { input, cancel } => {
-                        agent.run_turn(input, &events_tx, cancel).await;
+                        agent.run_turn(*input, &events_tx, cancel).await;
                     }
                     Job::SetMode(mode) => agent.set_mode(mode),
                 }
@@ -94,6 +97,7 @@ where
             approvals,
             runner: Some(runner),
             cancel: None,
+            text_editor,
         }
     }
 
@@ -128,13 +132,32 @@ where
         })
     }
 
-    fn dispatch(&mut self, action: Action) -> Flow {
-        match action {
+    fn dispatch(&mut self, action: Action) -> io::Result<Flow> {
+        Ok(match action {
+            Action::RunIn(mode, input) => {
+                self.dispatch(Action::SetMode(mode))?;
+                self.dispatch(Action::Run(input))?
+            }
+            Action::EditPlan(plan) => {
+                let edited = match &mut self.text_editor {
+                    Some(editor) => {
+                        // The editor gets the terminal; the live region is drawn again after.
+                        self.term.clear()?;
+                        editor.edit(&plan)
+                    }
+                    None => Err(io::Error::other("no editor is set up")),
+                };
+                self.app.plan_edited(edited);
+                Flow::Continue
+            }
             Action::Run(input) => {
                 let cancel = CancellationToken::new();
                 self.cancel = Some(cancel.clone());
                 if let Some(jobs) = &self.jobs {
-                    let _ = jobs.send(Job::Turn { input, cancel });
+                    let _ = jobs.send(Job::Turn {
+                        input: Box::new(input),
+                        cancel,
+                    });
                     self.awaiting_context = true;
                 }
                 Flow::Continue
@@ -153,14 +176,14 @@ where
                 Flow::Continue
             }
             Action::Quit => Flow::Quit,
-        }
+        })
     }
 
     /// Takes in one terminal event: a key, a paste, or a resize.
     pub fn handle(&mut self, event: Event) -> io::Result<Flow> {
         let flow = match event {
             Event::Key(key) => match self.app.on_key(key, Instant::now()) {
-                Some(action) => self.dispatch(action),
+                Some(action) => self.dispatch(action)?,
                 None => Flow::Continue,
             },
             Event::Paste(text) => {
@@ -188,10 +211,10 @@ where
             self.app.on_event(&event);
         }
         if let Some(action) = self.app.take_pending_mode() {
-            self.dispatch(action);
+            self.dispatch(action)?;
         }
         if let Some(action) = self.app.next_queued() {
-            self.dispatch(action);
+            self.dispatch(action)?;
         }
         self.draw()?;
         Ok(Flow::Continue)

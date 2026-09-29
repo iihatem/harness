@@ -498,6 +498,7 @@ impl Agent {
                     message: Message::User { content },
                     display,
                     note: false,
+                    ..
                 } => Some(RewindPoint {
                     entry: entry.id.clone(),
                     text: display.clone().unwrap_or_else(|| content.clone()),
@@ -505,6 +506,20 @@ impl Agent {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The plan the user last approved on the active branch, if any.
+    pub fn approved_plan(&self) -> Option<String> {
+        self.session
+            .branch()
+            .into_iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::Message {
+                    plan: Some(plan), ..
+                } => Some(plan.clone()),
+                _ => None,
+            })
     }
 
     /// Whether the rewind list offers "undo last rewind": nothing has happened since the last
@@ -735,10 +750,22 @@ impl Agent {
     /// Adds `message` to the history and saves it in the session. If the session file cannot be
     /// written, the conversation continues in memory and a warning says so once.
     fn record(&mut self, message: Message, display: Option<String>, note: bool) {
+        self.record_entry(message, display, note, None);
+    }
+
+    /// [`record`](Self::record), with the plan the message asks to build.
+    fn record_entry(
+        &mut self,
+        message: Message,
+        display: Option<String>,
+        note: bool,
+        plan: Option<String>,
+    ) {
         let id = self.session.append(EntryKind::Message {
             message: message.clone(),
             display,
             note,
+            plan,
         });
         self.history.push(message);
         self.history_ids.push(id);
@@ -824,7 +851,7 @@ impl Agent {
         let _ = events.send(AgentEvent::TurnStarted);
         self.message_recorded = false;
         let content = self.user_message(input.parts, events).await;
-        self.record(Message::User { content }, input.display, false);
+        self.record_entry(Message::User { content }, input.display, false, input.plan);
         self.message_recorded = true;
         for kind in std::mem::take(&mut self.held_entries) {
             self.append_turn_entry(kind);
@@ -1705,10 +1732,16 @@ fn stopped_result(call_id: String) -> Message {
 /// prompt does.
 fn mode_note(mode: Mode, sandboxed: bool) -> String {
     let rules = match mode {
-        Mode::Plan | Mode::ReadOnly if sandboxed => {
+        Mode::Plan if sandboxed => {
+            "file edits are refused, and shell commands run in a read-only sandbox. Investigate the task, then end your reply with a step-by-step implementation plan; the user will build it, edit it, or keep planning"
+        }
+        Mode::Plan => {
+            "file edits and shell commands are refused, since no OS sandbox is active; use the read, grep and glob tools. Investigate the task, then end your reply with a step-by-step implementation plan; the user will build it, edit it, or keep planning"
+        }
+        Mode::ReadOnly if sandboxed => {
             "file edits are refused, and shell commands run in a read-only sandbox"
         }
-        Mode::Plan | Mode::ReadOnly => {
+        Mode::ReadOnly => {
             "file edits and shell commands are refused, since no OS sandbox is active; use the read, grep and glob tools"
         }
         Mode::Ask if sandboxed => {

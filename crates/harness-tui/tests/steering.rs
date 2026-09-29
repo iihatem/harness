@@ -117,6 +117,8 @@ fn start_with(provider: Arc<dyn Provider>, dir: &Path, gate: &Arc<Notify>) -> Ui
         history: Vec::new(),
         instruction_files: Vec::new(),
         window_note: None,
+        default_mode: Mode::Auto,
+        text_editor: None,
     };
     let term = InlineTerminal::new(TestBackend::new(80, 24), 0).unwrap();
     let mut ui = Ui::start(

@@ -59,6 +59,8 @@ pub struct TurnInput {
     pub rules: RuleSet,
     /// Run this turn's shell commands in a read-only sandbox.
     pub read_only_shell: bool,
+    /// The plan the user approved, which this turn implements; saved with its user message.
+    pub plan: Option<String>,
 }
 
 impl From<String> for TurnInput {

@@ -220,6 +220,145 @@ fn tool_results_and_the_next_prompt_share_one_user_message() {
     );
 }
 
+/// Whether a tool-use id fits the API's pattern, `^[a-zA-Z0-9_-]+$`.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Checks `body` against the Messages API's rules for a conversation: it starts with a user
+/// message and roles alternate; no message is empty; text blocks hold more than whitespace;
+/// tool-use ids fit the pattern and are unique; and each tool use is answered, in the next
+/// message, by a result with its id.
+fn assert_valid(body: &serde_json::Value) {
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "user", "{body:#}");
+    let mut seen = std::collections::HashSet::new();
+    let mut unanswered: Vec<String> = Vec::new();
+    for (i, message) in messages.iter().enumerate() {
+        let role = message["role"].as_str().unwrap();
+        if i > 0 {
+            assert_ne!(messages[i - 1]["role"], role, "roles alternate: {body:#}");
+        }
+        let blocks = message["content"].as_array().unwrap();
+        assert!(!blocks.is_empty(), "an empty message: {body:#}");
+        let answered: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| b["tool_use_id"].as_str())
+            .collect();
+        assert_eq!(
+            answered, unanswered,
+            "each call is answered in the next message: {body:#}"
+        );
+        unanswered.clear();
+        for block in blocks {
+            match block["type"].as_str().unwrap() {
+                "text" => assert!(
+                    !block["text"].as_str().unwrap().trim().is_empty(),
+                    "whitespace-only text: {body:#}"
+                ),
+                "tool_use" => {
+                    let id = block["id"].as_str().unwrap();
+                    assert!(valid_id(id), "{id}");
+                    assert!(seen.insert(id.to_string()), "a repeated id: {id}");
+                    unanswered.push(id.to_string());
+                }
+                "tool_result" => {
+                    if let Some(content) = block.get("content") {
+                        assert!(!content.as_str().unwrap().trim().is_empty(), "{block}");
+                    }
+                }
+                other => panic!("unexpected block {other}"),
+            }
+        }
+    }
+    assert!(unanswered.is_empty(), "{body:#}");
+}
+
+// Review A I2: a conversation held on other providers carries what the Messages API rejects:
+// text that is only whitespace (a local model's "\n\n" beside its calls), and tool-call ids with
+// characters outside its pattern (Kimi K2 through OpenRouter writes `functions.read:0`). It is
+// sent without them, so that it can go on with Claude.
+#[test]
+fn a_conversation_from_another_provider_is_sent_as_the_api_accepts_it() {
+    let calls = vec![
+        call("functions.read:0", r#"{"path":"a"}"#),
+        call("functions.read:1", r#"{"path":"b"}"#),
+        // These two differ only in characters the pattern leaves out.
+        call("a.b", r#"{"path":"c"}"#),
+        call("a:b", r#"{"path":"d"}"#),
+        // Already fits: kept as it is.
+        call("call_h3", r#"{"path":"e"}"#),
+    ];
+    let mut messages = vec![
+        Message::User {
+            content: "read them".into(),
+        },
+        Message::Assistant {
+            content: "\n\n".into(),
+            tool_calls: calls.clone(),
+            model: "openrouter/moonshotai/kimi-k2".into(),
+        },
+    ];
+    for c in &calls {
+        messages.push(Message::Tool {
+            call_id: c.id.clone(),
+            content: if c.id == "a:b" {
+                " \n".into()
+            } else {
+                "data".into()
+            },
+            is_error: false,
+        });
+    }
+    messages.extend([
+        Message::Assistant {
+            content: " \n\t".into(),
+            tool_calls: vec![],
+            model: "ollama/qwen3".into(),
+        },
+        Message::User {
+            content: "\n".into(),
+        },
+        Message::Assistant {
+            content: "Read all five.".into(),
+            tool_calls: vec![],
+            model: "ollama/qwen3".into(),
+        },
+        Message::User {
+            content: "thanks".into(),
+        },
+    ]);
+    let body = request_body(&request(messages));
+    assert_valid(&body);
+    let sent = body["messages"].as_array().unwrap();
+    assert_eq!(sent.len(), 5, "{body:#}");
+    let ids: Vec<&str> = sent[1]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids[4], "call_h3");
+    assert!(ids[0].starts_with("functions_read_0_"), "{ids:?}");
+    assert!(ids[2].starts_with("a_b_") && ids[3].starts_with("a_b_"));
+    // An id maps the same way in every request, so the prompt cache still matches.
+    let earlier = request_body(&request(vec![
+        Message::User {
+            content: "read them".into(),
+        },
+        Message::Assistant {
+            content: String::new(),
+            tool_calls: calls,
+            model: "openrouter/moonshotai/kimi-k2".into(),
+        },
+    ]));
+    assert_eq!(earlier["messages"][1]["content"][0]["id"], ids[0]);
+    assert_eq!(earlier["messages"][1]["content"][3]["id"], ids[3]);
+}
+
 // The API rejects empty text blocks and messages without content.
 #[test]
 fn empty_assistant_messages_and_empty_text_are_left_out() {

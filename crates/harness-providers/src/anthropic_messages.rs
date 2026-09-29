@@ -18,8 +18,10 @@ pub const DEFAULT_MAX_TOKENS: u64 = 16_384;
 
 /// Builds a streaming Messages request body. Consecutive messages of one role become one message:
 /// tool results are user content here, so a note or prompt after them joins their message.
-/// Empty text and empty assistant messages are left out, since the API rejects them. The system
-/// prompt and the last message are prompt-cache breakpoints.
+/// What the API rejects, and a conversation held on other providers can hold, is left out or
+/// made to fit: text that is only whitespace, empty assistant messages, and tool-call ids with
+/// characters outside its pattern (`tool_use_id`). The system prompt and the last message
+/// are prompt-cache breakpoints.
 pub fn request_body(req: &ChatRequest) -> Value {
     let mut messages: Vec<(&str, Vec<Value>)> = Vec::new();
     let mut push = |role: &'static str, blocks: Vec<Value>| {
@@ -49,7 +51,7 @@ pub fn request_body(req: &ChatRequest) -> Value {
                         .unwrap_or_else(|| Value::Object(Map::new()));
                     blocks.push(json!({
                         "type": "tool_use",
-                        "id": call.id,
+                        "id": tool_use_id(&call.id),
                         "name": call.name,
                         "input": input,
                     }));
@@ -61,8 +63,8 @@ pub fn request_body(req: &ChatRequest) -> Value {
                 content,
                 is_error,
             } => {
-                let mut block = json!({"type": "tool_result", "tool_use_id": call_id});
-                if !content.is_empty() {
+                let mut block = json!({"type": "tool_result", "tool_use_id": tool_use_id(call_id)});
+                if !content.trim().is_empty() {
                     block["content"] = json!(content);
                 }
                 if *is_error {
@@ -111,13 +113,30 @@ pub fn request_body(req: &ChatRequest) -> Value {
     body
 }
 
-/// A text block, or none for empty text.
+/// A text block, or none for text that is empty or only whitespace, which the API rejects.
 fn text_block(text: &str) -> Vec<Value> {
-    if text.is_empty() {
+    if text.trim().is_empty() {
         Vec::new()
     } else {
         vec![json!({"type": "text", "text": text})]
     }
+}
+
+/// `id` as the API accepts tool-use ids (`^[a-zA-Z0-9_-]+$`): each other character becomes `_`,
+/// and an id that changed gets a short hash of the original appended, so that two ids never
+/// become one. The same id always maps the same way, so a call and its result still match, and so
+/// does the prompt cache from one request to the next. Ids from Anthropic and harness fit already.
+fn tool_use_id(id: &str) -> String {
+    let fits = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    if !id.is_empty() && id.chars().all(fits) {
+        return id.to_string();
+    }
+    let kept: String = id.chars().map(|c| if fits(c) { c } else { '_' }).collect();
+    // FNV-1a, which is stable across builds and platforms.
+    let hash = id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("{kept}_{:08x}", (hash >> 32) as u32 ^ hash as u32)
 }
 
 #[derive(Debug, Default)]

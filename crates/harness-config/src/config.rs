@@ -228,6 +228,43 @@ fn profiles_problem(profiles: &BTreeMap<String, ProfileSettings>) -> Option<Stri
         .find_map(|(key, profile)| profile.problem(key))
 }
 
+/// `[notifications]`: what the interactive session does when a long turn ends or an approval
+/// waits. A project may set it without trust: it changes nothing the agent may do.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationSettings {
+    /// A desktop notification through the terminal (OSC 9); on unless set to `false`.
+    pub desktop: Option<bool>,
+    /// The terminal bell; on unless set to `false`.
+    pub bell: Option<bool>,
+}
+
+/// The notifications in effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Notifications {
+    pub desktop: bool,
+    pub bell: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Notifications {
+            desktop: true,
+            bell: true,
+        }
+    }
+}
+
+impl Notifications {
+    /// These, with what `settings` sets.
+    fn overlaid(self, settings: &NotificationSettings) -> Notifications {
+        Notifications {
+            desktop: settings.desktop.unwrap_or(self.desktop),
+            bell: settings.bell.unwrap_or(self.bell),
+        }
+    }
+}
+
 /// One `config.toml` file as written by the user.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -245,6 +282,8 @@ pub struct ConfigFile {
     pub compaction: CompactionSettings,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileSettings>,
+    #[serde(default)]
+    pub notifications: NotificationSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -275,6 +314,7 @@ pub struct Config {
     pub linux_git_protection: LinuxGitProtection,
     /// Model profiles by model-id glob: the global config's, with a trusted project's over them.
     pub profiles: BTreeMap<String, ProfileSettings>,
+    pub notifications: Notifications,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -540,6 +580,7 @@ pub fn load(
         cfg.allow_localhost = global.sandbox.allow_localhost.unwrap_or(false);
         cfg.linux_git_protection = global.sandbox.linux_git_protection.unwrap_or_default();
         cfg.profiles = global.profiles;
+        cfg.notifications = cfg.notifications.overlaid(&global.notifications);
     }
     let path = project_file(workspace);
     let project = parse_file(&path)?;
@@ -553,6 +594,7 @@ pub fn load(
         {
             return Err(ConfigError::Parse { path, message });
         }
+        cfg.notifications = cfg.notifications.overlaid(&project.notifications);
         cfg.deny.extend(project.permissions.deny.iter().cloned());
         cfg.confirm
             .extend(project.permissions.confirm.iter().cloned());

@@ -98,6 +98,7 @@ fn start(
         window_note: None,
         default_mode,
         text_editor: Some(Box::new(DeleteStepThree)),
+        notifier: None,
     };
     let term = InlineTerminal::new(TestBackend::new(100, 30), 0).unwrap();
     let mut ui = Ui::start(agent, Box::new(NoCommands), term, options, approvals);

@@ -17,6 +17,7 @@ use crate::{
     app::{Action, App, Host, Options},
     approval::{Reply, Requests},
     inline::InlineTerminal,
+    notify::Notify,
     plan::TextEditor,
 };
 
@@ -51,6 +52,7 @@ pub struct Ui<B: Backend> {
     /// Cancels the running turn.
     cancel: Option<CancellationToken>,
     text_editor: Option<Box<dyn TextEditor>>,
+    notifier: Option<Box<dyn Notify>>,
 }
 
 impl<B> Ui<B>
@@ -68,6 +70,7 @@ where
         approvals: Requests,
     ) -> Self {
         let text_editor = options.text_editor.take();
+        let notifier = options.notifier.take();
         let (jobs, mut queue) = mpsc::unbounded_channel::<Job>();
         let (events_tx, events) = mpsc::unbounded_channel();
         let (contexts_tx, contexts) = mpsc::unbounded_channel();
@@ -98,6 +101,7 @@ where
             runner: Some(runner),
             cancel: None,
             text_editor,
+            notifier,
         }
     }
 
@@ -117,8 +121,18 @@ where
         &mut self.term
     }
 
+    /// Sends the notifications waiting. One that fails is dropped: it is no reason to stop.
+    fn notify(&mut self) {
+        for text in self.app.take_notifications() {
+            if let Some(notifier) = &mut self.notifier {
+                let _ = notifier.notify(&text);
+            }
+        }
+    }
+
     /// Writes the finished lines into the scrollback and redraws the live region.
     pub fn draw(&mut self) -> io::Result<()> {
+        self.notify();
         let finished = self.app.transcript.take_finished();
         self.term.insert(&finished)?;
         let rows = self.term.height() as usize;

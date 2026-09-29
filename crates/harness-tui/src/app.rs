@@ -25,6 +25,7 @@ use crate::{
     approval::{Answered, Prompt, Reply},
     complete::{self, Completer, Offer},
     editor::{Edit, Editor},
+    notify::{self, Notify},
     plan::{Choice, PlanChoice, TextEditor},
     status::{self, Totals},
     style::Theme,
@@ -88,6 +89,8 @@ pub struct Options {
     pub default_mode: Mode,
     /// Opens a plan in the user's editor.
     pub text_editor: Option<Box<dyn TextEditor>>,
+    /// Tells the user when a long turn ends or an approval waits.
+    pub notifier: Option<Box<dyn Notify>>,
 }
 
 /// What the session should do after a key.
@@ -151,6 +154,10 @@ pub struct App {
     plan_note_pending: bool,
     /// A plan waiting for the user's choice.
     plan_choice: Option<PlanChoice>,
+    /// When the running turn started.
+    turn_started: Option<Instant>,
+    /// Notifications to send.
+    notifications: Vec<String>,
     workspace: std::path::PathBuf,
     width: usize,
 }
@@ -182,6 +189,8 @@ impl App {
             default_mode: options.default_mode,
             plan_note_pending: options.mode == Mode::Plan,
             plan_choice: None,
+            turn_started: None,
+            notifications: Vec::new(),
             workspace: options.workspace,
             width,
         }
@@ -196,8 +205,15 @@ impl App {
         self.width = width;
     }
 
+    /// Notifications to send now, which are then forgotten.
+    pub fn take_notifications(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notifications)
+    }
+
     /// The agent asks the user to approve `request`.
     pub fn on_approval(&mut self, request: ApprovalRequest, reply: Reply) {
+        self.notifications
+            .push(format!("approval needed: {}", request.reason));
         let arguments = self.transcript.arguments(&request.call_id).cloned();
         let theme = self.theme();
         self.prompt = Some(Prompt::new(
@@ -250,12 +266,20 @@ impl App {
 
     /// Takes in an event from the agent.
     pub fn on_event(&mut self, event: &AgentEvent) {
+        self.on_event_at(event, Instant::now());
+    }
+
+    /// Takes in an event from the agent that came at `now`.
+    pub fn on_event_at(&mut self, event: &AgentEvent, now: Instant) {
         match event {
-            AgentEvent::TurnStarted => self.last_reply.clear(),
+            AgentEvent::TurnStarted => {
+                self.last_reply.clear();
+                self.turn_started = Some(now);
+            }
             AgentEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
                 self.last_reply = content.clone();
             }
-            AgentEvent::TurnFinished { reason } => self.turn_ended(*reason),
+            AgentEvent::TurnFinished { reason } => self.turn_ended(*reason, now),
             AgentEvent::Usage { model, usage } => self.totals.add(model, usage),
             AgentEvent::Steered { text } => {
                 if let Some(i) = self.sent_now.iter().position(|t| t == text) {
@@ -269,8 +293,21 @@ impl App {
 
     /// A turn ended. Send-now input it did not take is sent next, before queued input. After an
     /// interruption, both go back into the editor instead, for the user to look at again.
-    fn turn_ended(&mut self, reason: TurnEndReason) {
+    fn turn_ended(&mut self, reason: TurnEndReason, now: Instant) {
         self.running = false;
+        if let Some(started) = self.turn_started.take() {
+            let took = now.saturating_duration_since(started);
+            let how = match reason {
+                TurnEndReason::Completed => Some("the turn finished"),
+                TurnEndReason::Error => Some("the turn stopped with an error"),
+                TurnEndReason::StepLimit => Some("the turn stopped at the step limit"),
+                TurnEndReason::Interrupted => None,
+            };
+            if let Some(how) = how.filter(|_| took >= notify::LONG_TURN) {
+                self.notifications
+                    .push(format!("{how} after {}", notify::duration(took)));
+            }
+        }
         if reason == TurnEndReason::Completed
             && self.mode == Mode::Plan
             && !self.last_reply.trim().is_empty()

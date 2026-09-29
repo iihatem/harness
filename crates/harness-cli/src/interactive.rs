@@ -11,6 +11,7 @@ use harness_tui::{
     app::{Host, Options, Prepared},
     approval::{ChannelApprover, Requests},
     inline::InlineTerminal,
+    notify::TerminalNotifier,
     plan::ExternalEditor,
     style::Theme,
     terminal::{CrosstermRawMode, Modes},
@@ -163,13 +164,15 @@ pub async fn run(
             .filter(|m| !matches!(m, Mode::Plan | Mode::ReadOnly))
             .unwrap_or_else(|| config::default_mode(&setup.workspace)),
         text_editor: None,
+        notifier: None,
     };
     let host = CliHost {
         setup: setup.clone(),
         commands,
         policy,
     };
-    let result = terminal_session(agent, Box::new(host), options, approvals).await;
+    let notifications = setup.config.notifications;
+    let result = terminal_session(agent, Box::new(host), options, approvals, notifications).await;
     sandbox_session.end();
     match result {
         Ok(()) => 0,
@@ -186,6 +189,7 @@ async fn terminal_session(
     host: Box<dyn Host>,
     mut options: Options,
     approvals: Requests,
+    notifications: harness_config::config::Notifications,
 ) -> std::io::Result<()> {
     // Asked before any events are read: both queries read the terminal's answer from stdin.
     let keyboard = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -195,6 +199,11 @@ async fn terminal_session(
     // when the session ends.
     let modes = Modes::enter(std::io::stdout(), CrosstermRawMode, keyboard)?;
     options.text_editor = Some(Box::new(ExternalEditor::from_env(modes)));
+    options.notifier = Some(Box::new(TerminalNotifier::new(
+        std::io::stdout(),
+        notifications.desktop,
+        notifications.bell,
+    )));
     let term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)?;
     let ui = Ui::start(agent, host, term, options, approvals);
     ui.run(EventStream::new()).await

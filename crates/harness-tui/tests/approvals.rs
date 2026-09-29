@@ -96,6 +96,7 @@ fn start(provider: Arc<MockProvider>, dir: &Path, mode: Mode) -> Ui<TestBackend>
         window_note: None,
         default_mode: Mode::Auto,
         text_editor: None,
+        notifier: None,
     };
     let term = InlineTerminal::new(TestBackend::new(80, 24), 0).unwrap();
     let mut ui = Ui::start(agent, Box::new(NoCommands), term, options, approvals);

@@ -119,6 +119,7 @@ fn start_with(provider: Arc<dyn Provider>, dir: &Path, gate: &Arc<Notify>) -> Ui
         window_note: None,
         default_mode: Mode::Auto,
         text_editor: None,
+        notifier: None,
     };
     let term = InlineTerminal::new(TestBackend::new(80, 24), 0).unwrap();
     let mut ui = Ui::start(

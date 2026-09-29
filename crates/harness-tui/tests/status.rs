@@ -65,6 +65,7 @@ fn start(provider: Arc<MockProvider>, dir: &Path, system: &str) -> Ui<TestBacken
         window_note: Some("assumed".into()),
         default_mode: Mode::Auto,
         text_editor: None,
+        notifier: None,
     };
     let term = InlineTerminal::new(TestBackend::new(70, 20), 0).unwrap();
     let mut ui = Ui::start(

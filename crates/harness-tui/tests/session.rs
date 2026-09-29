@@ -90,6 +90,7 @@ fn options(dir: &Path) -> Options {
         window_note: None,
         default_mode: Mode::Auto,
         text_editor: None,
+        notifier: None,
     }
 }
 

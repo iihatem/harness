@@ -5,7 +5,7 @@
 //! `accounts.toml` next to it. Nothing here is ever written to the configuration directory.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -61,7 +61,7 @@ pub enum CredentialError {
         hint: &'static str,
     },
     #[error(
-        "{keychain} refused to store the new credential for {account} ({refused}) and to remove the older one it may still hold ({kept}), so harness would go on using that one; nothing was stored. Unlock the keychain and try again, or set {STORE_ENV}=file to keep credentials in credentials.json instead"
+        "{keychain} refused to store the new credential for {account} ({refused}) and to remove the older one it may still hold ({kept}), so harness would go on using that one; nothing was stored. Unlock the keychain and try again, or keep credentials in credentials.json instead: set {STORE_ENV}=file, and keep it set for every harness run (in your shell profile, say), since without it harness reads the keychain first and would use the older credential again"
     )]
     Stale {
         keychain: String,
@@ -195,7 +195,7 @@ fn within<T: Send + 'static>(
     match rx.recv_timeout(limit) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => Err(CredentialError::Keychain(format!(
-            "the keychain did not answer within {} (it may be waiting to be unlocked); set {STORE_ENV}=file to keep credentials in credentials.json instead",
+            "the keychain did not answer within {} (it may be waiting to be unlocked); to keep credentials in credentials.json instead, set {STORE_ENV}=file and keep it set for every harness run, since without it harness reads the keychain first",
             if limit >= Duration::from_secs(1) {
                 format!("{} s", limit.as_secs())
             } else {
@@ -496,7 +496,8 @@ struct AccountsFile {
 pub enum StoreChoice {
     /// The keychain, and the file when no keychain can be used.
     Keychain,
-    /// Only the file (`HARNESS_CREDENTIAL_STORE=file`). Removing still clears the keychain.
+    /// Only the file (`HARNESS_CREDENTIAL_STORE=file`). Storing and removing still clear the
+    /// keychain's copy.
     File,
 }
 
@@ -521,6 +522,10 @@ pub struct Credentials {
     file: FileStore,
     accounts: PathBuf,
     warnings: Mutex<Vec<String>>,
+    /// The accounts whose keychain copy this run has tried to remove after storing them in the
+    /// file (the file chosen): a keychain that refused, or kept an unlock prompt waiting, is
+    /// not asked again by each renewal.
+    cleared: Mutex<BTreeSet<String>>,
 }
 
 impl Credentials {
@@ -587,6 +592,7 @@ impl Credentials {
             file: FileStore::new(data_dir),
             accounts: data_dir.join("accounts.toml"),
             warnings: Mutex::new(Vec::new()),
+            cleared: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -731,7 +737,9 @@ impl Credentials {
     }
 
     /// Stores `secret` for `provider` under `profile`, in the keychain when one works, else in
-    /// the file with a warning. Returns where it went.
+    /// the file with a warning. Returns where it went. With the file chosen, an older copy in the
+    /// keychain is removed too, as [`remove`](Self::remove) does: it would be used again as soon
+    /// as the file is no longer chosen. A keychain that cannot remove it is a warning.
     pub fn set(
         &self,
         provider: &str,
@@ -776,7 +784,33 @@ impl Credentials {
                 self.file.describe()
             ));
         }
+        if self.choice == StoreChoice::File {
+            self.clear_keychain_copy(&account);
+        }
         Ok(self.file.describe())
+    }
+
+    /// Removes the keychain's copy of `account`, just stored in the file (the file chosen), once
+    /// a run. No keychain holds nothing; one that keeps its copy is a warning.
+    fn clear_keychain_copy(&self, account: &str) {
+        let first = self
+            .cleared
+            .lock()
+            .expect("cleared lock")
+            .insert(account.to_string());
+        if !first {
+            return;
+        }
+        let Ok(keychain) = self.keychain() else {
+            return;
+        };
+        if let Err(kept) = keychain.delete(account) {
+            self.warn(format!(
+                "the credential is in {}, but {} may still hold an older copy of {account}, which it could not remove ({kept}); harness reads the keychain first whenever {STORE_ENV} is not `file`, so keep it set, or remove that copy",
+                self.file.describe(),
+                keychain.describe()
+            ));
+        }
     }
 
     /// Removes what is stored for `provider` under `profile`, from the keychain and the file,

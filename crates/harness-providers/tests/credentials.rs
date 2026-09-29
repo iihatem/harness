@@ -329,6 +329,9 @@ fn a_keychain_that_keeps_an_old_key_it_cannot_replace_is_an_error() {
         .to_string();
     assert!(error.contains("older"), "{error}");
     assert!(error.contains("HARNESS_CREDENTIAL_STORE=file"), "{error}");
+    // Re-review B+C, R1: set for one command only, the older key would win again after it.
+    assert!(error.contains("keep it set"), "{error}");
+    assert!(error.contains("reads the keychain first"), "{error}");
     assert!(!error.contains("sk-"), "{error}");
     assert!(!dir.path().join("credentials.json").exists());
 }
@@ -431,10 +434,11 @@ fn with_the_file_store_chosen_logout_still_clears_the_keychain() {
     keychain.set("openai/default", "sk-from-before").unwrap();
     let (connects, connect) = counting(keychain.clone());
     let creds = Credentials::with_connector(dir.path(), StoreChoice::File, connect);
-    creds.set("openai", "work", "sk-work").unwrap();
-    assert!(creds.take_warnings().is_empty());
     assert_eq!(creds.get("openai", DEFAULT_PROFILE).unwrap(), None);
     assert_eq!(connects.load(Ordering::SeqCst), 0);
+    creds.set("openai", "work", "sk-work").unwrap();
+    assert!(creds.take_warnings().is_empty());
+    assert_eq!(keychain.get("openai/work").unwrap(), None);
     assert!(creds.remove("openai", DEFAULT_PROFILE).unwrap());
     assert_eq!(keychain.get("openai/default").unwrap(), None);
     // No keychain at all is nothing to remove.
@@ -443,6 +447,104 @@ fn with_the_file_store_chosen_logout_still_clears_the_keychain() {
     });
     assert!(none.remove("openai", "work").unwrap());
     assert!(!none.remove("openai", "work").unwrap());
+    // Nor is it anything to warn about when storing.
+    none.set("openai", "work", "sk-work").unwrap();
+    assert!(none.take_warnings().is_empty());
+}
+
+// Re-review B+C, R1: storing with `HARNESS_CREDENTIAL_STORE=file`, as the `Stale` error advises,
+// must not leave the older keychain copy to be used again once the variable is unset.
+#[test]
+fn a_key_stored_in_file_mode_is_not_shadowed_by_an_older_keychain_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = Recording::default();
+    keychain.set("openai/default", "sk-OLD-leaked").unwrap();
+    let (_, connect) = counting(keychain.clone());
+    let file_mode = Credentials::with_connector(dir.path(), StoreChoice::File, connect);
+    let place = file_mode
+        .set("openai", DEFAULT_PROFILE, "sk-NEW-rotated")
+        .unwrap();
+    assert_eq!(
+        place,
+        dir.path().join("credentials.json").display().to_string()
+    );
+    assert!(file_mode.take_warnings().is_empty());
+    assert_eq!(
+        file_mode.active("openai").unwrap().as_deref(),
+        Some("sk-NEW-rotated")
+    );
+    // The variable is unset again.
+    let (_, connect) = counting(keychain.clone());
+    let keychain_mode = Credentials::with_connector(dir.path(), StoreChoice::Keychain, connect);
+    assert_eq!(
+        keychain_mode.active("openai").unwrap().as_deref(),
+        Some("sk-NEW-rotated")
+    );
+    assert_eq!(keychain.get("openai/default").unwrap(), None);
+}
+
+/// Counts the deletes that reach `inner`.
+#[derive(Clone)]
+struct CountingDeletes {
+    inner: ReadOnly,
+    deletes: Arc<AtomicUsize>,
+}
+
+impl SecretStore for CountingDeletes {
+    fn get(&self, account: &str) -> Result<Option<String>, CredentialError> {
+        self.inner.get(account)
+    }
+    fn set(&self, account: &str, secret: &str) -> Result<(), CredentialError> {
+        self.inner.set(account, secret)
+    }
+    fn delete(&self, account: &str) -> Result<bool, CredentialError> {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        self.inner.delete(account)
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+// Re-review B+C, R1: when the keychain keeps its older copy, the new one is stored all the same (the
+// file is what was chosen), and the user hears that the variable has to stay set.
+#[test]
+fn an_older_keychain_copy_file_mode_cannot_remove_is_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut read_only = ReadOnly::holding(&[("chatgpt/default", "old-sign-in-json")]);
+    read_only.keeps = true;
+    let keychain = CountingDeletes {
+        inner: read_only,
+        deletes: Arc::new(AtomicUsize::new(0)),
+    };
+    let (_, connect) = counting(keychain.clone());
+    let creds = Credentials::with_connector(dir.path(), StoreChoice::File, connect);
+    creds
+        .set("chatgpt", DEFAULT_PROFILE, "new-sign-in-json")
+        .unwrap();
+    assert_eq!(
+        creds.get("chatgpt", DEFAULT_PROFILE).unwrap().as_deref(),
+        Some("new-sign-in-json")
+    );
+    let warnings = creds.take_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    for part in [
+        "a read-only keychain",
+        "older",
+        "chatgpt/default",
+        "HARNESS_CREDENTIAL_STORE",
+        "delete was denied",
+    ] {
+        assert!(warnings[0].contains(part), "{part}: {warnings:?}");
+    }
+    assert!(!warnings[0].contains("sign-in-json"), "{warnings:?}");
+    // A keychain that refused once, and may be waiting for an unlock prompt nobody answers, is
+    // not asked again by every renewal of the same run.
+    creds
+        .set("chatgpt", DEFAULT_PROFILE, "newer-sign-in-json")
+        .unwrap();
+    assert!(creds.take_warnings().is_empty());
+    assert_eq!(keychain.deletes.load(Ordering::SeqCst), 1);
 }
 
 /// A keychain waiting for an unlock prompt nobody answers.
@@ -475,6 +577,7 @@ fn keychain_operations_give_up_after_their_time_limit() {
     let error = limited.get("openai/default").unwrap_err().to_string();
     assert!(started.elapsed() < Duration::from_secs(3));
     assert!(error.contains("HARNESS_CREDENTIAL_STORE=file"), "{error}");
+    assert!(error.contains("keep it set"), "{error}");
     assert!(limited.set("openai/default", "sk-1").is_err());
     assert!(limited.delete("openai/default").is_err());
     assert_eq!(limited.describe(), "a stuck keychain");

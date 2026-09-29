@@ -1,9 +1,25 @@
-use std::{path::Path, process::Command};
+use std::{path::Path, process::Command, sync::Once};
 
 use harness_context::environment::{self, GitState};
 
+/// Makes the git that `environment::capture` runs ignore this machine's global and system
+/// configuration, as the fixtures' git does: a filter driver there (the git-lfs package configures
+/// one system-wide, as on CI runners) rightly leaves out whether a work tree is dirty.
+fn isolate() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: nothing in this binary reads the environment except through `std`, which
+        // serializes it with starting processes.
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+            std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        }
+    });
+}
+
 /// Runs git in `dir` with the user's own configuration ignored.
 fn git(dir: &Path, args: &[&str]) {
+    isolate();
     let status = Command::new("git")
         .arg("-C")
         .arg(dir)

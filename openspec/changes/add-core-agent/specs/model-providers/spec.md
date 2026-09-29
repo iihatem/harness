@@ -5,7 +5,7 @@ Model providers connect the runtime to language models over standard wire protoc
 ## ADDED Requirements
 
 ### Requirement: Three wire protocols are supported
-The system SHALL support streaming model calls with tool use over the OpenAI Chat Completions protocol, the OpenAI Responses protocol, and the Anthropic Messages protocol. Any provider MUST be configurable by choosing one of these protocols and a base URL.
+The system SHALL support streaming model calls with tool use over the OpenAI Chat Completions protocol, the OpenAI Responses protocol, and the Anthropic Messages protocol. Any provider MUST be configurable by choosing one of these protocols and a base URL. A configured base URL with a query string or fragment MUST be refused when the provider is used, with an error that names the provider and the file that defines it, never the query.
 
 #### Scenario: Custom OpenAI-compatible endpoint
 - **WHEN** the user configures a provider with protocol `openai-chat`, a base URL, and an API key environment variable

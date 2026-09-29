@@ -33,6 +33,9 @@ pub struct ProviderConfig {
     /// The environment variable holding its key: a name (`[A-Za-z_][A-Za-z0-9_]*`), which
     /// [`parse_file`] checks.
     pub api_key_env: Option<String>,
+    /// The file that defined it, for messages; [`parse_file`] sets it.
+    #[serde(skip)]
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -291,10 +294,13 @@ pub fn parse_file(path: &Path) -> Result<Option<ConfigFile>, ConfigError> {
             });
         }
     };
-    let file: ConfigFile = toml::from_str(&text).map_err(|e| ConfigError::Parse {
+    let mut file: ConfigFile = toml::from_str(&text).map_err(|e| ConfigError::Parse {
         path: path.to_path_buf(),
         message: toml_error(&text, &e),
     })?;
+    for provider in file.providers.values_mut() {
+        provider.file = Some(path.to_path_buf());
+    }
     if let Some(name) = file
         .providers
         .keys()

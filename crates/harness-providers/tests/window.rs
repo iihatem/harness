@@ -334,6 +334,7 @@ fn the_local_servers_are_known_by_name() {
             protocol: Protocol::OpenaiChat,
             base_url: "http://gpu-box:11434/v1".into(),
             api_key_env: None,
+            file: None,
         },
     );
     assert_eq!(Server::of("ollama", &providers), Some(Server::Ollama));

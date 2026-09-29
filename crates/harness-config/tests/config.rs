@@ -1021,3 +1021,27 @@ fn an_api_key_env_that_is_not_a_variable_name_is_refused_without_echoing_it() {
 fn dir_of(file: &std::path::Path) -> &std::path::Path {
     file.parent().unwrap()
 }
+
+// Re-review A, N4: a provider remembers the file that defined it, so that what is wrong with it
+// can name that file when it is used.
+#[test]
+fn a_provider_knows_the_file_that_defined_it() {
+    let provider = |name: &str| {
+        format!(
+            "[providers.{name}]\nprotocol = \"openai-chat\"\nbase_url = \"http://127.0.0.1:9/v1\"\n"
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    std::fs::write(&global, provider("g")).unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    let project = ws.join(".harness/config.toml");
+    std::fs::write(&project, provider("p")).unwrap();
+    let widening = widening_of(&global, &ws);
+    let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    trust.trust(&ws, &widening.fingerprint).unwrap();
+    let cfg = config::load(&global, &ws, &trust).unwrap();
+    assert_eq!(cfg.providers["g"].file.as_deref(), Some(global.as_path()));
+    assert_eq!(cfg.providers["p"].file.as_deref(), Some(project.as_path()));
+}

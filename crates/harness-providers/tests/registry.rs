@@ -21,6 +21,7 @@ fn custom(name: &str, url: &str, key_env: Option<&str>) -> BTreeMap<String, Prov
             protocol: Protocol::OpenaiChat,
             base_url: url.into(),
             api_key_env: key_env.map(String::from),
+            file: None,
         },
     )])
 }
@@ -412,6 +413,7 @@ async fn refused(
             protocol,
             base_url: format!("{}/v1", server.uri()),
             api_key_env: Some("MOCK_API_KEY".into()),
+            file: None,
         },
     )]);
     let resolved = resolve(model_id, &providers, secrets).unwrap();
@@ -467,4 +469,31 @@ async fn a_refused_key_says_which_key_it_was_and_how_to_replace_it() {
         matches!(error, ProviderError::Http { status: 404, .. }),
         "{error:?}"
     );
+}
+
+// Re-review A, N4: a `base_url` with a query or fragment would have the request's path appended
+// after it (`…/v1?key=K/messages` requests `/v1`). It is refused when used, naming the provider
+// and its file, never the query, where a key can be kept.
+#[test]
+fn a_base_url_with_a_query_or_fragment_is_refused() {
+    for url in [
+        "https://x.example/v1?key=SECRETQ",
+        "https://x.example/v1#SECRETQ",
+    ] {
+        let mut providers = custom("x", url, None);
+        providers.get_mut("x").unwrap().file = Some("/home/u/.config/harness/config.toml".into());
+        let error = resolve("x/m", &providers, env(&[])).unwrap_err();
+        let text = error.to_string();
+        for part in [
+            "`x`",
+            "/home/u/.config/harness/config.toml",
+            "base_url",
+            "query",
+        ] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
+        assert!(!text.contains("SECRETQ"), "{text}");
+    }
+    // A plain one is used.
+    assert!(resolve("x/m", &custom("x", "https://x.example/v1", None), env(&[])).is_ok());
 }

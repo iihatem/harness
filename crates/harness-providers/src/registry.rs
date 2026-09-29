@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use harness_core::redact::Redactor;
 
@@ -119,9 +123,25 @@ pub enum ResolveError {
     NotSignedIn { provider: String, profile: String },
     #[error("this build of harness was made without ChatGPT sign-in (the `chatgpt-login` feature)")]
     SignInUnavailable,
+    /// A configured `base_url` with a query string or fragment, which the request's path would
+    /// follow. It is not quoted: a key can be kept there.
+    #[error(
+        "the base_url of provider `{provider}`{} has a query string or fragment, which harness does not use: remove it (a key belongs in the variable `api_key_env` names)", in_file(.file.as_deref())
+    )]
+    BadBaseUrl {
+        provider: String,
+        /// The file that defines the provider.
+        file: Option<PathBuf>,
+    },
     /// A test hook's value that is not an http(s) URL.
     #[error("{var} is `{value}`, which is not an http(s) URL")]
     BadHook { var: String, value: String },
+}
+
+/// ` in <file>`, when it is known.
+fn in_file(file: Option<&Path>) -> String {
+    file.map(|file| format!(" in {}", file.display()))
+        .unwrap_or_default()
 }
 
 /// The command that signs in to `provider` under `profile`.
@@ -313,6 +333,13 @@ pub fn resolve(
         return chatgpt(model_id, model, &secrets);
     }
     let (protocol, base_url, key_env) = if let Some(cfg) = providers.get(name) {
+        // The request's path would follow the query (`…/v1?key=K/messages`).
+        if cfg.base_url.contains(['?', '#']) {
+            return Err(ResolveError::BadBaseUrl {
+                provider: name.to_string(),
+                file: cfg.file.clone(),
+            });
+        }
         (cfg.protocol, cfg.base_url.clone(), cfg.api_key_env.clone())
     } else if let Some(builtin) = BUILTIN_PROVIDERS.iter().find(|b| b.name == name) {
         (
@@ -551,6 +578,7 @@ mod tests {
                 protocol: Protocol::OpenaiResponses,
                 base_url: "https://proxy.example/v1".into(),
                 api_key_env: Some("OPENAI_API_KEY".into()),
+                file: None,
             },
         )]);
         assert!(!summaries_by_default("openai", &redefined));

@@ -173,6 +173,12 @@ impl SecretStore for TimeLimited {
 }
 
 /// Runs `work` on a thread of its own, and gives up on it after `limit`.
+///
+/// Work that is given up on is not stopped: a keychain write that timed out may still land later,
+/// even after a later write of the same entry, and leave the older value there (the refresh token
+/// of a renewal that timed out, say, which is spent by then). Only a keychain that answers after
+/// more than [`KEYCHAIN_TIMEOUT`] does that; serializing every keychain operation through one
+/// worker would rule it out, at the cost of a later operation waiting for one that is stuck.
 fn within<T: Send + 'static>(
     limit: Duration,
     work: impl FnOnce() -> Result<T, CredentialError> + Send + 'static,

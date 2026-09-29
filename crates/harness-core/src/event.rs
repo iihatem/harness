@@ -60,6 +60,11 @@ pub enum AgentEvent {
         reason: String,
         delay_ms: u64,
     },
+    /// Input the user sent while the turn ran, given to the model with the tool results just
+    /// sent.
+    Steered {
+        text: String,
+    },
     /// Something the user should know that did not stop the turn.
     Warning {
         message: String,

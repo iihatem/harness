@@ -3,14 +3,17 @@
 //! Keys and events go in; lines for the scrollback, the live region, and actions for the
 //! session to carry out come out.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use harness_context::commands::{is_builtin, parse_invocation};
 use harness_core::{
     agent::{ApprovalDecision, ApprovalRequest, ContextUsage},
-    event::AgentEvent,
+    event::{AgentEvent, TurnEndReason},
     permission::Mode,
-    turn::TurnInput,
+    turn::{Steering, TurnInput},
 };
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -124,6 +127,12 @@ pub struct App {
     prompt: Option<Prompt>,
     /// The mode chosen while a turn runs, to switch to when it ends.
     pending_mode: Option<Mode>,
+    /// Input to send when the running turn ends: as shown, and in full.
+    queued: VecDeque<(String, String)>,
+    /// Where send-now input goes; the agent takes it at the next tool result.
+    steering: Steering,
+    /// Send-now input the agent has not taken yet.
+    sent_now: Vec<String>,
     workspace: std::path::PathBuf,
     width: usize,
 }
@@ -147,6 +156,9 @@ impl App {
             window_note: options.window_note,
             prompt: None,
             pending_mode: None,
+            queued: VecDeque::new(),
+            steering: Steering::new(),
+            sent_now: Vec::new(),
             workspace: options.workspace,
             width,
         }
@@ -208,14 +220,55 @@ impl App {
         self.running
     }
 
+    /// Where send-now input goes: give it to the agent (`Agent::with_steering`).
+    pub fn steering(&self) -> Steering {
+        self.steering.clone()
+    }
+
     /// Takes in an event from the agent.
     pub fn on_event(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::TurnFinished { .. } => self.running = false,
+            AgentEvent::TurnFinished { reason } => self.turn_ended(*reason),
             AgentEvent::Usage { model, usage } => self.totals.add(model, usage),
+            AgentEvent::Steered { text } => {
+                if let Some(i) = self.sent_now.iter().position(|t| t == text) {
+                    self.sent_now.remove(i);
+                }
+            }
             _ => {}
         }
         self.transcript.on_event(event, self.width);
+    }
+
+    /// A turn ended. Send-now input it did not take is sent next, before queued input. After an
+    /// interruption, both go back into the editor instead, for the user to look at again.
+    fn turn_ended(&mut self, reason: TurnEndReason) {
+        self.running = false;
+        let left = self.steering.take();
+        self.sent_now.clear();
+        if reason == TurnEndReason::Interrupted {
+            let mut parts = left;
+            parts.extend(self.queued.drain(..).map(|(_, full)| full));
+            if !parts.is_empty() {
+                if !self.editor.is_empty() {
+                    parts.push(self.editor.expanded());
+                }
+                self.editor.set_text(&parts.join("\n\n"));
+            }
+        } else {
+            for text in left.into_iter().rev() {
+                self.queued.push_front((text.clone(), text));
+            }
+        }
+    }
+
+    /// The next queued input, once no turn runs.
+    pub fn next_queued(&mut self) -> Option<Action> {
+        if self.busy() || self.prompt.is_some() {
+            return None;
+        }
+        let (shown, full) = self.queued.pop_front()?;
+        self.send(shown, full)
     }
 
     /// Where the next request's tokens go, now.
@@ -261,6 +314,9 @@ impl App {
         }
         if ctrl && key.code == KeyCode::Char('d') && self.editor.is_empty() {
             return Some(Action::Quit);
+        }
+        if ctrl && key.code == KeyCode::Char('s') {
+            return self.send_now();
         }
         if let Some(action) = self.completion_key(key) {
             return action;
@@ -361,32 +417,65 @@ impl App {
         self.update_completion();
     }
 
-    /// Enter: sends the input, runs a built-in command, or says why it cannot.
+    /// Enter: runs a built-in command now, and sends the input, or queues it while a turn runs.
     fn submit(&mut self) -> Option<Action> {
-        if self.editor.expanded().trim().is_empty() {
-            return None;
-        }
-        if self.busy() {
-            self.hint = Some("a turn is running: press Esc to interrupt it".into());
+        let full = self.editor.expanded();
+        if full.trim().is_empty() {
             return None;
         }
         self.completion = None;
-        let full = self.editor.expanded();
-        let width = self.width;
-        if let Some(invocation) = parse_invocation(&full) {
+        if let Some(invocation) = parse_invocation(&full)
+            && !self.starts_a_turn(invocation.name)
+        {
             let name = invocation.name.to_string();
-            if name == "help" {
+            return self.builtin(&name, &full);
+        }
+        let (shown, full) = self.editor.submit();
+        if self.busy() {
+            self.queued.push_back((shown, full));
+            return None;
+        }
+        self.send(shown, full)
+    }
+
+    /// Ctrl+S: while a turn runs, gives the input to the model with the next tool results.
+    fn send_now(&mut self) -> Option<Action> {
+        if !self.busy() {
+            return self.submit();
+        }
+        let full = self.editor.expanded();
+        if full.trim().is_empty() {
+            return None;
+        }
+        if parse_invocation(&full).is_some() {
+            self.hint =
+                Some("a command cannot be sent during a turn: press Enter to queue it".into());
+            return None;
+        }
+        let (_, full) = self.editor.submit();
+        self.steering.send(full.clone());
+        self.sent_now.push(full);
+        None
+    }
+
+    /// Whether `/name` starts a turn: `/init` and custom commands.
+    fn starts_a_turn(&self, name: &str) -> bool {
+        name == "init" || (!is_builtin(name) && self.host.is_command(name))
+    }
+
+    /// A built-in command that runs here, without a turn, or an unknown one.
+    fn builtin(&mut self, name: &str, full: &str) -> Option<Action> {
+        let width = self.width;
+        match name {
+            "quit" => return Some(Action::Quit),
+            "help" => {
                 self.editor.submit();
-                self.transcript.push_user(&full, width);
+                self.transcript.push_user(full, width);
                 self.help();
-                return None;
             }
-            if name == "quit" {
-                return Some(Action::Quit);
-            }
-            if name == "context" || name == "usage" {
+            "context" | "usage" => {
                 self.editor.submit();
-                self.transcript.push_user(&full, width);
+                self.transcript.push_user(full, width);
                 let theme = self.theme();
                 let lines = if name == "context" {
                     status::context_report(
@@ -399,40 +488,45 @@ impl App {
                     self.totals.report(&theme)
                 };
                 self.transcript.push_lines(lines, width);
-                return None;
             }
-            if let Some((_, when)) = LATER.iter().find(|(n, _)| *n == name) {
-                self.editor.submit();
-                self.transcript.push_user(&full, width);
-                self.transcript.push_note(
-                    &format!("/{name} is not available yet: it comes {when}."),
-                    width,
-                );
-                return None;
-            }
-            if name == "init" || (!is_builtin(&name) && self.host.is_command(&name)) {
-                self.editor.submit();
-                let prepared = self.host.prepare(&full);
-                self.transcript.push_user(&full, width);
-                for warning in &prepared.warnings {
-                    self.transcript.push_warning(warning, width);
+            _ => {
+                if let Some((_, when)) = LATER.iter().find(|(n, _)| *n == name) {
+                    self.editor.submit();
+                    self.transcript.push_user(full, width);
+                    self.transcript.push_note(
+                        &format!("/{name} is not available yet: it comes {when}."),
+                        width,
+                    );
+                } else {
+                    self.transcript.push_error(
+                        &format!(
+                            "unknown command /{name}; custom commands are Markdown files in .harness/commands, .claude/commands or .opencode/commands; to send text that starts with /, put a word before it"
+                        ),
+                        width,
+                    );
                 }
-                for note in &prepared.notes {
-                    self.transcript.push_note(note, width);
-                }
-                return self.run(prepared.input);
-            }
-            if !is_builtin(&name) {
-                self.transcript.push_error(
-                    &format!(
-                        "unknown command /{name}; custom commands are Markdown files in .harness/commands, .claude/commands or .opencode/commands; to send text that starts with /, put a word before it"
-                    ),
-                    width,
-                );
-                return None;
             }
         }
-        let (shown, full) = self.editor.submit();
+        None
+    }
+
+    /// Sends input typed as `shown`, `full` with pastes expanded: a custom command or `/init`
+    /// expanded, anything else as it is.
+    fn send(&mut self, shown: String, full: String) -> Option<Action> {
+        let width = self.width;
+        if let Some(invocation) = parse_invocation(&full)
+            && self.starts_a_turn(invocation.name)
+        {
+            let prepared = self.host.prepare(&full);
+            self.transcript.push_user(&full, width);
+            for warning in &prepared.warnings {
+                self.transcript.push_warning(warning, width);
+            }
+            for note in &prepared.notes {
+                self.transcript.push_note(note, width);
+            }
+            return self.run(prepared.input);
+        }
         self.transcript.push_user(&shown, width);
         self.run(TurnInput::from(full))
     }
@@ -454,6 +548,9 @@ impl App {
             ("Up, Down", "earlier inputs"),
             ("Tab", "complete a /command or @file"),
             ("Ctrl+O", "expand a collapsed paste"),
+            ("Enter during a turn", "send the input when the turn ends"),
+            ("Ctrl+S during a turn", "send it with the next tool results"),
+            ("Shift+Tab", "switch between plan, ask and auto mode"),
             ("Esc", "interrupt the running turn"),
             ("Ctrl+C twice", "exit"),
         ] {
@@ -497,7 +594,22 @@ impl App {
             return (lines.split_off(skip), None);
         }
         below.clear();
-        let (editor, cursor) = self.editor.render("› ", width, &theme);
+        let (mut editor, mut cursor) = self.editor.render("› ", width, &theme);
+        // What waits to be sent, above the input.
+        let mut waiting: Vec<Line<'static>> = Vec::new();
+        for text in &self.sent_now {
+            waiting.push(pending_line(
+                "sending with the next tool results: ",
+                text,
+                &theme,
+            ));
+        }
+        for (shown, _) in &self.queued {
+            waiting.push(pending_line("queued: ", shown, &theme));
+        }
+        cursor.y += waiting.len() as u16;
+        waiting.append(&mut editor);
+        let editor = waiting;
         if let Some(completion) = &self.completion {
             below.extend(complete::render(
                 &completion.offer,
@@ -535,4 +647,14 @@ pub fn next_mode(mode: Mode) -> Mode {
         Mode::Ask => Mode::Auto,
         Mode::Auto | Mode::FullAccess => Mode::Plan,
     }
+}
+
+/// One line for input waiting to be sent: `label` and the input's first line.
+fn pending_line(label: &str, text: &str, theme: &Theme) -> Line<'static> {
+    let first = sanitize(text.lines().next().unwrap_or_default());
+    let more = if text.lines().count() > 1 { " …" } else { "" };
+    Line::from(vec![
+        Span::styled(label.to_string(), theme.dim()),
+        Span::raw(format!("{first}{more}")),
+    ])
 }

@@ -196,6 +196,7 @@ impl Transcript {
                 self.push_note(&text, width);
             }
             AgentEvent::Warning { message } => self.push_warning(message, width),
+            AgentEvent::Steered { text } => self.push_user(text, width),
             AgentEvent::Error { message, .. } => self.push_error(message, width),
             AgentEvent::Compacted {
                 summary,

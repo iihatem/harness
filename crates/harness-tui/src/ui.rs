@@ -70,6 +70,7 @@ where
         let (contexts_tx, contexts) = mpsc::unbounded_channel();
         let width = term.width() as usize;
         let mut app = App::new(options, host, width);
+        let agent = agent.with_steering(app.steering());
         app.set_context(agent.context_usage());
         let runner = tokio::spawn(async move {
             let mut agent = agent;
@@ -187,6 +188,9 @@ where
             self.app.on_event(&event);
         }
         if let Some(action) = self.app.take_pending_mode() {
+            self.dispatch(action);
+        }
+        if let Some(action) = self.app.next_queued() {
             self.dispatch(action);
         }
         self.draw()?;

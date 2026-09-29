@@ -204,15 +204,16 @@ async fn esc_interrupts_a_running_turn_and_the_session_goes_on() {
     while !shows(&ui, "partial answer") {
         ui.next().await.unwrap();
     }
-    // Enter while a turn runs keeps the input and says how to stop the turn.
+    // Enter while a turn runs queues the input; the interruption puts it back in the editor.
     type_text(&mut ui, "later");
     press(&mut ui, KeyCode::Enter);
-    assert_eq!(ui.app().editor().text(), "later");
-    assert!(shows(&ui, "a turn is running: press Esc to interrupt it"));
+    assert_eq!(ui.app().editor().text(), "");
+    assert!(shows(&ui, "queued: later"));
     press(&mut ui, KeyCode::Esc);
     settle(&mut ui).await;
     assert!(shows(&ui, "interrupted"));
     assert!(!ui.app().busy());
+    assert_eq!(ui.app().editor().text(), "later");
     press(&mut ui, KeyCode::Enter);
     settle(&mut ui).await;
     assert!(shows(&ui, "second answer"));

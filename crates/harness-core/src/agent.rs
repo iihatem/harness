@@ -26,7 +26,7 @@ use crate::{
     session::{Entry, EntryKind, RewindScope, Session},
     tokens::DEFAULT_CONTEXT_WINDOW,
     tool::{CommandSandbox, Tool, ToolContext, ToolOutput, ToolRegistry},
-    turn::{InputPart, TurnInput, TurnModel},
+    turn::{InputPart, Steering, TurnInput, TurnModel},
 };
 
 /// Model calls allowed per turn unless configured otherwise.
@@ -324,6 +324,8 @@ pub struct Agent {
     stats: Stats,
     /// The sandbox for each mode, when switching modes also switches the sandbox.
     sandboxes: Option<Sandboxes>,
+    /// Input the user sends while a turn runs.
+    steering: Option<Steering>,
 }
 
 impl Agent {
@@ -369,6 +371,7 @@ impl Agent {
             redactor: None,
             stats: Stats::default(),
             sandboxes: None,
+            steering: None,
         }
     }
 
@@ -464,6 +467,13 @@ impl Agent {
     /// started with.
     pub fn with_sandboxes(mut self, sandboxes: Sandboxes) -> Self {
         self.sandboxes = Some(sandboxes);
+        self
+    }
+
+    /// Gives the model what the user sends through `steering` while a turn runs, with the
+    /// results of the next tool calls.
+    pub fn with_steering(mut self, steering: Steering) -> Self {
+        self.steering = Some(steering);
         self
     }
 
@@ -903,6 +913,7 @@ impl Agent {
             if cancel.is_cancelled() {
                 return self.finish(TurnEndReason::Interrupted, events);
             }
+            self.deliver_steering(events);
         }
         self.finish(TurnEndReason::StepLimit, events)
     }
@@ -933,6 +944,23 @@ impl Agent {
         let _ = events.send(AgentEvent::Warning {
             message: message.into(),
         });
+    }
+
+    /// Adds what the user sent during the turn to the conversation, after the tool results.
+    fn deliver_steering(&mut self, events: &UnboundedSender<AgentEvent>) {
+        let Some(steering) = &self.steering else {
+            return;
+        };
+        for text in steering.take() {
+            self.record(
+                Message::User {
+                    content: text.clone(),
+                },
+                None,
+                false,
+            );
+            let _ = events.send(AgentEvent::Steered { text });
+        }
     }
 
     /// The turn's user message: text parts as they are, and each shell part replaced by the output

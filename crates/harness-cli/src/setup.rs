@@ -86,7 +86,7 @@ pub fn load() -> Result<Setup, String> {
     }
     let credentials = Arc::new(Credentials::open(&paths.data_dir, env));
     let redactor = Arc::new(Redactor::default());
-    redactor.add_env(std::env::vars());
+    redactor.add_env(std::env::vars_os());
     Ok(Setup {
         paths,
         config,

@@ -124,3 +124,30 @@ async fn no_secret_is_written_anywhere() {
     assert!(String::from_utf8_lossy(&requests[1].body).contains(TOKEN));
     drop(ws);
 }
+
+// Review F I1: one environment variable that is not UTF-8, in its name or its value, made every
+// command panic at startup (exit 101).
+#[test]
+fn a_variable_that_is_not_utf8_does_not_stop_harness() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    let home = TempDir::new().unwrap();
+    let ws = TempDir::new().unwrap();
+    let output = Command::new(BIN)
+        .current_dir(ws.path())
+        .env("HARNESS_HOME", home.path())
+        .env("HARNESS_CREDENTIAL_STORE", "file")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env("LEGACY_NAME", OsString::from_vec(b"caf\xe9".to_vec()))
+        .env(
+            OsString::from_vec(b"CAF\xc9_TOKEN".to_vec()),
+            "legacy-token-value",
+        )
+        .arg("models")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}

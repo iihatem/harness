@@ -66,6 +66,32 @@ fn secret_looking_environment_variables_are_secrets() {
     );
 }
 
+// Review F I1: a variable that is not UTF-8 is read, not a panic, and its value is a secret in
+// its lossy form, the form the bash tool's output takes.
+#[test]
+fn environment_variables_that_are_not_utf8_are_read_lossily() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    let redactor = Redactor::default();
+    redactor.add_env([
+        (
+            OsString::from("LEGACY_TOKEN"),
+            OsString::from_vec(b"caf\xe9-token-1234".to_vec()),
+        ),
+        (
+            OsString::from_vec(b"CAF\xc9_SECRET".to_vec()),
+            OsString::from("latin1-named-secret"),
+        ),
+        (
+            OsString::from("LEGACY_NAME"),
+            OsString::from_vec(b"caf\xe9-not-a-secret".to_vec()),
+        ),
+    ]);
+    assert_eq!(
+        redactor.redact("caf\u{fffd}-token-1234 latin1-named-secret caf\u{fffd}-not-a-secret"),
+        format!("{REDACTED} {REDACTED} caf\u{fffd}-not-a-secret")
+    );
+}
+
 #[test]
 fn session_files_hold_no_secrets() {
     let dir = tempfile::tempdir().unwrap();

@@ -3,7 +3,7 @@
 //! of environment variables whose names mark them as secrets. What the model is sent is left as
 //! it is, so a file it reads and writes back keeps its real contents.
 
-use std::sync::RwLock;
+use std::{ffi::OsStr, sync::RwLock};
 
 /// What a secret is replaced with.
 pub const REDACTED: &str = "[redacted]";
@@ -45,15 +45,19 @@ impl Redactor {
     }
 
     /// Adds the values of the variables in `vars` whose names end in `KEY`, `TOKEN`, `SECRET` or
-    /// `PASSWORD`, in any case.
-    pub fn add_env(&self, vars: impl IntoIterator<Item = (String, String)>) {
+    /// `PASSWORD`, in any case. A name or value that is not UTF-8 is read lossily, as the bash
+    /// tool reads what a command prints.
+    pub fn add_env<N: AsRef<OsStr>, V: AsRef<OsStr>>(
+        &self,
+        vars: impl IntoIterator<Item = (N, V)>,
+    ) {
         for (name, value) in vars {
-            let name = name.to_ascii_uppercase();
+            let name = name.as_ref().to_string_lossy().to_ascii_uppercase();
             if ["KEY", "TOKEN", "SECRET", "PASSWORD"]
                 .iter()
                 .any(|suffix| name.ends_with(suffix))
             {
-                self.add(&value);
+                self.add(&value.as_ref().to_string_lossy());
             }
         }
     }

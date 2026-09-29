@@ -11,7 +11,7 @@ use harness_core::{
     engine::{EngineConfig, PermissionEngine, RuleSet},
     event::{AgentEvent, TurnEndReason},
     permission::{FsAccess, Mode},
-    redact::Redactor,
+    redact::{EventRedactor, Redactor},
     tool::{CommandSandbox, ToolContext},
 };
 use harness_providers::{
@@ -503,7 +503,8 @@ fn open_log(
 }
 
 /// Prints events as they arrive, and writes them to the debug `log`, with every secret
-/// `redactor` knows replaced. Returns the last assistant text and whether an action was blocked.
+/// `redactor` knows replaced, including one the model streams in pieces. Returns the last
+/// assistant text and whether an action was blocked.
 ///
 /// If stdout is closed (e.g. the reader end of a pipe exits early), writing must not panic: it sets
 /// `stdout_broken` and cancels the run so it stops promptly, but keeps draining events (so `blocked`
@@ -513,35 +514,64 @@ async fn render(
     json: bool,
     cancel: CancellationToken,
     redactor: Arc<Redactor>,
-    mut log: Option<std::fs::File>,
+    log: Option<std::fs::File>,
 ) -> (String, bool) {
-    let mut last_text = String::new();
-    let mut blocked = false;
-    // What each `write` or `edit` call would change, to show it when the call is blocked.
-    let mut writes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut stdout_broken = false;
+    let mut events = EventRedactor::new(redactor.clone());
+    let mut shown = Shown {
+        json,
+        cancel,
+        redactor,
+        log,
+        last_text: String::new(),
+        blocked: false,
+        writes: std::collections::HashMap::new(),
+        stdout_broken: false,
+    };
     while let Some(event) = rx.recv().await {
-        let line = redactor.redact(&serde_json::to_string(&event).expect("events serialize"));
-        if let Some(file) = log.as_mut() {
+        for event in events.push(event) {
+            shown.show(event);
+        }
+    }
+    for event in events.finish() {
+        shown.show(event);
+    }
+    (shown.last_text, shown.blocked)
+}
+
+/// What [`render`] has shown so far, and where it shows events.
+struct Shown {
+    json: bool,
+    cancel: CancellationToken,
+    redactor: Arc<Redactor>,
+    log: Option<std::fs::File>,
+    last_text: String,
+    blocked: bool,
+    /// What each `write` or `edit` call would change, to show it when the call is blocked.
+    writes: std::collections::HashMap<String, String>,
+    stdout_broken: bool,
+}
+
+impl Shown {
+    /// Shows `event`, already redacted: as a line of NDJSON and of the log, or on the terminal.
+    fn show(&mut self, event: AgentEvent) {
+        let json = self.json;
+        let line = serde_json::to_string(&event).expect("events serialize");
+        if let Some(file) = self.log.as_mut() {
             let _ = writeln!(file, "{line}");
         }
-        if json && !stdout_broken && writeln!(std::io::stdout().lock(), "{line}").is_err() {
-            stdout_broken = true;
-            cancel.cancel();
+        if json && !self.stdout_broken && writeln!(std::io::stdout().lock(), "{line}").is_err() {
+            self.stdout_broken = true;
+            self.cancel.cancel();
         }
-        // Everything shown below comes from the redacted event.
-        let event: AgentEvent = serde_json::from_str(&line).unwrap_or(AgentEvent::Warning {
-            message: "an event was left out because it could not be shown without a secret".into(),
-        });
         match &event {
             AgentEvent::AssistantMessage { content, .. } if !content.is_empty() => {
-                last_text = content.clone()
+                self.last_text = content.clone()
             }
             AgentEvent::ActionBlocked { id, reason } => {
-                blocked = true;
+                self.blocked = true;
                 if !json {
                     eprintln!("blocked: {}", terminal_safe(reason));
-                    if let Some(proposed) = writes.get(id) {
+                    if let Some(proposed) = self.writes.get(id) {
                         eprintln!("{proposed}");
                     }
                 }
@@ -553,8 +583,8 @@ async fn render(
             } if !json => {
                 let shown: String = arguments.chars().take(120).collect();
                 eprintln!("-> {} {}", terminal_safe(name), terminal_safe(&shown));
-                if let Some(proposed) = proposed_change(name, arguments) {
-                    writes.insert(id.clone(), proposed);
+                if let Some(proposed) = proposed_change(name, arguments, &self.redactor) {
+                    self.writes.insert(id.clone(), proposed);
                 }
             }
             AgentEvent::Retrying {
@@ -591,19 +621,21 @@ async fn render(
             _ => {}
         }
     }
-    (last_text, blocked)
 }
 
 /// What a `write` or `edit` call with `arguments` would change, as printed when it is blocked: the
 /// whole new content, or the text an edit replaces and its replacement. Only what the model sent
-/// is shown; the file itself is not read, since a blocked file may hold secrets.
-fn proposed_change(name: &str, arguments: &str) -> Option<String> {
+/// is shown; the file itself is not read, since a blocked file may hold secrets. `arguments` come
+/// redacted, but the model may have escaped a secret in them otherwise than JSON usually does,
+/// so each value is redacted again once decoded.
+fn proposed_change(name: &str, arguments: &str, redactor: &Redactor) -> Option<String> {
     let args = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
-    let path = terminal_safe(args["path"].as_str()?);
+    let text = |field: &str| args[field].as_str().map(|text| redactor.redact(text));
+    let path = terminal_safe(&text("path")?);
     match name {
         "write" => Some(format!(
             "proposed content of {path}:\n{}",
-            terminal_safe_text(args["content"].as_str()?)
+            terminal_safe_text(&text("content")?)
         )),
         "edit" => {
             let every = if args["replace_all"].as_bool() == Some(true) {
@@ -613,8 +645,8 @@ fn proposed_change(name: &str, arguments: &str) -> Option<String> {
             };
             Some(format!(
                 "proposed edit of {path}, replacing:{every}\n{}\nwith:\n{}",
-                terminal_safe_text(args["old_string"].as_str()?),
-                terminal_safe_text(args["new_string"].as_str()?)
+                terminal_safe_text(&text("old_string")?),
+                terminal_safe_text(&text("new_string")?)
             ))
         }
         _ => None,

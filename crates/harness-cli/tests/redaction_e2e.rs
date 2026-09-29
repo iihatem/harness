@@ -1,28 +1,71 @@
-//! The canary test for task 4.7: a run whose API key and a secret-looking environment variable
-//! reach the conversation through `printenv` leaves neither in the session file, the tool-output
-//! files, the debug log, the NDJSON output or what harness prints.
+//! The canary tests for task 4.7: a run whose API key and secret-looking environment variables
+//! reach the conversation (through `printenv`, a model that repeats them in pieces, output long
+//! enough to be cut through them, and a tool call that quotes a password) leaves none of them in
+//! the session file, the tool-output files, the debug log, the NDJSON output or what harness
+//! prints.
 
 mod common;
-use common::Isolate;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use assert_cmd::Command;
+use common::Isolate;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use wiremock::matchers::{body_string_contains, method};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const BIN: &str = env!("CARGO_BIN_EXE_harness");
-const KEY: &str = "sk-canary-key-0123456789";
-const TOKEN: &str = "canary-token-9876543210";
+const KEY: &str = "sk-canary-key-qzvwjxpkfm";
+const TOKEN: &str = "canary-tqkzn-hgtrdwsmlq";
+/// A password with a quote and a backslash, which JSON escapes.
+const PASSWORD: &str = r#"pa"ss\wd-canary-bnfhq"#;
 
-fn stream(chunk: Value) -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_raw(
-        format!("data: {chunk}\n\ndata: [DONE]\n\n"),
-        "text/event-stream",
-    )
+fn sse(chunks: &[Value]) -> ResponseTemplate {
+    let mut body: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
+    body.push_str("data: [DONE]\n\n");
+    ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
 }
 
-/// Every file under `dir`, as text.
+fn text(text: &str) -> Value {
+    json!({"choices": [{"index": 0, "delta": {"content": text}}]})
+}
+
+fn reasoning(text: &str) -> Value {
+    json!({"choices": [{"index": 0, "delta": {"reasoning_content": text}}]})
+}
+
+fn stop() -> Value {
+    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+}
+
+/// A reply that calls each of `calls`, `(id, tool, arguments)`.
+fn tool_calls(calls: &[(&str, &str, Value)]) -> Value {
+    let calls: Vec<Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (id, name, arguments))| {
+            json!({"index": index, "id": id, "type": "function",
+                "function": {"name": name, "arguments": arguments.to_string()}})
+        })
+        .collect();
+    json!({"choices": [{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": "tool_calls"}]})
+}
+
+/// Answers the requests in turn with `replies`, the last one again after that.
+struct Replies {
+    replies: Vec<ResponseTemplate>,
+    next: AtomicUsize,
+}
+
+impl Respond for Replies {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let next = self.next.fetch_add(1, Ordering::SeqCst);
+        self.replies[next.min(self.replies.len() - 1)].clone()
+    }
+}
+
+/// Every file under `dir`, as text. Every file harness writes is text, so one that is not fails.
 fn files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -32,97 +75,271 @@ fn files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
         let path = entry.unwrap().path();
         if path.is_dir() {
             found.extend(files(&path));
-        } else if let Ok(text) = std::fs::read_to_string(&path) {
+        } else {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{} is not text: {e}", path.display()));
             found.push((path, text));
         }
     }
     found
 }
 
-// Spec: "Debug logging" and "A command prints the environment".
+/// The five-character pieces of `secret`: a piece of it that a cut or a stream lets through
+/// holds one of them.
+fn pieces(secret: &str) -> Vec<&str> {
+    (0..=secret.len() - 5).map(|i| &secret[i..i + 5]).collect()
+}
+
+/// What a run printed and wrote.
+struct Run {
+    home: TempDir,
+    stdout: String,
+    stderr: String,
+    code: Option<i32>,
+    requests: Vec<Request>,
+}
+
+impl Run {
+    /// Runs `harness <args>` against a mock provider that answers with `replies`, with `KEY` as
+    /// its API key and `vars` in the environment.
+    async fn new(replies: Vec<ResponseTemplate>, vars: &[(&str, &str)], args: &[&str]) -> Run {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(Replies {
+                replies,
+                next: AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+        let home = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        std::fs::write(
+            home.path().join("config/config.toml"),
+            format!(
+                "model = \"mock/m\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\napi_key_env = \"MOCK_API_KEY\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n",
+                server.uri()
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir(ws.path().join(".git")).unwrap();
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let (home, output) = tokio::task::spawn_blocking(move || {
+            use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+            let output = Command::new(BIN)
+                .current_dir(ws.path())
+                .env("HARNESS_HOME", home.path())
+                .isolate()
+                .env("MOCK_API_KEY", KEY)
+                // Review F I1: a variable that is not UTF-8 is no reason to stop.
+                .env("LEGACY_NAME", OsString::from_vec(b"caf\xe9".to_vec()))
+                .envs(vars)
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("XDG_DATA_HOME")
+                .env_remove("XDG_STATE_HOME")
+                .args(args)
+                .output()
+                .unwrap();
+            drop(ws);
+            (home, output)
+        })
+        .await
+        .unwrap();
+        Run {
+            home,
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            code: output.status.code(),
+            requests: server.received_requests().await.unwrap(),
+        }
+    }
+
+    /// Everything the run printed and wrote: stdout, stderr and each file under its home.
+    fn written(&self) -> Vec<(String, String)> {
+        let mut written = vec![
+            ("stdout".to_string(), self.stdout.clone()),
+            ("stderr".to_string(), self.stderr.clone()),
+        ];
+        for (path, text) in files(self.home.path()) {
+            written.push((path.display().to_string(), text));
+        }
+        written
+    }
+
+    /// Checks that a file of each of `kinds` was written.
+    fn wrote(&self, kinds: &[&str]) {
+        let written = self.written();
+        for kind in kinds {
+            assert!(
+                written.iter().any(|(name, _)| name.contains(kind)),
+                "no {kind} file: {:?}",
+                written.iter().map(|(n, _)| n).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// `printenv` prints the token; the key, printed back to back, runs through both ends of the
+/// cut the tool output gets (4,096 bytes from each end), with `printenv` and a long `seq` between
+/// them, which only the tool-output file holds.
+const COMMAND: &str = r#"printenv DEPLOY_TOKEN; yes "$MOCK_API_KEY" | head -n 250 | tr -d '\n'; echo; printenv; seq 1 4000; yes "$MOCK_API_KEY" | head -n 250 | tr -d '\n'"#;
+
+/// The model runs [`COMMAND`], then streams the key and the token back in pieces, in its
+/// reasoning and in its answer.
+fn printenv_replies() -> Vec<ResponseTemplate> {
+    let (key_head, key_tail) = KEY.split_at(10);
+    let (token_head, token_tail) = TOKEN.split_at(11);
+    vec![
+        sse(&[tool_calls(&[("c1", "bash", json!({"command": COMMAND}))])]),
+        sse(&[
+            reasoning("They asked for the key, "),
+            reasoning(key_head),
+            reasoning(key_tail),
+            reasoning("."),
+            text("Your key is "),
+            text(key_head),
+            text(&key_tail[..4]),
+            text(&key_tail[4..]),
+            text(" and the token is "),
+            text(token_head),
+            text(&format!("{token_tail}.")),
+            stop(),
+        ]),
+    ]
+}
+
+/// Checks that nothing `run` printed or wrote holds a piece of the key or the token.
+fn holds_no_piece_of_a_secret(run: &Run) {
+    for (what, text) in run.written() {
+        for piece in pieces(KEY).into_iter().chain(pieces(TOKEN)) {
+            assert!(!text.contains(piece), "{what} holds {piece}:\n{text}");
+        }
+    }
+}
+
+// Spec: "Debug logging" and "A command prints the environment". Review F C1 and I2: the model's
+// reply streamed in pieces, and tool output cut through a secret.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_secret_is_written_anywhere() {
-    let server = MockServer::start().await;
-    // Second request: the tool ran. The model repeats the key it saw.
-    Mock::given(method("POST"))
-        .and(body_string_contains("\"role\":\"tool\""))
-        .respond_with(stream(json!({"choices": [{"index": 0,
-            "delta": {"content": format!("Your key is {KEY}.")}, "finish_reason": "stop"}]})))
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    // The secrets first, so that the model's share of the output holds them; then enough output
-    // that it is saved to a tool-output file.
-    let command = "printenv DEPLOY_TOKEN MOCK_API_KEY; printenv; seq 1 4000";
-    Mock::given(method("POST"))
-        .respond_with(stream(json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
-            "id": "c1", "type": "function", "function": {"name": "bash",
-            "arguments": json!({"command": command}).to_string()}}]}, "finish_reason": "tool_calls"}]})))
-        .with_priority(2)
-        .mount(&server)
-        .await;
-    let home = TempDir::new().unwrap();
-    let ws = TempDir::new().unwrap();
-    std::fs::create_dir_all(home.path().join("config")).unwrap();
-    std::fs::write(
-        home.path().join("config/config.toml"),
-        format!(
-            "model = \"mock/m\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\napi_key_env = \"MOCK_API_KEY\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n",
-            server.uri()
-        ),
+    let run = Run::new(
+        printenv_replies(),
+        &[("DEPLOY_TOKEN", TOKEN)],
+        &["--debug", "ask", "--json", "show the env"],
     )
-    .unwrap();
-    std::fs::create_dir(ws.path().join(".git")).unwrap();
-    let (home, ws, output) = tokio::task::spawn_blocking(move || {
-        let output = Command::new(BIN)
-            .current_dir(ws.path())
-            .env("HARNESS_HOME", home.path())
-            .isolate()
-            .env("MOCK_API_KEY", KEY)
-            .env("DEPLOY_TOKEN", TOKEN)
-            .env_remove("XDG_CONFIG_HOME")
-            .env_remove("XDG_DATA_HOME")
-            .env_remove("XDG_STATE_HOME")
-            .args(["--debug", "ask", "--json", "show the env"])
-            .output()
-            .unwrap();
-        (home, ws, output)
-    })
-    .await
-    .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stderr}");
-    for (what, text) in [("stdout", stdout.as_ref()), ("stderr", stderr.as_ref())] {
-        assert!(
-            !text.contains(KEY) && !text.contains(TOKEN),
-            "{what}: {text}"
-        );
-    }
-    assert!(stdout.contains("[redacted]"), "{stdout}");
-    assert!(stderr.contains("debug log: "), "{stderr}");
-    let written = files(home.path());
-    let names: Vec<String> = written
-        .iter()
-        .map(|(p, _)| p.display().to_string())
+    .await;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(run.stderr.contains("debug log: "), "{}", run.stderr);
+    run.wrote(&["/data/sessions/", "/state/tool-output/", "/state/logs/"]);
+    holds_no_piece_of_a_secret(&run);
+    // The streamed answer is whole, and redacted.
+    let events: Vec<Value> = run
+        .stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    for kind in ["/data/sessions/", "/state/tool-output/", "/state/logs/"] {
-        assert!(
-            names.iter().any(|n| n.contains(kind)),
-            "no {kind} file: {names:?}"
-        );
-    }
-    for (path, text) in &written {
-        assert!(
-            !text.contains(KEY) && !text.contains(TOKEN),
-            "{} holds a secret",
-            path.display()
-        );
-    }
+    let streamed = |kind: &str| -> String {
+        events
+            .iter()
+            .filter(|e| e["type"] == kind)
+            .map(|e| e["text"].as_str().unwrap())
+            .collect()
+    };
+    assert_eq!(
+        streamed("text_delta"),
+        "Your key is [redacted] and the token is [redacted]."
+    );
+    assert_eq!(
+        streamed("reasoning_delta"),
+        "They asked for the key, [redacted]."
+    );
+    // The cut left each copy of the key whole, on one side or the other.
+    let output = events
+        .iter()
+        .find(|e| e["type"] == "tool_call_finished")
+        .unwrap()["output"]
+        .as_str()
+        .unwrap();
+    let (head, rest) = output.split_once("\n[... ").unwrap();
+    let (_, tail) = rest.split_once(" ...]\n").unwrap();
+    assert!(head.ends_with("[redacted]"), "{head}");
+    assert!(tail.starts_with("[redacted]"), "{tail}");
     // The model still saw the output as it was.
-    let requests = server.received_requests().await.unwrap();
-    assert!(String::from_utf8_lossy(&requests[1].body).contains(TOKEN));
-    drop(ws);
+    let seen = String::from_utf8_lossy(&run.requests[1].body);
+    assert!(seen.contains(TOKEN) && seen.contains(KEY));
+}
+
+// Review F M4: in plain mode the answer goes to stdout and the tool call to stderr.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_secret_is_printed_in_plain_mode() {
+    let run = Run::new(
+        printenv_replies(),
+        &[("DEPLOY_TOKEN", TOKEN)],
+        &["--debug", "ask", "show the env"],
+    )
+    .await;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(
+        run.stdout,
+        "Your key is [redacted] and the token is [redacted].\n"
+    );
+    assert!(run.stderr.contains("-> bash "), "{}", run.stderr);
+    run.wrote(&["/data/sessions/", "/state/tool-output/", "/state/logs/"]);
+    holds_no_piece_of_a_secret(&run);
+}
+
+/// The model runs a command that quotes [`PASSWORD`], then tries to write it outside the
+/// workspace, which is blocked (and shown on stderr in plain mode), then says it is done.
+fn password_replies() -> Vec<ResponseTemplate> {
+    let content = format!("password = '{PASSWORD}'\n");
+    vec![
+        sse(&[tool_calls(&[
+            (
+                "c1",
+                "bash",
+                json!({"command": format!("echo 'the password is {PASSWORD}' >/dev/null; echo done")}),
+            ),
+            (
+                "c2",
+                "write",
+                json!({"path": "../outside.conf", "content": content}),
+            ),
+        ])]),
+        sse(&[text("I could not write it."), stop()]),
+    ]
+}
+
+// Review F I3 (probe P4): a password with a quote and a backslash inside a tool call's arguments
+// is escaped twice in the event and the session entry. It must not survive anywhere, stderr
+// included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_in_a_tool_call_is_written_nowhere() {
+    for json in [false, true] {
+        let mut args = vec!["--debug", "ask"];
+        if json {
+            args.push("--json");
+        }
+        args.push("set up the database");
+        let run = Run::new(password_replies(), &[("DB_PASSWORD", PASSWORD)], &args).await;
+        // The write was blocked for lack of approval.
+        assert_eq!(run.code, Some(3), "{}", run.stderr);
+        run.wrote(&["/data/sessions/", "/state/logs/"]);
+        if json {
+            assert!(run.stdout.contains("tool_call_requested"), "{}", run.stdout);
+        } else {
+            assert!(run.stderr.contains("-> bash "), "{}", run.stderr);
+            assert!(run.stderr.contains("proposed content of"), "{}", run.stderr);
+        }
+        for (what, text) in run.written() {
+            assert!(!text.contains("wd-canary-bnfhq"), "{what}:\n{text}");
+        }
+        // The model's request carried the password as the model wrote it.
+        let seen = String::from_utf8_lossy(&run.requests[1].body);
+        assert!(seen.contains("wd-canary-bnfhq"));
+    }
 }
 
 // Review F I1: one environment variable that is not UTF-8, in its name or its value, made every
@@ -135,7 +352,7 @@ fn a_variable_that_is_not_utf8_does_not_stop_harness() {
     let output = Command::new(BIN)
         .current_dir(ws.path())
         .env("HARNESS_HOME", home.path())
-        .env("HARNESS_CREDENTIAL_STORE", "file")
+        .isolate()
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_STATE_HOME")

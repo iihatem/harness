@@ -86,10 +86,10 @@ fn git_state(cwd: &Path) -> GitState {
                 })
         });
     // `status` runs the clean filter of every file whose stat changed, so with a filter driver
-    // configured anywhere git looks, the answer is left out. Reading the configuration runs
-    // nothing. Submodules are left alone: `status` would run `git status` in each, with the
-    // submodule's own configuration.
-    let dirty = if filters_configured(cwd) {
+    // the repository's own configuration defines, the answer is left out. Reading the
+    // configuration runs nothing. Submodules are left alone: `status` would run `git status` in
+    // each, with the submodule's own configuration.
+    let dirty = if repository_defines_filters(cwd) {
         None
     } else {
         git(
@@ -106,13 +106,34 @@ fn git_state(cwd: &Path) -> GitState {
     GitState { head, dirty }
 }
 
-/// Whether git's configuration for `cwd` defines any filter driver (`filter.<driver>.clean`,
-/// `smudge` or `process`); also when git cannot say.
-fn filters_configured(cwd: &Path) -> bool {
-    match run_git(cwd, &["config", "--get-regexp", r"^filter\."]) {
-        // Exit code 1: no such setting.
-        Some(output) => output.status.code() != Some(1),
-        None => true,
+/// Whether the repository's own configuration for `cwd` (its `local` and `worktree` scopes, with
+/// the files they include, which git reports under the including file's scope) defines any
+/// filter driver (`filter.<driver>.clean`, `smudge` or `process`); also when git cannot say, as a
+/// git older than 2.26 cannot (no `--show-scope`). A driver in the user's global or system
+/// configuration, such as git-lfs's, is the user's own program, which their own `git status`
+/// runs as well.
+fn repository_defines_filters(cwd: &Path) -> bool {
+    let Some(output) = run_git(
+        cwd,
+        &[
+            "config",
+            "--show-scope",
+            "--includes",
+            "--get-regexp",
+            r"^filter\.",
+        ],
+    ) else {
+        return true;
+    };
+    match output.status.code() {
+        // No such setting anywhere.
+        Some(1) => false,
+        // Each setting's line starts with its scope and a tab. A value with a line break in it
+        // can only add lines, so no setting of the repository's goes unseen.
+        Some(0) => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with("local\t") || line.starts_with("worktree\t")),
+        _ => true,
     }
 }
 

@@ -1,19 +1,29 @@
-use std::{path::Path, process::Command, sync::Once};
+use std::{path::Path, process::Command, sync::OnceLock};
 
 use harness_context::environment::{self, GitState};
 
 /// Makes the git that `environment::capture` runs ignore this machine's global and system
-/// configuration, as the fixtures' git does: a filter driver there (the git-lfs package configures
-/// one system-wide, as on CI runners) rightly leaves out whether a work tree is dirty.
+/// configuration, as the fixtures' git does. Its global configuration is instead a file of the
+/// test's that defines a filter driver of the user's own, as git-lfs's `git lfs install` does: a
+/// driver there is the user's program, which their own `git status` runs too, so it must not
+/// keep harness from saying whether a work tree is dirty.
 fn isolate() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
+    static GLOBAL: OnceLock<tempfile::TempDir> = OnceLock::new();
+    GLOBAL.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("gitconfig");
+        std::fs::write(
+            &config,
+            "[filter \"users\"]\n\tclean = cat\n\tsmudge = cat\n",
+        )
+        .unwrap();
         // SAFETY: nothing in this binary reads the environment except through `std`, which
         // serializes it with starting processes.
         unsafe {
-            std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+            std::env::set_var("GIT_CONFIG_GLOBAL", &config);
             std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
         }
+        dir
     });
 }
 
@@ -170,6 +180,64 @@ fn a_clean_filter_the_repository_assigns_never_runs() {
     let text = env.render();
     assert!(text.contains("Git branch: main\n"), "{text}");
     assert!(!text.contains("Uncommitted changes"), "{text}");
+}
+
+// Ruling on the final review's important 1: only the repository's own configuration is untrusted.
+// A filter driver in the user's global configuration (see [`isolate`]) keeps the line.
+#[test]
+fn a_filter_driver_in_the_users_own_configuration_keeps_the_line() {
+    isolate();
+    let output = Command::new("git")
+        .args(["config", "--global", "--get", "filter.users.clean"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "cat\n");
+    let dir = repo();
+    std::fs::write(dir.path().join("a.txt"), "b\n").unwrap();
+    let env = environment::capture(dir.path(), "2026-09-27");
+    assert_eq!(env.git.clone().unwrap().dirty, Some(true));
+    assert!(env.render().contains("Uncommitted changes: yes\n"));
+}
+
+// A filter driver the repository's configuration pulls in from another file, or sets in its
+// worktree configuration, is the repository's too.
+#[test]
+fn a_filter_driver_included_by_the_repository_or_in_its_worktree_configuration_never_runs() {
+    for how in ["include.path", "includeIf", "worktree"] {
+        let dir = repo();
+        let tools = tempfile::tempdir().unwrap();
+        let (script, marker) = marker_script(tools.path(), "clean");
+        let definition = format!("[filter \"x\"]\n\tclean = {}\n", script.display());
+        match how {
+            "worktree" => {
+                git(dir.path(), &["config", "extensions.worktreeConfig", "true"]);
+                git(
+                    dir.path(),
+                    &[
+                        "config",
+                        "--worktree",
+                        "filter.x.clean",
+                        script.to_str().unwrap(),
+                    ],
+                );
+            }
+            include => {
+                let included = tools.path().join("included");
+                std::fs::write(&included, definition).unwrap();
+                let key = if include == "includeIf" {
+                    "includeIf.onbranch:main.path"
+                } else {
+                    "include.path"
+                };
+                git(dir.path(), &["config", key, included.to_str().unwrap()]);
+            }
+        }
+        std::fs::write(dir.path().join(".gitattributes"), "* filter=x\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "b\n").unwrap();
+        let env = environment::capture(dir.path(), "2026-09-27");
+        assert!(!marker.exists(), "{how}: the clean filter ran");
+        assert_eq!(env.git.unwrap().dirty, None, "{how}");
+    }
 }
 
 // `git status` runs `git status` in each submodule, with the submodule's own configuration.

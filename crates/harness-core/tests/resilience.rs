@@ -340,3 +340,94 @@ async fn a_usage_limit_ends_the_turn_with_its_reset_time() {
     let (reason, _) = run(&mut agent, "again").await;
     assert_eq!(reason, TurnEndReason::Completed);
 }
+
+/// The error a server that sent nothing within the wait for the reply's first data ends the
+/// stream with.
+fn no_start(local: bool) -> ProviderError {
+    ProviderError::NoStart {
+        message: format!(
+            "the server did not start its reply within {}",
+            if local { "30 min" } else { "300 s" }
+        ),
+        local,
+    }
+}
+
+fn error_message(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .unwrap()
+}
+
+// Ruling on the final review's I-1: a local server that did not start its reply within 30
+// minutes is not asked again, since a retry would start what it was doing (loading the model,
+// reading the prompt) over, and a headless run would wait hours. The message says what to check.
+#[tokio::test(start_paused = true)]
+async fn a_local_server_that_never_starts_its_reply_is_not_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::error(no_start(true)), Script::text("late")]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert!(retries(&events).is_empty(), "{events:?}");
+    assert_eq!(provider.requests().len(), 1);
+    let message = error_message(&events);
+    for part in ["local server", "30 min", "not retr", "model", "smaller"] {
+        assert!(message.contains(part), "{part}: {message}");
+    }
+}
+
+// The final review's I-1, optional part: a hosted provider that did not start its reply within
+// 300 s is asked once more, not four times, so a headless run waits 10 minutes at most.
+#[tokio::test(start_paused = true)]
+async fn a_hosted_first_data_timeout_is_retried_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::error(no_start(false)),
+        Script::error(no_start(false)),
+        Script::text("late"),
+    ]);
+    let mut hosted = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let (reason, events) = run(&mut hosted, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert_eq!(retries(&events).len(), 1, "{events:?}");
+    assert_eq!(provider.requests().len(), 2);
+    assert!(
+        error_message(&events).contains("did not start its reply within 300 s"),
+        "{events:?}"
+    );
+    // Once is enough when the retry answers.
+    let provider = MockProvider::new(vec![Script::error(no_start(false)), Script::text("ok")]);
+    let mut hosted = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let (reason, _) = run(&mut hosted, "go").await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    // Other network errors keep their five attempts.
+    let mut script: Vec<Script> = (0..4)
+        .map(|_| Script::error(ProviderError::Network("reset".into())))
+        .collect();
+    script.push(Script::text("ok"));
+    let provider = MockProvider::new(script);
+    let mut hosted = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
+    let (reason, events) = run(&mut hosted, "go").await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert_eq!(retries(&events).len(), 4);
+}

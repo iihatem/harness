@@ -23,7 +23,7 @@ The system SHALL classify an error a provider reports inside a response stream a
 - **THEN** the request is not retried, and the error says the usage limit is reached
 
 ### Requirement: A stalled response stream ends
-The system SHALL end a response that sends no data within 300 seconds of the request, or within 30 minutes when the model's profile says it is local, and a response that sends nothing for 300 seconds after its first data, with a network error that says so and is retried like other network errors. Only silence MUST count, not the length of the whole reply, and any data MUST count as activity. The user MUST be able to end any such wait with Ctrl+C. Network errors MUST show a request URL's host and path only, never its query, fragment or credentials.
+The system SHALL end a response that sends no data within 300 seconds of the request, or within 30 minutes when the model's profile says it is local (a slash command's model included), and a response that sends nothing for 300 seconds after its first data, with an error that says so. A local server that sends no data within its 30 minutes MUST NOT be asked again, since a retry would start over what it was doing, and the error MUST say what to check; a hosted provider that sends none within 300 seconds MUST be asked once more at most; silence after the first data MUST be retried like other network errors. Only silence MUST count, not the length of the whole reply, and any data MUST count as activity. The user MUST be able to end any such wait with Ctrl+C. Network errors MUST show a request URL's host and path only, never its query, fragment or credentials.
 
 #### Scenario: Server goes silent mid-reply
 - **WHEN** a provider stops sending in the middle of a reply without closing the connection
@@ -32,6 +32,10 @@ The system SHALL end a response that sends no data within 300 seconds of the req
 #### Scenario: A local server reads a long prompt
 - **WHEN** a local server sends its headers and then takes ten minutes to read the prompt before its first token
 - **THEN** the reply is waited for, since a local server gets 30 minutes to start it, and Ctrl+C ends the wait at once
+
+#### Scenario: A local server never starts its reply
+- **WHEN** a local server sends nothing for 30 minutes after a request, in a headless run
+- **THEN** the turn fails without asking the server again, with an error that says the local server did not start its reply and what to check
 
 ### Requirement: Reasoning summaries are streamed
 The system SHALL ask OpenAI's reasoning models for reasoning summaries (`summary: "auto"`) on the Responses protocol, keeping the API's default reasoning effort unless the model's profile sets one, and stream the summaries as reasoning. Reasoning models MUST include the `gpt-5*` family except `gpt-5-chat*`, the `o1`, `o3` and `o4` series, every model on ChatGPT's backend, and any model whose profile sets a reasoning effort. When the API refuses summaries (as it does to an organization it has not verified), the request MUST be sent again without them, and they MUST NOT be asked for again in that session. A refusal MUST reach the user as the reply's text.

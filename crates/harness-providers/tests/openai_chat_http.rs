@@ -152,12 +152,19 @@ async fn a_local_server_gets_longer_than_a_hosted_one_to_start_its_reply() {
         let events: Vec<_> = provider.stream(request).collect().await;
         let waited = started.elapsed().as_secs();
         match events.last() {
-            Some(Err(error @ ProviderError::Network(message))) => {
+            // Final review, I-1: the local server's is not retried.
+            Some(Err(
+                error @ ProviderError::NoStart {
+                    message,
+                    local: said,
+                },
+            )) => {
                 assert!(
                     message.contains(&format!("did not start its reply within {shown}")),
                     "{message}"
                 );
-                assert!(error.is_retryable());
+                assert_eq!(*said, local);
+                assert_eq!(error.is_retryable(), !local);
             }
             other => panic!("{other:?}"),
         }

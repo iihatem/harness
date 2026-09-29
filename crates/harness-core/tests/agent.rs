@@ -595,6 +595,7 @@ async fn the_room_left_in_the_window_reaches_the_provider() {
             provider: command_model.clone(),
             id: "mock/m2".into(),
             name: "m2".into(),
+            local: false,
         }),
         ..TurnInput::from("again")
     };

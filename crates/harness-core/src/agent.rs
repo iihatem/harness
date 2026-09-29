@@ -1020,12 +1020,19 @@ impl Agent {
             let mut request =
                 compaction::summary_request(&model, &self.history[..cut], focus, max_tokens);
             // The session's model writes it under its profile's options, as it answers turns; a
-            // slash command's model gets the provider's defaults, as for its turn.
-            if self.turn_model.is_none() {
-                request.options = self.config.request.clone();
-                let input =
-                    compaction::request_tokens(&request.system, &request.tools, &request.messages);
-                request.output_room = Some(window.saturating_sub(input));
+            // slash command's model gets the provider's defaults, but for whether it is local, as
+            // for its turn.
+            match &self.turn_model {
+                None => {
+                    request.options = self.config.request.clone();
+                    let input = compaction::request_tokens(
+                        &request.system,
+                        &request.tools,
+                        &request.messages,
+                    );
+                    request.output_room = Some(window.saturating_sub(input));
+                }
+                Some(turn) => request.options = turn.options(),
             }
             match self.summarize(request, events, cancel).await {
                 Err(CompactError::Overflow(_)) if max_tokens == window / 2 => max_tokens /= 2,
@@ -1091,7 +1098,7 @@ impl Agent {
                     ));
                 }
                 Ok((text, _)) => return Ok(text.trim().to_string()),
-                Err(error) if error.is_retryable() && attempt < self.config.retry.max_attempts => {
+                Err(error) if self.config.retry.retries(&error, attempt) => {
                     let delay = self.config.retry.delay(attempt, error.retry_after());
                     let _ = events.send(AgentEvent::Retrying {
                         attempt,
@@ -1165,9 +1172,8 @@ impl Agent {
                 None => return ModelOutcome::Interrupted(reply),
                 Some(Ok(())) => return ModelOutcome::Reply(reply),
                 Some(Err(error))
-                    if error.is_retryable()
+                    if self.config.retry.retries(&error, attempt)
                         && !reply.emitted
-                        && attempt < self.config.retry.max_attempts
                         && !error
                             .retry_after()
                             .is_some_and(|d| d > crate::retry::MAX_AUTOMATIC_RETRY_AFTER) =>
@@ -1246,15 +1252,10 @@ impl Agent {
         reply: &mut ModelReply,
         events: &UnboundedSender<AgentEvent>,
     ) -> Result<(), ProviderError> {
-        // A slash command's model gets the provider's defaults: the options, and the window, are
-        // the session model's.
+        // A slash command's model gets the provider's defaults, but for whether it is local: the
+        // options, and the window, are the session model's.
         let (provider, model, options, output_room) = match &self.turn_model {
-            Some(turn) => (
-                &turn.provider,
-                turn.name.clone(),
-                RequestOptions::default(),
-                None,
-            ),
+            Some(turn) => (&turn.provider, turn.name.clone(), turn.options(), None),
             None => (
                 &self.provider,
                 self.config.model_name.clone(),
@@ -1594,6 +1595,12 @@ fn describe(error: &ProviderError) -> String {
         );
     }
     match error {
+        ProviderError::NoStart {
+            message,
+            local: true,
+        } => format!(
+            "{message}: the local server may still be loading the model, or reading a long prompt on a CPU. harness does not retry, since a retry would start that work over; check the server (its log, and whether the model fits in memory and runs on the GPU), or use a smaller context or model"
+        ),
         ProviderError::Http { status: 429, .. } => {
             format!(
                 "{error}. The provider is rate limiting; try again later or switch models with --model."

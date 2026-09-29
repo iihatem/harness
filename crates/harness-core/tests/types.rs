@@ -58,6 +58,13 @@ fn only_network_429_and_5xx_are_retryable() {
     assert!(http(503).is_retryable());
     assert!(!http(401).is_retryable());
     assert!(!ProviderError::Protocol("bad json".into()).is_retryable());
+    // Final review, I-1: a hosted provider's first-data timeout is retried, a local server's not.
+    let no_start = |local| ProviderError::NoStart {
+        message: "the server did not start its reply".into(),
+        local,
+    };
+    assert!(no_start(false).is_retryable());
+    assert!(!no_start(true).is_retryable());
     let limited = ProviderError::Http {
         status: 429,
         body: String::new(),

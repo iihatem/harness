@@ -534,6 +534,7 @@ async fn a_turn_models_summary_request_keeps_the_defaults() {
             provider: command_model.clone(),
             id: "mock/m2".into(),
             name: "m2".into(),
+            local: false,
         }),
         ..TurnInput::from("d".repeat(1_500))
     };
@@ -653,4 +654,82 @@ fn a_parse_error_quoting_model_text_is_not_an_overflow() {
         !ProviderError::Protocol(format!("EOF while parsing an object in chunk: {chunk}"))
             .is_context_overflow()
     );
+}
+
+// Final review, I-1: the summary loop retries as a turn does: a local server's first-data
+// timeout not at all, a hosted provider's once.
+#[tokio::test(start_paused = true)]
+async fn a_summary_request_retries_first_data_timeouts_as_a_turn_does() {
+    let no_start = |local| {
+        Script::error(ProviderError::NoStart {
+            message: "the server did not start its reply".into(),
+            local,
+        })
+    };
+    let summaries = |provider: &MockProvider| {
+        provider
+            .requests()
+            .iter()
+            .filter(|r| is_summary_request(r))
+            .count()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, provider) =
+        after_three_turns(dir.path(), vec![no_start(true), Script::text("summary")]).await;
+    let (result, events) = compact_now(&mut agent).await;
+    let error = result.unwrap_err();
+    assert!(error.contains("local server"), "{error}");
+    assert!(compacted(&events).is_empty());
+    assert_eq!(summaries(&provider), 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, provider) = after_three_turns(
+        dir.path(),
+        vec![no_start(false), no_start(false), Script::text("summary")],
+    )
+    .await;
+    let (result, _) = compact_now(&mut agent).await;
+    assert!(result.is_err());
+    assert_eq!(summaries(&provider), 2);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, provider) =
+        after_three_turns(dir.path(), vec![no_start(false), Script::text("summary")]).await;
+    let (result, events) = compact_now(&mut agent).await;
+    result.unwrap();
+    assert_eq!(compacted(&events).len(), 1);
+    assert_eq!(summaries(&provider), 2);
+}
+
+// Final review, I-1: a slash command's model on a local server gets a local server's wait, for
+// its turn and for a summary it writes.
+#[tokio::test]
+async fn a_local_turn_models_requests_say_it_is_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, _) = after_three_turns(dir.path(), vec![]).await;
+    let command_model = MockProvider::new(vec![Script::text("summary"), Script::text("answer")]);
+    let input = TurnInput {
+        model: Some(TurnModel {
+            provider: command_model.clone(),
+            id: "ollama/m2".into(),
+            name: "m2".into(),
+            local: true,
+        }),
+        ..TurnInput::from("d".repeat(1_500))
+    };
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let reason = agent.run_turn(input, &tx, CancellationToken::new()).await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    let requests = command_model.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(is_summary_request(&requests[0]));
+    for request in &requests {
+        assert_eq!(
+            request.options,
+            RequestOptions {
+                local: true,
+                ..RequestOptions::default()
+            }
+        );
+    }
 }

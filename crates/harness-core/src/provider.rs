@@ -28,6 +28,11 @@ pub enum ProviderEvent {
 pub enum ProviderError {
     #[error("network error: {0}")]
     Network(String),
+    /// No data came within the wait for a reply's first data: 300 s for a hosted provider, 30
+    /// minutes for a local server (`local`), which may load the model and read a long prompt on a
+    /// CPU first.
+    #[error("{message}")]
+    NoStart { message: String, local: bool },
     #[error("HTTP {status}: {body}")]
     Http {
         status: u16,
@@ -43,10 +48,13 @@ pub enum ProviderError {
 
 impl ProviderError {
     /// Network errors, HTTP 429, and HTTP 5xx are worth retrying; a 429 that reports an
-    /// exhausted quota or plan limit is not, since waiting seconds does not end it.
+    /// exhausted quota or plan limit is not, since waiting seconds does not end it. Nor is a local
+    /// server that did not start its reply within its wait: a retry would start over what it was
+    /// doing (loading the model, reading the prompt), and wait as long again.
     pub fn is_retryable(&self) -> bool {
         match self {
             ProviderError::Network(_) => true,
+            ProviderError::NoStart { local, .. } => !local,
             ProviderError::Http { status: 429, .. } => !self.is_quota_exhausted(),
             ProviderError::Http { status, .. } => (500..600).contains(status),
             ProviderError::Protocol(_) | ProviderError::InStream(_) => false,

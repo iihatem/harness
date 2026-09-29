@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::{engine::RuleSet, provider::Provider};
+use crate::{engine::RuleSet, message::RequestOptions, provider::Provider};
 
 /// One piece of a turn's user message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,11 +22,27 @@ pub struct TurnModel {
     pub id: String,
     /// The model name sent to the provider.
     pub name: String,
+    /// Whether it runs on a server of the user's own (its profile's `local`), which gets longer to
+    /// start a reply, and is not asked again when it does not.
+    pub local: bool,
+}
+
+impl TurnModel {
+    /// What its requests carry: the provider's defaults, and whether it is local.
+    pub fn options(&self) -> RequestOptions {
+        RequestOptions {
+            local: self.local,
+            ..RequestOptions::default()
+        }
+    }
 }
 
 impl std::fmt::Debug for TurnModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TurnModel").field("id", &self.id).finish()
+        f.debug_struct("TurnModel")
+            .field("id", &self.id)
+            .field("local", &self.local)
+            .finish()
     }
 }
 

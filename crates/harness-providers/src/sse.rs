@@ -37,6 +37,8 @@ struct Waits {
     first: Duration,
     /// Between pieces of data after that.
     idle: Duration,
+    /// Whether they are a local server's.
+    local: bool,
 }
 
 impl Waits {
@@ -49,15 +51,17 @@ impl Waits {
                 FIRST_DATA_TIMEOUT
             },
             idle: IDLE_TIMEOUT,
+            local,
         }
     }
 }
 
 /// Awaits `response`, then streams its events through `parser`. An error status ends the stream
-/// with [`ProviderError::Http`]; a stream that ends before the reply finished, or that keeps the
-/// reader waiting too long, with [`ProviderError::Network`]: one that sends no data within
-/// [`FIRST_DATA_TIMEOUT`] of the request ([`LOCAL_FIRST_DATA_TIMEOUT`] for a `local` server), or
-/// nothing for [`IDLE_TIMEOUT`] after that. Any data counts, a keep-alive comment included.
+/// with [`ProviderError::Http`]; a stream that ends before the reply finished, or that sends
+/// nothing for [`IDLE_TIMEOUT`] once its first data came, with [`ProviderError::Network`]; one
+/// that sends no data within [`FIRST_DATA_TIMEOUT`] of the request ([`LOCAL_FIRST_DATA_TIMEOUT`]
+/// for a `local` server), with [`ProviderError::NoStart`], which is final for a local server. Any
+/// data counts, a keep-alive comment included.
 pub fn events<P: EventParser>(
     response: impl Future<Output = Result<reqwest::Response, ProviderError>> + Send + 'static,
     parser: P,
@@ -81,11 +85,13 @@ fn events_within<P: EventParser>(
     mut parser: P,
     waits: Waits,
 ) -> ProviderStream {
-    let no_start = move || {
-        ProviderError::Network(format!(
+    // A local server's is final: a retry would start over what it was doing, and wait as long.
+    let no_start = move || ProviderError::NoStart {
+        message: format!(
             "the server did not start its reply within {}",
             duration(waits.first)
-        ))
+        ),
+        local: waits.local,
     };
     // The if/else keeps `response` used within one branch: `http_error` takes it by value.
     Box::pin(async_stream::try_stream! {
@@ -290,7 +296,11 @@ mod tests {
     }
 
     fn waits(first: Duration, idle: Duration) -> Waits {
-        Waits { first, idle }
+        Waits {
+            first,
+            idle,
+            local: false,
+        }
     }
 
     fn network_message(events: &[Result<ProviderEvent, ProviderError>]) -> String {
@@ -362,12 +372,36 @@ mod tests {
             let url = serve(before_headers, reply(), false).await;
             let started = Instant::now();
             let events = collect(&url, waits(ms(300), ms(5_000))).await;
-            let message = network_message(&events);
-            assert!(
-                message.contains("the server did not start its reply within 300 ms"),
-                "{message}"
+            assert_eq!(
+                events.last(),
+                Some(&Err(ProviderError::NoStart {
+                    message: "the server did not start its reply within 300 ms".into(),
+                    local: false,
+                }))
             );
             assert!(started.elapsed() < ms(650), "{:?}", started.elapsed());
+        }
+    }
+
+    // Final review, I-1: a local server that does not start its reply within its wait ends the
+    // stream with an error that says it was the local wait, which is not retried; a hosted
+    // provider's is.
+    #[tokio::test]
+    async fn only_a_hosted_providers_first_data_timeout_is_retryable() {
+        for local in [false, true] {
+            let url = serve(ms(0), vec![(ms(2_000), "one")], false).await;
+            let wait = Waits {
+                local,
+                ..waits(ms(200), ms(5_000))
+            };
+            let events = collect(&url, wait).await;
+            match events.last() {
+                Some(Err(error @ ProviderError::NoStart { local: said, .. })) => {
+                    assert_eq!(*said, local);
+                    assert_eq!(error.is_retryable(), !local);
+                }
+                other => panic!("{other:?}"),
+            }
         }
     }
 

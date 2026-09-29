@@ -332,6 +332,31 @@ fn requested_wait(message: &str) -> Option<Duration> {
     Some(Duration::from_nanos(u64::try_from(nanos).ok()?))
 }
 
+/// Whether `error` is the API refusing reasoning summaries, as it does to an organization it has
+/// not verified ("Your organization must be verified to generate reasoning summaries").
+fn refuses_summaries(error: &ProviderError) -> bool {
+    let ProviderError::Http {
+        status: 400, body, ..
+    } = error
+    else {
+        return false;
+    };
+    serde_json::from_str::<Value>(body)
+        .is_ok_and(|value| value["error"]["param"] == "reasoning.summary")
+}
+
+/// Leaves reasoning summaries out of a request `body`, and `reasoning` too when nothing is left.
+fn drop_summary(body: &mut Value) {
+    if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+        reasoning.remove("summary");
+        if reasoning.is_empty()
+            && let Some(body) = body.as_object_mut()
+        {
+            body.remove("reasoning");
+        }
+    }
+}
+
 /// How requests are authorized.
 enum Auth {
     /// An API key, when the endpoint needs one.
@@ -346,6 +371,9 @@ pub struct OpenAiResponses {
     client: reqwest::Client,
     base_url: String,
     auth: Auth,
+    /// Set once the API refused reasoning summaries (to an organization it has not verified):
+    /// later requests do not ask for them.
+    no_summaries: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OpenAiResponses {
@@ -354,6 +382,7 @@ impl OpenAiResponses {
             client: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth: Auth::Key(api_key),
+            no_summaries: Default::default(),
         }
     }
 
@@ -367,6 +396,7 @@ impl OpenAiResponses {
             client: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth: Auth::ChatGpt(auth),
+            no_summaries: Default::default(),
         }
     }
 }
@@ -376,11 +406,38 @@ impl Provider for OpenAiResponses {
         let url = format!("{}/responses", self.base_url);
         match &self.auth {
             Auth::Key(key) => {
-                let mut http = self.client.post(url).json(&request_body(&request));
-                if let Some(key) = key {
-                    http = http.bearer_auth(key);
+                use std::sync::atomic::Ordering::Relaxed;
+                let mut body = request_body(&request);
+                let no_summaries = self.no_summaries.clone();
+                if no_summaries.load(Relaxed) {
+                    drop_summary(&mut body);
                 }
-                sse::events(sse::send(http), ResponsesStreamParser::default())
+                let (client, key) = (self.client.clone(), key.clone());
+                let send = move |body: &Value| {
+                    let mut http = client.post(&url).json(body);
+                    if let Some(key) = &key {
+                        http = http.bearer_auth(key);
+                    }
+                    sse::send(http)
+                };
+                // Summaries refused to an organization OpenAI has not verified: sent again
+                // without them, and not asked for again.
+                let response = async move {
+                    let first = send(&body).await?;
+                    if first.status() != reqwest::StatusCode::BAD_REQUEST
+                        || body["reasoning"].get("summary").is_none()
+                    {
+                        return Ok(first);
+                    }
+                    let error = sse::http_error(first).await;
+                    if !refuses_summaries(&error) {
+                        return Err(error);
+                    }
+                    no_summaries.store(true, Relaxed);
+                    drop_summary(&mut body);
+                    send(&body).await
+                };
+                sse::events(response, ResponsesStreamParser::default())
             }
             #[cfg(feature = "chatgpt-login")]
             Auth::ChatGpt(auth) => {

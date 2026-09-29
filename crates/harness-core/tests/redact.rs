@@ -543,6 +543,32 @@ fn the_tool_output_cut_never_splits_a_secret() {
     }
 }
 
+// Re-review F, R4: a secret that overlaps itself (`00000000`, a placeholder-like value) in a run of
+// zeros ran the cuts through the whole output, so the model got neither head nor tail, and 16 MB
+// took seconds. A cut moves by at most the longest secret's length, and only the text around it
+// is searched.
+#[test]
+fn a_self_overlapping_secret_moves_the_cut_a_little_and_quickly() {
+    use harness_core::output::limit_output;
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let redactor = Redactor::default();
+    redactor.add("00000000");
+    redactor.add(KEY);
+    let content = "0".repeat(16 * 1024 * 1024);
+    let (limit, keep) = (10 * 1024, 10 * 1024 * 2 / 5);
+    let started = Instant::now();
+    let limited = limit_output(&content, limit, dir.path(), "c1", Some(&redactor));
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(900), "took {took:?}");
+    let (head, rest) = limited.split_once("\n[... ").unwrap();
+    let (_, tail) = rest.split_once(" ...]\n").unwrap();
+    for (end, kept) in [("head", head), ("tail", tail)] {
+        assert!(kept.len() <= keep, "{end}: {}", kept.len());
+        assert!(kept.len() >= keep - KEY.len(), "{end}: {}", kept.len());
+    }
+}
+
 #[test]
 fn occurrences_are_where_secrets_are() {
     let redactor = Redactor::default();

@@ -38,16 +38,13 @@ pub fn limit_output(
     let keep = limit * 2 / 5;
     // The head and the tail go to the model as they are, and then to the session file and the
     // event stream, which can only redact secrets they hold whole: a secret the cut would run
-    // through goes wholly to the omitted part.
-    let secrets = redactor.map(|r| r.occurrences(content)).unwrap_or_default();
-    let crossing = |at: usize| secrets.iter().filter(move |s| s.start < at && s.end > at);
+    // through goes wholly to the omitted part. Only the text around each cut is searched, and a
+    // cut moves by the longest secret's length at most.
     let mut head_end = floor_boundary(content, keep);
-    while let Some(start) = crossing(head_end).map(|s| s.start).min() {
-        head_end = start;
-    }
     let mut tail_start = ceil_boundary(content, content.len() - keep);
-    while let Some(end) = crossing(tail_start).map(|s| s.end).max() {
-        tail_start = end;
+    if let Some(redactor) = redactor {
+        head_end = redactor.clear_cut(content, head_end, true);
+        tail_start = redactor.clear_cut(content, tail_start, false);
     }
     let omitted = &content[head_end..tail_start];
     let location = match saved {

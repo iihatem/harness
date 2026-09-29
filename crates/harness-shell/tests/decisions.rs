@@ -260,6 +260,12 @@ fn deny_sees_through_wrappers_and_expansions() {
             ("git --git-dir=.git push", Deny),
             ("eval 'curl x'", Deny),
             ("dash -ec 'curl x'", Deny),
+            ("trap 'curl x' EXIT", Deny),
+            ("trap -- 'curl x' EXIT", Deny),
+            ("compgen -C 'curl x'", Deny),
+            ("compgen -W 'a $(curl x)'", Deny),
+            ("complete -C 'curl x' foo", Deny),
+            ("complete -W '$(curl x)' foo", Deny),
             ("echo a#b; curl x", Deny),
             ("/usr/bin/git -C x push", Deny),
         ],
@@ -501,6 +507,32 @@ fn substitutions_hidden_in_arithmetic_text_ask() {
 }
 
 #[test]
+fn parameter_transforms_ask() {
+    use Want::{Allow, Ask};
+    // `${x@P}` runs prompt expansion of `x`'s value on bash 4.4+, which can run a
+    // command substitution the value holds; every `${…@<letter>}` transform is treated
+    // the same way, since the value is not known statically. An `@` that instead follows
+    // another operator (`${x:-user@host}`) is part of that operator's text, not a
+    // transform.
+    check(
+        &default_rules(),
+        &[
+            ("echo \"${x@P}\"", Ask),
+            ("echo \"${1@P}\"", Ask),
+            ("echo \"${x@Q}\"", Ask),
+            ("echo \"${x@A}\"", Ask),
+            ("echo \"${x@a}\"", Ask),
+            ("echo \"${x@E}\"", Ask),
+            ("echo \"${x@L}\"", Ask),
+            ("echo \"${x@U}\"", Ask),
+            ("echo \"${!x@P}\"", Ask),
+            ("echo \"${x:-user@host}\"", Allow),
+            ("echo \"${x}\"", Allow),
+        ],
+    );
+}
+
+#[test]
 fn alias_definitions_ask() {
     use Want::{Ask, Unlisted};
     check(
@@ -543,6 +575,71 @@ fn quoted_text_that_builtins_evaluate_asks() {
         ),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn trap_and_completion_actions_run_as_nested_shell_text() {
+    use Want::{Allow, Ask, Unlisted};
+    // A literal `trap` action, or a literal `compgen`/`complete` `-C` command or `-W` word
+    // list, is analyzed like `bash -c '…'`: harmless text is unlisted or allowed, and a
+    // denied command inside is caught (see `deny_sees_through_wrappers_and_expansions`).
+    // Text that is not a literal, and `-F` (a shell function this analysis cannot see),
+    // ask instead of running unseen. `trap -p`, `trap -l`, `trap - SIG` and `trap '' SIG`
+    // run nothing and are unaffected.
+    check(
+        &default_rules(),
+        &[
+            ("trap 'echo hi' EXIT", Allow),
+            ("trap 'git status' INT TERM", Allow),
+            ("trap \"$cmd\" EXIT", Ask),
+            ("trap \"echo $1\" EXIT", Ask),
+            ("trap -p", Unlisted),
+            ("trap -l", Unlisted),
+            ("trap - EXIT", Unlisted),
+            ("trap '' EXIT", Unlisted),
+            ("trap", Unlisted),
+            // `--` ends option parsing; the word after it is the action, even when that
+            // word looks like an option (bash reads no options past `--`, though `-` and
+            // `''` keep their special meaning there too).
+            ("trap -- 'echo hi' EXIT", Allow),
+            ("trap -- -p EXIT", Unlisted),
+            ("trap -- -l EXIT", Unlisted),
+            ("trap -- - EXIT", Unlisted),
+            ("trap -- '' EXIT", Unlisted),
+            ("trap --", Unlisted),
+            // `-l` or `-p`, alone, repeated, or combined, only list or print: no action,
+            // regardless of anything after (bash ignores it, even another `--`).
+            ("trap -l 'echo hi' EXIT", Unlisted),
+            ("trap -p 'echo hi' EXIT", Unlisted),
+            ("trap -lp", Unlisted),
+            ("trap -pl", Unlisted),
+            ("trap -p -p EXIT", Unlisted),
+            ("trap -p --", Unlisted),
+            ("trap -l -- 'echo hi' EXIT", Unlisted),
+            // An option this analysis does not recognize (bash 3.2 and 5.2 accept only
+            // `-l`/`-p`; a later bash could add another) asks rather than guessing.
+            ("trap -x 'echo hi' EXIT", Ask),
+            ("trap -P 'echo hi' EXIT", Ask),
+            ("compgen -W 'a b c'", Unlisted),
+            ("compgen -W \"$list\"", Ask),
+            ("compgen -C \"$cmd\"", Ask),
+            ("complete -F _myfunc foo", Ask),
+            ("compgen -F _myfunc", Ask),
+        ],
+    );
+}
+
+#[test]
+fn trap_double_dash_still_analyses_the_action() {
+    use Want::Deny;
+    // Before the fix, `trap`'s wrapper treated a leading `--` itself as the literal
+    // action to analyse (harmless) and silently dropped the real action after it. `rm`
+    // isn't in `default_rules`, so this needs its own deny rule to show the nested text
+    // is actually reached, not just that the same `curl`-based case above still denies.
+    check(
+        &rules(&[], &["rm -f*"], &[]),
+        &[("trap -- 'rm -f x' EXIT", Deny)],
+    );
 }
 
 #[test]
@@ -1163,6 +1260,44 @@ fn rough_scan_sees_past_redirections_split_by_line_continuations() {
     check(&default_rules(), &table);
     // Parsed programs too.
     check(&default_rules(), &[("3<\\\n&1 curl x", Deny)]);
+}
+
+#[test]
+fn rough_scan_tracks_here_documents_split_by_line_continuations() {
+    use Want::Deny;
+    // bash removes a backslash-newline before it reads a here-document operator, so one
+    // splitting `<<`, `<<-` or `<<<` does not hide it. Each program is refused as a whole
+    // (by the trailing `(`), so the rough scan decides; an unterminated quote in the body
+    // shows the operator was tracked, since otherwise nothing bounds where the body ends
+    // and the quote swallows `curl x` into one opaque word (asking instead of denying).
+    let table = [
+        // `<<` split between its two `<`.
+        ("cat <\\\n<EOF\n\"\nEOF\ncurl x\n(", Deny),
+        // `<<-` split between its two `<`, before the `-`.
+        ("cat <\\\n<-EOF\n\"\n\tEOF\ncurl x\n(", Deny),
+        // `<<-` split between `<<` and `-`.
+        ("cat <<\\\n-EOF\n\"\n\tEOF\ncurl x\n(", Deny),
+        // `<<<` (here-string) split between its 2nd and 3rd `<`.
+        ("cat <\\\n<<x\ncurl x\n(", Deny),
+        ("echo <\\\n<<'y'\ncurl x\n(", Deny),
+    ];
+    check(&default_rules(), &table);
+}
+
+#[test]
+fn a_heredoc_operator_only_found_by_joining_a_continuation_is_not_trusted() {
+    use Want::Deny;
+    // A mutfuzz find: recognizing `<<'EOF'` here needs the same join as above, but this
+    // program is a syntax error to bash (an unmatched `(` right after the delimiter), so
+    // nothing bash would call the body ever runs. Trusting the delimiter anyway would read
+    // `zzmark` after it as here-document data (never denied, only asked, since data may
+    // hide a command bash disagrees about) instead of a command of its own, turning the
+    // old Deny into an Ask: looser. Not trusting a delimiter recognized this way falls back
+    // to reading the text line by line, which still finds `zzmark` as its own line.
+    check(
+        &rules(&[], &["zzmark*"], &[]),
+        &[("echo $<\\\n<'EOF'(\n# c)\nzzmar\\\nk\n)", Deny)],
+    );
 }
 
 #[test]

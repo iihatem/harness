@@ -91,6 +91,30 @@ fn large_output_is_spilled_to_a_file_with_head_and_tail() {
     assert!(limited.len() < 1300);
 }
 
+// Review F M3: the tool-output file holds what the session file holds, so only its owner may
+// read it, as with session files.
+#[test]
+fn tool_output_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let spill = dir.path().join("tool-output/run-1");
+    let content = "x".repeat(5000);
+    limit_output(&content, 1000, &spill, "c1", None);
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir.path().join("tool-output")), 0o700);
+    assert_eq!(mode(&spill), 0o700);
+    assert_eq!(mode(&spill.join("c1.txt")), 0o600);
+    // A file left readable by others is made private when it is written again.
+    std::fs::set_permissions(spill.join("c1.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    limit_output(&content, 1000, &spill, "c1", None);
+    assert_eq!(mode(&spill.join("c1.txt")), 0o600);
+    assert_eq!(
+        std::fs::read_to_string(spill.join("c1.txt")).unwrap(),
+        content
+    );
+}
+
 #[test]
 fn limiting_never_splits_a_multibyte_character() {
     let dir = tempfile::tempdir().unwrap();

@@ -29,10 +29,11 @@ pub fn limit_output(
         })
         .collect();
     let file = dir.join(format!("{safe_id}.txt"));
-    let saved = std::fs::create_dir_all(dir).and_then(|_| {
-        let content = redactor.map_or_else(|| content.to_string(), |r| r.redact(content));
-        std::fs::write(&file, content)
-    });
+    let saved = save(
+        dir,
+        &file,
+        &redactor.map_or_else(|| content.to_string(), |r| r.redact(content)),
+    );
 
     let keep = limit * 2 / 5;
     // The head and the tail go to the model as they are, and then to the session file and the
@@ -60,6 +61,28 @@ pub fn limit_output(
         omitted.lines().count(),
         &content[tail_start..]
     )
+}
+
+/// Writes `content` to `file` in `dir`. It holds what the session file holds, so like session
+/// files only its owner may read it: the directories it creates are `0700`, the file `0600`.
+fn save(dir: &Path, file: &Path, content: &str) -> std::io::Result<()> {
+    use std::{
+        io::Write,
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    };
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(file)?;
+    // One that was already there keeps its mode unless it is set.
+    out.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    out.write_all(content.as_bytes())
 }
 
 fn floor_boundary(s: &str, mut i: usize) -> usize {

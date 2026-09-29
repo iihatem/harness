@@ -289,10 +289,10 @@ async fn later_built_ins_say_so_and_unknown_commands_are_explained() {
     let dir = tempfile::tempdir().unwrap();
     let provider = MockProvider::new(Vec::new());
     let mut ui = start(provider.clone(), dir.path());
-    type_text(&mut ui, "/rewind");
+    type_text(&mut ui, "/login");
     press(&mut ui, KeyCode::Esc);
     press(&mut ui, KeyCode::Enter);
-    assert!(shows(&ui, "/rewind is not available yet"));
+    assert!(shows(&ui, "/login is not available yet"));
     type_text(&mut ui, "/nope");
     press(&mut ui, KeyCode::Enter);
     assert!(shows(&ui, "unknown command /nope"));

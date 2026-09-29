@@ -9,9 +9,10 @@ use std::{
 
 use futures::{FutureExt, Stream, StreamExt};
 use harness_core::{
-    agent::{Agent, ContextUsage},
+    agent::{Agent, ContextUsage, RewindPoint},
     event::AgentEvent,
     redact::{EventRedactor, Redactor},
+    session::RewindScope,
     turn::TurnInput,
 };
 use ratatui::{backend::Backend, crossterm::event::Event};
@@ -85,12 +86,19 @@ enum Job {
         focus: Option<String>,
         cancel: CancellationToken,
     },
+    Rewind {
+        entry: String,
+        scope: RewindScope,
+    },
+    UndoRewind,
 }
 
 /// What the task that owns the agent says after each job: where the context goes now, and how
 /// the job ended when that has something to tell.
 struct Update {
     context: ContextUsage,
+    /// What the conversation can be rewound to, and whether the last rewind can be undone.
+    rewind: (Vec<RewindPoint>, bool),
     done: Option<Done>,
 }
 
@@ -146,6 +154,7 @@ where
         let mut app = App::new(options, host, width);
         let agent = agent.with_steering(app.steering());
         app.set_context(agent.context_usage());
+        app.set_rewind(agent.rewind_points(), agent.can_undo_rewind());
         let runner = tokio::spawn(async move {
             let mut agent = agent;
             while let Some(job) = queue.recv().await {
@@ -162,9 +171,18 @@ where
                         let result = agent.compact(focus.as_deref(), &events_tx, cancel).await;
                         Some(Done::Compacted(result))
                     }
+                    Job::Rewind { entry, scope } => {
+                        let result = agent.rewind(&entry, scope).await;
+                        Some(Done::Rewound(result.map_err(|e| e.to_string())))
+                    }
+                    Job::UndoRewind => {
+                        let result = agent.undo_rewind().await;
+                        Some(Done::UndidRewind(result.map_err(|e| e.to_string())))
+                    }
                 };
                 let _ = updates_tx.send(Update {
                     context: agent.context_usage(),
+                    rewind: (agent.rewind_points(), agent.can_undo_rewind()),
                     done,
                 });
             }
@@ -293,6 +311,14 @@ where
                 }
                 Flow::Continue
             }
+            Action::Rewind { entry, scope } => {
+                self.send_job(Job::Rewind { entry, scope });
+                Flow::Continue
+            }
+            Action::UndoRewind => {
+                self.send_job(Job::UndoRewind);
+                Flow::Continue
+            }
             Action::Compact(focus) => {
                 let cancel = CancellationToken::new();
                 self.cancel = Some(cancel.clone());
@@ -310,6 +336,14 @@ where
             }
             Action::Quit => Flow::Quit,
         })
+    }
+
+    /// Gives `job` to the task that owns the agent.
+    fn send_job(&mut self, job: Job) {
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send(job);
+            self.awaiting_context = true;
+        }
     }
 
     /// Opens the plan in the user's editor, when they asked to edit it, and takes in the edited
@@ -499,6 +533,8 @@ where
             self.show(event);
         }
         self.app.set_context(update.context);
+        let (points, can_undo) = update.rewind;
+        self.app.set_rewind(points, can_undo);
         if let Some(done) = update.done {
             self.app.on_done(done);
         }

@@ -11,10 +11,11 @@ use std::{
 
 use harness_context::commands::{is_builtin, parse_invocation};
 use harness_core::{
-    agent::{ApprovalDecision, ApprovalRequest, ContextUsage},
+    agent::{ApprovalDecision, ApprovalRequest, ContextUsage, REWIND_LIMITS, RewindPoint},
     event::{AgentEvent, TurnEndReason},
     permission::Mode,
     redact::Redactor,
+    session::RewindScope,
     turn::{Steering, TurnInput},
 };
 use ratatui::{
@@ -43,7 +44,7 @@ pub const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TYPED_PAST: &str = "your typing went to your message; the prompt takes keys once you pause";
 
 /// Built-in commands that come with the rest of the terminal UI, and where.
-const LATER: [(&str, &str); 5] = [
+const LATER: [(&str, &str); 4] = [
     (
         "model",
         "with the model picker; for now, start harness with --model <provider>/<model>",
@@ -57,7 +58,28 @@ const LATER: [(&str, &str); 5] = [
         "resume",
         "with the session picker; start harness with -c or --resume <id>",
     ),
-    ("rewind", "with the rewind picker"),
+];
+
+/// Esc twice on empty input within this long opens the rewind list.
+pub const REWIND_WINDOW: Duration = Duration::from_secs(1);
+
+/// What the rewind's second list offers, in order.
+const SCOPES: [(RewindScope, &str, &str); 3] = [
+    (
+        RewindScope::CodeAndConversation,
+        "code and conversation",
+        "the files and the conversation as they were",
+    ),
+    (
+        RewindScope::Conversation,
+        "conversation only",
+        "the files stay as they are now",
+    ),
+    (
+        RewindScope::Code,
+        "code only",
+        "the conversation stays as it is now",
+    ),
 ];
 
 /// The modes `/mode` offers, and what each lets the agent do. `full-access` is chosen only when
@@ -79,9 +101,13 @@ const MODES: [(Mode, &str); 4] = [
 ];
 
 /// What a picker is choosing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Pick {
     Mode,
+    /// The message to rewind to, one per item: `None` undoes the last rewind.
+    Rewind(Vec<Option<RewindPoint>>),
+    /// What to restore to before this message.
+    RewindScope(RewindPoint),
 }
 
 /// How work the agent did for a command ended.
@@ -89,6 +115,10 @@ enum Pick {
 pub enum Done {
     /// `/compact`: `Err` says why nothing was compacted.
     Compacted(Result<(), String>),
+    /// A rewind: `Err` says why it failed.
+    Rewound(Result<(), String>),
+    /// Undoing the last rewind.
+    UndidRewind(Result<(), String>),
 }
 
 /// A slash command expanded for a turn.
@@ -149,6 +179,10 @@ pub enum Action {
     EditPlan(String),
     /// Compact the conversation, with what to keep in particular.
     Compact(Option<String>),
+    /// Rewind to just before the user message `entry`.
+    Rewind { entry: String, scope: RewindScope },
+    /// Undo the last rewind.
+    UndoRewind,
     /// Stop the running turn.
     Interrupt,
     /// Leave harness.
@@ -218,6 +252,14 @@ pub struct App {
     picker: Option<(Pick, Picker)>,
     /// What the agent is doing for a command, shown until it is done.
     working: Option<String>,
+    /// The user messages the conversation can be rewound to, oldest first, and whether the last
+    /// rewind can be undone, as the agent last said.
+    rewind_points: Vec<RewindPoint>,
+    can_undo_rewind: bool,
+    /// The rewind asked for: to before which message, restoring what.
+    rewinding: Option<(String, RewindScope)>,
+    /// When Esc was last pressed on empty input.
+    last_esc: Option<Instant>,
 }
 
 impl App {
@@ -257,7 +299,18 @@ impl App {
             ran_tools: false,
             picker: None,
             working: None,
+            rewind_points: Vec::new(),
+            can_undo_rewind: false,
+            rewinding: None,
+            last_esc: None,
         }
+    }
+
+    /// What the conversation can be rewound to: `points`, oldest first, and whether the last
+    /// rewind can be undone.
+    pub fn set_rewind(&mut self, points: Vec<RewindPoint>, can_undo: bool) {
+        self.rewind_points = points;
+        self.can_undo_rewind = can_undo;
     }
 
     /// The picker the user is choosing in: the session draws it in a full-screen view.
@@ -274,6 +327,35 @@ impl App {
             Done::Compacted(Err(why)) => self
                 .transcript
                 .push_note(&format!("the conversation was not compacted: {why}"), width),
+            Done::Rewound(result) => {
+                let Some((text, scope)) = self.rewinding.take() else {
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        let what = match scope {
+                            RewindScope::CodeAndConversation => "the code and the conversation",
+                            RewindScope::Conversation => "the conversation",
+                            RewindScope::Code => "the code",
+                        };
+                        self.transcript.push_note(
+                            &format!("rewound {what} to before: {}", first_line(&text)),
+                            width,
+                        );
+                        // The message comes back, to send again as it is or changed.
+                        if scope != RewindScope::Code && self.editor.is_empty() {
+                            self.editor.set_text(&text);
+                        }
+                    }
+                    Err(why) => self
+                        .transcript
+                        .push_error(&format!("the rewind failed: {why}"), width),
+                }
+            }
+            Done::UndidRewind(Ok(())) => self.transcript.push_note("undid the last rewind", width),
+            Done::UndidRewind(Err(why)) => self
+                .transcript
+                .push_error(&format!("could not undo the last rewind: {why}"), width),
         }
     }
 
@@ -345,6 +427,14 @@ impl App {
         self.arming
             .armed_at()
             .filter(|_| self.takes_keys_after_a_pause())
+    }
+
+    /// Opens `picker`, drawn in a full-screen view. Every picker, one that follows another
+    /// included, takes keys only once the user has paused ([`Arming`]): keys typed ahead never
+    /// choose an item or confirm what the picker is for.
+    fn open_picker(&mut self, pick: Pick, picker: Picker) {
+        self.picker = Some((pick, picker));
+        self.arming = Arming::default();
     }
 
     /// Whether an approval, a plan choice or a picker waits for an answer: it takes keys only
@@ -608,6 +698,9 @@ impl App {
         }
         self.ctrl_c = None;
         self.hint = None;
+        if key.code != KeyCode::Esc {
+            self.last_esc = None;
+        }
         if self.takes_keys_after_a_pause() {
             if self.arming.armed(now) {
                 return self.prompt_key(key);
@@ -632,6 +725,7 @@ impl App {
         }
         match key.code {
             KeyCode::Esc if self.busy() => return Some(Action::Interrupt),
+            KeyCode::Esc if self.editor.is_empty() => return self.esc_on_empty_input(now),
             KeyCode::Esc => return None,
             KeyCode::BackTab => return self.cycle_mode(),
             _ => {}
@@ -656,9 +750,9 @@ impl App {
         }
         if let Some((_, picker)) = &mut self.picker {
             let picked = picker.key(key)?;
-            let (pick, picker) = self.picker.take()?;
+            let (pick, _) = self.picker.take()?;
             return match picked {
-                Picked::Chosen(index) => self.picked(pick, &picker, index),
+                Picked::Chosen(index) => self.picked(pick, index),
                 Picked::Cancelled => None,
             };
         }
@@ -846,7 +940,12 @@ impl App {
         let width = self.width;
         match name {
             "quit" => return self.quit(),
-            "mode" | "compact" if !self.between_turns(name) => {}
+            "mode" | "compact" | "rewind" if !self.between_turns(name) => {}
+            "rewind" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                self.open_rewind();
+            }
             "mode" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
@@ -918,7 +1017,7 @@ impl App {
                 .with_footer(vec![
                     "full-access is chosen only when harness starts (--mode full-access).".into(),
                 ]);
-            self.picker = Some((Pick::Mode, picker));
+            self.open_picker(Pick::Mode, picker);
             return None;
         }
         match args.parse::<Mode>() {
@@ -935,8 +1034,8 @@ impl App {
         None
     }
 
-    /// The user chose item `index` of `picker`, for `pick`.
-    fn picked(&mut self, pick: Pick, _picker: &Picker, index: usize) -> Option<Action> {
+    /// The user chose item `index` of the picker for `pick`.
+    fn picked(&mut self, pick: Pick, index: usize) -> Option<Action> {
         match pick {
             Pick::Mode => {
                 let mode = MODES.get(index)?.0;
@@ -945,7 +1044,70 @@ impl App {
                 }
                 self.switch_mode(mode)
             }
+            Pick::Rewind(points) => match points.into_iter().nth(index)? {
+                None => {
+                    self.working = Some("undoing the last rewind".into());
+                    Some(Action::UndoRewind)
+                }
+                Some(point) => {
+                    let items = SCOPES
+                        .iter()
+                        .map(|(_, name, what)| Item::new(name, what))
+                        .collect();
+                    let picker = Picker::new("Restore what, to before this message?", items)
+                        .with_footer(vec![
+                            format!("› {}", first_line(&point.text)),
+                            REWIND_LIMITS.into(),
+                        ]);
+                    self.open_picker(Pick::RewindScope(point), picker);
+                    None
+                }
+            },
+            Pick::RewindScope(point) => {
+                let scope = SCOPES.get(index)?.0;
+                self.working = Some("rewinding".into());
+                self.rewinding = Some((point.text, scope));
+                Some(Action::Rewind {
+                    entry: point.entry,
+                    scope,
+                })
+            }
         }
+    }
+
+    /// Esc on empty input: pressed twice within [`REWIND_WINDOW`], opens the rewind list.
+    fn esc_on_empty_input(&mut self, now: Instant) -> Option<Action> {
+        match self.last_esc.take() {
+            Some(at) if now.duration_since(at) <= REWIND_WINDOW => self.open_rewind(),
+            _ => self.last_esc = Some(now),
+        }
+        None
+    }
+
+    /// The rewind list: "undo the last rewind" when it can be, then the user's messages, the
+    /// latest first, with what a rewind cannot undo under them.
+    fn open_rewind(&mut self) {
+        let mut points: Vec<Option<RewindPoint>> = Vec::new();
+        let mut items = Vec::new();
+        if self.can_undo_rewind {
+            points.push(None);
+            items.push(Item::new(
+                "undo the last rewind",
+                "the files and the conversation as they were before it",
+            ));
+        }
+        for point in self.rewind_points.iter().rev() {
+            items.push(Item::new(&first_line(&point.text), ""));
+            points.push(Some(point.clone()));
+        }
+        if items.is_empty() {
+            self.transcript
+                .push_note("there is nothing to rewind yet", self.width);
+            return;
+        }
+        let picker = Picker::new("Rewind to before which message?", items)
+            .with_footer(vec![REWIND_LIMITS.into()]);
+        self.open_picker(Pick::Rewind(points), picker);
     }
 
     /// Sends input typed as `shown`, `full` with pastes expanded: a custom command or `/init`
@@ -990,6 +1152,7 @@ impl App {
             ("Ctrl+S during a turn", "send it with the next tool results"),
             ("Shift+Tab", "switch between plan, ask and auto mode"),
             ("Esc", "interrupt the running turn"),
+            ("Esc twice", "rewind to before an earlier message"),
             ("Ctrl+C twice", "exit"),
         ] {
             lines.push(Line::from(vec![
@@ -1114,6 +1277,17 @@ pub fn next_mode(mode: Mode) -> Mode {
         Mode::Plan | Mode::ReadOnly => Mode::Ask,
         Mode::Ask => Mode::Auto,
         Mode::Auto | Mode::FullAccess => Mode::Plan,
+    }
+}
+
+/// The first line of `text`, with `…` when there is more.
+fn first_line(text: &str) -> String {
+    let mut lines = text.trim().lines();
+    let first = lines.next().unwrap_or_default();
+    if lines.next().is_some() {
+        format!("{first} …")
+    } else {
+        first.to_string()
     }
 }
 

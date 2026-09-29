@@ -17,11 +17,11 @@ use harness_core::{
 };
 use harness_providers::registry;
 
-use crate::{context::home, setup::Setup, term::terminal_safe};
+use crate::{context::home, notices::Notices, setup::Setup, term::terminal_safe};
 
 /// The project's custom commands when `prompt` is a slash command, printing a warning for each
 /// command file that was ignored. `None` for ordinary prompts.
-pub fn discover(setup: &Setup, prompt: &str) -> Option<Commands> {
+pub fn discover(setup: &Setup, prompt: &str, notices: &mut Notices) -> Option<Commands> {
     parse_invocation(prompt)?;
     let found = commands::discover(
         &project_root(&setup.workspace),
@@ -29,7 +29,7 @@ pub fn discover(setup: &Setup, prompt: &str) -> Option<Commands> {
         home().as_deref(),
     );
     for warning in &found.warnings {
-        eprintln!("warning: {}", terminal_safe(warning));
+        notices.warn(warning);
     }
     Some(found)
 }
@@ -66,6 +66,7 @@ pub fn turn_input(
     commands: Option<&Commands>,
     setup: &Setup,
     policy: &dyn PermissionPolicy,
+    notices: &mut Notices,
 ) -> TurnInput {
     let whole = || TurnInput::from(format!("{prompt}{piped}"));
     let (Some(invocation), Some(commands)) = (parse_invocation(prompt), commands) else {
@@ -90,10 +91,10 @@ pub fn turn_input(
     };
     let expansion = expand(command, invocation.args, &setup.workspace, policy, trust);
     for warning in &expansion.warnings {
-        eprintln!("warning: {}", terminal_safe(warning));
+        notices.warn(warning);
     }
     for note in &expansion.notes {
-        eprintln!("note: {}", terminal_safe(note));
+        notices.note(note);
     }
     let mut input = expansion.input;
     if !piped.is_empty() {
@@ -102,14 +103,14 @@ pub fn turn_input(
     if let Some(model) = expansion.model {
         match registry::resolve(&model, &setup.config.providers, setup.keys()) {
             Ok(resolved) => {
-                eprintln!("{}", runs_on(&command.name, &resolved.id));
+                notices.note(&runs_on(&command.name, &resolved.id));
                 input.model = Some(TurnModel {
                     provider: resolved.provider,
                     id: resolved.id,
                     name: resolved.model,
                 });
             }
-            Err(e) => eprintln!("{}", cannot_use(&command.name, &model, &e.to_string())),
+            Err(e) => notices.warn(&cannot_use(&command.name, &model, &e.to_string())),
         }
     }
     input
@@ -118,7 +119,7 @@ pub fn turn_input(
 /// The note that command `name` runs on `model`.
 fn runs_on(name: &str, model: &str) -> String {
     format!(
-        "note: /{} runs on {}, as its command file asks",
+        "/{} runs on {}, as its command file asks",
         terminal_safe(name),
         terminal_safe(model)
     )
@@ -127,7 +128,7 @@ fn runs_on(name: &str, model: &str) -> String {
 /// The warning that command `name` asks for `model`, which `error` keeps from being used.
 fn cannot_use(name: &str, model: &str, error: &str) -> String {
     format!(
-        "warning: /{} asks for model {}, which cannot be used ({}); using the session's model",
+        "/{} asks for model {}, which cannot be used ({}); using the session's model",
         terminal_safe(name),
         terminal_safe(model),
         terminal_safe(error)

@@ -23,7 +23,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    models, prompt, sandbox, setup,
+    models,
+    notices::Notices,
+    prompt, sandbox, setup,
     term::{terminal_safe, terminal_safe_text},
 };
 
@@ -47,12 +49,17 @@ pub async fn run(
             return 2;
         }
     };
-    let commands = crate::slash::discover(&setup, &prompt_text);
+    // What is printed before the agent starts, for the debug log.
+    let mut notices = Notices::new(setup.redactor.clone());
+    for warning in &setup.config.warnings {
+        notices.printed(warning);
+    }
+    let commands = crate::slash::discover(&setup, &prompt_text, &mut notices);
     if let Err(message) = crate::slash::check(&prompt_text, commands.as_ref()) {
         eprintln!("error: {}", terminal_safe(&message));
         return 2;
     }
-    let session = match crate::sessions::open(&setup, &session) {
+    let session = match crate::sessions::open(&setup, &session, &mut notices) {
         Ok(session) => session,
         Err(message) => {
             eprintln!("error: {}", terminal_safe(&message));
@@ -104,7 +111,7 @@ pub async fn run(
     // Only read (and potentially block on) stdin once we know we're actually going to run: a
     // missing model must exit 2 promptly even if a pipe into stdin is still open.
     let typed = prompt_text.clone();
-    let input = match with_piped_stdin(prompt_text, cancel.clone()).await {
+    let input = match with_piped_stdin(prompt_text, cancel.clone(), &mut notices).await {
         StdinOutcome::Ready(input) => input,
         // Cancelled while waiting on stdin: exit immediately, before any model call.
         StdinOutcome::Cancelled => return exit_code(TurnEndReason::Interrupted, false),
@@ -114,7 +121,7 @@ pub async fn run(
         .or(setup.config.mode)
         .unwrap_or_else(|| config::default_mode(&setup.workspace));
     if mode == Mode::FullAccess {
-        eprintln!("warning: full-access mode: commands run without approval or sandbox");
+        notices.warn("full-access mode: commands run without approval or sandbox");
     }
     let run_id = format!(
         "run-{}-{}",
@@ -131,7 +138,7 @@ pub async fn run(
                 Some(file)
             }
             Err(e) => {
-                eprintln!("warning: cannot write the debug log: {e}");
+                notices.warn(&format!("cannot write the debug log: {e}"));
                 None
             }
         }
@@ -159,7 +166,7 @@ pub async fn run(
     };
     let choice = sandbox::choose(detected, mode.fs_access(), required);
     if let Some(warning) = &choice.warning {
-        eprintln!("warning: {}", terminal_safe(warning));
+        notices.warn(warning);
     }
     let sandbox = choice.sandbox;
     // From here on, however `run` is left, the sandbox's session ends: on Linux that ends what
@@ -168,18 +175,16 @@ pub async fn run(
     let sandboxed = sandbox.is_some();
     if mode != Mode::FullAccess && !sandboxed && choice.warning.is_none() {
         if sandbox_disabled_by_env {
-            eprintln!(
-                "warning: the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval"
+            notices.warn(
+                "the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval",
             );
         } else if workspace_too_broad {
-            eprintln!(
-                "warning: the workspace {} is your home directory or above, where the sandbox would make your dotfiles writable, so it is off; every shell command will need approval",
-                terminal_safe(&setup.workspace.display().to_string())
-            );
+            notices.warn(&format!(
+                "the workspace {} is your home directory or above, where the sandbox would make your dotfiles writable, so it is off; every shell command will need approval",
+                setup.workspace.display()
+            ));
         } else {
-            eprintln!(
-                "warning: no OS sandbox is available; every shell command will need approval"
-            );
+            notices.warn("no OS sandbox is available; every shell command will need approval");
         }
     }
     let mut read_dirs = setup.config.read_dirs.clone();
@@ -197,10 +202,9 @@ pub async fn run(
         writes_need_approval: workspace_too_broad,
     }));
     for rule in policy.unknown_rules() {
-        eprintln!(
-            "warning: rule `{}` names an unknown tool (use bash:, read:, or write:)",
-            terminal_safe(&rule)
-        );
+        notices.warn(&format!(
+            "rule `{rule}` names an unknown tool (use bash:, read:, or write:)"
+        ));
     }
     let ctx = tool_context(&setup.workspace, sandbox, mode.fs_access()).await;
     let local = profiles::is_local(&resolved.id, &resolved.base_url);
@@ -217,7 +221,7 @@ pub async fn run(
     };
     let window = window::effective_window(&resolved.id, &profile, running, server);
     for warning in &window.warnings {
-        eprintln!("warning: {}", terminal_safe(warning));
+        notices.warn(warning);
     }
     let context_window = window.tokens;
     let mut config = AgentConfig::new(
@@ -227,6 +231,7 @@ pub async fn run(
             &setup,
             &prompt::base_prompt(mode, sandboxed),
             context_window,
+            &mut notices,
         ),
         output_dir,
     );
@@ -247,6 +252,7 @@ pub async fn run(
         commands.as_ref(),
         &setup,
         &*policy,
+        &mut notices,
     );
     // Sandboxed commands run without approval: what they can write to must not hold the
     // checkpoint repository, which harness's own git reads outside the sandbox.
@@ -255,7 +261,7 @@ pub async fn run(
     } else {
         Vec::new()
     };
-    let checkpoints = crate::sessions::checkpoints(&setup, &session, &writable);
+    let checkpoints = crate::sessions::checkpoints(&setup, &session, &writable, &mut notices);
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin(),
@@ -276,6 +282,7 @@ pub async fn run(
         cancel.clone(),
         setup.redactor.clone(),
         log,
+        notices.into_events(),
     ));
     let reason = agent.run_turn(turn, &tx, cancel).await;
     drop(tx);
@@ -394,7 +401,11 @@ enum StdinOutcome {
 /// Both the first-data wait and the (potentially unbounded) read-to-EOF join race against `cancel`:
 /// Ctrl+C during either phase abandons the reader thread and returns `StdinOutcome::Cancelled`
 /// immediately, so the caller can exit without ever making a model call.
-async fn with_piped_stdin(prompt_text: String, cancel: CancellationToken) -> StdinOutcome {
+async fn with_piped_stdin(
+    prompt_text: String,
+    cancel: CancellationToken,
+    notices: &mut Notices,
+) -> StdinOutcome {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
         return StdinOutcome::Ready(prompt_text);
@@ -442,8 +453,8 @@ async fn with_piped_stdin(prompt_text: String, cancel: CancellationToken) -> Std
         _ = cancel.cancelled() => return StdinOutcome::Cancelled,
     };
     if !first_signal_received {
-        eprintln!(
-            "warning: no stdin data received in 3s, proceeding without it (redirect stdin from /dev/null to skip the wait)"
+        notices.warn(
+            "no stdin data received in 3s, proceeding without it (redirect stdin from /dev/null to skip the wait)",
         );
         return StdinOutcome::Ready(prompt_text);
     }
@@ -482,17 +493,21 @@ fn with_credential_warnings(
     rx
 }
 
-/// Opens `<state>/logs/<run_id>.log` for `--debug`, readable only by its owner.
+/// Opens `<state>/logs/<run_id>.log` for `--debug`, readable only by its owner, in a directory
+/// only its owner can read, even when it was there already.
 fn open_log(
     state_dir: &Path,
     run_id: &str,
 ) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     let dir = state_dir.join("logs");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&dir)?;
+    if std::fs::metadata(&dir)?.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let path = dir.join(format!("{run_id}.log"));
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -503,8 +518,9 @@ fn open_log(
 }
 
 /// Prints events as they arrive, and writes them to the debug `log`, with every secret
-/// `redactor` knows replaced, including one the model streams in pieces. Returns the last
-/// assistant text and whether an action was blocked.
+/// `redactor` knows replaced, including one the model streams in pieces. The log starts with
+/// `startup`, the warnings printed before the agent started. Returns the last assistant text and
+/// whether an action was blocked.
 ///
 /// If stdout is closed (e.g. the reader end of a pipe exits early), writing must not panic: it sets
 /// `stdout_broken` and cancels the run so it stops promptly, but keeps draining events (so `blocked`
@@ -514,8 +530,18 @@ async fn render(
     json: bool,
     cancel: CancellationToken,
     redactor: Arc<Redactor>,
-    log: Option<std::fs::File>,
+    mut log: Option<std::fs::File>,
+    startup: Vec<AgentEvent>,
 ) -> (String, bool) {
+    if let Some(file) = log.as_mut() {
+        for event in &startup {
+            let _ = writeln!(
+                file,
+                "{}",
+                serde_json::to_string(event).expect("events serialize")
+            );
+        }
+    }
     let mut events = EventRedactor::new(redactor.clone());
     let mut shown = Shown {
         json,
@@ -846,6 +872,23 @@ mod tests {
         let shared: Arc<dyn CommandSandbox> = probe.clone();
         end_run(agent, SessionEnd::new(Some(shared)));
         assert_eq!(*probe.free.lock().unwrap(), Some(true));
+    }
+
+    // Review F M6: a logs directory left readable by others is made private again.
+    #[test]
+    fn the_debug_log_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir(state.path().join("logs")).unwrap();
+        std::fs::set_permissions(
+            state.path().join("logs"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let (_file, path) = open_log(state.path(), "run-1").unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&state.path().join("logs")), 0o700);
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod context;
 mod doctor;
 mod login;
 mod models;
+mod notices;
 mod prompt;
 mod sandbox;
 mod sessions;
@@ -33,7 +34,8 @@ struct Cli {
     /// Continue the most recent session in this project
     #[arg(short = 'c', long = "continue", global = true)]
     continue_session: bool,
-    /// Also write the run's events, secrets redacted, to a log file in the state directory
+    /// With `ask`: also write the run's events and warnings, secrets redacted, to a log file in
+    /// the state directory
     #[arg(long, global = true)]
     debug: bool,
     /// Resume the session with this id; without an id, list this project's sessions
@@ -196,7 +198,8 @@ fn main() -> ExitCode {
         }
         Err(e) => e.exit(),
     };
-    // Only `ask` continues a session: with another subcommand the flag would do nothing.
+    // Only `ask` continues a session and has a run to log: with another subcommand `-c`,
+    // `--resume` and `--debug` would do nothing.
     if let Some(command) = cli
         .command
         .as_ref()
@@ -210,6 +213,13 @@ fn main() -> ExitCode {
         if let Some(flag) = flag {
             eprintln!(
                 "error: {flag} continues a session, which only `harness ask` does; run `{}` without it",
+                command_line(command)
+            );
+            return ExitCode::from(2);
+        }
+        if cli.debug {
+            eprintln!(
+                "error: --debug logs a run of `harness ask`; run `{}` without it",
                 command_line(command)
             );
             return ExitCode::from(2);

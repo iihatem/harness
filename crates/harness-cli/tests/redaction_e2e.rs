@@ -103,6 +103,16 @@ impl Run {
     /// Runs `harness <args>` against a mock provider that answers with `replies`, with `KEY` as
     /// its API key and `vars` in the environment.
     async fn new(replies: Vec<ResponseTemplate>, vars: &[(&str, &str)], args: &[&str]) -> Run {
+        Run::in_workspace(replies, vars, args, &[]).await
+    }
+
+    /// [`Run::new`], in a workspace that holds `files`, `(path, content)`.
+    async fn in_workspace(
+        replies: Vec<ResponseTemplate>,
+        vars: &[(&str, &str)],
+        args: &[&str],
+        files: &[(&str, &str)],
+    ) -> Run {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(Replies {
@@ -123,6 +133,11 @@ impl Run {
         )
         .unwrap();
         std::fs::create_dir(ws.path().join(".git")).unwrap();
+        for (path, content) in files {
+            let path = ws.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
         let vars: Vec<(String, String)> = vars
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -339,6 +354,77 @@ async fn a_password_in_a_tool_call_is_written_nowhere() {
         // The model's request carried the password as the model wrote it.
         let seen = String::from_utf8_lossy(&run.requests[1].body);
         assert!(seen.contains("wd-canary-bnfhq"));
+    }
+}
+
+// Review F M8: the warnings printed before the agent starts (here from the configuration, from
+// `ask` itself and from reading the instruction files) are in the debug log too, redacted.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_debug_log_holds_the_warnings_printed_at_startup() {
+    let run = Run::in_workspace(
+        vec![sse(&[text("hi"), stop()])],
+        &[],
+        &["--debug", "--mode", "full-access", "ask", "hi"],
+        &[
+            (
+                ".harness/config.toml",
+                "[permissions]\nallow = [\"bash:make*\"]\n",
+            ),
+            ("AGENTS.md", &format!("Be brief.\n@{KEY}.md\n")),
+        ],
+    )
+    .await;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let log = run
+        .written()
+        .into_iter()
+        .find(|(name, _)| name.contains("/state/logs/"))
+        .unwrap()
+        .1;
+    for warning in [
+        "ignoring 1 setting(s) that widen what the agent may do",
+        "full-access mode: commands run without approval or sandbox",
+        "skipped import @[redacted].md in ",
+    ] {
+        assert!(run.stderr.contains(warning), "{warning}: {}", run.stderr);
+        assert!(
+            log.lines().any(|line| line.contains(warning)
+                && serde_json::from_str::<Value>(line).unwrap()["type"] == "warning"),
+            "{warning}: {log}"
+        );
+    }
+    holds_no_piece_of_a_secret(&run);
+}
+
+// Review F M6: `--debug` logs a run of `harness ask`; with another command it did nothing,
+// silently.
+#[test]
+fn debug_with_another_command_is_refused() {
+    let home = TempDir::new().unwrap();
+    for (args, command) in [
+        (&["--debug", "models"][..], "harness models"),
+        (&["trust", "--debug", "--yes"], "harness trust"),
+        (&["sandbox", "doctor", "--debug"], "harness sandbox doctor"),
+        (
+            &["auth", "use", "openai", "work", "--debug"],
+            "harness auth use",
+        ),
+        (&["logout", "openai", "--debug"], "harness logout"),
+    ] {
+        let output = Command::new(BIN)
+            .args(args)
+            .env("HARNESS_HOME", home.path())
+            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "--debug logs a run of `harness ask`; run `{command}` without it"
+            )),
+            "{args:?}: {stderr}"
+        );
     }
 }
 

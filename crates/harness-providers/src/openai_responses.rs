@@ -12,8 +12,10 @@ use serde_json::{Value, json};
 
 use crate::sse::{self, EventParser};
 
-/// Builds a streaming Responses request body.
-pub fn request_body(req: &ChatRequest) -> Value {
+/// Builds a streaming Responses request body. With `summaries`, OpenAI's reasoning models are
+/// asked for reasoning summaries even when no profile sets an effort; without it, only a model
+/// whose profile sets one is.
+pub fn request_body(req: &ChatRequest, summaries: bool) -> Value {
     let mut input = Vec::new();
     for message in &req.messages {
         match message {
@@ -86,7 +88,7 @@ pub fn request_body(req: &ChatRequest) -> Value {
     // Summaries stream as reasoning deltas; without a profile's effort, the API's default is kept.
     if let Some(effort) = &req.options.reasoning_effort {
         body["reasoning"] = json!({"effort": effort, "summary": "auto"});
-    } else if reasons(&req.model) {
+    } else if summaries && reasons(&req.model) {
         body["reasoning"] = json!({"summary": "auto"});
     }
     body
@@ -371,6 +373,9 @@ pub struct OpenAiResponses {
     client: reqwest::Client,
     base_url: String,
     auth: Auth,
+    /// Whether reasoning models are asked for summaries without a profile's effort: only from
+    /// OpenAI's own API, whose refusal harness recognises, and ChatGPT's backend.
+    summaries: bool,
     /// Set once the API refused reasoning summaries (to an organization it has not verified):
     /// later requests do not ask for them.
     no_summaries: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -384,8 +389,16 @@ impl OpenAiResponses {
                 .expect("an HTTP client builds"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth: Auth::Key(api_key),
+            summaries: false,
             no_summaries: Default::default(),
         }
+    }
+
+    /// Asks reasoning models for summaries even when no profile sets an effort, as OpenAI's own
+    /// API is asked (the built-in `openai` provider).
+    pub fn with_default_summaries(mut self) -> Self {
+        self.summaries = true;
+        self
     }
 
     /// ChatGPT's backend, as the signed-in account `auth`.
@@ -400,6 +413,7 @@ impl OpenAiResponses {
                 .expect("an HTTP client builds"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth: Auth::ChatGpt(auth),
+            summaries: true,
             no_summaries: Default::default(),
         }
     }
@@ -411,7 +425,7 @@ impl Provider for OpenAiResponses {
         match &self.auth {
             Auth::Key(key) => {
                 use std::sync::atomic::Ordering::Relaxed;
-                let mut body = request_body(&request);
+                let mut body = request_body(&request, self.summaries);
                 let no_summaries = self.no_summaries.clone();
                 if no_summaries.load(Relaxed) {
                     drop_summary(&mut body);
@@ -446,7 +460,7 @@ impl Provider for OpenAiResponses {
             }
             #[cfg(feature = "chatgpt-login")]
             Auth::ChatGpt(auth) => {
-                let mut body = request_body(&request);
+                let mut body = request_body(&request, self.summaries);
                 // ChatGPT's backend takes no output limit (Codex never sends one). Every model it
                 // serves reasons, and streams its summaries.
                 if let Some(object) = body.as_object_mut() {

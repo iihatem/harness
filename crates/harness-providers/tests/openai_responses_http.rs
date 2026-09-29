@@ -153,7 +153,8 @@ async fn summaries_an_organization_may_not_have_are_dropped() {
         .with_priority(2)
         .mount(&server)
         .await;
-    let provider = OpenAiResponses::new(format!("{}/v1", server.uri()), Some("sk-test".into()));
+    let provider = OpenAiResponses::new(format!("{}/v1", server.uri()), Some("sk-test".into()))
+        .with_default_summaries();
     for _ in 0..2 {
         let events: Vec<_> = provider.stream(request()).collect().await;
         assert_eq!(
@@ -195,6 +196,32 @@ async fn summaries_an_organization_may_not_have_are_dropped() {
         "{events:?}"
     );
     assert_eq!(other.received_requests().await.unwrap().len(), 1);
+}
+
+// Re-review A, N1: only OpenAI's own API (and ChatGPT's backend) is asked for summaries by
+// default; another Responses server gets `reasoning` only when a profile sets an effort.
+#[tokio::test]
+async fn only_openai_is_asked_for_summaries_by_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(sse(fixture("text.sse")))
+        .mount(&server)
+        .await;
+    let url = format!("{}/v1", server.uri());
+    let other = OpenAiResponses::new(&url, Some("k".into()));
+    let openai = OpenAiResponses::new(&url, Some("k".into())).with_default_summaries();
+    for provider in [&other, &openai] {
+        let _: Vec<_> = provider.stream(request()).collect().await;
+    }
+    let bodies: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.body_json().unwrap())
+        .collect();
+    assert!(bodies[0].get("reasoning").is_none(), "{}", bodies[0]);
+    assert_eq!(bodies[1]["reasoning"], json!({"summary": "auto"}));
 }
 
 /// A server that answers one request with its headers, then sends nothing for a minute. It runs

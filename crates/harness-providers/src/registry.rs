@@ -345,7 +345,12 @@ pub fn resolve(
     let provider: Arc<dyn Provider> = match protocol {
         Protocol::OpenaiChat => Arc::new(OpenAiChat::new(base_url.clone(), api_key.clone())),
         Protocol::OpenaiResponses => {
-            Arc::new(OpenAiResponses::new(base_url.clone(), api_key.clone()))
+            let responses = OpenAiResponses::new(base_url.clone(), api_key.clone());
+            Arc::new(if summaries_by_default(name, providers) {
+                responses.with_default_summaries()
+            } else {
+                responses
+            })
         }
         Protocol::AnthropicMessages => {
             Arc::new(AnthropicMessages::new(base_url.clone(), api_key.clone()))
@@ -366,6 +371,12 @@ pub fn resolve(
         base_url,
         api_key,
     })
+}
+
+/// Whether provider `name` asks reasoning models for summaries without a profile's effort: the
+/// built-in `openai` only, unless the configuration redefines it.
+fn summaries_by_default(name: &str, providers: &BTreeMap<String, ProviderConfig>) -> bool {
+    name == "openai" && !providers.contains_key(name)
 }
 
 /// A test hook: the value of `var`, in debug builds only, so that no release build can be
@@ -519,5 +530,29 @@ fn listed_key(name: &str, key_env: Option<&str>, secrets: &impl Secrets) -> Opti
             }
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Re-review A, N1: summaries are asked for by default only from OpenAI's own API (ChatGPT's
+    // backend always asks); a server the user configured, whatever its name, gets them only when
+    // a profile sets an effort.
+    #[test]
+    fn only_the_builtin_openai_provider_asks_for_summaries_by_default() {
+        let none = BTreeMap::new();
+        assert!(summaries_by_default("openai", &none));
+        assert!(!summaries_by_default("azure", &none));
+        let redefined = BTreeMap::from([(
+            "openai".to_string(),
+            ProviderConfig {
+                protocol: Protocol::OpenaiResponses,
+                base_url: "https://proxy.example/v1".into(),
+                api_key_env: Some("OPENAI_API_KEY".into()),
+            },
+        )]);
+        assert!(!summaries_by_default("openai", &redefined));
     }
 }

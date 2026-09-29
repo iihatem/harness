@@ -361,7 +361,7 @@ fn conversation() -> ChatRequest {
 
 #[test]
 fn the_request_carries_the_whole_conversation_without_server_state() {
-    let body = request_body(&conversation());
+    let body = request_body(&conversation(), true);
     assert_eq!(body["model"], "gpt-5");
     assert_eq!(body["instructions"], "be brief");
     assert_eq!(body["stream"], true);
@@ -411,21 +411,27 @@ fn reasoning_models_are_asked_for_summaries() {
     ] {
         let mut request = conversation();
         request.model = model.into();
-        let body = request_body(&request);
+        let body = request_body(&request, true);
         if reasons {
             assert_eq!(body["reasoning"], json!({"summary": "auto"}), "{model}");
         } else {
             assert!(body.get("reasoning").is_none(), "{model}");
         }
+        // Re-review A, N1: another server with a model of that name (Azure, vLLM, OpenRouter)
+        // is not asked by default: it may reject `reasoning` in a way harness cannot tell.
+        let body = request_body(&request, false);
+        assert!(body.get("reasoning").is_none(), "{model}");
     }
-    // A profile's effort says the model reasons, whatever its name.
+    // A profile's effort says the model reasons, whatever its name and wherever it runs.
     let mut request = conversation();
     request.model = "my-reasoner".into();
     request.options.reasoning_effort = Some("low".into());
-    assert_eq!(
-        request_body(&request)["reasoning"],
-        json!({"effort": "low", "summary": "auto"})
-    );
+    for summaries in [true, false] {
+        assert_eq!(
+            request_body(&request, summaries)["reasoning"],
+            json!({"effort": "low", "summary": "auto"})
+        );
+    }
 }
 
 #[test]
@@ -437,7 +443,7 @@ fn profile_options_reach_the_request() {
         reasoning_effort: Some("high".into()),
         ..RequestOptions::default()
     };
-    let body = request_body(&request);
+    let body = request_body(&request, true);
     assert_eq!(body["max_output_tokens"], 4096);
     assert_eq!(body["temperature"], 0.2);
     assert_eq!(
@@ -452,7 +458,11 @@ fn an_assistant_message_with_only_tool_calls_sends_no_empty_text() {
     if let Message::Assistant { content, .. } = &mut request.messages[1] {
         content.clear();
     }
-    let body = request_body(&request);
+    let body = request_body(&request, true);
     assert_eq!(body["input"][1]["type"], "function_call");
-    assert!(request_body(&ChatRequest::default()).get("tools").is_none());
+    assert!(
+        request_body(&ChatRequest::default(), true)
+            .get("tools")
+            .is_none()
+    );
 }

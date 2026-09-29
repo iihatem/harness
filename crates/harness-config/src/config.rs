@@ -21,6 +21,8 @@ pub enum Protocol {
     OpenaiChat,
     /// `POST /responses`: OpenAI API keys and ChatGPT sign-in.
     OpenaiResponses,
+    /// `POST /messages`: Anthropic API keys and Anthropic-compatible servers.
+    AnthropicMessages,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

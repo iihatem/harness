@@ -152,3 +152,29 @@ fn configured_providers_may_speak_the_responses_protocol() {
     assert_eq!(r.protocol, Protocol::OpenaiResponses);
     assert_eq!(r.base_url, "https://x.example/openai/v1");
 }
+
+#[test]
+fn builtin_anthropic_speaks_the_messages_protocol_with_its_key() {
+    let r = resolve(
+        "anthropic/claude-sonnet-4-5",
+        &BTreeMap::new(),
+        env(&[("ANTHROPIC_API_KEY", "sk-ant-api03-k")]),
+    )
+    .unwrap();
+    assert_eq!(r.model, "claude-sonnet-4-5");
+    assert_eq!(r.protocol, Protocol::AnthropicMessages);
+    assert_eq!(r.base_url, "https://api.anthropic.com/v1");
+    assert_eq!(
+        resolve("anthropic/claude-sonnet-4-5", &BTreeMap::new(), env(&[])).err(),
+        Some(ResolveError::MissingKey {
+            provider: "anthropic".into(),
+            var: "ANTHROPIC_API_KEY".into()
+        })
+    );
+    let found = configured_endpoints(
+        &BTreeMap::new(),
+        env(&[("ANTHROPIC_API_KEY", "sk-ant-api03-k")]),
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].protocol, Protocol::AnthropicMessages);
+}

@@ -3,7 +3,10 @@ use std::{collections::BTreeMap, sync::Arc};
 use harness_config::config::{Protocol, ProviderConfig};
 use harness_core::provider::Provider;
 
-use crate::{discovery::Endpoint, openai_chat::OpenAiChat, openai_responses::OpenAiResponses};
+use crate::{
+    anthropic_messages::AnthropicMessages, discovery::Endpoint, openai_chat::OpenAiChat,
+    openai_responses::OpenAiResponses,
+};
 
 /// A provider usable without configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +33,7 @@ const fn builtin(
 }
 
 /// Providers usable without configuration.
-pub const BUILTIN_PROVIDERS: [Builtin; 5] = [
+pub const BUILTIN_PROVIDERS: [Builtin; 6] = [
     builtin(
         "ollama",
         Protocol::OpenaiChat,
@@ -60,6 +63,12 @@ pub const BUILTIN_PROVIDERS: [Builtin; 5] = [
         Protocol::OpenaiResponses,
         "https://api.openai.com/v1",
         Some("OPENAI_API_KEY"),
+    ),
+    builtin(
+        "anthropic",
+        Protocol::AnthropicMessages,
+        "https://api.anthropic.com/v1",
+        Some("ANTHROPIC_API_KEY"),
     ),
 ];
 
@@ -119,6 +128,7 @@ pub fn resolve(
     let provider: Arc<dyn Provider> = match protocol {
         Protocol::OpenaiChat => Arc::new(OpenAiChat::new(base_url.clone(), api_key)),
         Protocol::OpenaiResponses => Arc::new(OpenAiResponses::new(base_url.clone(), api_key)),
+        Protocol::AnthropicMessages => Arc::new(AnthropicMessages::new(base_url.clone(), api_key)),
     };
     Ok(Resolved {
         provider,
@@ -138,12 +148,13 @@ pub fn local_endpoints(providers: &BTreeMap<String, ProviderConfig>) -> Vec<Endp
             provider: b.name.to_string(),
             base_url: b.base_url.to_string(),
             api_key: None,
+            protocol: b.protocol,
         })
         .collect()
 }
 
 /// Configured providers whose API key (if one is required) is present, plus any built-in
-/// provider that needs a key (openrouter, openai) whose key is set and that the user hasn't
+/// provider that needs a key (openrouter, openai, anthropic) whose key is set and that the user hasn't
 /// redefined under `[providers.<name>]`.
 pub fn configured_endpoints(
     providers: &BTreeMap<String, ProviderConfig>,
@@ -160,6 +171,7 @@ pub fn configured_endpoints(
                 provider: name.clone(),
                 base_url: cfg.base_url.clone(),
                 api_key,
+                protocol: cfg.protocol,
             })
         })
         .collect();
@@ -173,6 +185,7 @@ pub fn configured_endpoints(
                 provider: builtin.name.to_string(),
                 base_url: builtin.base_url.to_string(),
                 api_key: Some(api_key),
+                protocol: builtin.protocol,
             });
         }
     }

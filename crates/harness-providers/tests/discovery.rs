@@ -1,8 +1,9 @@
 use std::time::{Duration, Instant};
 
+use harness_config::config::Protocol;
 use harness_providers::discovery::{DiscoveredModel, Endpoint, list_models};
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn endpoint(provider: &str, base_url: String) -> Endpoint {
@@ -10,6 +11,7 @@ fn endpoint(provider: &str, base_url: String) -> Endpoint {
         provider: provider.into(),
         base_url,
         api_key: None,
+        protocol: Protocol::OpenaiChat,
     }
 }
 
@@ -131,4 +133,36 @@ async fn error_statuses_yield_no_models() {
     )
     .await;
     assert!(found.is_empty());
+}
+
+#[tokio::test]
+async fn anthropic_endpoints_are_listed_with_their_own_headers() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("x-api-key", "sk-ant-api03-k"))
+        .and(header("anthropic-version", "2023-06-01"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"type": "model", "id": "claude-sonnet-4-5", "display_name": "Claude Sonnet 4.5"}],
+            "has_more": false
+        })))
+        .mount(&server)
+        .await;
+    let found = list_models(
+        &[Endpoint {
+            provider: "anthropic".into(),
+            base_url: format!("{}/v1", server.uri()),
+            api_key: Some("sk-ant-api03-k".into()),
+            protocol: Protocol::AnthropicMessages,
+        }],
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(
+        found,
+        vec![DiscoveredModel {
+            provider: "anthropic".into(),
+            name: "claude-sonnet-4-5".into()
+        }]
+    );
 }

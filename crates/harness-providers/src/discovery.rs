@@ -1,6 +1,9 @@
 use std::time::Duration;
 
+use harness_config::config::Protocol;
 use serde_json::Value;
+
+use crate::anthropic_messages::API_VERSION;
 
 /// Each local-server probe gives up after this long, so absent servers never delay startup.
 pub const LOCAL_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -24,9 +27,12 @@ pub struct Endpoint {
     pub provider: String,
     pub base_url: String,
     pub api_key: Option<String>,
+    /// How the key is sent: Anthropic's own headers, or a bearer token.
+    pub protocol: Protocol,
 }
 
-/// Lists models from OpenAI-compatible `/models` endpoints concurrently. Unreachable, slow, or failing
+/// Lists models from `/models` endpoints (OpenAI-compatible, or Anthropic's, which answers in the
+/// same shape) concurrently. Unreachable, slow, or failing
 /// endpoints are skipped. Results keep endpoint order; models within an endpoint are sorted by name.
 pub async fn list_models(endpoints: &[Endpoint], timeout: Duration) -> Vec<DiscoveredModel> {
     let Ok(client) = reqwest::Client::builder().timeout(timeout).build() else {
@@ -39,7 +45,12 @@ pub async fn list_models(endpoints: &[Endpoint], timeout: Duration) -> Vec<Disco
                 "{}/models",
                 endpoint.base_url.trim_end_matches('/')
             ));
-            if let Some(key) = &endpoint.api_key {
+            if endpoint.protocol == Protocol::AnthropicMessages {
+                request = request.header("anthropic-version", API_VERSION);
+                if let Some(key) = &endpoint.api_key {
+                    request = request.header("x-api-key", key);
+                }
+            } else if let Some(key) = &endpoint.api_key {
                 request = request.bearer_auth(key);
             }
             let Ok(response) = request.send().await.and_then(|r| r.error_for_status()) else {

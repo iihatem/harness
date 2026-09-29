@@ -787,3 +787,19 @@ fn providers_may_use_the_responses_protocol() {
         config::Protocol::OpenaiResponses
     );
 }
+
+#[test]
+fn providers_may_use_the_messages_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(
+        &file,
+        "[providers.local-claude]\nprotocol = \"anthropic-messages\"\nbase_url = \"http://127.0.0.1:4000/v1\"\n",
+    )
+    .unwrap();
+    let parsed = config::parse_file(&file).unwrap().unwrap();
+    assert_eq!(
+        parsed.providers["local-claude"].protocol,
+        config::Protocol::AnthropicMessages
+    );
+}

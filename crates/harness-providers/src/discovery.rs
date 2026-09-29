@@ -22,13 +22,25 @@ impl DiscoveredModel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Endpoint {
     pub provider: String,
     pub base_url: String,
     pub api_key: Option<String>,
     /// How the key is sent: Anthropic's own headers, or a bearer token.
     pub protocol: Protocol,
+}
+
+/// Leaves the key out, so that it never reaches a log or an error message.
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("protocol", &self.protocol)
+            .finish()
+    }
 }
 
 /// Lists models from `/models` endpoints (OpenAI-compatible, or Anthropic's, which answers in the

@@ -155,12 +155,24 @@ fn claims(jwt: &str) -> Option<Value> {
 }
 
 /// A device code the user enters at `verification_url`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceCode {
     pub verification_url: String,
     pub user_code: String,
     device_auth_id: String,
     interval: Duration,
+}
+
+/// Leaves the device auth id out: with the user code, it fetches the tokens.
+impl std::fmt::Debug for DeviceCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCode")
+            .field("verification_url", &self.verification_url)
+            .field("user_code", &self.user_code)
+            .field("device_auth_id", &"[redacted]")
+            .field("interval", &self.interval)
+            .finish()
+    }
 }
 
 /// The authorization server's endpoints, for one client.

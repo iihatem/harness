@@ -249,6 +249,9 @@ async fn the_device_flow_polls_until_the_user_approves() {
         device.verification_url,
         format!("{}/codex/device", server.uri())
     );
+    // Review B, M11: with the user code, the device auth id fetches the tokens.
+    let shown = format!("{device:?}");
+    assert!(!shown.contains("device-auth-123"), "{shown}");
     let tokens = oauth
         .poll_device_code(&device, Duration::from_secs(10))
         .await

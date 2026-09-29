@@ -166,3 +166,15 @@ async fn anthropic_endpoints_are_listed_with_their_own_headers() {
         }]
     );
 }
+
+// Review B, M11: an endpoint carries a stored key, which its Debug leaves out.
+#[test]
+fn an_endpoints_debug_leaves_its_key_out() {
+    let endpoint = Endpoint {
+        api_key: Some("sk-stored-secret".into()),
+        ..endpoint("openai", "https://api.openai.com/v1".into())
+    };
+    let shown = format!("{endpoint:?}");
+    assert!(!shown.contains("sk-stored-secret"), "{shown}");
+    assert!(shown.contains("openai"), "{shown}");
+}

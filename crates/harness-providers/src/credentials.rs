@@ -494,6 +494,11 @@ pub enum StoreChoice {
     File,
 }
 
+/// Held while a credential is renewed: see [`Credentials::try_lock_renewal`].
+pub struct RenewalLock {
+    _file: File,
+}
+
 /// Connects to a keychain.
 type Connect = Box<dyn Fn() -> Result<Box<dyn SecretStore>, CredentialError> + Send + Sync>;
 
@@ -505,6 +510,8 @@ pub struct Credentials {
     connect: Connect,
     /// The keychain, or why there is none.
     keychain: OnceLock<Result<Box<dyn SecretStore>, String>>,
+    /// The data directory.
+    dir: PathBuf,
     file: FileStore,
     accounts: PathBuf,
     warnings: Mutex<Vec<String>>,
@@ -570,6 +577,7 @@ impl Credentials {
             choice,
             connect: Box::new(connect),
             keychain: OnceLock::new(),
+            dir: data_dir.to_path_buf(),
             file: FileStore::new(data_dir),
             accounts: data_dir.join("accounts.toml"),
             warnings: Mutex::new(Vec::new()),
@@ -670,6 +678,44 @@ impl Credentials {
             }
         }
         self.file.get(&account)
+    }
+
+    /// Takes the lock under which `provider`'s credential for `profile` is renewed, unless
+    /// another process holds it (`Ok(None)`): a refresh token is good for one use, so two
+    /// processes must never renew with it at once. The lock is a file in the data directory,
+    /// readable only by its owner, and is held until the returned value is dropped.
+    pub fn try_lock_renewal(
+        &self,
+        provider: &str,
+        profile: &str,
+    ) -> Result<Option<RenewalLock>, CredentialError> {
+        check_name("provider", provider)?;
+        check_name("profile", profile)?;
+        // `+` is in no provider or profile name, so no two locks share a file.
+        let path = self.dir.join(format!("{provider}+{profile}.lock"));
+        make_dir(&self.dir)?;
+        let file = open_own(
+            &path,
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600),
+        )?
+        .ok_or_else(|| CredentialError::File {
+            path: path.clone(),
+            source: std::io::ErrorKind::NotFound.into(),
+        })?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(RenewalLock { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(source)) => Err(CredentialError::Lock {
+                path,
+                source,
+                hint: "",
+            }),
+        }
     }
 
     /// The credential of the profile `provider` uses.

@@ -320,7 +320,11 @@ impl Provider for OpenAiResponses {
                         return Ok(first);
                     }
                     let tokens = auth.after_unauthorized(&tokens.access_token).await?;
-                    sse::send(chatgpt_request(&client, &url, &body, &tokens)).await
+                    let second = sse::send(chatgpt_request(&client, &url, &body, &tokens)).await?;
+                    if second.status() == reqwest::StatusCode::UNAUTHORIZED {
+                        return Err(auth.still_refused(sse::http_error(second).await));
+                    }
+                    Ok(second)
                 };
                 sse::events(response, ResponsesStreamParser::default())
             }

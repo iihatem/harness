@@ -5,6 +5,7 @@
 #![cfg(feature = "chatgpt-login")]
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use base64::Engine;
@@ -64,31 +65,84 @@ struct Signed {
 
 impl Signed {
     fn new(stored: &Tokens) -> Signed {
+        Signed::in_profile(stored, "default")
+    }
+
+    fn in_profile(stored: &Tokens, profile: &str) -> Signed {
         let dir = tempfile::tempdir().unwrap();
         let credentials = Arc::new(Credentials::with_keychain(dir.path(), None));
         credentials
-            .set("chatgpt", "default", &stored.to_json())
+            .set("chatgpt", profile, &stored.to_json())
             .unwrap();
+        credentials.use_profile("chatgpt", profile).unwrap();
         Signed { dir, credentials }
     }
 
-    fn provider(&self, server: &MockServer) -> OpenAiResponses {
-        let auth = ChatGptAuth::load(
+    /// The account as another harness process would load it: with a store of its own over the
+    /// same data directory.
+    fn another_process(&self) -> Signed {
+        Signed {
+            dir: tempfile::tempdir().unwrap(),
+            credentials: Arc::new(Credentials::with_keychain(self.dir.path(), None)),
+        }
+    }
+
+    fn profile(&self) -> String {
+        self.credentials.active_profile("chatgpt").unwrap()
+    }
+
+    fn auth(&self, server: &MockServer) -> ChatGptAuth {
+        ChatGptAuth::load(
             self.credentials.clone(),
-            "default",
+            &self.profile(),
             OAuth::new(&server.uri()),
         )
         .unwrap()
-        .expect("signed in");
+        .expect("signed in")
+    }
+
+    fn provider(&self, server: &MockServer) -> OpenAiResponses {
         OpenAiResponses::chatgpt(
             format!("{}/backend-api/codex", server.uri()),
-            Arc::new(auth),
+            Arc::new(self.auth(server)),
         )
     }
 
     fn stored(&self) -> Tokens {
-        Tokens::from_json(&self.credentials.get("chatgpt", "default").unwrap().unwrap()).unwrap()
+        let json = self
+            .credentials
+            .get("chatgpt", &self.profile())
+            .unwrap()
+            .unwrap();
+        Tokens::from_json(&json).unwrap()
     }
+}
+
+/// The refresh requests `server` received.
+async fn refreshes(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == "/oauth/token")
+        .map(|r| r.body_json().unwrap())
+        .collect()
+}
+
+/// Answers a refresh of `refresh_token` with `access` and the new refresh token `next`.
+async fn mock_refresh(server: &MockServer, refresh_token: &str, access: &str, next: &str) {
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains(
+            format!(r#""refresh_token":"{refresh_token}""#).as_str(),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token": access, "refresh_token": next})),
+        )
+        .mount(server)
+        .await;
 }
 
 fn request() -> ChatRequest {
@@ -296,6 +350,11 @@ async fn a_second_401_is_an_error_not_a_loop() {
         matches!(error, ProviderError::Http { status: 401, .. }),
         "{error:?}"
     );
+    // Review C, M2: renewed and still refused, the sign-in has to be done again.
+    assert!(
+        error.to_string().contains("harness login chatgpt"),
+        "{error}"
+    );
 }
 
 /// The credential store and nothing in the environment.
@@ -383,4 +442,213 @@ fn a_damaged_credentials_file_is_not_taken_for_a_sign_out() {
         !matches!(error, ResolveError::NotSignedIn { .. }),
         "{error:?}"
     );
+}
+
+// Review C, M2: the hint signs in the profile in use, not `default`.
+#[tokio::test]
+async fn a_refused_refresh_names_the_profile_to_sign_in_again() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"error": {"code": "refresh_token_expired"}})),
+        )
+        .mount(&server)
+        .await;
+    let signed = Signed::in_profile(&tokens(&access_token("old", 60), "rt-1"), "work");
+    let error = signed.auth(&server).current().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("`harness login chatgpt --profile work`"),
+        "{error}"
+    );
+}
+
+// Review C, I2: refreshed tokens are the only valid ones once the server has rotated the refresh
+// token; a store that fails must not drop them.
+#[tokio::test]
+async fn refreshed_tokens_are_kept_when_they_cannot_be_stored() {
+    let server = MockServer::start().await;
+    let first = access_token("first", 7200);
+    let second = access_token("second", 7200);
+    mock_refresh(&server, "rt-1", &first, "rt-2").await;
+    mock_refresh(&server, "rt-2", &second, "rt-3").await;
+    let signed = Signed::new(&tokens(&access_token("old", 60), "rt-1"));
+    let auth = signed.auth(&server);
+    let data = signed.dir.path();
+    std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let current = auth.current().await;
+    std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The request goes on with the fresh tokens, and the user hears why they are not stored.
+    assert_eq!(current.unwrap().access_token, first);
+    let warnings = signed.credentials.take_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("could not be stored")),
+        "{warnings:?}"
+    );
+    assert_eq!(signed.stored().refresh_token, "rt-1");
+    // The next renewal uses the fresh refresh token, and stores what it gets.
+    let renewed = auth.after_unauthorized(&first).await.unwrap();
+    assert_eq!(renewed.access_token, second);
+    let sent: Vec<Value> = refreshes(&server).await;
+    let used: Vec<&str> = sent
+        .iter()
+        .map(|b| b["refresh_token"].as_str().unwrap())
+        .collect();
+    assert_eq!(used, ["rt-1", "rt-2"]);
+    assert_eq!(signed.stored().refresh_token, "rt-3");
+}
+
+// Review C, I3: two processes renewing at once would both spend the single-use refresh token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_processes_renewing_at_once_send_one_refresh() {
+    let server = MockServer::start().await;
+    let new = access_token("new", 7200);
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token": new, "refresh_token": "rt-2"}))
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .mount(&server)
+        .await;
+    let signed = Signed::new(&tokens(&access_token("old", 60), "rt-1"));
+    let other = signed.another_process();
+    let (ours, theirs) = (signed.auth(&server), other.auth(&server));
+    let (a, b) = tokio::join!(ours.current(), theirs.current());
+    assert_eq!(a.unwrap().access_token, new);
+    assert_eq!(b.unwrap().access_token, new);
+    assert_eq!(refreshes(&server).await.len(), 1);
+    assert_eq!(signed.stored().refresh_token, "rt-2");
+    // The lock file is private.
+    let lock = std::fs::read_dir(signed.dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with("chatgpt+default.lock"))
+        .expect("a lock file");
+    let mode = std::fs::metadata(lock).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+// Review C, I3: a refresh refused because another process (without the lock: an older harness)
+// spent the refresh token first is saved by the tokens that process stored.
+#[tokio::test]
+async fn a_refused_refresh_falls_back_on_tokens_stored_meanwhile() {
+    let server = MockServer::start().await;
+    let theirs = access_token("theirs", 7200);
+    let signed = Signed::new(&tokens(&access_token("old", 60), "rt-1"));
+    let other = signed.another_process();
+    let stored_meanwhile = tokens(&theirs, "rt-2").to_json();
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(move |_: &wiremock::Request| {
+            other
+                .credentials
+                .set("chatgpt", "default", &stored_meanwhile)
+                .unwrap();
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"error": {"code": "refresh_token_reused"}}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let current = signed.auth(&server).current().await.unwrap();
+    assert_eq!(current.access_token, theirs);
+}
+
+// Review C, M10: signing the same profile in to another account elsewhere does not move a running
+// session to that account, nor does the session's renewal undo that sign-in.
+#[tokio::test]
+async fn a_renewal_keeps_the_sessions_account() {
+    let server = MockServer::start().await;
+    let renewed = access_token("renewed", 7200);
+    mock_refresh(&server, "rt-1", &renewed, "rt-2").await;
+    let signed = Signed::new(&tokens(&access_token("old", 60), "rt-1"));
+    let auth = signed.auth(&server);
+    let elsewhere = Tokens {
+        account_id: Some("acct-OTHER".into()),
+        ..tokens(&access_token("other", 7200), "rt-other")
+    };
+    signed
+        .another_process()
+        .credentials
+        .set("chatgpt", "default", &elsewhere.to_json())
+        .unwrap();
+    let current = auth.current().await.unwrap();
+    assert_eq!(current.access_token, renewed);
+    assert_eq!(current.account_id.as_deref(), Some("acct-123"));
+    assert_eq!(signed.stored(), elsewhere);
+    let warnings = signed.credentials.take_warnings();
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w.contains("another ChatGPT account"))
+            .count(),
+        1,
+        "{warnings:?}"
+    );
+    // Once is enough.
+    auth.after_unauthorized(&renewed).await.ok();
+    let warnings = signed.credentials.take_warnings();
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.contains("another ChatGPT account")),
+        "{warnings:?}"
+    );
+}
+
+// Review C, M1: only the sign-in server saying the refresh token is no good means signing in
+// again. A server that cannot answer now is retried later, and the tokens stay.
+#[tokio::test]
+async fn only_a_refused_refresh_token_means_signing_in_again() {
+    for (status, body, signed_out) in [
+        (503, json!({"error": "unavailable"}), false),
+        (429, json!({"error": "slow down"}), false),
+        (500, json!({}), false),
+        (401, json!({"error": "unauthorized"}), true),
+        (400, json!({"error": "invalid_grant"}), true),
+        (
+            400,
+            json!({"error": {"code": "refresh_token_reused"}}),
+            true,
+        ),
+        (
+            400,
+            json!({"error": {"code": "refresh_token_invalidated"}}),
+            true,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body.clone()))
+            .mount(&server)
+            .await;
+        let before = tokens(&access_token("old", 60), "rt-1");
+        let signed = Signed::new(&before);
+        let error = signed.auth(&server).current().await.unwrap_err();
+        let says_sign_in = error.to_string().contains("harness login chatgpt");
+        assert_eq!(says_sign_in, signed_out, "{status} {body}: {error}");
+        assert_eq!(
+            error.is_retryable(),
+            !signed_out,
+            "{status} {body}: {error}"
+        );
+        assert_eq!(signed.stored(), before);
+    }
+    // An unreachable server too.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let issuer = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let signed = Signed::new(&tokens(&access_token("old", 60), "rt-1"));
+    let auth = ChatGptAuth::load(signed.credentials.clone(), "default", OAuth::new(&issuer))
+        .unwrap()
+        .unwrap();
+    let error = auth.current().await.unwrap_err();
+    assert!(error.is_retryable(), "{error}");
+    assert!(!error.to_string().contains("harness login"), "{error}");
 }

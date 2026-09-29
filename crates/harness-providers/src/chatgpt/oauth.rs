@@ -40,10 +40,13 @@ pub const DEVICE_CODE_WAIT: Duration = Duration::from_secs(15 * 60);
 pub enum OAuthError {
     #[error("cannot reach the sign-in server: {0}")]
     Network(String),
-    #[error(
-        "the sign-in server refused (HTTP {status}): {body}; run `harness login chatgpt` to sign in again"
-    )]
-    Rejected { status: u16, body: String },
+    #[error("the sign-in server refused (HTTP {status}): {body}")]
+    Rejected {
+        status: u16,
+        /// The OAuth error code: `error` when it is a string, else `error.code` or `code`.
+        code: Option<String>,
+        body: String,
+    },
     #[error("the sign-in server answered something unexpected: {0}")]
     Invalid(String),
     #[error("sign-in was refused: {0}")]
@@ -350,8 +353,14 @@ async fn read(response: reqwest::Result<reqwest::Response>) -> Result<Value, OAu
         .await
         .map_err(|e| OAuthError::Network(e.to_string()))?;
     if !status.is_success() {
+        let value: Value = serde_json::from_str(&text).unwrap_or_default();
+        let code = [&value["error"], &value["error"]["code"], &value["code"]]
+            .into_iter()
+            .find_map(|v| v.as_str().filter(|c| !c.is_empty()))
+            .map(String::from);
         return Err(OAuthError::Rejected {
             status: status.as_u16(),
+            code,
             body: text.chars().take(500).collect(),
         });
     }

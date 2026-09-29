@@ -310,8 +310,10 @@ async fn a_refresh_keeps_what_the_server_did_not_replace() {
     assert_eq!(after.account_id.as_deref(), Some("acct-123"));
 }
 
+// What the refusal means, and the command to sign in again with the profile in use, is the
+// `chatgpt` provider's to say (chatgpt_provider.rs); the refusal carries the server's code.
 #[tokio::test]
-async fn a_rejected_refresh_says_to_sign_in_again() {
+async fn a_rejected_refresh_carries_the_servers_code() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
@@ -330,12 +332,11 @@ async fn a_rejected_refresh_says_to_sign_in_again() {
     };
     let error = oauth.refresh(&tokens).await.unwrap_err();
     assert!(
-        matches!(error, OAuthError::Rejected { status: 400, .. }),
+        matches!(
+            &error,
+            OAuthError::Rejected { status: 400, code: Some(code), .. } if code == "refresh_token_reused"
+        ),
         "{error:?}"
-    );
-    assert!(
-        error.to_string().contains("harness login chatgpt"),
-        "{error}"
     );
 }
 

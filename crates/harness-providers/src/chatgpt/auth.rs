@@ -1,15 +1,26 @@
 //! The signed-in ChatGPT account a `chatgpt/*` model uses: its tokens, refreshed when the access
 //! token expires within five minutes and after a 401, and stored again whenever they change.
-//! Refresh tokens are single-use, so before asking for new tokens the stored ones are read
-//! again: another harness process may already have refreshed them.
+//!
+//! Refresh tokens are single-use, so a renewal runs under a lock shared with other harness
+//! processes (a file in the data directory, one per profile), and reads the stored tokens again
+//! once it holds it: another process may have renewed them already. A renewal keeps the session's
+//! account: when the profile has since been signed in to another account, the session goes on
+//! with its own and leaves that sign-in alone. Fresh tokens are used even when they cannot be
+//! stored, with a warning, and storing them is tried again at the next renewal.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use harness_core::{provider::ProviderError, redact::Redactor, time::now_unix};
 use tokio::sync::Mutex;
 
 use super::oauth::{OAuth, OAuthError, Tokens};
-use crate::credentials::{CredentialError, Credentials};
+use crate::{
+    credentials::{CredentialError, Credentials, RenewalLock},
+    registry::login_command,
+};
 
 /// The provider name of the ChatGPT account.
 pub const PROVIDER: &str = "chatgpt";
@@ -17,14 +28,27 @@ pub const PROVIDER: &str = "chatgpt";
 pub const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 /// Refresh the access token when it expires within this long.
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
+/// How long a renewal waits for another process's to finish before going on without the lock.
+const RENEWAL_WAIT: Duration = Duration::from_secs(60);
 
 pub struct ChatGptAuth {
     oauth: OAuth,
     credentials: Arc<Credentials>,
     profile: String,
-    tokens: Mutex<Tokens>,
+    session: Mutex<Session>,
     /// Where the tokens, and those that replace them, are registered as secrets.
     redactor: Option<Arc<Redactor>>,
+}
+
+/// The session's view of the sign-in.
+struct Session {
+    /// The tokens requests carry.
+    tokens: Tokens,
+    /// What the store held when this session last read or wrote it. Stored tokens that differ
+    /// were written by someone else since.
+    seen: Option<Tokens>,
+    /// Whether the user was told the profile is now signed in to another account.
+    told_of_other_account: bool,
 }
 
 impl ChatGptAuth {
@@ -41,14 +65,18 @@ impl ChatGptAuth {
             oauth,
             credentials,
             profile: profile.to_string(),
-            tokens: Mutex::new(tokens),
+            session: Mutex::new(Session {
+                seen: Some(tokens.clone()),
+                tokens,
+                told_of_other_account: false,
+            }),
             redactor: None,
         }))
     }
 
     /// Registers the tokens, now and after each refresh, as secrets with `redactor`.
     pub fn with_redactor(mut self, redactor: Arc<Redactor>) -> ChatGptAuth {
-        let tokens = self.tokens.get_mut();
+        let tokens = &self.session.get_mut().tokens;
         redactor.add(&tokens.access_token);
         redactor.add(&tokens.refresh_token);
         self.redactor = Some(redactor);
@@ -58,23 +86,42 @@ impl ChatGptAuth {
     /// The tokens for the next request, refreshed first when the access token is about to
     /// expire.
     pub async fn current(&self) -> Result<Tokens, ProviderError> {
-        let mut tokens = self.tokens.lock().await;
-        if expiring(&tokens) {
-            let used = tokens.access_token.clone();
-            self.renew(&mut tokens, &used).await?;
+        let mut session = self.session.lock().await;
+        if expiring(&session.tokens) {
+            let used = session.tokens.access_token.clone();
+            self.renew(&mut session, &used).await?;
         }
-        Ok(tokens.clone())
+        Ok(session.tokens.clone())
     }
 
     /// The tokens to retry with after the server refused `used` with a 401.
     pub async fn after_unauthorized(&self, used: &str) -> Result<Tokens, ProviderError> {
-        let mut tokens = self.tokens.lock().await;
+        let mut session = self.session.lock().await;
         // Another request of this process already renewed them.
-        if tokens.access_token != used {
-            return Ok(tokens.clone());
+        if session.tokens.access_token != used {
+            return Ok(session.tokens.clone());
         }
-        self.renew(&mut tokens, used).await?;
-        Ok(tokens.clone())
+        self.renew(&mut session, used).await?;
+        Ok(session.tokens.clone())
+    }
+
+    /// `error`, the server's answer to renewed tokens, with what to do: sign in again.
+    pub fn still_refused(&self, error: ProviderError) -> ProviderError {
+        match error {
+            ProviderError::Http {
+                status: 401,
+                body,
+                retry_after,
+            } => ProviderError::Http {
+                status: 401,
+                body: format!(
+                    "{body} (the ChatGPT sign-in was renewed and is still refused: run `{}` to sign in again)",
+                    login_command(PROVIDER, &self.profile)
+                ),
+                retry_after,
+            },
+            other => other,
+        }
     }
 
     /// Registers `tokens` as secrets.
@@ -85,27 +132,129 @@ impl ChatGptAuth {
         }
     }
 
-    /// Replaces `tokens`, whose access token `used` is no good: with the stored tokens when
-    /// another process has renewed them, else with refreshed ones, which are then stored.
-    async fn renew(&self, tokens: &mut Tokens, used: &str) -> Result<(), ProviderError> {
-        if let Ok(Some(theirs)) = stored(&self.credentials, &self.profile)
-            && theirs.access_token != used
-        {
-            self.register(&theirs);
-            *tokens = theirs;
-            if !expiring(tokens) {
-                return Ok(());
+    /// Replaces the session's tokens, whose access token `used` is no good: with the stored
+    /// tokens when another process has renewed them, else with refreshed ones, which are then
+    /// stored.
+    async fn renew(&self, session: &mut Session, used: &str) -> Result<(), ProviderError> {
+        let _lock = self.lock().await;
+        match self.read_store().await {
+            Ok(now) => {
+                self.take_in(session, now);
+            }
+            Err(e) => self.credentials.warn(format!(
+                "cannot read the stored ChatGPT sign-in ({e}); renewing this session's"
+            )),
+        }
+        if usable(&session.tokens, used) {
+            return Ok(());
+        }
+        match self.oauth.refresh(&session.tokens).await {
+            Ok(fresh) => {
+                self.register(&fresh);
+                session.tokens = fresh;
+                self.save(session).await;
+                Ok(())
+            }
+            Err(error) => {
+                // Another process may have spent the refresh token without the lock (an older
+                // harness), and stored what it got for it.
+                if let Ok(now) = self.read_store().await
+                    && self.take_in(session, now)
+                    && usable(&session.tokens, used)
+                {
+                    return Ok(());
+                }
+                Err(refresh_error(error, &self.profile))
             }
         }
-        let fresh = self.oauth.refresh(tokens).await.map_err(refresh_error)?;
-        self.register(&fresh);
-        self.credentials
-            .set(PROVIDER, &self.profile, &fresh.to_json())
-            .map_err(|e| {
-                ProviderError::Protocol(format!("cannot store the refreshed tokens: {e}"))
-            })?;
-        *tokens = fresh;
-        Ok(())
+    }
+
+    /// Takes the renewal lock, waiting for another process's renewal to end. Without the lock
+    /// (it cannot be taken, or another process holds it too long), the renewal goes on, with a
+    /// warning: the stored tokens are read again all the same.
+    async fn lock(&self) -> Option<RenewalLock> {
+        let started = Instant::now();
+        loop {
+            match self.credentials.try_lock_renewal(PROVIDER, &self.profile) {
+                Ok(Some(lock)) => return Some(lock),
+                Ok(None) if started.elapsed() < RENEWAL_WAIT => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok(None) => {
+                    self.credentials.warn(format!(
+                        "another harness process has been renewing the ChatGPT sign-in for over {} s; renewing without waiting for it",
+                        RENEWAL_WAIT.as_secs()
+                    ));
+                    return None;
+                }
+                Err(e) => {
+                    self.credentials.warn(format!(
+                        "renewing the ChatGPT sign-in without the lock that keeps other harness processes from renewing it at the same time: {e}"
+                    ));
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// What the store holds for the profile now. The keychain may take a while to answer.
+    async fn read_store(&self) -> Result<Option<Tokens>, CredentialError> {
+        let (credentials, profile) = (self.credentials.clone(), self.profile.clone());
+        tokio::task::spawn_blocking(move || stored(&credentials, &profile))
+            .await
+            .unwrap_or_else(|e| Err(CredentialError::Keychain(e.to_string())))
+    }
+
+    /// Takes in `now`, what the store holds: when someone else stored tokens for the session's
+    /// account since the session last looked, the session uses them. Returns whether it does.
+    fn take_in(&self, session: &mut Session, now: Option<Tokens>) -> bool {
+        if now == session.seen {
+            return false;
+        }
+        session.seen = now.clone();
+        // Signed out elsewhere: this session goes on with its own tokens.
+        let Some(theirs) = now else {
+            return false;
+        };
+        if theirs.account_id != session.tokens.account_id {
+            if !session.told_of_other_account {
+                session.told_of_other_account = true;
+                self.credentials.warn(format!(
+                    "the ChatGPT profile `{}` has been signed in to another ChatGPT account since this session started; the session goes on with its own account, and leaves that sign-in as it is",
+                    self.profile
+                ));
+            }
+            return false;
+        }
+        self.register(&theirs);
+        session.tokens = theirs;
+        true
+    }
+
+    /// Stores the session's tokens over what the store holds, when that is still the session's
+    /// own sign-in: never over another account's, nor after a sign-out. A store that fails is a
+    /// warning; the session keeps the tokens, and the next renewal stores its own.
+    async fn save(&self, session: &mut Session) {
+        let ours = session
+            .seen
+            .as_ref()
+            .is_some_and(|seen| seen.account_id == session.tokens.account_id);
+        if !ours {
+            return;
+        }
+        let (credentials, profile) = (self.credentials.clone(), self.profile.clone());
+        let json = session.tokens.to_json();
+        let stored =
+            tokio::task::spawn_blocking(move || credentials.set(PROVIDER, &profile, &json))
+                .await
+                .unwrap_or_else(|e| Err(CredentialError::Keychain(e.to_string())));
+        match stored {
+            Ok(_) => session.seen = Some(session.tokens.clone()),
+            Err(e) => self.credentials.warn(format!(
+                "the renewed ChatGPT sign-in could not be stored ({e}); this run goes on with it and tries again at its next renewal, but until then another run may have to sign in again with `{}`",
+                login_command(PROVIDER, &self.profile)
+            )),
+        }
     }
 }
 
@@ -117,6 +266,11 @@ fn stored(credentials: &Credentials, profile: &str) -> Result<Option<Tokens>, Cr
         .and_then(Tokens::from_json))
 }
 
+/// Whether `tokens` can be used in place of the access token `used`, which is no good.
+fn usable(tokens: &Tokens, used: &str) -> bool {
+    tokens.access_token != used && !expiring(tokens)
+}
+
 /// Whether the access token expires within [`REFRESH_MARGIN`]. A token without an expiry is used
 /// until the server refuses it.
 fn expiring(tokens: &Tokens) -> bool {
@@ -125,15 +279,41 @@ fn expiring(tokens: &Tokens) -> bool {
         .is_some_and(|at| at <= now_unix() + REFRESH_MARGIN.as_secs())
 }
 
-/// A failed refresh as the provider's error: an unreachable server can be retried; a refusal
-/// means signing in again, and reads as the 401 it stands for.
-fn refresh_error(error: OAuthError) -> ProviderError {
+/// A failed refresh as the provider's error. Only the sign-in server refusing the refresh token
+/// (a 401, `invalid_grant`, or a refresh token that expired, was used, or was revoked) means
+/// signing in again, and reads as the 401 it stands for; a server that cannot answer now (a 5xx,
+/// a 429, no connection) can be retried, with the same tokens, as Codex does.
+fn refresh_error(error: OAuthError, profile: &str) -> ProviderError {
+    const SIGNED_OUT: [&str; 4] = [
+        "invalid_grant",
+        "refresh_token_expired",
+        "refresh_token_reused",
+        "refresh_token_invalidated",
+    ];
     match error {
-        OAuthError::Network(message) => ProviderError::Network(message),
-        other => ProviderError::Http {
-            status: 401,
-            body: other.to_string(),
+        OAuthError::Network(message) => ProviderError::Network(format!(
+            "cannot reach the sign-in server to renew the ChatGPT sign-in: {message}"
+        )),
+        OAuthError::Rejected { status, code, body }
+            if status == 401
+                || code.as_deref().is_some_and(|code| {
+                    SIGNED_OUT.contains(&code.to_ascii_lowercase().as_str())
+                }) =>
+        {
+            ProviderError::Http {
+                status: 401,
+                body: format!(
+                    "the ChatGPT sign-in has ended (the sign-in server answered HTTP {status}: {body}); run `{}` to sign in again",
+                    login_command(PROVIDER, profile)
+                ),
+                retry_after: None,
+            }
+        }
+        OAuthError::Rejected { status, body, .. } => ProviderError::Http {
+            status,
+            body: format!("the sign-in server could not renew the ChatGPT sign-in now: {body}"),
             retry_after: None,
         },
+        other => ProviderError::Protocol(format!("cannot renew the ChatGPT sign-in: {other}")),
     }
 }

@@ -10,7 +10,8 @@ use std::{
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, mpsc},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,10 +22,17 @@ pub const SERVICE: &str = "harness";
 pub const DEFAULT_PROFILE: &str = "default";
 /// `file` keeps credentials in the file only, never in the keychain.
 pub const STORE_ENV: &str = "HARNESS_CREDENTIAL_STORE";
+/// A test hook, honoured by debug builds only: any value leaves the platform keychain out
+/// entirely, removal included, so that tests never touch the real one.
+pub const NO_KEYCHAIN_ENV: &str = "HARNESS_TEST_NO_KEYCHAIN";
+/// How long a keychain operation may take: long enough to answer an unlock prompt, but a
+/// prompt nobody sees (on a desktop, over SSH) does not hold harness up for good.
+pub const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
-    #[error("the keychain refused: {0}")]
+    /// What the keychain said, or why it could not be used.
+    #[error("{0}")]
     Keychain(String),
     #[error("cannot use {}: {source}", .path.display())]
     File {
@@ -100,7 +108,79 @@ impl KeychainStore {
 }
 
 fn keychain_error(error: keyring_core::Error) -> CredentialError {
-    CredentialError::Keychain(error.to_string())
+    CredentialError::Keychain(format!("the keychain refused: {error}"))
+}
+
+/// A keychain whose every operation gives up after a time limit, with an error that says how
+/// to do without the keychain. What was cut short goes on, unwaited for, on its own thread.
+pub struct TimeLimited {
+    inner: Arc<dyn SecretStore>,
+    limit: Duration,
+}
+
+impl TimeLimited {
+    pub fn new(inner: Arc<dyn SecretStore>, limit: Duration) -> TimeLimited {
+        TimeLimited { inner, limit }
+    }
+
+    fn run<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&dyn SecretStore) -> Result<T, CredentialError> + Send + 'static,
+    ) -> Result<T, CredentialError> {
+        let inner = self.inner.clone();
+        within(self.limit, move || work(&*inner))
+    }
+}
+
+impl SecretStore for TimeLimited {
+    fn get(&self, account: &str) -> Result<Option<String>, CredentialError> {
+        let account = account.to_string();
+        self.run(move |store| store.get(&account))
+    }
+
+    fn set(&self, account: &str, secret: &str) -> Result<(), CredentialError> {
+        let (account, secret) = (account.to_string(), secret.to_string());
+        self.run(move |store| store.set(&account, &secret))
+    }
+
+    fn delete(&self, account: &str) -> Result<bool, CredentialError> {
+        let account = account.to_string();
+        self.run(move |store| store.delete(&account))
+    }
+
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+/// Runs `work` on a thread of its own, and gives up on it after `limit`.
+fn within<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> Result<T, CredentialError> + Send + 'static,
+) -> Result<T, CredentialError> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("keychain".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .map_err(|e| {
+            CredentialError::Keychain(format!("cannot start a thread for the keychain: {e}"))
+        })?;
+    match rx.recv_timeout(limit) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(CredentialError::Keychain(format!(
+            "the keychain did not answer within {} (it may be waiting to be unlocked); set {STORE_ENV}=file to keep credentials in credentials.json instead",
+            if limit >= Duration::from_secs(1) {
+                format!("{} s", limit.as_secs())
+            } else {
+                format!("{} ms", limit.as_millis())
+            }
+        ))),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(CredentialError::Keychain(
+            "the keychain failed without answering".into(),
+        )),
+    }
 }
 
 impl SecretStore for KeychainStore {
@@ -259,11 +339,26 @@ struct AccountsFile {
     active: BTreeMap<String, String>,
 }
 
+/// Where credentials are stored and looked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreChoice {
+    /// The keychain, and the file when no keychain can be used.
+    Keychain,
+    /// Only the file (`HARNESS_CREDENTIAL_STORE=file`). Removing still clears the keychain.
+    File,
+}
+
+/// Connects to a keychain.
+type Connect = Box<dyn Fn() -> Result<Box<dyn SecretStore>, CredentialError> + Send + Sync>;
+
 /// Stored credentials by provider and account profile.
 pub struct Credentials {
-    keychain: Option<Box<dyn SecretStore>>,
-    /// Why there is no keychain, when it was not left out on purpose.
-    no_keychain: Option<String>,
+    choice: StoreChoice,
+    /// Connects to the keychain the first time a credential is needed: on Linux that is a D-Bus
+    /// connection, which a run that needs no stored credential never makes.
+    connect: Connect,
+    /// The keychain, or why there is none.
+    keychain: OnceLock<Result<Box<dyn SecretStore>, String>>,
     file: FileStore,
     accounts: PathBuf,
     warnings: Mutex<Vec<String>>,
@@ -271,33 +366,84 @@ pub struct Credentials {
 
 impl Credentials {
     /// The credentials for `data_dir`: in the OS keychain when there is one, unless `STORE_ENV`
-    /// (read through `env`) is `file`.
+    /// (read through `env`) is `file`. The keychain is reached only once a credential is
+    /// needed, and each of its operations gives up after [`KEYCHAIN_TIMEOUT`].
     pub fn open(data_dir: &Path, env: impl Fn(&str) -> Option<String>) -> Credentials {
-        if env(STORE_ENV).as_deref() == Some("file") {
-            let mut credentials = Credentials::with_keychain(data_dir, None);
-            credentials.no_keychain = None;
-            return credentials;
+        let chosen = env(STORE_ENV).filter(|value| !value.is_empty());
+        let choice = match chosen.as_deref() {
+            Some("file") => StoreChoice::File,
+            _ => StoreChoice::Keychain,
+        };
+        let platform = !(cfg!(debug_assertions) && env(NO_KEYCHAIN_ENV).is_some());
+        let credentials = if platform {
+            Credentials::with_connector(data_dir, choice, || {
+                within(KEYCHAIN_TIMEOUT, || {
+                    let keychain = KeychainStore::platform()?;
+                    Ok(
+                        Box::new(TimeLimited::new(Arc::new(keychain), KEYCHAIN_TIMEOUT))
+                            as Box<dyn SecretStore>,
+                    )
+                })
+            })
+        } else {
+            Credentials::with_connector(data_dir, choice, || {
+                Err(CredentialError::Keychain(format!(
+                    "{NO_KEYCHAIN_ENV} leaves it out"
+                )))
+            })
+        };
+        if let Some(other) = chosen.filter(|value| value != "file") {
+            credentials.warn(format!(
+                "{STORE_ENV} is `{other}`, which harness does not know (only `file` is); credentials go to the keychain"
+            ));
         }
-        match KeychainStore::platform() {
-            Ok(keychain) => Credentials::with_keychain(data_dir, Some(Box::new(keychain))),
-            Err(e) => {
-                let mut credentials = Credentials::with_keychain(data_dir, None);
-                credentials.no_keychain = Some(e.to_string());
-                credentials
-            }
-        }
+        credentials
     }
 
     /// The credentials for `data_dir`, with `keychain` as the keychain. Without one, credentials
     /// go to the file with a warning.
     pub fn with_keychain(data_dir: &Path, keychain: Option<Box<dyn SecretStore>>) -> Credentials {
+        let credentials = Credentials::with_connector(data_dir, StoreChoice::Keychain, || {
+            Err(CredentialError::Keychain("none is available".into()))
+        });
+        if let Some(keychain) = keychain {
+            let _ = credentials.keychain.set(Ok(keychain));
+        }
+        credentials
+    }
+
+    /// The credentials for `data_dir`, stored as `choice` says, with the keychain `connect`
+    /// connects to, the first time one is needed. A connection that fails means there is no
+    /// keychain.
+    pub fn with_connector(
+        data_dir: &Path,
+        choice: StoreChoice,
+        connect: impl Fn() -> Result<Box<dyn SecretStore>, CredentialError> + Send + Sync + 'static,
+    ) -> Credentials {
         Credentials {
-            no_keychain: keychain.is_none().then(|| "none is available".to_string()),
-            keychain,
+            choice,
+            connect: Box::new(connect),
+            keychain: OnceLock::new(),
             file: FileStore::new(data_dir),
             accounts: data_dir.join("accounts.toml"),
             warnings: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The keychain, connected to now if it was not yet, or why there is none.
+    fn keychain(&self) -> Result<&dyn SecretStore, &str> {
+        match self
+            .keychain
+            .get_or_init(|| (self.connect)().map_err(|e| e.to_string()))
+        {
+            Ok(keychain) => Ok(keychain.as_ref()),
+            Err(why) => Err(why),
+        }
+    }
+
+    /// The keychain credentials are stored in and read from: none with the file chosen.
+    fn storing_keychain(&self) -> Option<Result<&dyn SecretStore, &str>> {
+        (self.choice == StoreChoice::Keychain).then(|| self.keychain())
     }
 
     /// Warnings gathered since the last call: that a credential went to the file, say, or that
@@ -378,7 +524,7 @@ impl Credentials {
     /// error, unless the file holds the credential, which is then used with a warning.
     pub fn get(&self, provider: &str, profile: &str) -> Result<Option<String>, CredentialError> {
         let account = account(provider, profile)?;
-        if let Some(keychain) = &self.keychain {
+        if let Some(Ok(keychain)) = self.storing_keychain() {
             match keychain.get(&account) {
                 Ok(Some(secret)) => return Ok(Some(secret)),
                 Ok(None) => {}
@@ -414,8 +560,8 @@ impl Credentials {
     ) -> Result<String, CredentialError> {
         let account = account(provider, profile)?;
         // Why the file is used; nothing to say when it was chosen (`HARNESS_CREDENTIAL_STORE`).
-        let why = match &self.keychain {
-            Some(keychain) => match keychain.set(&account, secret) {
+        let why = match self.storing_keychain() {
+            Some(Ok(keychain)) => match keychain.set(&account, secret) {
                 Ok(()) => {
                     // An older copy in the file must not outlive this one.
                     if let Err(e) = self.file.delete(&account) {
@@ -440,7 +586,8 @@ impl Credentials {
                     Some(refused.to_string())
                 }
             },
-            None => self.no_keychain.clone(),
+            Some(Err(why)) => Some(why.to_string()),
+            None => None,
         };
         self.file.set(&account, secret)?;
         if let Some(why) = why {
@@ -452,14 +599,16 @@ impl Credentials {
         Ok(self.file.describe())
     }
 
-    /// Removes what is stored for `provider` under `profile`, from the keychain and the file.
+    /// Removes what is stored for `provider` under `profile`, from the keychain and the file,
+    /// whichever is chosen: an earlier run may have stored it in either, and removing is safe.
     /// A keychain that refuses is an error, once the file's copy is gone: the keychain's would
     /// still be used.
     pub fn remove(&self, provider: &str, profile: &str) -> Result<bool, CredentialError> {
         let account = account(provider, profile)?;
-        let in_keychain = match &self.keychain {
-            Some(keychain) => keychain.delete(&account),
-            None => Ok(false),
+        let in_keychain = match self.keychain() {
+            Ok(keychain) => keychain.delete(&account),
+            // No keychain holds nothing.
+            Err(_) => Ok(false),
         };
         let in_file = self.file.delete(&account)?;
         Ok(in_keychain? || in_file)

@@ -4,8 +4,12 @@
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
 use harness_providers::credentials::{
     CredentialError, Credentials, DEFAULT_PROFILE, FileStore, KeychainStore, SecretStore,
+    StoreChoice, TimeLimited,
 };
 
 fn mock_keychain() -> KeychainStore {
@@ -273,8 +277,11 @@ fn provider_and_profile_names_are_checked() {
 #[test]
 fn the_file_store_can_be_chosen_with_an_environment_variable() {
     let dir = tempfile::tempdir().unwrap();
-    let creds = Credentials::open(dir.path(), |var| {
-        (var == "HARNESS_CREDENTIAL_STORE").then(|| "file".to_string())
+    // The test hook leaves the real keychain out.
+    let creds = Credentials::open(dir.path(), |var| match var {
+        "HARNESS_CREDENTIAL_STORE" => Some("file".to_string()),
+        "HARNESS_TEST_NO_KEYCHAIN" => Some("1".to_string()),
+        _ => None,
     });
     creds.set("openai", DEFAULT_PROFILE, "sk-1").unwrap();
     assert!(dir.path().join("credentials.json").exists());
@@ -379,6 +386,113 @@ fn a_keychain_that_cannot_be_read_is_an_error_unless_the_file_has_the_key() {
     let warnings = creds.take_warnings();
     assert!(
         warnings.iter().any(|w| w.contains("locked")),
+        "{warnings:?}"
+    );
+}
+
+/// A keychain connector that counts how often it connects, to `store`.
+fn counting(
+    store: impl SecretStore + Clone + 'static,
+) -> (
+    Arc<AtomicUsize>,
+    impl Fn() -> Result<Box<dyn SecretStore>, CredentialError> + Send + Sync + 'static,
+) {
+    let connects = Arc::new(AtomicUsize::new(0));
+    let counter = connects.clone();
+    let connect = move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(store.clone()) as Box<dyn SecretStore>)
+    };
+    (connects, connect)
+}
+
+// Review B, M8: on Linux, reaching the keychain means a D-Bus connection, which a run that needs
+// no stored credential (`ask` on ollama) must not make.
+#[test]
+fn the_keychain_is_reached_only_once_a_credential_is_needed() {
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = Recording::default();
+    keychain.set("openai/default", "sk-1").unwrap();
+    let (connects, connect) = counting(keychain);
+    let creds = Credentials::with_connector(dir.path(), StoreChoice::Keychain, connect);
+    assert_eq!(creds.active_profile("openai").unwrap(), "default");
+    assert_eq!(connects.load(Ordering::SeqCst), 0);
+    assert_eq!(creds.active("openai").unwrap().as_deref(), Some("sk-1"));
+    assert_eq!(creds.active("openai").unwrap().as_deref(), Some("sk-1"));
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+}
+
+// Review B, M7: with `HARNESS_CREDENTIAL_STORE=file` the keychain is neither read nor written, but
+// logging out removes what an earlier run stored there too.
+#[test]
+fn with_the_file_store_chosen_logout_still_clears_the_keychain() {
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = Recording::default();
+    keychain.set("openai/default", "sk-from-before").unwrap();
+    let (connects, connect) = counting(keychain.clone());
+    let creds = Credentials::with_connector(dir.path(), StoreChoice::File, connect);
+    creds.set("openai", "work", "sk-work").unwrap();
+    assert!(creds.take_warnings().is_empty());
+    assert_eq!(creds.get("openai", DEFAULT_PROFILE).unwrap(), None);
+    assert_eq!(connects.load(Ordering::SeqCst), 0);
+    assert!(creds.remove("openai", DEFAULT_PROFILE).unwrap());
+    assert_eq!(keychain.get("openai/default").unwrap(), None);
+    // No keychain at all is nothing to remove.
+    let none = Credentials::with_connector(dir.path(), StoreChoice::File, || {
+        Err(CredentialError::Keychain("no session bus".into()))
+    });
+    assert!(none.remove("openai", "work").unwrap());
+    assert!(!none.remove("openai", "work").unwrap());
+}
+
+/// A keychain waiting for an unlock prompt nobody answers.
+#[derive(Clone)]
+struct Stuck;
+
+impl SecretStore for Stuck {
+    fn get(&self, _account: &str) -> Result<Option<String>, CredentialError> {
+        std::thread::sleep(Duration::from_secs(5));
+        Ok(None)
+    }
+    fn set(&self, _account: &str, _secret: &str) -> Result<(), CredentialError> {
+        std::thread::sleep(Duration::from_secs(5));
+        Ok(())
+    }
+    fn delete(&self, _account: &str) -> Result<bool, CredentialError> {
+        std::thread::sleep(Duration::from_secs(5));
+        Ok(false)
+    }
+    fn describe(&self) -> String {
+        "a stuck keychain".into()
+    }
+}
+
+// Review B, M8: a locked Secret Service collection waits for its unlock prompt without a limit.
+#[test]
+fn keychain_operations_give_up_after_their_time_limit() {
+    let limited = TimeLimited::new(Arc::new(Stuck), Duration::from_millis(100));
+    let started = Instant::now();
+    let error = limited.get("openai/default").unwrap_err().to_string();
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(error.contains("HARNESS_CREDENTIAL_STORE=file"), "{error}");
+    assert!(limited.set("openai/default", "sk-1").is_err());
+    assert!(limited.delete("openai/default").is_err());
+    assert_eq!(limited.describe(), "a stuck keychain");
+}
+
+#[test]
+fn an_unknown_store_choice_is_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let creds = Credentials::open(dir.path(), |var| match var {
+        "HARNESS_CREDENTIAL_STORE" => Some("files".to_string()),
+        "HARNESS_TEST_NO_KEYCHAIN" => Some("1".to_string()),
+        _ => None,
+    });
+    let warnings = creds.take_warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("HARNESS_CREDENTIAL_STORE")),
         "{warnings:?}"
     );
 }

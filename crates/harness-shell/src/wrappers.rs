@@ -341,12 +341,35 @@ fn eval(args: &[Tok]) -> Option<Unwrapped> {
     })
 }
 
-/// `trap arg sigspec...` sets `arg` as the action that runs, in the same shell, when a
-/// listed signal is caught later. `trap -p`, `trap -l`, `trap - sig` (reset to default) and
-/// `trap '' sig` (ignore) run nothing and are left as ordinary commands.
+/// `trap [-lp] [[arg] sigspec...]` sets `arg` as the action that runs, in the same shell,
+/// when a listed signal is caught later. `trap -p`, `trap -l`, `trap - sig` (reset to
+/// default) and `trap '' sig` (ignore) run nothing and are left as ordinary commands.
+///
+/// `-l` or `-p`, alone, repeated or combined (`-lp`, `-pl`), only list signal names or
+/// print current traps: bash reads no `arg` after either, even past a further `--`, so
+/// there is nothing to analyse. `--` (bash 3.2 and 5.2 accept only `-l`/`-p` as options,
+/// so this is the first non-option word either way) ends option parsing; the word after
+/// it is `arg`, read the same way as when there is no `--` (a literal `-` or `''` there
+/// keeps its special meaning: confirmed on both bashes that `trap -- - sig` still resets
+/// and `trap -- '' sig` still ignores). An option this analysis does not recognize (a
+/// later bash could add one) asks rather than guessing what it does to `arg`'s position.
 fn trap(args: &[Tok]) -> Option<Unwrapped> {
-    match args.first()? {
-        Tok::Lit(s) if matches!(s.as_str(), "-p" | "-l" | "-" | "") => None,
+    let mut i = 0;
+    if let Some(Tok::Lit(s)) = args.first() {
+        if s == "--" {
+            i = 1;
+        } else if let Some(opts) = s.strip_prefix('-').filter(|o| !o.is_empty()) {
+            return if opts.chars().all(|c| c == 'l' || c == 'p') {
+                None
+            } else {
+                Some(opaque(
+                    "`trap` uses an option this analysis does not recognize",
+                ))
+            };
+        }
+    }
+    match args.get(i)? {
+        Tok::Lit(s) if matches!(s.as_str(), "-" | "") => None,
         Tok::Lit(src) => Some(Unwrapped {
             next: vec![Next::Script(src.clone())],
             unknown_cwd: true,

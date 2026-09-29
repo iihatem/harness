@@ -261,6 +261,7 @@ fn deny_sees_through_wrappers_and_expansions() {
             ("eval 'curl x'", Deny),
             ("dash -ec 'curl x'", Deny),
             ("trap 'curl x' EXIT", Deny),
+            ("trap -- 'curl x' EXIT", Deny),
             ("compgen -C 'curl x'", Deny),
             ("compgen -W 'a $(curl x)'", Deny),
             ("complete -C 'curl x' foo", Deny),
@@ -597,12 +598,47 @@ fn trap_and_completion_actions_run_as_nested_shell_text() {
             ("trap - EXIT", Unlisted),
             ("trap '' EXIT", Unlisted),
             ("trap", Unlisted),
+            // `--` ends option parsing; the word after it is the action, even when that
+            // word looks like an option (bash reads no options past `--`, though `-` and
+            // `''` keep their special meaning there too).
+            ("trap -- 'echo hi' EXIT", Allow),
+            ("trap -- -p EXIT", Unlisted),
+            ("trap -- -l EXIT", Unlisted),
+            ("trap -- - EXIT", Unlisted),
+            ("trap -- '' EXIT", Unlisted),
+            ("trap --", Unlisted),
+            // `-l` or `-p`, alone, repeated, or combined, only list or print: no action,
+            // regardless of anything after (bash ignores it, even another `--`).
+            ("trap -l 'echo hi' EXIT", Unlisted),
+            ("trap -p 'echo hi' EXIT", Unlisted),
+            ("trap -lp", Unlisted),
+            ("trap -pl", Unlisted),
+            ("trap -p -p EXIT", Unlisted),
+            ("trap -p --", Unlisted),
+            ("trap -l -- 'echo hi' EXIT", Unlisted),
+            // An option this analysis does not recognize (bash 3.2 and 5.2 accept only
+            // `-l`/`-p`; a later bash could add another) asks rather than guessing.
+            ("trap -x 'echo hi' EXIT", Ask),
+            ("trap -P 'echo hi' EXIT", Ask),
             ("compgen -W 'a b c'", Unlisted),
             ("compgen -W \"$list\"", Ask),
             ("compgen -C \"$cmd\"", Ask),
             ("complete -F _myfunc foo", Ask),
             ("compgen -F _myfunc", Ask),
         ],
+    );
+}
+
+#[test]
+fn trap_double_dash_still_analyses_the_action() {
+    use Want::Deny;
+    // Before the fix, `trap`'s wrapper treated a leading `--` itself as the literal
+    // action to analyse (harmless) and silently dropped the real action after it. `rm`
+    // isn't in `default_rules`, so this needs its own deny rule to show the nested text
+    // is actually reached, not just that the same `curl`-based case above still denies.
+    check(
+        &rules(&[], &["rm -f*"], &[]),
+        &[("trap -- 'rm -f x' EXIT", Deny)],
     );
 }
 

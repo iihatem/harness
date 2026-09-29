@@ -1524,14 +1524,7 @@ fn request_messages(history: &[Message]) -> Vec<Message> {
 
 /// A human-readable error message for the user.
 fn describe(error: &ProviderError) -> String {
-    if let Some(wait) = error.retry_after()
-        && wait > crate::retry::MAX_AUTOMATIC_RETRY_AFTER
-    {
-        return format!(
-            "the provider asked to wait {}s before retrying, which is longer than we wait automatically. {error}",
-            wait.as_secs()
-        );
-    }
+    // An exhausted quota says when it resets, whatever `Retry-After` asks.
     if error.is_quota_exhausted() {
         let resets = error
             .resets_at()
@@ -1543,6 +1536,14 @@ fn describe(error: &ProviderError) -> String {
         };
         return format!(
             "the provider's usage limit is reached{resets}. Switch models with --model (or /model in the terminal UI). HTTP 429: {body}"
+        );
+    }
+    if let Some(wait) = error.retry_after()
+        && wait > crate::retry::MAX_AUTOMATIC_RETRY_AFTER
+    {
+        return format!(
+            "the provider asked to wait {}s before retrying, which is longer than we wait automatically. {error}",
+            wait.as_secs()
         );
     }
     match error {

@@ -85,7 +85,7 @@ impl ProviderError {
         error["resets_at"].as_u64().or_else(|| {
             error["resets_in_seconds"]
                 .as_u64()
-                .map(|secs| crate::time::now_unix() + secs)
+                .map(|secs| crate::time::now_unix().saturating_add(secs))
         })
     }
 

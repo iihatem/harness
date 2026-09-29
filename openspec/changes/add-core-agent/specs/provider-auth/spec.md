@@ -5,7 +5,7 @@ Provider authentication manages how the harness obtains, stores, refreshes, and 
 ## ADDED Requirements
 
 ### Requirement: API keys come from the environment or the credential store
-The system SHALL resolve a provider's API key from its configured environment variable first and from the credential store for the active account profile second. `harness auth add <provider>` MUST read the key from standard input, without echoing it on a terminal, and MUST store it in the OS keychain. When no keychain service is available, the key MUST be stored in `credentials.json` in the harness data directory with file mode 0600, never in the configuration directory, and the user MUST be warned. A keychain that refuses a new key MUST NOT leave an older key it holds in use: the older key is removed, or storing fails with an error that says so. A credential store that cannot be read MUST be reported as such, naming the file and how to recover, never taken for an empty one.
+The system SHALL resolve a provider's API key from its configured environment variable first and from the credential store for the active account profile second. `harness auth add <provider>` MUST read the key from standard input, without echoing it on a terminal, and MUST store it in the OS keychain. When no keychain service is available, the key MUST be stored in `credentials.json` in the harness data directory with file mode 0600, never in the configuration directory, and the user MUST be warned. A keychain that refuses a new key MUST NOT leave an older key it holds in use: the older key is removed, or storing fails with an error that says so. When the file is chosen (`HARNESS_CREDENTIAL_STORE=file`), storing a credential MUST also remove an older copy the keychain holds, or warn that it could not and that the variable must stay set; an error that recommends the variable MUST say it must stay set. A credential store that cannot be read MUST be reported as such, naming the file and how to recover, never taken for an empty one.
 
 #### Scenario: Environment variable wins
 - **WHEN** both `OPENAI_API_KEY` and a stored key for `openai` exist
@@ -23,6 +23,10 @@ The system SHALL resolve a provider's API key from its configured environment va
 - **WHEN** the keychain holds a key for `openai` and refuses to store the one the user adds to replace it
 - **THEN** requests to `openai` use the new key, or `harness auth add` fails saying the keychain still holds the older one
 
+#### Scenario: A rotated key stored in the file
+- **WHEN** the keychain holds a key for `openai`, the user adds a new one with `HARNESS_CREDENTIAL_STORE=file`, and a later run leaves the variable unset
+- **THEN** requests to `openai` use the new key, or storing it warned that the keychain still holds the older one and that the variable must stay set
+
 ### Requirement: Multiple account profiles per provider
 The system SHALL store credentials per provider and named account profile, with `default` as the unnamed profile. `harness login <provider> --profile <name>` and `harness auth add <provider> --profile <name>` MUST store credentials under that profile, and `harness auth use <provider> <name>` MUST make that profile the active one for the provider.
 
@@ -35,7 +39,7 @@ The system SHALL store credentials per provider and named account profile, with 
 - **THEN** harness reports the damaged file and how to recover, and sends no request as the `default` profile's account
 
 ### Requirement: ChatGPT sign-in
-The system SHALL provide `harness login chatgpt`, which signs the user in through a browser-based OAuth flow with PKCE and a localhost callback, and SHALL offer a device-code flow when `--device` is given or a browser cannot be opened. The access and refresh tokens MUST be stored in the credential store, with the account id read from the ID token (the ID token itself is not stored), and refreshed automatically before expiry or after a single 401 response. A refresh MUST hold a lock shared by every harness process for that profile, and, once it holds it, MUST read the stored tokens again and use them when another process has already refreshed them. Refreshed tokens MUST be used even when they cannot be stored, with a warning. Only the authorization server refusing the refresh token MUST lead to signing in again; an unavailable server MUST leave the tokens as they are and fail the request as retryable. The provider name `chatgpt` MUST be reserved for the signed-in account: a configuration file that defines it MUST be refused with an error naming the file, and the stored sign-in MUST never be sent as an API key. The login flow MUST tell the user that ChatGPT subscription use in third-party tools relies on OpenAI's current practice rather than a contractual guarantee, and that harness identifies to OpenAI as the Codex CLI.
+The system SHALL provide `harness login chatgpt`, which signs the user in through a browser-based OAuth flow with PKCE and a localhost callback, and SHALL offer a device-code flow when `--device` is given or a browser cannot be opened. The access and refresh tokens MUST be stored in the credential store, with the account id read from the ID token (the ID token itself is not stored), and refreshed automatically before expiry or after a single 401 response. A refresh MUST hold a lock shared by every harness process for that profile, and, once it holds it, MUST read the stored tokens again and use them when another process has already refreshed them; `harness login` and `harness logout` MUST hold the same lock while they store or remove the profile's tokens, and a wait for it longer than two seconds MUST be told. A refresh that finds the profile signed out MUST end the session's use of it, with an error that names the profile and says how to sign in again. Refreshed tokens MUST be used even when they cannot be stored, with a warning. Only the authorization server refusing the refresh token MUST lead to signing in again; an unavailable server MUST leave the tokens as they are and fail the request as retryable. The provider name `chatgpt` MUST be reserved for the signed-in account: a configuration file that defines it MUST be refused with an error naming the file, and the stored sign-in MUST never be sent as an API key. The login flow MUST tell the user that ChatGPT subscription use in third-party tools relies on OpenAI's current practice rather than a contractual guarantee, and that harness identifies to OpenAI as the Codex CLI.
 
 #### Scenario: Sign-in over SSH
 - **WHEN** the user runs `harness login chatgpt` in an SSH session without a browser
@@ -52,6 +56,14 @@ The system SHALL provide `harness login chatgpt`, which signs the user in throug
 #### Scenario: Two sessions find the token expired at the same moment
 - **WHEN** two harness processes find the stored access token about to expire at the same time
 - **THEN** only one of them asks the authorization server for new tokens, and the other uses the tokens it stored
+
+#### Scenario: Logout during another session
+- **WHEN** the user runs `harness logout chatgpt` while another harness process is using the account
+- **THEN** that process's next refresh fails the request with an error that says the profile was signed out and how to sign in again, and no refreshed tokens are stored
+
+#### Scenario: Logout while another process refreshes
+- **WHEN** the user runs `harness logout chatgpt` while another harness process is refreshing the profile's tokens
+- **THEN** the logout waits for that refresh to end, and the refreshed tokens are not left stored
 
 #### Scenario: Refreshed tokens cannot be stored
 - **WHEN** a refresh succeeds but the credential store refuses the new tokens
@@ -89,7 +101,7 @@ The system MUST NOT read, store, request, or use Claude.ai subscription credenti
 - **THEN** harness refuses it with an explanation and sends no request
 
 ### Requirement: Secrets are redacted everywhere
-The system MUST NOT write the API keys, OAuth access tokens, or refresh tokens it holds to logs, session files, tool-output files, NDJSON output, error messages, or anything else it prints, whether they appear whole in one place, in pieces across streamed deltas, or JSON-escaped inside a tool call's arguments. They are those in the environment (each configured provider's key variable included), every one in the credential file, whichever provider and profile it belongs to, and those read from the keychain or refreshed during the run; the keychain is not read only to learn keys the run does not use. The values of environment variables whose names end in `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or their plurals, `PASSPHRASE`, `CREDENTIALS`, `_PASS` or `_PWD`, and the password of any URL an environment variable holds, MUST be treated as secrets too, when they are eight characters or longer.
+The system MUST NOT write the API keys, OAuth access tokens, or refresh tokens it holds to logs, session files, tool-output files, NDJSON output, error messages, or anything else it prints, whether they appear whole in one place, in pieces across streamed deltas, or JSON-escaped inside a tool call's arguments. They are those in the environment (each configured provider's key variable included), every one in the credential file, whichever provider and profile it belongs to, and those read from the keychain or refreshed during the run; the keychain is not read only to learn keys the run does not use. A reply of the model MUST be recorded without an end of it that a secret starts with, or a start of it that a secret ends with, when that part is eight characters or longer, so that a secret split across a reply cut off at the output limit and the reply that continues it is written nowhere; what the model is sent is left as it is. Configuration warnings and errors MUST be printed redacted too, and a configuration file that cannot be parsed MUST be reported by file, line and column, without quoting the line. The values of environment variables whose names end in `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or their plurals, `PASSPHRASE`, `CREDENTIALS`, `_PASS` or `_PWD`, and the password of any URL an environment variable holds, MUST be treated as secrets too, when they are eight characters or longer.
 
 #### Scenario: Debug logging
 - **WHEN** a turn runs with `--debug` using an API key provider
@@ -102,6 +114,14 @@ The system MUST NOT write the API keys, OAuth access tokens, or refresh tokens i
 #### Scenario: The model repeats a key in a streamed answer
 - **WHEN** the model's streamed answer holds an API key split across several deltas
 - **THEN** the NDJSON output and the debug log show `[redacted]` in its place, and no part of the key
+
+#### Scenario: A reply cut off inside a key
+- **WHEN** the model's reply stops at the output limit in the middle of an API key, and its next reply continues the key where it stopped
+- **THEN** neither the session file, the NDJSON output nor the debug log contains either part of the key
+
+#### Scenario: A key in the configuration
+- **WHEN** a config file holds `api_key = "sk-…"`, which harness does not know
+- **THEN** harness reports the file, line and column of the unknown setting without printing the line or the key
 
 #### Scenario: A password in a tool call
 - **WHEN** the model runs a command holding the value of `DB_PASSWORD`, which contains a quote and a backslash

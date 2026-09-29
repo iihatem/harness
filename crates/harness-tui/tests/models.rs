@@ -1,0 +1,238 @@
+//! `/model`: the model picker, fed by the models the host finds, and switching the session's
+//! model between turns, with the status line and `/context` following the new model's window.
+
+mod common;
+
+use std::{collections::HashMap, sync::Arc};
+
+use common::*;
+use futures::future::BoxFuture;
+use harness_core::{
+    agent::SessionModel,
+    message::{Message, RequestOptions},
+    permission::Mode,
+    testing::{MockProvider, Script},
+};
+use harness_tui::{
+    app::{Host, ModelSwitch, Prepared},
+    ui::Ui,
+};
+use ratatui::{backend::TestBackend, crossterm::event::KeyCode};
+use tokio_util::sync::CancellationToken;
+
+/// Models by id, each on a mock provider, with its window.
+#[derive(Default)]
+struct Models {
+    models: HashMap<String, (Arc<MockProvider>, u64)>,
+    /// Switching waits until it is cancelled.
+    stuck: bool,
+}
+
+impl Host for Models {
+    fn is_command(&self, _name: &str) -> bool {
+        false
+    }
+    fn prepare(&mut self, _typed: &str) -> Prepared {
+        unreachable!()
+    }
+    fn models(&self) -> BoxFuture<'static, Vec<String>> {
+        let mut ids: Vec<String> = self.models.keys().cloned().collect();
+        ids.sort();
+        Box::pin(async move { ids })
+    }
+    fn switch_model(
+        &self,
+        id: &str,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<ModelSwitch, String>> {
+        let found = self.models.get(id).cloned();
+        let stuck = self.stuck;
+        let id = id.to_string();
+        Box::pin(async move {
+            if stuck {
+                cancel.cancelled().await;
+                return Err("stopped".into());
+            }
+            let (provider, window) = found.ok_or_else(|| {
+                format!(
+                    "unknown provider `{}`",
+                    id.split('/').next().unwrap_or_default()
+                )
+            })?;
+            Ok(ModelSwitch {
+                model: SessionModel {
+                    provider,
+                    name: id.split_once('/').unwrap().1.to_string(),
+                    id,
+                    context_window: window,
+                    request: RequestOptions::default(),
+                    text_tool_calls: false,
+                },
+                window_note: "from the model's profile".into(),
+                warnings: vec!["a warning about the window".into()],
+            })
+        })
+    }
+}
+
+fn open(first: Arc<MockProvider>, host: Models) -> (Ui<TestBackend>, Log, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (ui, log) = start(
+        agent(first, dir.path(), Mode::Auto),
+        Box::new(host),
+        options(dir.path(), Mode::Auto),
+    );
+    (ui, log, dir)
+}
+
+fn status(ui: &Ui<TestBackend>) -> String {
+    screen(ui)
+        .into_iter()
+        .rfind(|r| r.contains(" · auto · "))
+        .unwrap_or_default()
+}
+
+fn two_models() -> (Arc<MockProvider>, Arc<MockProvider>, Models) {
+    let first = MockProvider::new(vec![Script::text("from the first")]);
+    let big = MockProvider::new(vec![Script::text("from the big one")]);
+    let mut host = Models::default();
+    host.models.insert("mock/m".into(), (first.clone(), 32_768));
+    host.models
+        .insert("mock/big".into(), (big.clone(), 200_000));
+    (first, big, host)
+}
+
+#[tokio::test]
+async fn model_alone_lists_the_models_and_switches_to_the_chosen_one() {
+    let (first, big, host) = two_models();
+    let (mut ui, log, _dir) = open(first.clone(), host);
+    send(&mut ui, "hello");
+    settle(&mut ui).await;
+    send(&mut ui, "/model");
+    assert_eq!(screen(&ui)[0], "Choose a model");
+    until(&mut ui, |app| {
+        app.picker().is_some_and(|p| !p.items().is_empty())
+    })
+    .await;
+    let shown = screen(&ui);
+    assert!(
+        shown
+            .iter()
+            .any(|r| r.contains("mock/m ") && r.contains("(current)")),
+        "{shown:#?}"
+    );
+    // Typed as the list appears, a key chooses nothing: the list takes keys after a pause.
+    let before = ui.app().picker().unwrap().selected();
+    type_text(&mut ui, "big");
+    press(&mut ui, KeyCode::Down);
+    assert!(ui.app().picker().is_some());
+    assert_eq!(ui.app().picker().unwrap().selected(), before);
+    until_armed(&ui).await;
+    type_text(&mut ui, "big");
+    press(&mut ui, KeyCode::Enter);
+    settle(&mut ui).await;
+    assert_eq!(*log.lock().unwrap(), ["enter", "leave"]);
+    assert!(shows(&ui, "switched to mock/big"));
+    assert!(shows(&ui, "warning: a warning about the window"));
+    // What was typed ahead went to the input.
+    assert_eq!(ui.app().editor().text(), "big");
+    ctrl(&mut ui, 'u');
+    assert!(
+        status(&ui).starts_with("mock/big · auto"),
+        "{}",
+        status(&ui)
+    );
+    send(&mut ui, "and now?");
+    settle(&mut ui).await;
+    assert_eq!(first.requests().len(), 1);
+    let request = big.requests().pop().unwrap();
+    assert_eq!(request.model, "big");
+    // The conversation came along.
+    assert!(request.messages.contains(&Message::User {
+        content: "hello".into()
+    }));
+    assert!(shows(&ui, "from the big one"));
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn model_with_an_id_switches_and_the_window_follows() {
+    let (first, _big, host) = two_models();
+    let (mut ui, log, _dir) = open(first, host);
+    send(&mut ui, "/model mock/big");
+    settle(&mut ui).await;
+    assert!(log.lock().unwrap().is_empty());
+    assert!(
+        status(&ui).starts_with("mock/big · auto · 0% of context"),
+        "{}",
+        status(&ui)
+    );
+    send(&mut ui, "/context");
+    assert!(shows(
+        &ui,
+        "Context window: 200,000 tokens (from the model's profile)"
+    ));
+    send(&mut ui, "/model mock/big");
+    assert!(shows(&ui, "already on mock/big"));
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_model_that_cannot_be_used_leaves_the_session_as_it_was() {
+    let (first, _big, host) = two_models();
+    let (mut ui, _log, _dir) = open(first.clone(), host);
+    send(&mut ui, "/model nope/x");
+    settle(&mut ui).await;
+    assert!(shows(
+        &ui,
+        "error: could not switch to nope/x: unknown provider `nope`"
+    ));
+    assert!(status(&ui).starts_with("mock/m · auto"), "{}", status(&ui));
+    send(&mut ui, "still here?");
+    settle(&mut ui).await;
+    assert_eq!(first.requests().len(), 1);
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn esc_stops_a_switch_that_waits() {
+    let (first, _big, mut host) = two_models();
+    host.stuck = true;
+    let (mut ui, _log, _dir) = open(first, host);
+    send(&mut ui, "/model mock/big");
+    assert!(ui.app().busy());
+    assert!(
+        screen(&ui)
+            .iter()
+            .any(|r| r.contains("switching to mock/big… (Esc to stop)")),
+        "{:#?}",
+        screen(&ui)
+    );
+    press(&mut ui, KeyCode::Esc);
+    settle(&mut ui).await;
+    assert!(shows(&ui, "error: could not switch to mock/big: stopped"));
+    assert!(status(&ui).starts_with("mock/m · auto"), "{}", status(&ui));
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_picker_says_how_to_get_models_when_there_are_none() {
+    let first = MockProvider::new(Vec::new());
+    let (mut ui, _log, _dir) = open(first, Models::default());
+    send(&mut ui, "/model");
+    until(&mut ui, |app| {
+        app.picker()
+            .is_some_and(|p| p.items().is_empty() && !p.is_loading())
+    })
+    .await;
+    ui.draw().unwrap();
+    assert!(
+        screen(&ui).iter().any(|r| r.contains("no models found")),
+        "{:#?}",
+        screen(&ui)
+    );
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Esc);
+    assert!(ui.app().picker().is_none());
+    ui.finish().await.unwrap();
+}

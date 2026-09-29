@@ -1376,6 +1376,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "crossterm",
+ "futures",
  "harness-config",
  "harness-context",
  "harness-core",

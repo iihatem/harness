@@ -9,9 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::future::BoxFuture;
 use harness_context::commands::{is_builtin, parse_invocation};
 use harness_core::{
-    agent::{ApprovalDecision, ApprovalRequest, ContextUsage, REWIND_LIMITS, RewindPoint},
+    agent::{
+        ApprovalDecision, ApprovalRequest, ContextUsage, REWIND_LIMITS, RewindPoint, SessionModel,
+    },
     checkpoint::Checkpoints,
     event::{AgentEvent, TurnEndReason},
     message::Message,
@@ -25,6 +28,7 @@ use ratatui::{
     layout::Position,
     text::{Line, Span},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     approval::{Answered, Arming, Prompt, Reply},
@@ -46,16 +50,13 @@ pub const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TYPED_PAST: &str = "your typing went to your message; the prompt takes keys once you pause";
 
 /// Built-in commands that come with the rest of the terminal UI, and where.
-const LATER: [(&str, &str); 2] = [
-    (
-        "model",
-        "with the model picker; for now, start harness with --model <provider>/<model>",
-    ),
-    (
-        "login",
-        "with sign-in inside the session; for now, run `harness login <provider>` or `harness auth add <provider>` in a shell",
-    ),
-];
+const LATER: [(&str, &str); 1] = [(
+    "login",
+    "with sign-in inside the session; for now, run `harness login <provider>` or `harness auth add <provider>` in a shell",
+)];
+
+/// What the model picker says when no model is found.
+const NO_MODELS: &str = "no models found: start Ollama, LM Studio or llama.cpp, add a provider's API key with `harness auth add <provider>`, or sign in to ChatGPT with `harness login chatgpt`";
 
 /// Esc twice on empty input within this long opens the rewind list.
 pub const REWIND_WINDOW: Duration = Duration::from_secs(1);
@@ -105,6 +106,8 @@ enum Pick {
     Rewind(Vec<Option<RewindPoint>>),
     /// The session to resume, one id per item.
     Session(Vec<String>),
+    /// The model to switch to, one id per item.
+    Model(Vec<String>),
     /// What to restore to before this message.
     RewindScope(RewindPoint),
 }
@@ -123,6 +126,8 @@ pub enum Done {
         resumed: bool,
         result: Result<SessionView, String>,
     },
+    /// `/model`: the model the session continues on, or why it could not switch.
+    Model(Result<ModelView, String>),
 }
 
 /// A session the agent is to continue in, as the host opened it.
@@ -140,6 +145,22 @@ pub struct SessionView {
     pub id: String,
     /// Its conversation, oldest first.
     pub history: Vec<Message>,
+}
+
+/// A model made ready for the session by the host: the agent switches to it.
+pub struct ModelSwitch {
+    pub model: SessionModel,
+    /// Where its context window comes from, for `/context`.
+    pub window_note: String,
+    /// What to warn about, such as a window too small for agentic work.
+    pub warnings: Vec<String>,
+}
+
+/// The model the session continues on now, for the app to show.
+#[derive(Debug, Clone)]
+pub struct ModelView {
+    pub id: String,
+    pub window_note: String,
 }
 
 /// A slash command expanded for a turn.
@@ -170,6 +191,21 @@ pub trait Host: Send {
     /// in. Errors say why it cannot be.
     fn open_session(&self, _id: Option<&str>) -> Result<OpenedSession, String> {
         Err("this session cannot change".into())
+    }
+    /// The ids of the models harness finds: local servers', and those of providers with a key
+    /// or a sign-in.
+    fn models(&self) -> BoxFuture<'static, Vec<String>> {
+        Box::pin(async { Vec::new() })
+    }
+    /// Makes model `id` ready for the session: its provider, and what its profile and window
+    /// say. Errors say why it cannot be used. `cancel` stops it while a local server is asked
+    /// for its window.
+    fn switch_model(
+        &self,
+        _id: &str,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<ModelSwitch, String>> {
+        Box::pin(async { Err("the model cannot change".into()) })
     }
 }
 
@@ -215,6 +251,10 @@ pub enum Action {
     UndoRewind,
     /// Continue in a new session (`None`), or in this project's session with this id.
     OpenSession(Option<String>),
+    /// Look for the models, for the model picker.
+    ListModels,
+    /// Continue on the model with this id.
+    SwitchModel(String),
     /// Stop the running turn.
     Interrupt,
     /// Leave harness.
@@ -299,6 +339,8 @@ pub struct App {
     /// The agent continues in another session, whose conversation may not say the mode: the
     /// next turn tells the model.
     mode_note_pending: bool,
+    /// The model being switched to.
+    switching: Option<String>,
 }
 
 impl App {
@@ -345,7 +387,30 @@ impl App {
             session_id: String::new(),
             start_mode: options.mode,
             mode_note_pending: false,
+            switching: None,
         }
+    }
+
+    /// The models the host found, for the model picker if it is open.
+    pub fn on_models(&mut self, ids: Vec<String>) {
+        let Some((Pick::Model(listed), picker)) = &mut self.picker else {
+            return;
+        };
+        let items = ids
+            .iter()
+            .map(|id| {
+                let current = if *id == self.model { "(current)" } else { "" };
+                Item::new(id, current)
+            })
+            .collect();
+        picker.set_items(items);
+        if let Some(current) = ids.iter().position(|id| *id == self.model) {
+            picker.select(current);
+        }
+        *listed = ids;
+        // The list that arrived takes keys once the user has paused, as the picker did when it
+        // opened: a key typed as it appears never chooses in it.
+        self.arming = Arming::default();
     }
 
     /// The id of the session the agent continues in.
@@ -400,6 +465,20 @@ impl App {
                 }
             }
             Done::Session { resumed, result } => self.session_started(resumed, result),
+            Done::Model(result) => {
+                let wanted = self.switching.take().unwrap_or_default();
+                match result {
+                    Ok(view) => {
+                        self.transcript
+                            .push_note(&format!("switched to {}", view.id), width);
+                        self.model = view.id;
+                        self.window_note = Some(view.window_note);
+                    }
+                    Err(why) => self
+                        .transcript
+                        .push_error(&format!("could not switch to {wanted}: {why}"), width),
+                }
+            }
             Done::UndidRewind(Ok(())) => self.transcript.push_note("undid the last rewind", width),
             Done::UndidRewind(Err(why)) => self
                 .transcript
@@ -1057,7 +1136,19 @@ impl App {
         let width = self.width;
         match name {
             "quit" => return self.quit(),
-            "mode" | "compact" | "rewind" | "new" | "resume" if !self.between_turns(name) => {}
+            "mode" | "compact" | "rewind" | "new" | "resume" | "model"
+                if !self.between_turns(name) => {}
+            "model" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                if !args.is_empty() {
+                    return self.switch_to(args);
+                }
+                let picker =
+                    Picker::loading("Choose a model", "looking for models…").with_empty(NO_MODELS);
+                self.open_picker(Pick::Model(Vec::new()), picker);
+                return Some(Action::ListModels);
+            }
             "new" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
@@ -1191,6 +1282,10 @@ impl App {
                     None
                 }
             },
+            Pick::Model(ids) => {
+                let id = ids.into_iter().nth(index)?;
+                self.switch_to(&id)
+            }
             Pick::Session(ids) => {
                 let id = ids.into_iter().nth(index)?;
                 self.working = Some("resuming the session".into());
@@ -1206,6 +1301,18 @@ impl App {
                 })
             }
         }
+    }
+
+    /// Switches the session to model `id`, unless it is on it already.
+    fn switch_to(&mut self, id: &str) -> Option<Action> {
+        if id == self.model {
+            self.transcript
+                .push_note(&format!("already on {id}"), self.width);
+            return None;
+        }
+        self.working = Some(format!("switching to {id}"));
+        self.switching = Some(id.to_string());
+        Some(Action::SwitchModel(id.to_string()))
     }
 
     /// `/resume`: with an id, continues that session; alone, opens the session picker.

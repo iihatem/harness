@@ -9,7 +9,7 @@ use std::{
 
 use futures::{FutureExt, Stream, StreamExt};
 use harness_core::{
-    agent::{Agent, ContextUsage, RewindPoint},
+    agent::{Agent, ContextUsage, RewindPoint, SessionModel},
     checkpoint::Checkpoints,
     event::AgentEvent,
     redact::{EventRedactor, Redactor},
@@ -21,7 +21,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    app::{Action, App, Done, Host, Options, SessionView},
+    app::{Action, App, Done, Host, ModelSwitch, ModelView, Options, SessionView},
     approval::{Reply, Requests},
     inline::{CursorReport, InlineTerminal},
     input::{CursorQuery, Timed},
@@ -97,6 +97,18 @@ enum Job {
         checkpoints: Option<Arc<Checkpoints>>,
         resumed: bool,
     },
+    SwitchModel {
+        model: Box<SessionModel>,
+        window_note: String,
+    },
+}
+
+/// What work the session started in the background, apart from the agent, comes back with.
+enum Background {
+    /// The models the host found.
+    Models(Vec<String>),
+    /// The model to switch to, made ready, or why it could not be.
+    Switch(Result<ModelSwitch, String>),
 }
 
 /// What the task that owns the agent says after each job: where the context goes now, and how
@@ -137,6 +149,9 @@ pub struct Ui<B: Backend> {
     /// Asks the terminal where its cursor is after a resize, through the thread that reads it;
     /// without it, the backend is asked.
     cursor_query: Option<CursorQuery>,
+    /// What work in the background comes back with.
+    background_tx: mpsc::UnboundedSender<Background>,
+    background: mpsc::UnboundedReceiver<Background>,
 }
 
 impl<B> Ui<B>
@@ -158,6 +173,7 @@ where
         let (jobs, mut queue) = mpsc::unbounded_channel::<Job>();
         let (events_tx, events) = mpsc::unbounded_channel();
         let (updates_tx, updates) = mpsc::unbounded_channel();
+        let (background_tx, background) = mpsc::unbounded_channel();
         let width = term.width() as usize;
         let mut app = App::new(options, host, width);
         let agent = agent.with_steering(app.steering());
@@ -203,6 +219,14 @@ where
                             result: Ok(view),
                         })
                     }
+                    Job::SwitchModel { model, window_note } => {
+                        agent.switch_model(*model);
+                        let view = ModelView {
+                            id: agent.model_id().to_string(),
+                            window_note,
+                        };
+                        Some(Done::Model(Ok(view)))
+                    }
                 };
                 let _ = updates_tx.send(Update {
                     context: agent.context_usage(),
@@ -229,6 +253,8 @@ where
             drawn_at: None,
             redraw: false,
             cursor_query: None,
+            background_tx,
+            background,
         }
     }
 
@@ -342,6 +368,24 @@ where
             }
             Action::UndoRewind => {
                 self.send_job(Job::UndoRewind);
+                Flow::Continue
+            }
+            Action::ListModels => {
+                let models = self.app.host().models();
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(Background::Models(models.await));
+                });
+                Flow::Continue
+            }
+            Action::SwitchModel(id) => {
+                let cancel = CancellationToken::new();
+                self.cancel = Some(cancel.clone());
+                let switch = self.app.host().switch_model(&id, cancel);
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(Background::Switch(switch.await));
+                });
                 Flow::Continue
             }
             Action::OpenSession(id) => {
@@ -598,6 +642,29 @@ where
         Ok(Flow::Continue)
     }
 
+    /// Takes in what work in the background came back with.
+    fn background(&mut self, done: Background) -> io::Result<Flow> {
+        match done {
+            Background::Models(ids) => self.app.on_models(ids),
+            Background::Switch(Ok(switch)) => {
+                for message in switch.warnings {
+                    self.show(AgentEvent::Warning { message });
+                }
+                self.send_job(Job::SwitchModel {
+                    model: Box::new(switch.model),
+                    window_note: switch.window_note,
+                });
+            }
+            Background::Switch(Err(why)) => {
+                self.app.on_done(Done::Model(Err(why)));
+                self.next_actions()?;
+            }
+        }
+        self.host_warnings();
+        self.draw()?;
+        Ok(Flow::Continue)
+    }
+
     /// Waits for the agent's next event, the runner's next message, or
     /// [`HOST_WARNINGS_EVERY`], and takes it in.
     pub async fn next(&mut self) -> io::Result<Flow> {
@@ -608,6 +675,7 @@ where
                 None => Ok(Flow::Quit),
             },
             Some(update) = self.updates.recv() => self.update(update),
+            Some(done) = self.background.recv() => self.background(done),
             Some((request, reply)) = self.approvals.recv() => self.approval(request, reply).await,
             _ = tokio::time::sleep_until(redraw_at), if redraw => {
                 self.draw().map(|()| Flow::Continue)
@@ -751,6 +819,7 @@ where
                     None => Flow::Quit,
                 },
                 Some(update) = self.updates.recv() => self.update(update)?,
+                Some(done) = self.background.recv() => self.background(done)?,
                 // A request left unshown when the session ends is denied when its reply drops.
                 Some((request, reply)) = self.approvals.recv() => match self.keys(None, input).await? {
                     None => self.approval(request, reply).await?,

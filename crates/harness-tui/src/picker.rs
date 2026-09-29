@@ -111,9 +111,14 @@ impl Picker {
 
     /// Starts at the item at `index` (the current model, say).
     pub fn with_selected(mut self, index: usize) -> Self {
+        self.select(index);
+        self
+    }
+
+    /// Selects the item at `index`, and starts there again when the filter is cleared.
+    pub fn select(&mut self, index: usize) {
         self.preferred = Some(index);
         self.refilter();
-        self
     }
 
     /// The items, once found.
@@ -124,6 +129,11 @@ impl Picker {
 
     pub fn items(&self) -> &[Item] {
         self.items.as_deref().unwrap_or_default()
+    }
+
+    /// Whether the items are still being looked for.
+    pub fn is_loading(&self) -> bool {
+        self.items.is_none()
     }
 
     /// The index of the selected item, if any.

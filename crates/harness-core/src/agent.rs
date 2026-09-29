@@ -115,6 +115,29 @@ impl AgentConfig {
     }
 }
 
+/// A model the session continues on after `/model`: its provider, its ids, and what its profile
+/// and window say about requests to it.
+#[derive(Clone)]
+pub struct SessionModel {
+    pub provider: Arc<dyn Provider>,
+    /// `<provider>/<model>`, recorded on its assistant messages.
+    pub id: String,
+    /// The model name sent to the provider.
+    pub name: String,
+    pub context_window: u64,
+    pub request: RequestOptions,
+    pub text_tool_calls: bool,
+}
+
+impl std::fmt::Debug for SessionModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionModel")
+            .field("id", &self.id)
+            .field("context_window", &self.context_window)
+            .finish()
+    }
+}
+
 /// The OS sandbox shell commands get in each mode, for a session whose mode can change: one for
 /// read-only access (`plan`, `read-only`) and one for workspace-write access (`ask`, `auto`).
 /// Either may be missing: a workspace too broad to make writable has no workspace-write sandbox,
@@ -822,6 +845,21 @@ impl Agent {
         self.invalid_calls
     }
 
+    /// Continues on `model` from the next request, as `/model` does between turns. The
+    /// conversation stays as it is: it is kept in a form every provider takes, and each adapter
+    /// leaves out what its provider cannot accept. The next request's size is estimated afresh,
+    /// since the new model counts tokens its own way, and it is compacted against the new window.
+    pub fn switch_model(&mut self, model: SessionModel) {
+        self.provider = model.provider;
+        self.config.model_id = model.id;
+        self.config.model_name = model.name;
+        self.config.context_window = model.context_window;
+        self.config.request = model.request;
+        self.config.text_tool_calls = model.text_tool_calls;
+        self.reported_usage = None;
+        self.auto_compaction_paused = false;
+    }
+
     /// Switches the approval mode between turns, and with [`with_sandboxes`](Self::with_sandboxes)
     /// the sandbox with it. The system prompt stays as it is, so providers keep reusing their
     /// prompt caches; the change is appended to the conversation as a note.
@@ -1350,8 +1388,8 @@ impl Agent {
         }
     }
 
-    /// The id of the model answering the current turn.
-    fn model_id(&self) -> &str {
+    /// The id of the model answering the current turn: between turns, the session's.
+    pub fn model_id(&self) -> &str {
         self.turn_model
             .as_ref()
             .map_or(&self.config.model_id, |model| &model.id)

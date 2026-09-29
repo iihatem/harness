@@ -8,6 +8,7 @@ use harness_config::config::LinuxGitProtection;
 use harness_core::{
     agent::{Agent, AgentConfig, Approver, Sandboxes},
     engine::{EngineConfig, PermissionEngine, RuleSet},
+    message::RequestOptions,
     permission::{FsAccess, Mode},
     session::Session,
     tool::{CommandSandbox, ToolContext},
@@ -180,24 +181,11 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     {
         start_sandbox_session(&ctx.workspace, sandbox).await;
     }
-    let local = profiles::is_local(&resolved.id, &resolved.base_url);
-    let profile = profiles::resolve(&resolved.id, local, &setup.config.profiles);
-    // The window the server really runs the model with, when it is a local server that says.
-    let provider = resolved.id.split('/').next().unwrap_or_default();
-    let server = window::Server::of(provider, &setup.config.providers);
-    let running = match server {
-        Some(server) => tokio::select! {
-            tokens = window::running_context(server, &resolved.base_url, &resolved.model, PROBE_TIMEOUT, LOAD_TIMEOUT) => tokens,
-            _ = cancel.cancelled() => return None,
-        },
-        None => window::Running::Unknown,
-    };
-    let window_note = window_note(running.tokens(), profile.context_window);
-    let window = window::effective_window(&resolved.id, &profile, running, server);
-    for warning in &window.warnings {
+    let model = model_setup(setup, &resolved, &cancel).await?;
+    for warning in &model.warnings {
         notices.warn(warning);
     }
-    let context_window = window.tokens;
+    let context_window = model.context_window;
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),
@@ -210,8 +198,8 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         output_dir,
     );
     config.context_window = context_window;
-    config.request = profile.request_options();
-    config.text_tool_calls = profile.text_tool_calls;
+    config.request = model.request;
+    config.text_tool_calls = model.text_tool_calls;
     if let Some(steps) = setup.config.max_steps {
         config.max_steps = steps;
     }
@@ -246,7 +234,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         agent,
         sandbox_session,
         policy,
-        window_note: window_note.into(),
+        window_note: model.window_note.into(),
         write_mode_warning,
         writable: writable_roots,
     })
@@ -328,6 +316,46 @@ fn write_modes(
             unsandboxed: None,
         },
     }
+}
+
+/// What harness knows of a model before asking it anything: its window and where that comes
+/// from, what its profile sets for requests, and what to warn about.
+pub struct ModelSetup {
+    pub context_window: u64,
+    pub window_note: &'static str,
+    pub request: RequestOptions,
+    pub text_tool_calls: bool,
+    pub warnings: Vec<String>,
+}
+
+/// The setup of `resolved`, from its profile and, for a local server, the window the server
+/// runs it with. `None` when `cancel` stops the wait for the server's answer.
+pub async fn model_setup(
+    setup: &Setup,
+    resolved: &Resolved,
+    cancel: &CancellationToken,
+) -> Option<ModelSetup> {
+    let local = profiles::is_local(&resolved.id, &resolved.base_url);
+    let profile = profiles::resolve(&resolved.id, local, &setup.config.profiles);
+    // The window the server really runs the model with, when it is a local server that says.
+    let provider = resolved.id.split('/').next().unwrap_or_default();
+    let server = window::Server::of(provider, &setup.config.providers);
+    let running = match server {
+        Some(server) => tokio::select! {
+            tokens = window::running_context(server, &resolved.base_url, &resolved.model, PROBE_TIMEOUT, LOAD_TIMEOUT) => tokens,
+            _ = cancel.cancelled() => return None,
+        },
+        None => window::Running::Unknown,
+    };
+    let window_note = window_note(running.tokens(), profile.context_window);
+    let window = window::effective_window(&resolved.id, &profile, running, server);
+    Some(ModelSetup {
+        context_window: window.tokens,
+        window_note,
+        request: profile.request_options(),
+        text_tool_calls: profile.text_tool_calls,
+        warnings: window.warnings,
+    })
 }
 
 /// Where the window comes from: the smaller of what the server runs the model with (`running`)

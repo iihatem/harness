@@ -193,6 +193,37 @@ async fn piped_stdin_is_appended_to_the_prompt() {
     .unwrap();
 }
 
+// Final review, M-3: a refused key is named by where it came from, with what fixes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_key_says_which_key_it_was() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Incorrect API key provided"))
+        .mount(&server)
+        .await;
+    let keyed = format!(
+        "model = \"keyed/m\"\n[providers.keyed]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\napi_key_env = \"KEYED_API_KEY\"\n",
+        server.uri()
+    );
+    let env = Env::new(&server.uri(), &keyed);
+    tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .env("KEYED_API_KEY", "sk-keyed-0123456789")
+            .args(["ask", "hi"])
+            .assert()
+            .code(1)
+            .stderr(contains("HTTP 401: Incorrect API key provided"))
+            .stderr(contains("$KEYED_API_KEY"))
+            .stderr(contains("unset KEYED_API_KEY"))
+            .stderr(contains("`harness auth add keyed`"))
+            .stderr(predicates::prelude::PredicateBooleanExt::not(contains(
+                "sk-keyed",
+            )));
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn provider_errors_exit_1() {
     let server = MockServer::start().await;

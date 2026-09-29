@@ -387,3 +387,84 @@ fn chatgpt_never_takes_the_key_path() {
     let found = configured_endpoints(&providers, Keys::new(&[], &[("chatgpt", sign_in)]));
     assert!(found.is_empty(), "{found:?}");
 }
+
+/// The error a request to `model_id`, resolved with `secrets`, ends with when the provider
+/// answers `status`.
+async fn refused(
+    model_id: &str,
+    protocol: Protocol,
+    status: u16,
+    secrets: impl Secrets,
+) -> harness_core::provider::ProviderError {
+    use futures::StreamExt;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(status).set_body_string(
+            r#"{"error":{"message":"Incorrect API key provided: sk-mo****WXYZ","code":"invalid_api_key"}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let name = model_id.split('/').next().unwrap();
+    let providers = BTreeMap::from([(
+        name.to_string(),
+        ProviderConfig {
+            protocol,
+            base_url: format!("{}/v1", server.uri()),
+            api_key_env: Some("MOCK_API_KEY".into()),
+        },
+    )]);
+    let resolved = resolve(model_id, &providers, secrets).unwrap();
+    let request = harness_core::message::ChatRequest {
+        model: resolved.model.clone(),
+        ..Default::default()
+    };
+    let first = resolved.provider.stream(request).next().await.unwrap();
+    first.unwrap_err()
+}
+
+// Final review, M-3: a key the provider refuses is named by where it came from (the variable,
+// which wins over a stored key, or the stored profile), with what fixes it; never by its value.
+#[tokio::test]
+async fn a_refused_key_says_which_key_it_was_and_how_to_replace_it() {
+    use harness_core::provider::ProviderError;
+    for protocol in [
+        Protocol::OpenaiChat,
+        Protocol::OpenaiResponses,
+        Protocol::AnthropicMessages,
+    ] {
+        let from_env = Keys::new(&[("MOCK_API_KEY", "sk-mock-env-0123456789")], &[]);
+        let error = refused("mock/m", protocol, 401, from_env).await;
+        let ProviderError::KeyRefused { status, hint, body } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(*status, 401);
+        assert!(body.contains("invalid_api_key"), "{body}");
+        for part in ["$MOCK_API_KEY", "unset", "`harness auth add mock`"] {
+            assert!(hint.contains(part), "{part}: {hint}");
+        }
+        assert!(!error.is_retryable());
+        let mut stored = Keys::new(&[], &[("mock", "sk-mock-stored-0123456789")]);
+        stored.profile = "work".into();
+        let error = refused("mock/m", protocol, 403, stored).await;
+        let ProviderError::KeyRefused { status, hint, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(*status, 403);
+        for part in [
+            "stored",
+            "profile `work`",
+            "`harness auth add mock --profile work`",
+        ] {
+            assert!(hint.contains(part), "{part}: {hint}");
+        }
+        assert!(!error.to_string().contains("sk-mock"), "{error}");
+    }
+    // Other statuses are what they were.
+    let keys = Keys::new(&[("MOCK_API_KEY", "sk-mock-env-0123456789")], &[]);
+    let error = refused("mock/m", Protocol::OpenaiChat, 404, keys).await;
+    assert!(
+        matches!(error, ProviderError::Http { status: 404, .. }),
+        "{error:?}"
+    );
+}

@@ -1611,6 +1611,10 @@ fn describe(error: &ProviderError) -> String {
             )
         }
         ProviderError::Http { status, body, .. } => format!("HTTP {status}: {}", quoted(body)),
+        // What fixes it is kept, however long the body.
+        ProviderError::KeyRefused { status, body, hint } => {
+            format!("HTTP {status}: {}; {hint}", quoted(body))
+        }
         ProviderError::Reported {
             status,
             body,

@@ -137,7 +137,7 @@ fn events_within<P: EventParser>(
                         "the server stopped responding: nothing arrived for {}",
                         duration(waits.idle)
                     )),
-                    EventStreamError::Transport(Read::Failed(e)) => network_error(e),
+                    EventStreamError::Transport(Read::Failed(e)) => network_error(e, waits.local),
                     EventStreamError::Utf8(e) => ProviderError::Network(e.to_string()),
                     EventStreamError::Parser(e) => ProviderError::Network(e.to_string()),
                 })?;
@@ -177,21 +177,49 @@ fn duration(duration: Duration) -> String {
     }
 }
 
-/// Sends `request`, mapping a failure to connect or send to [`ProviderError::Network`].
-pub async fn send(request: reqwest::RequestBuilder) -> Result<reqwest::Response, ProviderError> {
-    request.send().await.map_err(network_error)
+/// Sends `request` to a `local` server or a hosted provider, mapping a failure to connect or send
+/// to [`ProviderError::Network`] (see [`network_error`]).
+pub async fn send(
+    request: reqwest::RequestBuilder,
+    local: bool,
+) -> Result<reqwest::Response, ProviderError> {
+    request
+        .send()
+        .await
+        .map_err(|error| network_error(error, local))
 }
 
-/// A failure on the network, described with the URL's host and path only: its query, fragment and
-/// credentials are left out, since a key can be kept there.
-pub fn network_error(mut error: reqwest::Error) -> ProviderError {
+/// A failure on the network, with its cause ("connection refused"), which reqwest's own message
+/// leaves out, and with the URL's host and path only: its query, fragment and credentials are
+/// left out, since a key can be kept there. A `local` server that cannot be connected to is
+/// asked after: it may not have been started.
+pub fn network_error(mut error: reqwest::Error, local: bool) -> ProviderError {
     if let Some(url) = error.url_mut() {
         url.set_query(None);
         url.set_fragment(None);
         let _ = url.set_username("");
         let _ = url.set_password(None);
     }
-    ProviderError::Network(error.to_string())
+    let mut text = error.to_string();
+    let mut cause = std::error::Error::source(&error);
+    while let Some(error) = cause {
+        let said = error.to_string();
+        if !text.contains(&said) {
+            text.push_str(": ");
+            text.push_str(&said);
+        }
+        cause = error.source();
+    }
+    if local
+        && error.is_connect()
+        && let Some(url) = error.url()
+        && let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default())
+    {
+        text.push_str(&format!(
+            "; is the server at {host}:{port} running? Start it, and try again"
+        ));
+    }
+    ProviderError::Network(text)
 }
 
 /// The error an unsuccessful response stands for: its status, body and `Retry-After` in seconds.
@@ -290,7 +318,7 @@ mod tests {
 
     async fn collect(url: &str, waits: Waits) -> Vec<Result<ProviderEvent, ProviderError>> {
         let request = reqwest::Client::new().get(url);
-        events_within(send(request), Lines::default(), waits)
+        events_within(send(request, waits.local), Lines::default(), waits)
             .collect()
             .await
     }
@@ -405,15 +433,42 @@ mod tests {
         }
     }
 
+    /// A port on 127.0.0.1 nothing listens on.
+    fn closed_port() -> u16 {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        closed.local_addr().unwrap().port()
+    }
+
+    // Final review, M-3: a network error keeps its cause ("connection refused"), which reqwest's
+    // own message leaves out, and a local server's says to start it.
+    #[tokio::test]
+    async fn a_network_error_keeps_its_cause_and_says_to_start_a_local_server() {
+        let port = closed_port();
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions?key=SECRETQ");
+        for local in [false, true] {
+            let error = send(reqwest::Client::new().post(&url), local)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ProviderError::Network(_)), "{error:?}");
+            let text = error.to_string();
+            assert!(
+                text.to_ascii_lowercase().contains("connection refused"),
+                "{text}"
+            );
+            let hint = format!("is the server at 127.0.0.1:{port} running?");
+            assert_eq!(text.contains(&hint), local, "{text}");
+            assert!(!text.contains("SECRETQ"), "{text}");
+        }
+    }
+
     // Review A M8: a key kept in the URL's query never appears in a network error.
     #[tokio::test]
     async fn network_errors_leave_out_the_urls_query() {
-        let port = {
-            let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            closed.local_addr().unwrap().port()
-        };
+        let port = closed_port();
         let url = format!("http://user:pw@127.0.0.1:{port}/v1/messages?key=SECRETQ#frag");
-        let error = send(reqwest::Client::new().get(&url)).await.unwrap_err();
+        let error = send(reqwest::Client::new().get(&url), true)
+            .await
+            .unwrap_err();
         let text = error.to_string();
         assert!(matches!(error, ProviderError::Network(_)), "{error:?}");
         assert!(

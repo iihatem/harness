@@ -50,6 +50,14 @@ pub enum ProviderError {
         body: String,
         retry_after: Option<Duration>,
     },
+    /// An API key the provider refused (HTTP 401 or 403), with which key that was (the
+    /// variable, or the stored profile) and how to replace it.
+    #[error("HTTP {status}: {body}; {hint}")]
+    KeyRefused {
+        status: u16,
+        body: String,
+        hint: String,
+    },
     /// An error the provider reported inside a response stream.
     #[error("provider error: {0}")]
     InStream(String),
@@ -69,7 +77,9 @@ impl ProviderError {
             ProviderError::Http { status, .. } | ProviderError::Reported { status, .. } => {
                 (500..600).contains(status)
             }
-            ProviderError::Protocol(_) | ProviderError::InStream(_) => false,
+            ProviderError::Protocol(_)
+            | ProviderError::InStream(_)
+            | ProviderError::KeyRefused { .. } => false,
         }
     }
 

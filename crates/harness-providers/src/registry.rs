@@ -4,8 +4,12 @@ use harness_core::redact::Redactor;
 
 use crate::credentials::{CredentialError, Credentials, DEFAULT_PROFILE};
 
+use futures::StreamExt;
 use harness_config::config::{Protocol, ProviderConfig};
-use harness_core::provider::Provider;
+use harness_core::{
+    message::ChatRequest,
+    provider::{Provider, ProviderError, ProviderStream},
+};
 
 use crate::{
     anthropic_messages::AnthropicMessages, discovery::Endpoint, openai_chat::OpenAiChat,
@@ -194,14 +198,22 @@ pub fn is_claude_subscription_token(key: &str) -> bool {
         .starts_with("sk-ant-oat")
 }
 
+/// Where a provider's key came from.
+enum KeySource {
+    /// This environment variable.
+    Env(String),
+    /// The credential store, under the provider's active profile.
+    Stored,
+}
+
 /// The key for provider `name`, whose key is in the environment variable `key_env`: that
-/// variable, else the stored key. A provider without a key variable takes no key, and nothing
-/// stored is looked up for it.
+/// variable, else the stored key, with where it came from. A provider without a key variable
+/// takes no key, and nothing stored is looked up for it.
 fn api_key(
     name: &str,
     key_env: Option<&str>,
     secrets: &impl Secrets,
-) -> Result<Option<String>, CredentialError> {
+) -> Result<Option<(String, KeySource)>, CredentialError> {
     // What is stored for `chatgpt` is a sign-in, which is never sent as a key.
     if name == CHATGPT {
         return Ok(None);
@@ -210,9 +222,56 @@ fn api_key(
         return Ok(None);
     };
     if let Some(key) = secrets.env(var).filter(|v| !v.is_empty()) {
-        return Ok(Some(key));
+        return Ok(Some((key, KeySource::Env(var.to_string()))));
     }
-    Ok(secrets.stored(name)?.filter(|v| !v.is_empty()))
+    Ok(secrets
+        .stored(name)?
+        .filter(|v| !v.is_empty())
+        .map(|key| (key, KeySource::Stored)))
+}
+
+/// What to say when `provider` refuses its key, from `source`: which key it was, and what
+/// replaces it. Never the key.
+fn refused_key_hint(provider: &str, source: &KeySource, secrets: &impl Secrets) -> String {
+    let profile = secrets
+        .profile(provider)
+        .unwrap_or_else(|_| DEFAULT_PROFILE.to_string());
+    let add = auth_add_command(provider, &profile);
+    match source {
+        KeySource::Env(var) => format!(
+            "harness sent the key in ${var}, which it uses whenever that is set: correct it, or unset {var} to use the key stored with `{add}`"
+        ),
+        KeySource::Stored => format!(
+            "harness sent the key stored for {provider}'s profile `{profile}`: replace it with `{add}`"
+        ),
+    }
+}
+
+/// A provider whose refusal of its key (HTTP 401 or 403) says which key that was, and how to
+/// replace it.
+struct KeyHinted {
+    inner: Arc<dyn Provider>,
+    hint: String,
+}
+
+impl Provider for KeyHinted {
+    fn stream(&self, request: ChatRequest) -> ProviderStream {
+        let hint = self.hint.clone();
+        Box::pin(self.inner.stream(request).map(move |item| {
+            item.map_err(|error| match error {
+                ProviderError::Http {
+                    status: status @ (401 | 403),
+                    body,
+                    ..
+                } => ProviderError::KeyRefused {
+                    status,
+                    body,
+                    hint: hint.clone(),
+                },
+                other => other,
+            })
+        }))
+    }
 }
 
 /// A ready-to-use provider for one model id.
@@ -264,7 +323,8 @@ pub fn resolve(
     } else {
         return Err(ResolveError::UnknownProvider(name.to_string()));
     };
-    let api_key = api_key(name, key_env.as_deref(), &secrets).map_err(|e| store_error(name, e))?;
+    let found = api_key(name, key_env.as_deref(), &secrets).map_err(|e| store_error(name, e))?;
+    let api_key = found.as_ref().map(|(key, _)| key.clone());
     if let (None, Some(var)) = (&api_key, key_env) {
         return Err(ResolveError::MissingKey {
             provider: name.to_string(),
@@ -290,6 +350,13 @@ pub fn resolve(
         Protocol::AnthropicMessages => {
             Arc::new(AnthropicMessages::new(base_url.clone(), api_key.clone()))
         }
+    };
+    let provider: Arc<dyn Provider> = match &found {
+        Some((_, source)) => Arc::new(KeyHinted {
+            inner: provider,
+            hint: refused_key_hint(name, source, &secrets),
+        }),
+        None => provider,
     };
     Ok(Resolved {
         provider,
@@ -442,7 +509,7 @@ pub fn configured_endpoints(
 /// that cannot be read leaves it out, with a warning.
 fn listed_key(name: &str, key_env: Option<&str>, secrets: &impl Secrets) -> Option<Option<String>> {
     match api_key(name, key_env, secrets) {
-        Ok(key) => Some(key),
+        Ok(key) => Some(key.map(|(key, _)| key)),
         Err(e) => {
             if let Some(credentials) = secrets.credentials() {
                 credentials.warn(format!(

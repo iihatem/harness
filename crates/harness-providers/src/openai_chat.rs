@@ -222,6 +222,6 @@ impl Provider for OpenAiChat {
             http = http.bearer_auth(key);
         }
         let local = request.options.local;
-        sse::events(sse::send(http), ChatStreamParser::default(), local)
+        sse::events(sse::send(http, local), ChatStreamParser::default(), local)
     }
 }

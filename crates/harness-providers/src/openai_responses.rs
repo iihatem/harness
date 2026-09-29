@@ -413,12 +413,13 @@ impl Provider for OpenAiResponses {
                     drop_summary(&mut body);
                 }
                 let (client, key) = (self.client.clone(), key.clone());
+                let local = request.options.local;
                 let send = move |body: &Value| {
                     let mut http = client.post(&url).json(body);
                     if let Some(key) = &key {
                         http = http.bearer_auth(key);
                     }
-                    sse::send(http)
+                    sse::send(http, local)
                 };
                 // Summaries refused to an organization OpenAI has not verified: sent again
                 // without them, and not asked for again.
@@ -437,11 +438,7 @@ impl Provider for OpenAiResponses {
                     drop_summary(&mut body);
                     send(&body).await
                 };
-                sse::events(
-                    response,
-                    ResponsesStreamParser::default(),
-                    request.options.local,
-                )
+                sse::events(response, ResponsesStreamParser::default(), local)
             }
             #[cfg(feature = "chatgpt-login")]
             Auth::ChatGpt(auth) => {
@@ -458,12 +455,14 @@ impl Provider for OpenAiResponses {
                 // A 401 renews the tokens once, and the request is sent once more.
                 let response = async move {
                     let tokens = auth.current().await?;
-                    let first = sse::send(chatgpt_request(&client, &url, &body, &tokens)).await?;
+                    let first =
+                        sse::send(chatgpt_request(&client, &url, &body, &tokens), false).await?;
                     if first.status() != reqwest::StatusCode::UNAUTHORIZED {
                         return Ok(first);
                     }
                     let tokens = auth.after_unauthorized(&tokens.access_token).await?;
-                    let second = sse::send(chatgpt_request(&client, &url, &body, &tokens)).await?;
+                    let second =
+                        sse::send(chatgpt_request(&client, &url, &body, &tokens), false).await?;
                     if second.status() == reqwest::StatusCode::UNAUTHORIZED {
                         return Err(auth.still_refused(sse::http_error(second).await));
                     }

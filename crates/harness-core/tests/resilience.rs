@@ -480,3 +480,32 @@ async fn an_error_reported_in_the_stream_is_described_as_such() {
     assert!(slow_down.is_retryable());
     assert_eq!(slow_down.retry_after(), Some(Duration::from_secs(3)));
 }
+
+// Final review, M-3: a refused key's message keeps what fixes it, however long the body.
+#[tokio::test(start_paused = true)]
+async fn a_refused_keys_message_keeps_its_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let refused = ProviderError::KeyRefused {
+        status: 401,
+        body: "<html>".repeat(200),
+        hint: "harness sent the key in $OPENAI_API_KEY".into(),
+    };
+    assert!(!refused.is_retryable());
+    let provider = MockProvider::new(vec![Script::error(refused)]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert_eq!(provider.requests().len(), 1);
+    let message = error_message(&events);
+    assert!(message.starts_with("HTTP 401: <html>"), "{message}");
+    assert!(message.len() < 700, "{message}");
+    assert!(
+        message.ends_with("harness sent the key in $OPENAI_API_KEY"),
+        "{message}"
+    );
+}

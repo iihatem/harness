@@ -5,6 +5,7 @@
 
 use std::{
     ffi::OsStr,
+    ops::Range,
     sync::{Arc, RwLock},
 };
 
@@ -110,6 +111,23 @@ impl Redactor {
             }
         }
         text
+    }
+
+    /// Where the secrets are in `text`: the byte range of each occurrence, overlapping ones
+    /// included, in order.
+    pub fn occurrences(&self, text: &str) -> Vec<Range<usize>> {
+        let secrets = self.secrets.read().expect("secrets lock");
+        let mut found = Vec::new();
+        for secret in secrets.iter() {
+            let mut from = 0;
+            while let Some(i) = text[from..].find(secret.as_str()) {
+                let start = from + i;
+                found.push(start..start + secret.len());
+                from = start + text[start..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        found.sort_by_key(|found| (found.start, found.end));
+        found
     }
 
     /// A stream for text that arrives in pieces, such as a model's streamed reply: a secret split

@@ -502,3 +502,56 @@ fn a_secret_that_is_one_of_harnesss_own_words_breaks_no_record() {
         Message::Assistant { content, .. } if content == &format!("the {REDACTED} speaks")
     )));
 }
+
+/// The five-character pieces of `secret`: a piece of it that a cut lets through holds one.
+fn pieces(secret: &str) -> Vec<&str> {
+    (0..=secret.len() - 5).map(|i| &secret[i..i + 5]).collect()
+}
+
+// Review F I2: the tool output the model gets (and the writers then redact whole) is cut 400
+// bytes from each end at this limit. A secret the cut would run through goes wholly to one
+// side, wherever it starts, at either end; the model still gets the text as it is.
+#[test]
+fn the_tool_output_cut_never_splits_a_secret() {
+    use harness_core::output::limit_output;
+    let dir = tempfile::tempdir().unwrap();
+    let redactor = Redactor::default();
+    redactor.add(KEY);
+    let (limit, keep) = (1000, 400);
+    for k in 0..=KEY.len() + 1 {
+        let at_the_head = format!("{}{KEY}{}", "a".repeat(keep - k), "b".repeat(3000));
+        let at_the_tail = format!(
+            "{}{KEY}{}",
+            "b".repeat(3000),
+            "c".repeat(keep + k - KEY.len())
+        );
+        for content in [at_the_head, at_the_tail] {
+            let limited = limit_output(&content, limit, dir.path(), "c1", Some(&redactor));
+            assert!(limited.contains("omitted"), "{limited}");
+            let shown = redactor.redact(&limited);
+            for piece in pieces(KEY) {
+                assert!(!shown.contains(piece), "k = {k}: {shown}");
+            }
+            // What the model gets is the output as it is, the secret whole where it is kept.
+            assert!(!limited.contains(REDACTED), "{limited}");
+            if pieces(KEY).iter().any(|piece| limited.contains(piece)) {
+                assert!(limited.contains(KEY), "k = {k}: {limited}");
+            }
+        }
+    }
+}
+
+#[test]
+fn occurrences_are_where_secrets_are() {
+    let redactor = Redactor::default();
+    redactor.add(KEY);
+    redactor.add("abababab");
+    let text = format!("x{KEY}y ababababab");
+    let key = 1..1 + KEY.len();
+    let at = text.find("abab").unwrap();
+    assert_eq!(
+        redactor.occurrences(&text),
+        vec![key, at..at + 8, at + 2..at + 10]
+    );
+    assert!(redactor.occurrences("nothing here").is_empty());
+}

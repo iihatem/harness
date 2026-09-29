@@ -104,6 +104,8 @@ fn unwrap_named(name: &str, args: &[Tok]) -> Option<Unwrapped> {
         "watch" => watch(args),
         "flock" => flock(args).map(|u| unlisted(u, "`flock` runs a command under a lock")),
         "ssh" => Some(ssh(args)),
+        "trap" => trap(args),
+        "compgen" | "complete" => completion_action(name, args),
         _ => None,
     }
 }
@@ -337,6 +339,97 @@ fn eval(args: &[Tok]) -> Option<Unwrapped> {
         },
         None => opaque("`eval` of text only known at run time"),
     })
+}
+
+/// `trap [-lp] [[arg] sigspec...]` sets `arg` as the action that runs, in the same shell,
+/// when a listed signal is caught later. `trap -p`, `trap -l`, `trap - sig` (reset to
+/// default) and `trap '' sig` (ignore) run nothing and are left as ordinary commands.
+///
+/// `-l` or `-p`, alone, repeated or combined (`-lp`, `-pl`), only list signal names or
+/// print current traps: bash reads no `arg` after either, even past a further `--`, so
+/// there is nothing to analyse. `--` (bash 3.2 and 5.2 accept only `-l`/`-p` as options,
+/// so this is the first non-option word either way) ends option parsing; the word after
+/// it is `arg`, read the same way as when there is no `--` (a literal `-` or `''` there
+/// keeps its special meaning: confirmed on both bashes that `trap -- - sig` still resets
+/// and `trap -- '' sig` still ignores). An option this analysis does not recognize (a
+/// later bash could add one) asks rather than guessing what it does to `arg`'s position.
+fn trap(args: &[Tok]) -> Option<Unwrapped> {
+    let mut i = 0;
+    if let Some(Tok::Lit(s)) = args.first() {
+        if s == "--" {
+            i = 1;
+        } else if let Some(opts) = s.strip_prefix('-').filter(|o| !o.is_empty()) {
+            return if opts.chars().all(|c| c == 'l' || c == 'p') {
+                None
+            } else {
+                Some(opaque(
+                    "`trap` uses an option this analysis does not recognize",
+                ))
+            };
+        }
+    }
+    match args.get(i)? {
+        Tok::Lit(s) if matches!(s.as_str(), "-" | "") => None,
+        Tok::Lit(src) => Some(Unwrapped {
+            next: vec![Next::Script(src.clone())],
+            unknown_cwd: true,
+            ..Default::default()
+        }),
+        _ => Some(opaque(
+            "`trap` sets an action whose text is only known at run time",
+        )),
+    }
+}
+
+/// `compgen`/`complete`'s `-C command` runs `command` as a full command; `-W wordlist`
+/// expands each word of `wordlist` (so a command substitution in it runs); both are
+/// analyzed as nested shell text when literal. `-F function` runs a shell function this
+/// analysis cannot see, so it always asks. Other options take no action text.
+fn completion_action(name: &str, args: &[Tok]) -> Option<Unwrapped> {
+    let mut i = 0;
+    while let Some(tok) = args.get(i) {
+        i += 1;
+        let Some(s) = tok.lit() else { continue };
+        if s == "--" {
+            break;
+        }
+        let Some(rest) = s.strip_prefix('-').filter(|r| !r.is_empty()) else {
+            continue;
+        };
+        let mut chars = rest.chars();
+        let mut opt = None;
+        for c in chars.by_ref() {
+            if "ACWFGXPSo".contains(c) {
+                opt = Some(c);
+                break;
+            }
+        }
+        let Some(opt) = opt else { continue };
+        let attached = chars.as_str();
+        let value = if !attached.is_empty() {
+            Some(Tok::Lit(attached.to_owned()))
+        } else {
+            let v = args.get(i).cloned();
+            i += 1;
+            v
+        };
+        if opt == 'F' {
+            return Some(opaque(&format!(
+                "`{name} -F` runs a shell function whose body this analysis does not see"
+            )));
+        }
+        if opt == 'C' || opt == 'W' {
+            return Some(match value {
+                Some(Tok::Lit(src)) => Unwrapped {
+                    next: vec![Next::Script(src)],
+                    unknown_cwd: true,
+                    ..Default::default()
+                },
+                _ => opaque(&format!("`{name} -{opt}` runs text only known at run time")),
+            });
+        }
+    }
+    None
 }
 
 fn xargs(args: &[Tok]) -> Unwrapped {

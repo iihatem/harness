@@ -1,7 +1,9 @@
 //! A build without ChatGPT sign-in (`--no-default-features`): what it says when asked for it,
 //! and that no hint points to a `harness login chatgpt` it does not have. CI runs these with
-//! `cargo test -p harness-cli --no-default-features --test no_sign_in_e2e`.
-#![cfg(not(feature = "chatgpt-login"))]
+//! `cargo test -p harness-cli --no-default-features --test no_sign_in_e2e`. `harness logout`
+//! stays off the real keychain through a test hook that release builds ignore, so the suite is
+//! built in debug builds only.
+#![cfg(all(not(feature = "chatgpt-login"), debug_assertions))]
 
 mod common;
 use common::Isolate;

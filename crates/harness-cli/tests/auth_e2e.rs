@@ -1,5 +1,8 @@
 //! `harness auth add`, `auth use` and `logout`, and which key requests carry. Credentials go to
-//! the file store (`HARNESS_CREDENTIAL_STORE=file`), so the tests never touch a real keychain.
+//! the file store (`HARNESS_CREDENTIAL_STORE=file`), and the debug-only `HARNESS_TEST_NO_KEYCHAIN`
+//! keeps storing and removing off the real keychain: a release build ignores it, so the suite is
+//! built in debug builds only.
+#![cfg(debug_assertions)]
 
 mod common;
 use common::Isolate;

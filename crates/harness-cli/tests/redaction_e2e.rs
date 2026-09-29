@@ -470,7 +470,9 @@ async fn the_debug_log_holds_the_warnings_printed_at_startup() {
 }
 
 // Review F M6: `--debug` logs a run of `harness ask`; with another command it did nothing,
-// silently.
+// silently. Should the refusal break, `logout` would reach the keychain: only the debug-only test
+// hook keeps it off the real one.
+#[cfg(debug_assertions)]
 #[test]
 fn debug_with_another_command_is_refused() {
     let home = TempDir::new().unwrap();
@@ -487,7 +489,7 @@ fn debug_with_another_command_is_refused() {
         let output = Command::new(BIN)
             .args(args)
             .env("HARNESS_HOME", home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);

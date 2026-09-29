@@ -1,6 +1,8 @@
 //! `harness login` against a mock OAuth server that also plays ChatGPT's backend. The tests use
-//! the device flow, which needs no browser; tokens go to the file store.
-#![cfg(feature = "chatgpt-login")]
+//! the device flow, which needs no browser; tokens go to the file store. The mock servers and the
+//! file store stand in for OpenAI and the keychain through test hooks that release builds ignore,
+//! so the suite is built in debug builds only.
+#![cfg(all(feature = "chatgpt-login", debug_assertions))]
 
 mod common;
 use common::Isolate;

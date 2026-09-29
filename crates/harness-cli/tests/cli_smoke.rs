@@ -133,6 +133,9 @@ fn help_lists_the_credential_commands() {
         .stdout(contains("--profile").and(contains("standard input")));
 }
 
+// Should the refusal break, `logout` would reach the keychain: only the debug-only test hook keeps
+// it off the real one.
+#[cfg(debug_assertions)]
 #[test]
 fn session_flags_with_the_credential_commands_are_refused() {
     let home = tempfile::tempdir().unwrap();

@@ -274,6 +274,9 @@ fn provider_and_profile_names_are_checked() {
     assert!(creds.use_profile("openai", "a b").is_err());
 }
 
+// `Credentials::open` reaches the platform keychain unless the test hook, which release builds
+// ignore, leaves it out: storing would remove the real keychain's entry.
+#[cfg(debug_assertions)]
 #[test]
 fn the_file_store_can_be_chosen_with_an_environment_variable() {
     let dir = tempfile::tempdir().unwrap();
@@ -583,6 +586,7 @@ fn keychain_operations_give_up_after_their_time_limit() {
     assert_eq!(limited.describe(), "a stuck keychain");
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn an_unknown_store_choice_is_a_warning() {
     let dir = tempfile::tempdir().unwrap();

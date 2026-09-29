@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use crate::credentials::Credentials;
+
 use harness_config::config::{Protocol, ProviderConfig};
 use harness_core::provider::Provider;
 
@@ -33,7 +35,7 @@ const fn builtin(
 }
 
 /// Providers usable without configuration.
-pub const BUILTIN_PROVIDERS: [Builtin; 6] = [
+pub const BUILTIN_PROVIDERS: [Builtin; 7] = [
     builtin(
         "ollama",
         Protocol::OpenaiChat,
@@ -70,7 +72,17 @@ pub const BUILTIN_PROVIDERS: [Builtin; 6] = [
         "https://api.anthropic.com/v1",
         Some("ANTHROPIC_API_KEY"),
     ),
+    // Signed in with `harness login chatgpt`, not a key.
+    builtin(
+        "chatgpt",
+        Protocol::OpenaiResponses,
+        "https://chatgpt.com/backend-api/codex",
+        None,
+    ),
 ];
+
+/// The built-in provider a ChatGPT account answers for.
+pub const CHATGPT: &str = "chatgpt";
 
 const LOCAL_PROVIDERS: [&str; 3] = ["ollama", "lmstudio", "llamacpp"];
 
@@ -88,6 +100,19 @@ pub enum ResolveError {
         "the key for `{provider}` is a Claude subscription token, which only Claude Code may use; harness needs an Anthropic API key (from console.anthropic.com)"
     )]
     SubscriptionToken { provider: String },
+    #[error("not signed in to {provider} (profile {profile}); run `{}`", login_command(.provider, .profile))]
+    NotSignedIn { provider: String, profile: String },
+    #[error("this build of harness was made without ChatGPT sign-in (the `chatgpt-login` feature)")]
+    SignInUnavailable,
+}
+
+/// The command that signs in to `provider` under `profile`.
+fn login_command(provider: &str, profile: &str) -> String {
+    if profile == crate::credentials::DEFAULT_PROFILE {
+        format!("harness login {provider}")
+    } else {
+        format!("harness login {provider} --profile {profile}")
+    }
 }
 
 /// Where API keys come from: environment variables, and keys stored with `harness auth add`.
@@ -96,6 +121,11 @@ pub trait Secrets {
     fn env(&self, var: &str) -> Option<String>;
     /// The key stored for `provider`'s active profile.
     fn stored(&self, _provider: &str) -> Option<String> {
+        None
+    }
+
+    /// The credential store, for providers that sign in (`chatgpt`).
+    fn credentials(&self) -> Option<Arc<Credentials>> {
         None
     }
 }
@@ -156,6 +186,9 @@ pub fn resolve(
         .split_once('/')
         .filter(|(p, m)| !p.is_empty() && !m.is_empty())
         .ok_or_else(|| ResolveError::BadId(model_id.to_string()))?;
+    if name == CHATGPT && !providers.contains_key(name) {
+        return chatgpt(model_id, model, &secrets);
+    }
     let (protocol, base_url, key_env) = if let Some(cfg) = providers.get(name) {
         (cfg.protocol, cfg.base_url.clone(), cfg.api_key_env.clone())
     } else if let Some(builtin) = BUILTIN_PROVIDERS.iter().find(|b| b.name == name) {
@@ -199,6 +232,54 @@ pub fn resolve(
         base_url,
         api_key,
     })
+}
+
+/// A `chatgpt/*` model, for the account signed in under the provider's active profile.
+/// `HARNESS_CHATGPT_ISSUER` and `HARNESS_CHATGPT_BASE_URL` point sign-in and requests elsewhere,
+/// for tests.
+#[cfg(feature = "chatgpt-login")]
+fn chatgpt(model_id: &str, model: &str, secrets: &impl Secrets) -> Result<Resolved, ResolveError> {
+    use crate::chatgpt::{
+        auth::{BASE_URL, ChatGptAuth},
+        oauth::{ISSUER, OAuth},
+    };
+    let credentials = secrets.credentials();
+    let profile = credentials
+        .as_ref()
+        .and_then(|c| c.active_profile(CHATGPT).ok())
+        .unwrap_or_else(|| crate::credentials::DEFAULT_PROFILE.to_string());
+    let not_signed_in = || ResolveError::NotSignedIn {
+        provider: CHATGPT.to_string(),
+        profile: profile.clone(),
+    };
+    let credentials = credentials.ok_or_else(not_signed_in)?;
+    let issuer = secrets
+        .env("HARNESS_CHATGPT_ISSUER")
+        .unwrap_or_else(|| ISSUER.to_string());
+    let auth = ChatGptAuth::load(credentials, &profile, OAuth::new(&issuer))
+        .ok()
+        .flatten()
+        .ok_or_else(not_signed_in)?;
+    let base_url = secrets
+        .env("HARNESS_CHATGPT_BASE_URL")
+        .unwrap_or_else(|| BASE_URL.to_string());
+    Ok(Resolved {
+        provider: Arc::new(OpenAiResponses::chatgpt(base_url.clone(), Arc::new(auth))),
+        model: model.to_string(),
+        id: model_id.to_string(),
+        protocol: Protocol::OpenaiResponses,
+        base_url,
+        api_key: None,
+    })
+}
+
+#[cfg(not(feature = "chatgpt-login"))]
+fn chatgpt(
+    _model_id: &str,
+    _model: &str,
+    _secrets: &impl Secrets,
+) -> Result<Resolved, ResolveError> {
+    Err(ResolveError::SignInUnavailable)
 }
 
 /// The three local servers, except any the user has redefined in config.

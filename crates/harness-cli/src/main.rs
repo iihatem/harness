@@ -2,6 +2,7 @@ mod ask;
 mod auth;
 mod context;
 mod doctor;
+mod login;
 mod models;
 mod prompt;
 mod sandbox;
@@ -62,6 +63,17 @@ enum Command {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+    /// Sign in to ChatGPT, in the browser or with a device code
+    Login {
+        /// The provider to sign in to: chatgpt
+        provider: String,
+        /// The account profile to sign in under
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Sign in with a device code instead of the browser (for SSH sessions)
+        #[arg(long)]
+        device: bool,
     },
     /// Remove a provider's stored credentials
     Logout {
@@ -157,6 +169,7 @@ fn command_line(command: &Command) -> &'static str {
         Command::Auth {
             command: AuthCommand::Use { .. },
         } => "harness auth use",
+        Command::Login { .. } => "harness login",
         Command::Logout { .. } => "harness logout",
         Command::Trust { .. } => "harness trust",
         Command::Sandbox { .. } => "harness sandbox doctor",
@@ -223,6 +236,11 @@ fn main() -> ExitCode {
             Some(Command::Auth {
                 command: AuthCommand::Use { provider, profile },
             }) => auth::use_profile(&provider, &profile),
+            Some(Command::Login {
+                provider,
+                profile,
+                device,
+            }) => login::run(&provider, &profile, device).await,
             Some(Command::Logout { provider, profile }) => {
                 auth::logout(&provider, profile.as_deref())
             }

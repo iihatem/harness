@@ -1463,6 +1463,19 @@ fn describe(error: &ProviderError) -> String {
             wait.as_secs()
         );
     }
+    if error.is_quota_exhausted() {
+        let resets = error
+            .resets_at()
+            .map(|at| format!("; it resets at {}", crate::time::timestamp(at)))
+            .unwrap_or_default();
+        let body: String = match error {
+            ProviderError::Http { body, .. } => body.chars().take(500).collect(),
+            _ => String::new(),
+        };
+        return format!(
+            "the provider's usage limit is reached{resets}. Switch models with --model (or /model in the terminal UI). HTTP 429: {body}"
+        );
+    }
     match error {
         ProviderError::Http { status: 429, .. } => {
             format!(

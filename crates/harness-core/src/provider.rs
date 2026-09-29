@@ -42,13 +42,51 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
-    /// Network errors, HTTP 429, and HTTP 5xx are worth retrying.
+    /// Network errors, HTTP 429, and HTTP 5xx are worth retrying; a 429 that reports an
+    /// exhausted quota or plan limit is not, since waiting seconds does not end it.
     pub fn is_retryable(&self) -> bool {
         match self {
             ProviderError::Network(_) => true,
-            ProviderError::Http { status, .. } => *status == 429 || (500..600).contains(status),
+            ProviderError::Http { status: 429, .. } => !self.is_quota_exhausted(),
+            ProviderError::Http { status, .. } => (500..600).contains(status),
             ProviderError::Protocol(_) | ProviderError::InStream(_) => false,
         }
+    }
+
+    /// Whether this is a 429 that reports an exhausted quota or plan limit: ChatGPT's
+    /// `usage_limit_reached` and `usage_not_included`, or OpenAI's `insufficient_quota`.
+    pub fn is_quota_exhausted(&self) -> bool {
+        let ProviderError::Http {
+            status: 429, body, ..
+        } = self
+        else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+        let error = &value["error"];
+        [&error["type"], &error["code"]].iter().any(|v| {
+            matches!(
+                v.as_str(),
+                Some("usage_limit_reached" | "usage_not_included" | "insufficient_quota")
+            )
+        })
+    }
+
+    /// When an exhausted limit resets, in seconds since the Unix epoch, if the provider said:
+    /// `resets_at`, or `resets_in_seconds` from now.
+    pub fn resets_at(&self) -> Option<u64> {
+        let ProviderError::Http { body, .. } = self else {
+            return None;
+        };
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        let error = &value["error"];
+        error["resets_at"].as_u64().or_else(|| {
+            error["resets_in_seconds"]
+                .as_u64()
+                .map(|secs| crate::time::now_unix() + secs)
+        })
     }
 
     /// Whether the provider rejected the request as longer than the model's context window.

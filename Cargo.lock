@@ -1197,6 +1197,7 @@ name = "harness-cli"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "base64 0.23.1",
  "clap",
  "harness-config",
  "harness-context",

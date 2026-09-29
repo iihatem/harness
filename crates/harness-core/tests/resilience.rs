@@ -243,3 +243,66 @@ async fn tool_calls_still_run_normally_without_interrupts() {
     assert_eq!(reason, TurnEndReason::Completed);
     assert_eq!(finished_outputs(&events), vec![("fine".to_string(), false)]);
 }
+
+fn quota(body: &str) -> ProviderError {
+    ProviderError::Http {
+        status: 429,
+        body: body.to_string(),
+        retry_after: None,
+    }
+}
+
+const USAGE_LIMIT: &str = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":1790208000}}"#;
+
+#[test]
+fn exhausted_quotas_are_not_worth_retrying() {
+    for body in [
+        USAGE_LIMIT,
+        r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+        r#"{"error":{"type":"usage_not_included","message":"Upgrade to use this model"}}"#,
+    ] {
+        let error = quota(body);
+        assert!(error.is_quota_exhausted(), "{body}");
+        assert!(!error.is_retryable(), "{body}");
+    }
+    let busy = quota(r#"{"error":{"type":"rate_limit_exceeded","message":"Slow down"}}"#);
+    assert!(!busy.is_quota_exhausted());
+    assert!(busy.is_retryable());
+    assert_eq!(quota(USAGE_LIMIT).resets_at(), Some(1_790_208_000));
+    let relative = quota(r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":60}}"#);
+    let resets = relative.resets_at().unwrap();
+    let now = harness_core::time::now_unix();
+    assert!((now + 55..=now + 65).contains(&resets), "{resets} vs {now}");
+}
+
+// Spec: "Subscription limit reached".
+#[tokio::test(start_paused = true)]
+async fn a_usage_limit_ends_the_turn_with_its_reset_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::error(quota(USAGE_LIMIT)),
+        Script::text("later"),
+    ]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert!(retries(&events).is_empty());
+    assert_eq!(provider.requests().len(), 1);
+    let message = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(message.contains("2026-09-24T00:00:00Z"), "{message}");
+    assert!(message.contains("--model"), "{message}");
+    // The session stays usable.
+    let (reason, _) = run(&mut agent, "again").await;
+    assert_eq!(reason, TurnEndReason::Completed);
+}

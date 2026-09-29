@@ -254,11 +254,20 @@ fn stream_error(error: &Value) -> ProviderError {
     }
 }
 
-/// A provider speaking the Responses protocol with an optional API key.
+/// How requests are authorized.
+enum Auth {
+    /// An API key, when the endpoint needs one.
+    Key(Option<String>),
+    /// A signed-in ChatGPT account.
+    #[cfg(feature = "chatgpt-login")]
+    ChatGpt(std::sync::Arc<crate::chatgpt::auth::ChatGptAuth>),
+}
+
+/// A provider speaking the Responses protocol, with an API key or a ChatGPT account.
 pub struct OpenAiResponses {
     client: reqwest::Client,
     base_url: String,
-    api_key: Option<String>,
+    auth: Auth,
 }
 
 impl OpenAiResponses {
@@ -266,20 +275,74 @@ impl OpenAiResponses {
         OpenAiResponses {
             client: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            api_key,
+            auth: Auth::Key(api_key),
+        }
+    }
+
+    /// ChatGPT's backend, as the signed-in account `auth`.
+    #[cfg(feature = "chatgpt-login")]
+    pub fn chatgpt(
+        base_url: impl Into<String>,
+        auth: std::sync::Arc<crate::chatgpt::auth::ChatGptAuth>,
+    ) -> Self {
+        OpenAiResponses {
+            client: reqwest::Client::new(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            auth: Auth::ChatGpt(auth),
         }
     }
 }
 
 impl Provider for OpenAiResponses {
     fn stream(&self, request: ChatRequest) -> ProviderStream {
-        let mut http = self
-            .client
-            .post(format!("{}/responses", self.base_url))
-            .json(&request_body(&request));
-        if let Some(key) = &self.api_key {
-            http = http.bearer_auth(key);
+        let url = format!("{}/responses", self.base_url);
+        match &self.auth {
+            Auth::Key(key) => {
+                let mut http = self.client.post(url).json(&request_body(&request));
+                if let Some(key) = key {
+                    http = http.bearer_auth(key);
+                }
+                sse::events(sse::send(http), ResponsesStreamParser::default())
+            }
+            #[cfg(feature = "chatgpt-login")]
+            Auth::ChatGpt(auth) => {
+                let mut body = request_body(&request);
+                // ChatGPT's backend takes no output limit (Codex never sends one).
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("max_output_tokens");
+                }
+                let (client, auth) = (self.client.clone(), auth.clone());
+                // A 401 renews the tokens once, and the request is sent once more.
+                let response = async move {
+                    let tokens = auth.current().await?;
+                    let first = sse::send(chatgpt_request(&client, &url, &body, &tokens)).await?;
+                    if first.status() != reqwest::StatusCode::UNAUTHORIZED {
+                        return Ok(first);
+                    }
+                    let tokens = auth.after_unauthorized(&tokens.access_token).await?;
+                    sse::send(chatgpt_request(&client, &url, &body, &tokens)).await
+                };
+                sse::events(response, ResponsesStreamParser::default())
+            }
         }
-        sse::events(sse::send(http), ResponsesStreamParser::default())
     }
+}
+
+/// A request to ChatGPT's backend: the access token, and the account it belongs to.
+#[cfg(feature = "chatgpt-login")]
+fn chatgpt_request(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    tokens: &crate::chatgpt::oauth::Tokens,
+) -> reqwest::RequestBuilder {
+    let mut request = client
+        .post(url)
+        .bearer_auth(&tokens.access_token)
+        .header("originator", crate::chatgpt::oauth::ORIGINATOR)
+        .json(body);
+    if let Some(account) = &tokens.account_id {
+        request = request.header("ChatGPT-Account-ID", account);
+    }
+    request
 }

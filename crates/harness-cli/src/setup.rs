@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use harness_config::{
     config::{self, Config},
@@ -15,7 +15,7 @@ pub struct Setup {
     /// The workspaces the user trusts.
     pub trust: TrustStore,
     /// Stored API keys and sign-in tokens.
-    pub credentials: Credentials,
+    pub credentials: Arc<Credentials>,
 }
 
 impl Setup {
@@ -30,7 +30,7 @@ impl Setup {
 /// API keys from the environment, then from the credential store (`harness auth add`).
 #[derive(Clone, Copy)]
 pub struct Keys<'a> {
-    credentials: &'a Credentials,
+    credentials: &'a Arc<Credentials>,
 }
 
 impl Secrets for Keys<'_> {
@@ -50,6 +50,10 @@ impl Secrets for Keys<'_> {
             }
         }
     }
+
+    fn credentials(&self) -> Option<Arc<Credentials>> {
+        Some(self.credentials.clone())
+    }
 }
 
 /// Loads paths and configuration. Errors are user-facing messages (exit code 2).
@@ -64,7 +68,7 @@ pub fn load() -> Result<Setup, String> {
     for warning in &config.warnings {
         eprintln!("warning: {}", crate::term::terminal_safe(warning));
     }
-    let credentials = Credentials::open(&paths.data_dir, env);
+    let credentials = Arc::new(Credentials::open(&paths.data_dir, env));
     Ok(Setup {
         paths,
         config,

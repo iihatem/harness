@@ -53,6 +53,8 @@ fn a_build_without_sign_in_says_so_and_never_points_to_it() {
         &["login", "chatgpt", "--device"],
         &["--model", "chatgpt/gpt-5.5", "ask", "hi"],
         &["auth", "add", "chatgpt"],
+        // Final review, M-4: refused like `auth add chatgpt`, rather than recording a profile.
+        &["auth", "use", "chatgpt", "work"],
     ] {
         env.cmd()
             .args(args)
@@ -62,12 +64,7 @@ fn a_build_without_sign_in_says_so_and_never_points_to_it() {
             .stderr(contains(UNAVAILABLE))
             .stderr(contains("harness login").not());
     }
-    env.cmd()
-        .args(["auth", "use", "chatgpt", "work"])
-        .assert()
-        .success()
-        .stdout(contains(UNAVAILABLE))
-        .stdout(contains("harness login").not());
+    assert!(!env.home.path().join("data/accounts.toml").exists());
     env.cmd()
         .args(["logout", "chatgpt"])
         .assert()

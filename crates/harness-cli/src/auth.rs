@@ -161,6 +161,11 @@ fn choose(setup: &Setup, provider: &str, profile: &str) -> u8 {
             );
             return 2;
         }
+        // A build without sign-in has no profile of it to choose, as it has none to add.
+        Some(Needs::SignIn) if !cfg!(feature = "chatgpt-login") => {
+            eprintln!("error: {}", ResolveError::SignInUnavailable);
+            return 2;
+        }
         Some(Needs::SignIn) => registry::sign_in_hint(provider, profile),
         Some(Needs::Key(_)) => format!("run `{}`", registry::auth_add_command(provider, profile)),
     };

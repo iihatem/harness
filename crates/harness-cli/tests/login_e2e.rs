@@ -244,6 +244,17 @@ fn only_chatgpt_can_be_signed_in_to() {
         .assert()
         .code(2)
         .stderr(contains("harness auth add openai"));
+    // Review B, M4: with the profile it was asked for.
+    env.cmd()
+        .args(["login", "openai", "--profile", "work"])
+        .assert()
+        .code(2)
+        .stderr(contains("`harness auth add openai --profile work`"));
+    env.cmd()
+        .args(["login", "anthropic", "--profile", "work"])
+        .assert()
+        .code(2)
+        .stderr(contains("`harness auth add anthropic --profile work`"));
     env.cmd()
         .args(["login", "nope"])
         .assert()
@@ -264,4 +275,76 @@ fn help_lists_login_with_its_flags() {
         .assert()
         .success()
         .stdout(contains("--device").and(contains("--profile")));
+}
+
+/// ChatGPT's backend: answers requests that carry `token`.
+async fn mock_backend_for(server: &MockServer, token: &str) {
+    let body = [
+        json!({"type": "response.output_text.delta", "output_index": 0, "delta": "hi from chatgpt"}),
+        json!({"type": "response.completed", "response": {"status": "completed"}}),
+    ]
+    .iter()
+    .map(|e| format!("data: {e}\n\n"))
+    .collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .and(header("authorization", format!("Bearer {token}").as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(server)
+        .await;
+}
+
+// Review C, I2 and I4: a sign-in renewed during `ask` that cannot be stored is still used, and
+// the user hears about it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renewal_that_cannot_be_stored_is_announced() {
+    let server = MockServer::start().await;
+    let renewed = access_token();
+    mock_backend_for(&server, &renewed).await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token": renewed, "refresh_token": "rt-2"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri());
+    // Signed in with an access token that expires within a minute.
+    let expiring = jwt(json!({"exp": harness_core::time::now_unix() + 60}));
+    let tokens =
+        json!({"access_token": expiring, "refresh_token": "rt-1", "account_id": "acct-123"});
+    let data = env.home.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        env.credentials(),
+        json!({"credentials": {"chatgpt/default": tokens.to_string()}}).to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(env.credentials(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The credentials file can be read, but nothing in the data directory can be written.
+    std::fs::write(data.join("credentials.json.lock"), "").unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let output = tokio::task::spawn_blocking(move || {
+        let output = env
+            .cmd()
+            .args(["--model", "chatgpt/gpt-5.5", "ask", "hi"])
+            .output()
+            .unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        output
+    })
+    .await
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hi from chatgpt"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("warning: the renewed ChatGPT sign-in could not be stored"),
+        "{stderr}"
+    );
 }

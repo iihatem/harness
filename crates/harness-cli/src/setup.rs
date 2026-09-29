@@ -26,6 +26,14 @@ pub struct Setup {
 }
 
 impl Setup {
+    /// Prints, on stderr, what the credential store has had to warn about since the last call:
+    /// that a credential went to the file, say, or that a renewed sign-in could not be stored.
+    pub fn print_credential_warnings(&self) {
+        for warning in self.credentials.take_warnings() {
+            eprintln!("warning: {}", crate::term::terminal_safe(&warning));
+        }
+    }
+
     /// API keys from the environment, then from the credential store.
     pub fn keys(&self) -> Keys<'_> {
         Keys {

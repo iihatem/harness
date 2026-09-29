@@ -15,6 +15,7 @@ use harness_core::{
     tool::{CommandSandbox, ToolContext},
 };
 use harness_providers::{
+    credentials::Credentials,
     profiles, registry,
     window::{self, LOAD_TIMEOUT, PROBE_TIMEOUT},
 };
@@ -61,6 +62,7 @@ pub async fn run(
     let Some(model_id) = model_flag.or_else(|| setup.config.model.clone()) else {
         eprintln!("error: no model configured.");
         let found = models::available(&setup).await;
+        setup.print_credential_warnings();
         if found.is_empty() {
             eprintln!(
                 "No local model servers were found. Start Ollama, LM Studio, or llama.cpp, or configure a provider."
@@ -77,7 +79,9 @@ pub async fn run(
         );
         return 2;
     };
-    let resolved = match registry::resolve(&model_id, &setup.config.providers, setup.keys()) {
+    let resolved = registry::resolve(&model_id, &setup.config.providers, setup.keys());
+    setup.print_credential_warnings();
+    let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(e) => {
             eprintln!("error: {}", terminal_safe(&e.to_string()));
@@ -265,6 +269,7 @@ pub async fn run(
     .with_checkpoints(checkpoints);
 
     let (tx, rx) = mpsc::unbounded_channel();
+    let rx = with_credential_warnings(rx, setup.credentials.clone());
     let renderer = tokio::spawn(render(
         rx,
         json,
@@ -452,6 +457,29 @@ async fn with_piped_stdin(prompt_text: String, cancel: CancellationToken) -> Std
     } else {
         StdinOutcome::Ready(format!("{prompt_text}\n\n{piped}"))
     }
+}
+
+/// Passes `events` on, each after what the credential store has had to warn about by then, as
+/// warning events: a sign-in renewed during the turn that could not be stored, say, is told
+/// before what the provider sent after the renewal.
+fn with_credential_warnings(
+    mut events: mpsc::UnboundedReceiver<AgentEvent>,
+    credentials: Arc<Credentials>,
+) -> mpsc::UnboundedReceiver<AgentEvent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let warnings = |tx: &mpsc::UnboundedSender<AgentEvent>| {
+            for message in credentials.take_warnings() {
+                let _ = tx.send(AgentEvent::Warning { message });
+            }
+        };
+        while let Some(event) = events.recv().await {
+            warnings(&tx);
+            let _ = tx.send(event);
+        }
+        warnings(&tx);
+    });
+    rx
 }
 
 /// Opens `<state>/logs/<run_id>.log` for `--debug`, readable only by its owner.

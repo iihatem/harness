@@ -1,7 +1,7 @@
 //! `harness login <provider>`: ChatGPT sign-in, in the browser or with a device code. Claude
 //! subscriptions cannot be signed in to: Anthropic allows them only in Claude Code.
 
-use harness_providers::registry::BUILTIN_PROVIDERS;
+use harness_providers::registry::{BUILTIN_PROVIDERS, auth_add_command};
 
 use crate::{setup::Setup, term::terminal_safe};
 
@@ -18,16 +18,30 @@ pub async fn run(provider: &str, profile: &str, device: bool) -> u8 {
             return 2;
         }
     };
+    let code = login(&setup, provider, profile, device).await;
+    setup.print_credential_warnings();
+    code
+}
+
+async fn login(setup: &Setup, provider: &str, profile: &str, device: bool) -> u8 {
+    if let Err(e) = harness_providers::credentials::check_name("profile", profile) {
+        eprintln!("error: {}", terminal_safe(&e.to_string()));
+        return 2;
+    }
     match provider {
-        "chatgpt" => sign_in(&setup, profile, device).await,
+        "chatgpt" => sign_in(setup, profile, device).await,
         "anthropic" | "claude" => {
             eprintln!(
-                "error: harness cannot sign in to Claude: Anthropic allows Claude Free, Pro and Max plans only in Claude Code. Use an Anthropic API key instead: `harness auth add anthropic`."
+                "error: harness cannot sign in to Claude: Anthropic allows Claude Free, Pro and Max plans only in Claude Code. Use an Anthropic API key instead: `{}`.",
+                auth_add_command("anthropic", profile)
             );
             2
         }
-        other if takes_a_key(&setup, other) => {
-            eprintln!("error: {other} takes an API key, not a sign-in: `harness auth add {other}`");
+        other if takes_a_key(setup, other) => {
+            eprintln!(
+                "error: {other} takes an API key, not a sign-in: `{}`",
+                auth_add_command(other, profile)
+            );
             2
         }
         other
@@ -59,13 +73,8 @@ async fn sign_in(_setup: &Setup, _profile: &str, _device: bool) -> u8 {
 async fn sign_in(setup: &Setup, profile: &str, device: bool) -> u8 {
     use harness_providers::{
         chatgpt::oauth::{ISSUER, OAuth},
-        credentials,
         registry::CHATGPT,
     };
-    if let Err(e) = credentials::check_name("profile", profile) {
-        eprintln!("error: {}", terminal_safe(&e.to_string()));
-        return 2;
-    }
     eprintln!("{NOTICE}");
     // A test hook: a mock authorization server.
     let issuer = crate::setup::env("HARNESS_CHATGPT_ISSUER").unwrap_or_else(|| ISSUER.to_string());
@@ -87,9 +96,7 @@ async fn sign_in(setup: &Setup, profile: &str, device: bool) -> u8 {
     };
     match setup.credentials.set(CHATGPT, profile, &tokens.to_json()) {
         Ok(place) => {
-            for warning in setup.credentials.take_warnings() {
-                eprintln!("warning: {}", terminal_safe(&warning));
-            }
+            setup.print_credential_warnings();
             let who = tokens
                 .email
                 .as_deref()

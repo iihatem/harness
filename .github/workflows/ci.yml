@@ -37,6 +37,13 @@ jobs:
         if: matrix.tier != 'full'
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         if: matrix.tier != 'full'
+      # A build without ChatGPT sign-in (the `chatgpt-login` feature), which D3 promises can be
+      # made quickly: it must build cleanly, and say what it lacks without pointing to it.
+      - name: Build and test without ChatGPT sign-in
+        if: matrix.tier != 'full'
+        run: |
+          cargo clippy -p harness-providers -p harness-cli --no-default-features --all-targets --locked -- -D warnings
+          cargo test -p harness-cli --no-default-features --locked --test no_sign_in_e2e
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
         env:

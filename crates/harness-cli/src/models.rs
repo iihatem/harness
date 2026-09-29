@@ -29,6 +29,7 @@ pub async fn run() -> u8 {
         }
     };
     let found = available(&setup).await;
+    setup.print_credential_warnings();
     if found.is_empty() {
         eprintln!(
             "No models found. Start Ollama, LM Studio, or llama.cpp, or configure a provider in {}.",

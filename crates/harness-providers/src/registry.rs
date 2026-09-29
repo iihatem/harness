@@ -122,6 +122,16 @@ pub fn login_command(provider: &str, profile: &str) -> String {
     with_profile(&format!("harness login {provider}"), profile)
 }
 
+/// How to sign in to `provider` under `profile`, as a hint: the command, or, in a build without
+/// ChatGPT sign-in, that there is none.
+pub fn sign_in_hint(provider: &str, profile: &str) -> String {
+    if cfg!(feature = "chatgpt-login") {
+        format!("sign in with `{}`", login_command(provider, profile))
+    } else {
+        ResolveError::SignInUnavailable.to_string()
+    }
+}
+
 /// The command that stores a key for `provider` under `profile`.
 pub fn auth_add_command(provider: &str, profile: &str) -> String {
     with_profile(&format!("harness auth add {provider}"), profile)

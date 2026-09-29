@@ -7,6 +7,7 @@ use common::Isolate;
 use std::os::unix::fs::PermissionsExt;
 
 use assert_cmd::Command;
+use predicates::prelude::*;
 use predicates::str::contains;
 use serde_json::json;
 use tempfile::TempDir;
@@ -293,4 +294,158 @@ fn auth_add_refuses_claude_subscription_tokens_for_every_provider() {
     env.add("mock", None, "\u{feff}sk-marked\n").success();
     let stored = std::fs::read_to_string(env.credentials()).unwrap();
     assert!(stored.contains("\"sk-marked\""), "{stored:?}");
+}
+
+// Review B, M4: every hint leads somewhere: `auth use` refuses a provider there is nothing to
+// store for, rather than suggesting an `auth add` that is refused too; and `auth add` says when
+// the environment's key wins over the one just stored.
+#[test]
+fn hints_lead_somewhere() {
+    let env = Env::new("http://127.0.0.1:9", "");
+    env.cmd()
+        .args(["auth", "use", "ollama", "work"])
+        .assert()
+        .code(2)
+        .stderr(contains("needs no credentials"))
+        .stdout(contains("auth add").not());
+    env.cmd()
+        .env("MOCK_API_KEY", "sk-from-env")
+        .args(["auth", "add", "mock"])
+        .write_stdin("sk-stored\n")
+        .assert()
+        .success()
+        .stderr(contains("$MOCK_API_KEY is set"));
+    env.cmd()
+        .args(["auth", "use", "mock", "work"])
+        .assert()
+        .success()
+        .stdout(contains("`harness auth add mock --profile work`"));
+}
+
+/// Runs `auth add mock` with `stdin` written to it and left open, and returns how it ended, or
+/// `None` when it was still waiting after ten seconds (it is then killed).
+fn add_with_open_pipe(env: &Env, stdin: &[u8]) -> Option<std::process::Output> {
+    use std::io::Write;
+    let mut child = std::process::Command::new(BIN)
+        .current_dir(env.ws.path())
+        .env("HARNESS_HOME", env.home.path())
+        .env("HOME", env.user_home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("MOCK_API_KEY")
+        .isolate()
+        .args(["auth", "add", "mock"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pipe = child.stdin.take().unwrap();
+    pipe.write_all(stdin).unwrap();
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(10) {
+        if child.try_wait().unwrap().is_some() {
+            drop(pipe);
+            return Some(child.wait_with_output().unwrap());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    None
+}
+
+// Review B, M6: a password manager that keeps the pipe open does not hold `auth add` up: the key
+// is the first line with something on it.
+#[test]
+fn a_piped_key_is_read_up_to_its_line_only() {
+    let env = Env::new("http://127.0.0.1:9", "");
+    let output = add_with_open_pipe(&env, b"\n  sk-first \nsk-second\n").expect("it returned");
+    assert!(output.status.success(), "{output:?}");
+    let stored = std::fs::read_to_string(env.credentials()).unwrap();
+    assert!(stored.contains("\"sk-first\""), "{stored}");
+    assert!(!stored.contains("sk-second"), "{stored}");
+}
+
+// Review B, M6: there is a limit to what is read, and what is not text is an input error.
+#[test]
+fn a_key_too_long_or_not_text_is_refused() {
+    let env = Env::new("http://127.0.0.1:9", "");
+    let long = vec![b'k'; 100 * 1024];
+    let output = add_with_open_pipe(&env, &long).expect("it returned");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("too long"),
+        "{output:?}"
+    );
+    let mut cmd = env.cmd();
+    cmd.args(["auth", "add", "mock"])
+        .write_stdin(vec![0xff, 0xfe, b'\n'])
+        .assert()
+        .code(2)
+        .stderr(contains("UTF-8"));
+    assert!(!env.credentials().exists());
+}
+
+// Review B, M6: Ctrl+C at the hidden prompt leaves the terminal as it found it, echo included.
+#[test]
+fn ctrl_c_at_the_hidden_prompt_restores_the_terminal() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::sys::termios::{LocalFlags, tcgetattr};
+    use nix::unistd::Pid;
+    use std::os::unix::process::ExitStatusExt;
+    let env = Env::new("http://127.0.0.1:9", "");
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let tty = || std::process::Stdio::from(pty.slave.try_clone().unwrap());
+    assert!(
+        tcgetattr(&pty.slave)
+            .unwrap()
+            .local_flags
+            .contains(LocalFlags::ECHO)
+    );
+    let mut child = std::process::Command::new(BIN)
+        .current_dir(env.ws.path())
+        .env("HARNESS_HOME", env.home.path())
+        .env("HOME", env.user_home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .isolate()
+        .args(["auth", "add", "mock"])
+        .stdin(tty())
+        .stdout(tty())
+        .stderr(tty())
+        .spawn()
+        .unwrap();
+    // Wait for the prompt to turn echo off.
+    let started = std::time::Instant::now();
+    while tcgetattr(&pty.slave)
+        .unwrap()
+        .local_flags
+        .contains(LocalFlags::ECHO)
+    {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "echo was never turned off"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).unwrap();
+    let status = child.wait().unwrap();
+    assert!(
+        status.signal() == Some(libc_sigint()) || status.code() == Some(130),
+        "{status:?}"
+    );
+    assert!(
+        tcgetattr(&pty.slave)
+            .unwrap()
+            .local_flags
+            .contains(LocalFlags::ECHO)
+    );
+    assert!(!env.credentials().exists());
+}
+
+fn libc_sigint() -> i32 {
+    nix::sys::signal::Signal::SIGINT as i32
 }

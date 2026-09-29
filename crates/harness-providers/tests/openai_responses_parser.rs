@@ -91,6 +91,64 @@ fn reasoning_summaries_are_reasoning_deltas() {
     );
 }
 
+/// The events a parser yields for these payloads.
+fn events_of(payloads: &[serde_json::Value]) -> Vec<ProviderEvent> {
+    let mut parser = ResponsesStreamParser::default();
+    payloads
+        .iter()
+        .flat_map(|p| parser.push(&p.to_string()).unwrap())
+        .collect()
+}
+
+// Review A M1: parts of a summary are separate paragraphs, as Codex shows them.
+#[test]
+fn summary_parts_are_separated() {
+    let part = |index: u64| {
+        json!({"type": "response.reasoning_summary_part.added",
+        "item_id": "rs_1", "output_index": 0, "summary_index": index,
+        "part": {"type": "summary_text", "text": ""}})
+    };
+    let delta = |index: u64, text: &str| {
+        json!({"type": "response.reasoning_summary_text.delta",
+        "item_id": "rs_1", "output_index": 0, "summary_index": index, "delta": text})
+    };
+    assert_eq!(
+        events_of(&[
+            part(0),
+            delta(0, "**First**"),
+            part(1),
+            delta(1, "**Second**")
+        ]),
+        [
+            ProviderEvent::ReasoningDelta("**First**".into()),
+            ProviderEvent::ReasoningDelta("\n\n".into()),
+            ProviderEvent::ReasoningDelta("**Second**".into()),
+        ]
+    );
+}
+
+// Review A M2: a refusal is what the model answered; it must reach the user.
+#[test]
+fn a_refusal_arrives_as_text() {
+    let events = events_of(&[
+        json!({"type": "response.refusal.delta", "item_id": "msg_1", "output_index": 0,
+            "content_index": 0, "delta": "I can't help"}),
+        json!({"type": "response.refusal.delta", "item_id": "msg_1", "output_index": 0,
+            "content_index": 0, "delta": " with that."}),
+        json!({"type": "response.refusal.done", "item_id": "msg_1", "output_index": 0,
+            "content_index": 0, "refusal": "I can't help with that."}),
+        json!({"type": "response.completed", "response": {"status": "completed"}}),
+    ]);
+    assert_eq!(
+        events,
+        [
+            ProviderEvent::TextDelta("I can't help".into()),
+            ProviderEvent::TextDelta(" with that.".into()),
+            ProviderEvent::Finished(FinishReason::Stop),
+        ]
+    );
+}
+
 #[test]
 fn a_reply_stopped_by_the_output_limit_finishes_with_length() {
     let events = parse("incomplete.sse").unwrap();
@@ -315,14 +373,50 @@ fn the_request_carries_the_whole_conversation_without_server_state() {
             "parameters": {"type": "object"}, "strict": false}])
     );
     assert_eq!(body["tool_choice"], "auto");
+    // Reasoning is asked for by model: see `reasoning_models_are_asked_for_summaries`.
     for absent in [
         "max_output_tokens",
         "temperature",
-        "reasoning",
         "previous_response_id",
+        "include",
     ] {
         assert!(body.get(absent).is_none(), "{absent} should be absent");
     }
+}
+
+// Review A M1 (decision 3): a reasoning model streams its summaries even when no profile sets a
+// reasoning effort; the API's default effort is kept. Other models get no `reasoning`.
+#[test]
+fn reasoning_models_are_asked_for_summaries() {
+    for (model, reasons) in [
+        ("gpt-5", true),
+        ("gpt-5-codex", true),
+        ("gpt-5.1-mini", true),
+        ("o3", true),
+        ("o4-mini", true),
+        ("o1-pro", true),
+        ("gpt-5-chat-latest", false),
+        ("gpt-4.1", false),
+        ("gpt-4o-mini", false),
+        ("omni-moderation-latest", false),
+    ] {
+        let mut request = conversation();
+        request.model = model.into();
+        let body = request_body(&request);
+        if reasons {
+            assert_eq!(body["reasoning"], json!({"summary": "auto"}), "{model}");
+        } else {
+            assert!(body.get("reasoning").is_none(), "{model}");
+        }
+    }
+    // A profile's effort says the model reasons, whatever its name.
+    let mut request = conversation();
+    request.model = "my-reasoner".into();
+    request.options.reasoning_effort = Some("low".into());
+    assert_eq!(
+        request_body(&request)["reasoning"],
+        json!({"effort": "low", "summary": "auto"})
+    );
 }
 
 #[test]

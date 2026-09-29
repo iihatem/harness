@@ -83,10 +83,23 @@ pub fn request_body(req: &ChatRequest) -> Value {
     if let Some(temperature) = req.options.temperature {
         body["temperature"] = json!(temperature);
     }
+    // Summaries stream as reasoning deltas; without a profile's effort, the API's default is kept.
     if let Some(effort) = &req.options.reasoning_effort {
         body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+    } else if reasons(&req.model) {
+        body["reasoning"] = json!({"summary": "auto"});
     }
     body
+}
+
+/// Whether `model` is one of OpenAI's reasoning families, `gpt-5*` (but not its non-reasoning
+/// `gpt-5-chat*`) and `o1`, `o3`, `o4-mini` and the like, which take reasoning settings.
+fn reasons(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    let o_series = model
+        .strip_prefix('o')
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    o_series || (model.starts_with("gpt-5") && !model.starts_with("gpt-5-chat"))
 }
 
 #[derive(Debug, Default)]
@@ -112,7 +125,8 @@ impl ResponsesStreamParser {
         let mut out = Vec::new();
         let delta = || event["delta"].as_str().filter(|d| !d.is_empty());
         match event["type"].as_str().unwrap_or_default() {
-            "response.output_text.delta" => {
+            // A refusal is the model's answer, and is shown as one.
+            "response.output_text.delta" | "response.refusal.delta" => {
                 if let Some(text) = delta() {
                     out.push(ProviderEvent::TextDelta(text.to_string()));
                 }
@@ -120,6 +134,12 @@ impl ResponsesStreamParser {
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 if let Some(text) = delta() {
                     out.push(ProviderEvent::ReasoningDelta(text.to_string()));
+                }
+            }
+            // Each part of a summary after the first starts a new paragraph.
+            "response.reasoning_summary_part.added" => {
+                if event["summary_index"].as_u64().is_some_and(|i| i > 0) {
+                    out.push(ProviderEvent::ReasoningDelta("\n\n".into()));
                 }
             }
             "response.output_item.added" | "response.output_item.done"
@@ -365,9 +385,13 @@ impl Provider for OpenAiResponses {
             #[cfg(feature = "chatgpt-login")]
             Auth::ChatGpt(auth) => {
                 let mut body = request_body(&request);
-                // ChatGPT's backend takes no output limit (Codex never sends one).
+                // ChatGPT's backend takes no output limit (Codex never sends one). Every model it
+                // serves reasons, and streams its summaries.
                 if let Some(object) = body.as_object_mut() {
                     object.remove("max_output_tokens");
+                    object
+                        .entry("reasoning")
+                        .or_insert_with(|| json!({"summary": "auto"}));
                 }
                 let (client, auth) = (self.client.clone(), auth.clone());
                 // A 401 renews the tokens once, and the request is sent once more.

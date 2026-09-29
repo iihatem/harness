@@ -195,6 +195,28 @@ async fn requests_carry_the_token_and_the_account() {
     assert!(body.get("max_output_tokens").is_none(), "{body}");
 }
 
+// Review A M1: every model ChatGPT's backend serves reasons, so each streams its summaries,
+// whatever its name.
+#[tokio::test]
+async fn chatgpt_models_are_asked_for_reasoning_summaries() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(text_reply())
+        .mount(&server)
+        .await;
+    let signed = Signed::new(&tokens(&access_token("a", 3600), "rt-1"));
+    let request = ChatRequest {
+        model: "codex-mini-latest".into(),
+        ..request()
+    };
+    let events: Vec<_> = signed.provider(&server).stream(request).collect().await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    let body: Value = server.received_requests().await.unwrap()[0]
+        .body_json()
+        .unwrap();
+    assert_eq!(body["reasoning"], json!({"summary": "auto"}));
+}
+
 // Spec: "Expired access token".
 #[tokio::test]
 async fn a_401_refreshes_the_token_and_retries_once() {

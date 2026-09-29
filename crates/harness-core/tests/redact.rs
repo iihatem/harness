@@ -555,3 +555,45 @@ fn occurrences_are_where_secrets_are() {
     );
     assert!(redactor.occurrences("nothing here").is_empty());
 }
+
+// Some servers report usage with every chunk, so a usage event can arrive between the deltas of
+// one reply. It does not end the reply: the streams go on, and the secret is still whole.
+#[test]
+fn a_usage_event_between_deltas_does_not_split_a_secret() {
+    use harness_core::event::AgentEvent;
+    use harness_core::message::Usage;
+    use harness_core::redact::EventRedactor;
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(KEY);
+    let (head, tail) = KEY.split_at(10);
+    let usage = AgentEvent::Usage {
+        model: "mock/m".into(),
+        usage: Usage::default(),
+    };
+    let mut events = EventRedactor::new(redactor);
+    let mut shown = Vec::new();
+    for event in [
+        AgentEvent::TextDelta {
+            text: format!("key {head}"),
+        },
+        usage.clone(),
+        AgentEvent::TextDelta {
+            text: tail.to_string(),
+        },
+    ] {
+        shown.extend(events.push(event));
+    }
+    shown.extend(events.finish());
+    assert_eq!(
+        shown,
+        [
+            AgentEvent::TextDelta {
+                text: "key ".into()
+            },
+            usage,
+            AgentEvent::TextDelta {
+                text: REDACTED.into()
+            },
+        ]
+    );
+}

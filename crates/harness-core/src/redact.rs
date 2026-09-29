@@ -145,12 +145,7 @@ impl Redactor {
     /// values of the [`WORD_FIELDS`] are left alone.
     pub fn redact_value(&self, value: &mut Value) {
         match value {
-            Value::String(text) => {
-                let redacted = self.redact(text);
-                if redacted != *text {
-                    *text = redacted;
-                }
-            }
+            Value::String(text) => *text = self.redact(text),
             Value::Array(items) => items.iter_mut().for_each(|item| self.redact_value(item)),
             Value::Object(fields) => {
                 for (name, field) in fields.iter_mut() {
@@ -242,7 +237,8 @@ impl StreamRedactor {
 /// Redacts a turn's events for a frontend to show or write: the strings of each event, and the
 /// text of the deltas across events, through one stream for the reply's text and one for its
 /// reasoning. What the streams hold back comes out, as deltas, before the next event of another
-/// kind and at [`finish`](Self::finish).
+/// kind (other than usage, which can arrive while a reply streams) and at
+/// [`finish`](Self::finish).
 #[derive(Debug)]
 pub struct EventRedactor {
     redactor: Arc<Redactor>,
@@ -268,6 +264,8 @@ impl EventRedactor {
             AgentEvent::ReasoningDelta { text } => delta(self.reasoning.push(&text), |text| {
                 AgentEvent::ReasoningDelta { text }
             }),
+            // Some servers report usage with every chunk: it does not end the reply.
+            usage @ AgentEvent::Usage { .. } => vec![self.redactor.redact_event(&usage)],
             other => {
                 let mut shown = self.finish();
                 shown.push(self.redactor.redact_event(&other));

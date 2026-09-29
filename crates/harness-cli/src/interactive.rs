@@ -508,6 +508,7 @@ mod tests {
             credentials: Arc::new(Credentials::with_keychain(&paths.data_dir, None)),
             redactor,
             paths,
+            env: Arc::new(|_| None),
         });
         let commands =
             harness_context::commands::discover(&workspace, &setup.paths.config_dir, None);

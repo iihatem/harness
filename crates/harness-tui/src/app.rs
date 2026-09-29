@@ -28,6 +28,7 @@ use ratatui::{
     layout::Position,
     text::{Line, Span},
 };
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -48,12 +49,6 @@ pub const QUIT_WINDOW: Duration = Duration::from_secs(2);
 
 /// Said under a prompt once keys typed while it waited went to the input instead.
 const TYPED_PAST: &str = "your typing went to your message; the prompt takes keys once you pause";
-
-/// Built-in commands that come with the rest of the terminal UI, and where.
-const LATER: [(&str, &str); 1] = [(
-    "login",
-    "with sign-in inside the session; for now, run `harness login <provider>` or `harness auth add <provider>` in a shell",
-)];
 
 /// What the model picker says when no model is found.
 const NO_MODELS: &str = "no models found: start Ollama, LM Studio or llama.cpp, add a provider's API key with `harness auth add <provider>`, or sign in to ChatGPT with `harness login chatgpt`";
@@ -128,6 +123,8 @@ pub enum Done {
     },
     /// `/model`: the model the session continues on, or why it could not switch.
     Model(Result<ModelView, String>),
+    /// `/login`: what to tell the user, or why it did not sign in.
+    LoggedIn(Result<String, String>),
 }
 
 /// A session the agent is to continue in, as the host opened it.
@@ -207,6 +204,18 @@ pub trait Host: Send {
     ) -> BoxFuture<'static, Result<ModelSwitch, String>> {
         Box::pin(async { Err("the model cannot change".into()) })
     }
+    /// Signs in to `provider`, with a device code when `device` is set: what the user must do
+    /// (the address to open, the code) goes to `notes` as it comes, and `cancel` stops it. Ok:
+    /// what to tell the user; errors say why not.
+    fn login(
+        &self,
+        _provider: &str,
+        _device: bool,
+        _notes: mpsc::UnboundedSender<String>,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<String, String>> {
+        Box::pin(async { Err("sign-in is not available here".into()) })
+    }
 }
 
 /// Settings of the interactive session.
@@ -255,6 +264,8 @@ pub enum Action {
     ListModels,
     /// Continue on the model with this id.
     SwitchModel(String),
+    /// Sign in to a provider, with a device code when `device` is set.
+    Login { provider: String, device: bool },
     /// Stop the running turn.
     Interrupt,
     /// Leave harness.
@@ -465,6 +476,16 @@ impl App {
                 }
             }
             Done::Session { resumed, result } => self.session_started(resumed, result),
+            Done::LoggedIn(Ok(done)) => {
+                self.transcript.push_note(&done, width);
+                self.transcript.push_note(
+                    "/model chatgpt/<model> uses it; /model lists the models your plan includes",
+                    width,
+                );
+            }
+            Done::LoggedIn(Err(why)) => self
+                .transcript
+                .push_error(&format!("could not sign in: {why}"), width),
             Done::Model(result) => {
                 let wanted = self.switching.take().unwrap_or_default();
                 match result {
@@ -495,6 +516,16 @@ impl App {
     /// Shows approvals with the secrets `redactor` knows replaced.
     pub fn set_redactor(&mut self, redactor: Arc<Redactor>) {
         self.redactor = Some(redactor);
+    }
+
+    /// Shows `text`, something the host says, as a note, with the secrets harness knows
+    /// replaced.
+    pub fn push_note(&mut self, text: &str) {
+        let text = match &self.redactor {
+            Some(redactor) => redactor.redact(text),
+            None => text.to_string(),
+        };
+        self.transcript.push_note(&text, self.width);
     }
 
     /// What the CLI provides.
@@ -1136,8 +1167,33 @@ impl App {
         let width = self.width;
         match name {
             "quit" => return self.quit(),
-            "mode" | "compact" | "rewind" | "new" | "resume" | "model"
+            "mode" | "compact" | "rewind" | "new" | "resume" | "model" | "login"
                 if !self.between_turns(name) => {}
+            "login" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                let mut words = args.split_whitespace();
+                let mut provider = None;
+                let mut device = false;
+                for word in words.by_ref() {
+                    match word {
+                        "--device" => device = true,
+                        _ if provider.is_none() => provider = Some(word.to_string()),
+                        other => {
+                            self.transcript.push_error(
+                                &format!("/login takes a provider and --device, not `{other}`"),
+                                width,
+                            );
+                            return None;
+                        }
+                    }
+                }
+                self.working = Some("signing in".into());
+                return Some(Action::Login {
+                    provider: provider.unwrap_or_else(|| "chatgpt".into()),
+                    device,
+                });
+            }
             "model" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
@@ -1199,21 +1255,12 @@ impl App {
                 self.transcript.push_lines(lines, width);
             }
             _ => {
-                if let Some((_, when)) = LATER.iter().find(|(n, _)| *n == name) {
-                    self.editor.submit();
-                    self.transcript.push_user(full, width);
-                    self.transcript.push_note(
-                        &format!("/{name} is not available yet: it comes {when}."),
-                        width,
-                    );
-                } else {
-                    self.transcript.push_error(
-                        &format!(
-                            "unknown command /{name}; custom commands are Markdown files in .harness/commands, .claude/commands or .opencode/commands; to send text that starts with /, put a word before it"
-                        ),
-                        width,
-                    );
-                }
+                self.transcript.push_error(
+                    &format!(
+                        "unknown command /{name}; custom commands are Markdown files in .harness/commands, .claude/commands or .opencode/commands; to send text that starts with /, put a word before it"
+                    ),
+                    width,
+                );
             }
         }
         None

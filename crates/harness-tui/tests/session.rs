@@ -285,33 +285,15 @@ async fn help_lists_the_commands_and_the_keys() {
 }
 
 #[tokio::test]
-async fn later_built_ins_say_so_and_unknown_commands_are_explained() {
+async fn unknown_commands_are_explained() {
     let dir = tempfile::tempdir().unwrap();
     let provider = MockProvider::new(Vec::new());
     let mut ui = start(provider.clone(), dir.path());
-    type_text(&mut ui, "/login");
-    press(&mut ui, KeyCode::Esc);
-    press(&mut ui, KeyCode::Enter);
-    assert!(shows(&ui, "/login is not available yet"));
     type_text(&mut ui, "/nope");
     press(&mut ui, KeyCode::Enter);
     assert!(shows(&ui, "unknown command /nope"));
     assert_eq!(ui.app().editor().text(), "/nope");
     assert!(provider.requests().is_empty());
-    ui.finish().await.unwrap();
-}
-
-// Review C, minor 8: `/login` said it comes "with provider sign-in (P4)"; P4 shipped, and a phase
-// name means nothing to a user. It should say what to do now instead. (`/model` works now.)
-#[tokio::test]
-async fn login_says_what_to_do_now_not_a_phase_name() {
-    let dir = tempfile::tempdir().unwrap();
-    let provider = MockProvider::new(Vec::new());
-    let mut ui = start(provider, dir.path());
-    type_text(&mut ui, "/login");
-    press(&mut ui, KeyCode::Enter);
-    assert!(shows(&ui, "harness login") || shows(&ui, "harness auth add"));
-    assert!(!shows(&ui, "P4"));
     ui.finish().await.unwrap();
 }
 

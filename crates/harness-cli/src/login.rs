@@ -1,9 +1,25 @@
-//! `harness login <provider>`: ChatGPT sign-in, in the browser or with a device code. Claude
-//! subscriptions cannot be signed in to: Anthropic allows them only in Claude Code.
+//! `harness login <provider>`, and `/login` inside the session: ChatGPT sign-in, in the browser
+//! or with a device code. Claude subscriptions cannot be signed in to: Anthropic allows them
+//! only in Claude Code.
 
 use harness_providers::registry::{BUILTIN_PROVIDERS, auth_add_command};
+use tokio_util::sync::CancellationToken;
 
 use crate::{setup::Setup, term::terminal_safe};
+
+/// What a sign-in says while it runs: the notice, the address to open, the device code.
+pub type Say = dyn Fn(String) + Send + Sync;
+
+/// Why a sign-in did not happen: the message, and `harness login`'s exit code.
+#[derive(Debug)]
+pub struct Failed {
+    pub code: u8,
+    pub message: String,
+}
+
+fn failed(code: u8, message: String) -> Failed {
+    Failed { code, message }
+}
 
 /// What every ChatGPT sign-in says first.
 #[cfg(feature = "chatgpt-login")]
@@ -28,137 +44,172 @@ async fn login(setup: &Setup, provider: &str, profile: &str, device: bool) -> u8
         eprintln!("error: {}", terminal_safe(&e.to_string()));
         return 2;
     }
-    match provider {
-        "chatgpt" => sign_in(setup, profile, device).await,
-        "anthropic" | "claude" => {
-            eprintln!(
-                "error: harness cannot sign in to Claude: Anthropic allows Claude Free, Pro and Max plans only in Claude Code. Use an Anthropic API key instead: `{}`.",
-                auth_add_command("anthropic", profile)
-            );
-            2
+    if provider != "chatgpt" {
+        eprintln!("error: {}", refusal(setup, provider, profile));
+        return 2;
+    }
+    // Ctrl+C stops the sign-in.
+    let cancel = CancellationToken::new();
+    let on_ctrl_c = cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            on_ctrl_c.cancel();
         }
-        other if takes_a_key(setup, other) => {
-            eprintln!(
-                "error: {other} takes an API key, not a sign-in: `{}`",
-                auth_add_command(other, profile)
-            );
-            2
+    });
+    let device = device || wants_device_flow(crate::setup::env);
+    let say = |text: String| eprintln!("{text}");
+    match sign_in(setup, profile, device, &say, cancel).await {
+        Ok(done) => {
+            setup.print_credential_warnings();
+            println!("{done}");
+            println!("Use a model your plan includes with --model chatgpt/<model>.");
+            0
         }
-        other
-            if setup.config.providers.contains_key(other)
-                || BUILTIN_PROVIDERS.iter().any(|b| b.name == other) =>
-        {
-            eprintln!("error: {other} needs no sign-in");
-            2
+        Err(Failed { code: 130, message }) => {
+            eprintln!("{message}");
+            130
         }
-        other => {
-            eprintln!(
-                "error: unknown provider `{}`; `harness login` signs in to chatgpt",
-                terminal_safe(other)
-            );
-            2
+        Err(Failed { code, message }) => {
+            eprintln!("error: {message}");
+            code
         }
     }
 }
 
-#[cfg(not(feature = "chatgpt-login"))]
-async fn sign_in(_setup: &Setup, _profile: &str, _device: bool) -> u8 {
-    eprintln!(
-        "error: this build of harness was made without ChatGPT sign-in (the `chatgpt-login` feature)"
-    );
-    2
+/// `/login [provider] [--device]` inside the session: ChatGPT sign-in, under the profile ChatGPT
+/// uses now; what it says goes to `say`, and `cancel` (Esc) stops it. Ok: what to tell the
+/// user. Other providers are refused as `harness login` refuses them.
+pub async fn in_session(
+    setup: &Setup,
+    provider: &str,
+    device: bool,
+    say: &Say,
+    cancel: CancellationToken,
+) -> Result<String, String> {
+    if provider != "chatgpt" {
+        return Err(refusal(setup, provider, "default"));
+    }
+    let profile = setup
+        .credentials
+        .active_profile(harness_providers::registry::CHATGPT)
+        .map_err(|e| e.to_string())?;
+    let device = device || wants_device_flow(|var| (setup.env)(var));
+    sign_in(setup, &profile, device, say, cancel)
+        .await
+        .map_err(|failed| failed.message)
 }
 
+/// Why `provider`, which is not `chatgpt`, cannot be signed in to (`profile` for the hint).
+fn refusal(setup: &Setup, provider: &str, profile: &str) -> String {
+    match provider {
+        "anthropic" | "claude" => format!(
+            "harness cannot sign in to Claude: Anthropic allows Claude Free, Pro and Max plans only in Claude Code. Use an Anthropic API key instead: `{}`.",
+            auth_add_command("anthropic", profile)
+        ),
+        other if takes_a_key(setup, other) => format!(
+            "{other} takes an API key, not a sign-in: `{}`",
+            auth_add_command(other, profile)
+        ),
+        other
+            if setup.config.providers.contains_key(other)
+                || BUILTIN_PROVIDERS.iter().any(|b| b.name == other) =>
+        {
+            format!("{other} needs no sign-in")
+        }
+        other => format!(
+            "unknown provider `{}`; `harness login` signs in to chatgpt",
+            terminal_safe(other)
+        ),
+    }
+}
+
+#[cfg(not(feature = "chatgpt-login"))]
+async fn sign_in(
+    _setup: &Setup,
+    _profile: &str,
+    _device: bool,
+    _say: &Say,
+    _cancel: CancellationToken,
+) -> Result<String, Failed> {
+    Err(failed(
+        2,
+        "this build of harness was made without ChatGPT sign-in (the `chatgpt-login` feature)"
+            .into(),
+    ))
+}
+
+/// Signs in to ChatGPT under `profile`, with a device code when `device` is set, and stores the
+/// tokens, which harness keeps out of everything it shows from then on. Ok: what to tell the
+/// user.
 #[cfg(feature = "chatgpt-login")]
-async fn sign_in(setup: &Setup, profile: &str, device: bool) -> u8 {
+async fn sign_in(
+    setup: &Setup,
+    profile: &str,
+    device: bool,
+    say: &Say,
+    cancel: CancellationToken,
+) -> Result<String, Failed> {
     use harness_providers::{
         chatgpt::oauth::{ISSUER, OAuth},
         registry::CHATGPT,
     };
-    eprintln!("{NOTICE}");
+    say(NOTICE.to_string());
     // A test hook, in debug builds only: a mock authorization server.
     let issuer =
-        harness_providers::registry::test_hook("HARNESS_CHATGPT_ISSUER", crate::setup::env)
+        harness_providers::registry::test_hook("HARNESS_CHATGPT_ISSUER", |var| (setup.env)(var))
             .unwrap_or_else(|| ISSUER.to_string());
-    let oauth = match OAuth::new(&issuer) {
-        Ok(oauth) => oauth,
-        Err(e) => {
-            eprintln!("error: {}", terminal_safe(&e.to_string()));
-            return 2;
-        }
-    };
-    let device = device || wants_device_flow(crate::setup::env);
+    let oauth = OAuth::new(&issuer).map_err(|e| failed(2, terminal_safe(&e.to_string())))?;
     let tokens = tokio::select! {
-        tokens = flows::sign_in(&oauth, device) => tokens,
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("sign-in cancelled");
-            return 130;
-        }
+        tokens = flows::sign_in(&oauth, device, say) => tokens,
+        _ = cancel.cancelled() => return Err(failed(130, "sign-in cancelled".into())),
     };
-    let tokens = match tokens {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            eprintln!("error: {}", terminal_safe(&e.to_string()));
-            return 1;
-        }
-    };
+    let tokens = tokens.map_err(|e| failed(1, terminal_safe(&e.to_string())))?;
     // A renewal in flight in another run would store its tokens over these.
     let renewing = setup.credentials.lock_renewal(
         CHATGPT,
         profile,
         "storing the new ChatGPT sign-in",
-        |note| eprintln!("note: {}", terminal_safe(&note)),
+        |note| say(format!("note: {}", terminal_safe(&note))),
     );
     let renewing = tokio::select! {
         lock = renewing => lock,
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("sign-in cancelled");
-            return 130;
-        }
+        _ = cancel.cancelled() => return Err(failed(130, "sign-in cancelled".into())),
     };
+    // What harness shows from now on leaves the new tokens out.
+    setup.redactor.add(&tokens.access_token);
+    setup.redactor.add(&tokens.refresh_token);
     let stored = setup.credentials.set(CHATGPT, profile, &tokens.to_json());
     drop(renewing);
-    report_signed_in(stored, &tokens, profile)
+    let place = stored_at(stored)?;
+    let who = tokens
+        .email
+        .as_deref()
+        .map(|email| format!(" as {}", terminal_safe(email)))
+        .unwrap_or_default();
+    Ok(format!(
+        "Signed in to ChatGPT{who} (profile {profile}); the tokens are in {}.",
+        terminal_safe(&place)
+    ))
 }
 
-/// What `harness login chatgpt` says, and exits with, once the tokens are stored (or not): the
-/// tokens' place on success; on [`Stored::stale_file_copy`](harness_providers::credentials::Stored),
-/// a plain failure, since the new sign-in has not actually replaced the old one everywhere it is
-/// read from. `run` prints the warnings queued by [`Credentials::set`](harness_providers::credentials::Credentials::set)
-/// either way, which gives the fix for a stale file copy. A background renewal never calls this:
-/// see `chatgpt::auth::save`, which just warns.
+/// Where the new tokens are, or why the sign-in failed: a keychain store that could not remove an
+/// older file copy has not replaced the credential everywhere it is read from, which is a
+/// failure whose fix the warnings queued by `Credentials::set` give.
 #[cfg(feature = "chatgpt-login")]
-fn report_signed_in(
+fn stored_at(
     stored: Result<
         harness_providers::credentials::Stored,
         harness_providers::credentials::CredentialError,
     >,
-    tokens: &harness_providers::chatgpt::oauth::Tokens,
-    profile: &str,
-) -> u8 {
-    match stored {
-        Ok(stored) if stored.stale_file_copy => {
-            eprintln!("error: {}", harness_providers::credentials::STALE_FILE_COPY);
-            1
-        }
-        Ok(stored) => {
-            let who = tokens
-                .email
-                .as_deref()
-                .map(|email| format!(" as {}", terminal_safe(email)))
-                .unwrap_or_default();
-            println!(
-                "Signed in to ChatGPT{who} (profile {profile}); the tokens are in {}.",
-                terminal_safe(&stored.place)
-            );
-            println!("Use a model your plan includes with --model chatgpt/<model>.");
-            0
-        }
-        Err(e) => {
-            eprintln!("error: {}", terminal_safe(&e.to_string()));
-            1
-        }
+) -> Result<String, Failed> {
+    let stored = stored.map_err(|e| failed(1, terminal_safe(&e.to_string())))?;
+    if stored.stale_file_copy {
+        return Err(failed(
+            1,
+            harness_providers::credentials::STALE_FILE_COPY.to_string(),
+        ));
     }
+    Ok(stored.place)
 }
 
 /// Whether `provider` authenticates with an API key.
@@ -172,7 +223,6 @@ fn takes_a_key(setup: &Setup, provider: &str) -> bool {
 }
 
 /// Whether no browser can be opened here: over SSH, or on Linux without a display.
-#[cfg(feature = "chatgpt-login")]
 pub fn wants_device_flow(env: impl Fn(&str) -> Option<String>) -> bool {
     let set = |var: &str| env(var).is_some_and(|value| !value.is_empty());
     if set("SSH_CONNECTION") || set("SSH_TTY") {
@@ -190,29 +240,31 @@ mod flows {
         random_state,
     };
 
+    use super::Say;
     use crate::term::terminal_safe;
 
     /// How long the browser flow waits for the user.
     const BROWSER_WAIT: Duration = Duration::from_secs(10 * 60);
 
     /// Signs in in the browser, or with a device code when `device` is set or no browser opens.
-    pub async fn sign_in(oauth: &OAuth, device: bool) -> Result<Tokens, OAuthError> {
+    /// What the user must do goes to `say`.
+    pub async fn sign_in(oauth: &OAuth, device: bool, say: &Say) -> Result<Tokens, OAuthError> {
         if !device {
-            match browser(oauth).await {
+            match browser(oauth, say).await {
                 Ok(tokens) => return Ok(tokens),
-                Err(Browser::CannotOpen(why)) => eprintln!(
+                Err(Browser::CannotOpen(why)) => say(format!(
                     "cannot open a browser ({}); signing in with a device code instead",
                     terminal_safe(&why)
-                ),
+                )),
                 Err(Browser::Failed(e)) => return Err(e),
             }
         }
         let code = oauth.request_device_code().await?;
-        eprintln!(
+        say(format!(
             "To sign in, open {} in a browser and enter the code {} (it expires in 15 minutes).\nOnly enter it if you started this sign-in yourself.",
             terminal_safe(&code.verification_url),
             terminal_safe(&code.user_code)
-        );
+        ));
         oauth.poll_device_code(&code, DEVICE_CODE_WAIT).await
     }
 
@@ -233,7 +285,7 @@ mod flows {
         }
     }
 
-    async fn browser(oauth: &OAuth) -> Result<Tokens, Browser> {
+    async fn browser(oauth: &OAuth, say: &Say) -> Result<Tokens, Browser> {
         let callback = CallbackServer::bind(&CALLBACK_PORTS).await?;
         let pkce = Pkce::generate()?;
         let state = random_state()?;
@@ -241,7 +293,7 @@ mod flows {
         open(&url)
             .await
             .map_err(|e| Browser::CannotOpen(e.to_string()))?;
-        eprintln!("{}", waiting_message(&url));
+        say(waiting_message(&url));
         let code = tokio::time::timeout(BROWSER_WAIT, callback.wait_for_code(&state))
             .await
             .map_err(|_| OAuthError::TimedOut)??;
@@ -253,7 +305,7 @@ mod flows {
     /// What the browser flow says while it waits for the user at `url`.
     pub fn waiting_message(url: &str) -> String {
         format!(
-            "Sign in in the browser window that opened. If none did, open:\n  {}\nharness waits 10 minutes for the browser to come back to 127.0.0.1. Where a browser cannot reach this machine's 127.0.0.1 (in a container, a remote editor), press Ctrl+C and sign in with a device code instead: add --device.",
+            "Sign in in the browser window that opened. If none did, open:\n  {}\nharness waits 10 minutes for the browser to come back to 127.0.0.1. Where a browser cannot reach this machine's 127.0.0.1 (in a container, a remote editor), stop (Ctrl+C, or Esc in a session) and sign in with a device code instead: add --device.",
             terminal_safe(url)
         )
     }
@@ -316,15 +368,6 @@ mod tests {
         assert_eq!(wants_device_flow(env(&[])), cfg!(target_os = "linux"));
     }
 
-    fn tokens() -> harness_providers::chatgpt::oauth::Tokens {
-        harness_providers::chatgpt::oauth::Tokens {
-            access_token: "at".into(),
-            refresh_token: "rt".into(),
-            account_id: None,
-            email: Some("dev@example.com".into()),
-        }
-    }
-
     // Final review, wave 5 re-review R1: a keychain store that could not remove an older file
     // copy has not actually replaced the credential everywhere it is read from, so `harness
     // login` must fail loudly rather than report success.
@@ -334,7 +377,7 @@ mod tests {
             place: "the keychain".into(),
             stale_file_copy: true,
         });
-        assert_eq!(report_signed_in(stored, &tokens(), "default"), 1);
+        assert_eq!(stored_at(stored).unwrap_err().code, 1);
     }
 
     #[test]
@@ -343,7 +386,7 @@ mod tests {
             place: "the keychain".into(),
             stale_file_copy: false,
         });
-        assert_eq!(report_signed_in(stored, &tokens(), "default"), 0);
+        assert_eq!(stored_at(stored).unwrap(), "the keychain");
     }
 
     #[test]
@@ -351,6 +394,6 @@ mod tests {
         let stored = Err(harness_providers::credentials::CredentialError::Keychain(
             "the collection is locked".into(),
         ));
-        assert_eq!(report_signed_in(stored, &tokens(), "default"), 1);
+        assert_eq!(stored_at(stored).unwrap_err().code, 1);
     }
 }

@@ -89,6 +89,23 @@ impl Host for CliHost {
         })
     }
 
+    fn login(
+        &self,
+        provider: &str,
+        device: bool,
+        notes: tokio::sync::mpsc::UnboundedSender<String>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<String, String>> {
+        let setup = self.setup.clone();
+        let provider = provider.to_string();
+        Box::pin(async move {
+            let say = move |text: String| {
+                let _ = notes.send(text);
+            };
+            crate::login::in_session(&setup, &provider, device, &say, cancel).await
+        })
+    }
+
     fn switch_model(
         &self,
         id: &str,
@@ -146,14 +163,28 @@ pub mod tests {
     /// The setup of a run in `workspace`, with harness's files under `home`. Credentials go to
     /// the file there, and the keychain is never opened.
     pub fn setup_in(home: &Path, workspace: &Path) -> Arc<Setup> {
+        setup_with(home, workspace, &[])
+    }
+
+    /// [`setup_in`], with the environment variables `vars` and no others, for the credential
+    /// store and the test hooks.
+    pub fn setup_with(home: &Path, workspace: &Path, vars: &[(&str, &str)]) -> Arc<Setup> {
         let home = home.display().to_string();
         let paths = Paths::from_env(|var| (var == "HARNESS_HOME").then(|| home.clone())).unwrap();
-        let store = |var: &str| match var {
-            harness_providers::credentials::STORE_ENV => Some("file".to_string()),
-            harness_providers::credentials::NO_KEYCHAIN_ENV => Some("1".to_string()),
-            _ => None,
-        };
-        Arc::new(crate::setup::load_in(workspace.to_path_buf(), paths, store).unwrap())
+        let mut env: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        env.insert(
+            harness_providers::credentials::STORE_ENV.into(),
+            "file".into(),
+        );
+        env.insert(
+            harness_providers::credentials::NO_KEYCHAIN_ENV.into(),
+            "1".into(),
+        );
+        let env: crate::setup::Env = Arc::new(move |var: &str| env.get(var).cloned());
+        Arc::new(crate::setup::load_in(workspace.to_path_buf(), paths, env).unwrap())
     }
 
     pub fn host(home: &Path, workspace: &Path) -> CliHost {
@@ -426,5 +457,201 @@ pub mod tests {
             })
             .collect();
         assert_eq!(models, ["chat/small", "chat/small", "claude/opus"]);
+    }
+
+    // M1's done criterion, with mock servers: ChatGPT sign-in inside the session, then a
+    // mid-session `/model` switch to a ChatGPT model, which answers with the signed-in account.
+    #[cfg(feature = "chatgpt-login")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signing_in_mid_session_lets_model_switch_to_chatgpt() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use serde_json::{Value, json};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+
+        let jwt = |claims: Value| {
+            let part = |value: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).unwrap());
+            format!(
+                "{}.{}.{}",
+                part(&json!({"alg": "none"})),
+                part(&claims),
+                URL_SAFE_NO_PAD.encode(b"sig")
+            )
+        };
+        let access = jwt(json!({"exp": 4_102_444_800u64}));
+        let chat = MockServer::start().await;
+        let openai = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(chat_stream(&[
+                json!({"choices": [{"index": 0, "delta": {"content": "Hello from the local model."}, "finish_reason": "stop"}]}),
+            ]))
+            .mount(&chat)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/usercode"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "device_auth_id": "device-auth-1",
+                "user_code": "ABCD-1234",
+                "interval": "0"
+            })))
+            .mount(&openai)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/accounts/deviceauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "authorization_code": "code-1",
+                "code_challenge": "challenge",
+                "code_verifier": "verifier"
+            })))
+            .mount(&openai)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id_token": jwt(json!({
+                    "email": "dev@example.com",
+                    "https://api.openai.com/auth": {"chatgpt_account_id": "acct-123"}
+                })),
+                "access_token": access,
+                "refresh_token": "rt-canary-0123456789"
+            })))
+            .mount(&openai)
+            .await;
+        let answer = [
+            json!({"type": "response.output_text.delta", "output_index": 0, "delta": "Hi from ChatGPT."}),
+            json!({"type": "response.completed", "response": {"status": "completed"}}),
+        ]
+        .iter()
+        .map(|e| format!("data: {e}\n\n"))
+        .collect::<String>();
+        Mock::given(method("POST"))
+            .and(path("/backend-api/codex/responses"))
+            .and(header("authorization", format!("Bearer {access}").as_str()))
+            .and(header("chatgpt-account-id", "acct-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(answer, "text/event-stream"))
+            .mount(&openai)
+            .await;
+
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir(workspace.join(".git")).unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        std::fs::write(
+            home.path().join("config/config.toml"),
+            format!(
+                "[providers.chat]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n[profiles.\"chat/*\"]\ncontext_window = 32768\n",
+                chat.uri()
+            ),
+        )
+        .unwrap();
+        let base_url = format!("{}/backend-api/codex", openai.uri());
+        let setup = setup_with(
+            home.path(),
+            &workspace,
+            &[
+                ("HARNESS_CHATGPT_ISSUER", &openai.uri()),
+                ("HARNESS_CHATGPT_BASE_URL", &base_url),
+            ],
+        );
+        let mut notices = Notices::quiet(setup.redactor.clone());
+        let session = sessions::open(&setup, &Choice::New, &mut notices).unwrap();
+        let resolved =
+            registry::resolve("chat/small", &setup.config.providers, setup.keys()).unwrap();
+        let (approver, approvals) = ChannelApprover::new();
+        let Some(Started {
+            agent,
+            sandbox_session,
+            policy,
+            window_note,
+            writable,
+            ..
+        }) = start::start(
+            Request {
+                setup: &setup,
+                mode: Mode::Auto,
+                model: resolved,
+                session,
+                approver,
+                interactive: true,
+                run_id: start::run_id(),
+                cancel: CancellationToken::new(),
+            },
+            &mut notices,
+        )
+        .await
+        else {
+            panic!("the start was cancelled");
+        };
+        let host = CliHost {
+            setup: setup.clone(),
+            commands: Commands::default(),
+            policy,
+            writable,
+        };
+        let options = Options {
+            theme: Theme::monochrome(),
+            model: "chat/small".into(),
+            mode: Mode::Auto,
+            commands: Vec::new(),
+            workspace: workspace.clone(),
+            history: Vec::new(),
+            instruction_files: Vec::new(),
+            window_note: Some(window_note),
+            default_mode: Mode::Auto,
+            text_editor: None,
+            notifier: None,
+        };
+        let term = InlineTerminal::new(TestBackend::new(120, 40), 0).unwrap();
+        let mut ui = Ui::start(agent, Box::new(host), term, options, approvals)
+            .with_redactor(setup.redactor.clone());
+        ui.draw().unwrap();
+        send(&mut ui, "hello");
+        settle(&mut ui).await;
+        send(&mut ui, "/login chatgpt --device");
+        settle(&mut ui).await;
+        send(&mut ui, "/model chatgpt/gpt-5-codex");
+        settle(&mut ui).await;
+        send(&mut ui, "and now?");
+        settle(&mut ui).await;
+        let backend = ui.terminal().backend();
+        let shown: String = [backend.scrollback(), backend.buffer()]
+            .iter()
+            .flat_map(|buffer| {
+                buffer
+                    .content
+                    .chunks(buffer.area.width as usize)
+                    .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.finish().await.unwrap();
+        sandbox_session.end();
+
+        assert!(shown.contains("enter the code ABCD-1234"), "{shown}");
+        assert!(
+            shown.contains("Signed in to ChatGPT as dev@example.com"),
+            "{shown}"
+        );
+        assert!(shown.contains("switched to chatgpt/gpt-5-codex"), "{shown}");
+        assert!(shown.contains("Hi from ChatGPT."), "{shown}");
+        // Neither token was shown.
+        assert!(!shown.contains("rt-canary-0123456789"), "{shown}");
+        assert!(!shown.contains(&access[10..40]), "{shown}");
+        assert!(home.path().join("data/credentials.json").exists());
+        // The conversation came along to ChatGPT.
+        let requests = openai.received_requests().await.unwrap();
+        let asked = requests
+            .iter()
+            .find(|r| r.url.path() == "/backend-api/codex/responses")
+            .expect("ChatGPT was asked");
+        let body = String::from_utf8_lossy(&asked.body);
+        for said in ["hello", "Hello from the local model.", "and now?"] {
+            assert!(body.contains(said), "{said}: {body}");
+        }
     }
 }

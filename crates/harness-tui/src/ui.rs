@@ -109,6 +109,10 @@ enum Background {
     Models(Vec<String>),
     /// The model to switch to, made ready, or why it could not be.
     Switch(Result<ModelSwitch, String>),
+    /// Something a sign-in says while it waits.
+    Note(String),
+    /// How a sign-in ended.
+    Login(Result<String, String>),
 }
 
 /// What the task that owns the agent says after each job: where the context goes now, and how
@@ -394,6 +398,30 @@ where
                 });
                 Flow::Continue
             }
+            Action::Login { provider, device } => {
+                let cancel = CancellationToken::new();
+                self.cancel = Some(cancel.clone());
+                let (notes_tx, mut notes) = mpsc::unbounded_channel();
+                let login = self.app.host().login(&provider, device, notes_tx, cancel);
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let mut login = login;
+                    let result = loop {
+                        tokio::select! {
+                            result = &mut login => break result,
+                            Some(note) = notes.recv() => {
+                                let _ = tx.send(Background::Note(note));
+                            }
+                        }
+                    };
+                    // What it said before it ended comes first.
+                    while let Ok(note) = notes.try_recv() {
+                        let _ = tx.send(Background::Note(note));
+                    }
+                    let _ = tx.send(Background::Login(result));
+                });
+                Flow::Continue
+            }
             Action::OpenSession(id) => {
                 let resumed = id.is_some();
                 match self.app.host().open_session(id.as_deref()) {
@@ -663,6 +691,11 @@ where
             }
             Background::Switch(Err(why)) => {
                 self.app.on_done(Done::Model(Err(why)));
+                self.next_actions()?;
+            }
+            Background::Note(note) => self.app.push_note(&note),
+            Background::Login(result) => {
+                self.app.on_done(Done::LoggedIn(result));
                 self.next_actions()?;
             }
         }

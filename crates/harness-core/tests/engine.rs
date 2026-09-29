@@ -798,3 +798,114 @@ fn writes_to_harness_metadata_or_a_top_level_head_ask() {
     let e = engine(Mode::Auto, &ws2, true, RuleSet::default());
     assert!(is_ask(&e.check(&write(".harness/config.toml"))));
 }
+
+#[test]
+fn a_mode_switch_changes_later_decisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(Mode::Auto, dir.path(), true, RuleSet::default());
+    let write = Action::Write(dir.path().join("a.txt"));
+    assert_eq!(e.check(&write), Decision::Allow);
+    e.set_mode(Mode::ReadOnly);
+    assert_eq!(e.mode(), Mode::ReadOnly);
+    assert!(is_deny(&e.check(&write)));
+    e.set_mode(Mode::Ask);
+    assert!(is_ask(&e.check(&write)));
+}
+
+#[test]
+fn turn_allow_rules_preapprove_commands_until_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(Mode::Ask, dir.path(), true, RuleSet::default());
+    assert!(is_ask(&e.check(&bash("openspec status"))));
+    e.set_turn_rules(Some(rules(&["bash:openspec", "bash:openspec *"], &[], &[])));
+    assert_eq!(e.check(&bash("openspec status")), Decision::Allow);
+    assert_eq!(e.check(&bash("openspec")), Decision::Allow);
+    assert!(is_ask(&e.check(&bash("openspecx"))));
+    e.set_turn_rules(None);
+    assert!(is_ask(&e.check(&bash("openspec status"))));
+}
+
+#[test]
+fn turn_allow_rules_never_beat_deny_or_destructive_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(
+        Mode::Ask,
+        dir.path(),
+        true,
+        rules(&[], &["bash:rm -rf*"], &[]),
+    );
+    e.set_turn_rules(Some(rules(&["bash:*"], &[], &[])));
+    assert!(is_deny(&e.check(&bash("rm -rf build"))));
+    assert!(is_ask(&e.check(&bash("git reset --hard HEAD~1"))));
+    assert_eq!(e.check(&bash("cargo build")), Decision::Allow);
+}
+
+#[test]
+fn turn_confirm_rules_make_a_write_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let e = engine(Mode::Auto, &ws, true, RuleSet::default());
+    e.set_turn_rules(Some(rules(&[], &[], &["write:AGENTS.md"])));
+    assert!(is_ask(&e.check(&Action::Write(ws.join("AGENTS.md")))));
+    assert_eq!(
+        e.check(&Action::Write(ws.join("README.md"))),
+        Decision::Allow
+    );
+    e.set_turn_rules(None);
+    assert_eq!(
+        e.check(&Action::Write(ws.join("AGENTS.md"))),
+        Decision::Allow
+    );
+}
+
+// Review C, minor 2: a check reads the mode once, so a mode switch during a check gives the
+// answer of one mode or the other, never a mix of both.
+#[test]
+fn a_check_answers_for_one_mode_while_the_mode_changes() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let deny = rules(&[], &["bash:git push*"], &[]);
+    // Between ask and full-access, neither allows a command that may match a deny rule.
+    let bash_engine = Arc::new(engine(Mode::Ask, dir.path(), true, deny.clone()));
+    // Between full-access and plan, neither asks for a write in the workspace.
+    let write_engine = Arc::new(engine(Mode::Plan, dir.path(), true, deny));
+    let stop = Arc::new(AtomicBool::new(false));
+    let flipper = {
+        let (b, w, stop) = (bash_engine.clone(), write_engine.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                b.set_mode(Mode::FullAccess);
+                w.set_mode(Mode::FullAccess);
+                b.set_mode(Mode::Ask);
+                w.set_mode(Mode::Plan);
+            }
+        })
+    };
+    let command = bash("git $X origin");
+    let write = Action::Write(dir.path().join("a.txt"));
+    let mut mixed = Vec::new();
+    for _ in 0..3000 {
+        let decision = bash_engine.check(&command);
+        if decision == Decision::Allow {
+            mixed.push(format!("bash: {decision:?}"));
+        }
+        let decision = write_engine.check(&write);
+        if is_ask(&decision) {
+            mixed.push(format!("write: {decision:?}"));
+        }
+        if bash_engine.remember(&command) {
+            mixed.push("remembered a command that asks in both modes".into());
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    flipper.join().unwrap();
+    assert!(
+        mixed.is_empty(),
+        "{} mixed answers: {:?}",
+        mixed.len(),
+        &mixed[..mixed.len().min(3)]
+    );
+}

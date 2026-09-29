@@ -609,8 +609,12 @@ async fn basic_tier_quarantines_a_planted_hook() {
         "echo 'echo pwned' > .git/hooks/pre-commit",
     )
     .await;
+    // The watcher can move the new hook between its creation and the end of the shell's open.
+    // Landlock then checks the file at its new path, outside the workspace, and refuses the open.
+    // The hook is quarantined either way: with its text, or empty.
+    let refused = !output.status.success();
     assert!(
-        output.status.success(),
+        !refused || stderr(&output).contains("Permission denied"),
         "{}{}before the command: {before:?}\nafter it: {:?}\nreport: {report:?}",
         stderr(&output),
         permissions_around(&env, ".git/hooks"),
@@ -626,7 +630,7 @@ async fn basic_tier_quarantines_a_planted_hook() {
     assert!(!env.exists(".git/hooks/pre-commit"));
     assert_eq!(
         std::fs::read_to_string(env.quarantined(".git/hooks/pre-commit")).unwrap(),
-        "echo pwned\n"
+        if refused { "" } else { "echo pwned\n" }
     );
 }
 
@@ -759,7 +763,7 @@ async fn the_watcher_quarantines_a_hook_while_the_command_runs() {
             "/bin/sh",
             &[
                 "-c",
-                "echo 'echo pwned' > .git/hooks/post-checkout; exec sleep 30",
+                "echo 'echo pwned' > .git/hooks/post-checkout; echo $? > attempted; exec sleep 30",
             ],
         )
         .expect("prepare the sandboxed command");
@@ -772,6 +776,14 @@ async fn the_watcher_quarantines_a_hook_while_the_command_runs() {
     let mut child = cmd.spawn().expect("spawn the sandboxed command");
     guard.started(child.id().expect("a pid"));
     env.wait_for_quarantine(".git/hooks/post-checkout").await;
+    // The hook can be moved between the shell's open and its write, and the write then lands in
+    // the moved file; or before the open finishes, and Landlock, checking the file at its new
+    // path outside the workspace, refuses the open. Wait for the shell to have tried.
+    wait_until("the shell has tried to write the hook", || {
+        env.read_now("attempted").is_some_and(|s| s.ends_with('\n'))
+    })
+    .await;
+    let refused = env.read_now("attempted").as_deref() != Some("0\n");
     assert!(
         child.try_wait().unwrap().is_none(),
         "the command should still be running"
@@ -787,7 +799,7 @@ async fn the_watcher_quarantines_a_hook_while_the_command_runs() {
     );
     assert_eq!(
         std::fs::read_to_string(env.quarantined(".git/hooks/post-checkout")).unwrap(),
-        "echo pwned\n"
+        if refused { "" } else { "echo pwned\n" }
     );
 }
 

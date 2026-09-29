@@ -16,7 +16,7 @@ The system SHALL load the global `AGENTS.md` from the harness configuration dire
 - **THEN** `CLAUDE.md` from that directory is loaded
 
 ### Requirement: File imports are resolved safely
-The system SHALL expand `@<path>` import lines in instruction files relative to the importing file, to a maximum depth of 5. Imports MUST be confined to the discovery root and the harness configuration directory, each file MUST be included at most once, and a missing or disallowed import MUST produce a warning rather than a failure.
+The system SHALL expand `@<path>` import lines (lines holding only the import, outside code fences) in instruction files relative to the importing file, to a maximum depth of 5. Imports MUST be confined to the discovery root and the harness configuration directory; outside a repository they MUST be confined to the importing file's own directory and the harness configuration directory. Each file MUST be included at most once, and a missing or disallowed import MUST produce a warning rather than a failure. An instruction file found in the project that resolves, through symlinks, outside the repository and the harness configuration directory MUST be skipped with a warning; outside a repository, one that resolves outside the directory it was found in and the harness configuration directory MUST be skipped with a warning.
 
 #### Scenario: CLAUDE.md importing AGENTS.md
 - **WHEN** a subdirectory has only a `CLAUDE.md` containing `@../AGENTS.md`, and the parent's `AGENTS.md` is already loaded
@@ -26,12 +26,32 @@ The system SHALL expand `@<path>` import lines in instruction files relative to 
 - **WHEN** an instruction file contains `@/etc/passwd`
 - **THEN** the import is skipped with a warning
 
+#### Scenario: Instruction file linked to a secret
+- **WHEN** a repository's `AGENTS.md` is a symlink to `~/.aws/credentials`
+- **THEN** it is skipped with a warning and its target is not sent to the model
+
+#### Scenario: Instruction file outside a repository linked to a secret
+- **WHEN** a folder in the home directory that is not a repository, such as an extracted archive, has an `AGENTS.md` that is a symlink to `~/.aws/credentials`
+- **THEN** it is skipped with a warning and its target is not sent to the model, while a symlink to a file inside that folder is loaded
+
 ### Requirement: Environment information is captured at session start
-The system SHALL include the working directory, operating system, date, and, inside a git repository, the current branch and whether the work tree has uncommitted changes, all captured once when the session starts.
+The system SHALL include the working directory, operating system, date, and, inside a git repository, the current branch and whether the work tree has uncommitted changes, all captured once when the session starts. Capturing them MUST NOT run any program that the repository's configuration, or a submodule's, names (a file-system monitor, a hook, a filter driver, or the transport of a partial clone's promisor remote); when the repository's own configuration (its local or worktree configuration, or a file that includes) defines a filter driver or makes the repository a partial clone, or git cannot say whether it does, whether there are uncommitted changes MUST be left out. A filter driver in the user's global or system configuration MUST NOT cause that.
 
 #### Scenario: Dirty git repository
 - **WHEN** the session starts in a repository with uncommitted changes on branch `main`
 - **THEN** the context states the branch `main` and that there are uncommitted changes
+
+#### Scenario: Repository whose configuration names a program
+- **WHEN** the session starts in a repository whose `.git/config` sets `core.fsmonitor` to a script, or defines a clean filter that its `.gitattributes` assigns to a modified file
+- **THEN** the script and the filter never run, the context still states the branch, and with the filter configured it does not say whether there are uncommitted changes
+
+#### Scenario: Partial clone whose promisor remote names a program
+- **WHEN** the session starts in a repository whose `.git/config` makes it a partial clone, with a promisor remote reached through `core.sshCommand` or an `ext::` URL, and `git status` would need an object that is missing
+- **THEN** the program never runs, the context still states the branch, and it does not say whether there are uncommitted changes
+
+#### Scenario: Filter driver in the user's own git configuration
+- **WHEN** the session starts in a repository with uncommitted changes, and the user's global git configuration defines a filter driver (as `git lfs install` does)
+- **THEN** the context still states that there are uncommitted changes
 
 ### Requirement: The prompt prefix is stable within a session
 The system SHALL keep the system prompt and tool definitions byte-identical across all requests in a session, rebuilding them only after compaction or a model switch. Mode changes, planning instructions, and other mid-session context MUST be appended as messages instead of modifying the system prompt. The base system prompt, excluding instruction files and environment information, MUST NOT exceed 1,000 tokens.

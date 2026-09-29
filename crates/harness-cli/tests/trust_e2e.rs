@@ -35,14 +35,29 @@ impl Env {
 
 const PROJECT: &str = "[permissions]\nallow = [\"bash:make*\"]\n";
 
+// Ruling P3-R1: a workspace without widening settings can still be trusted (for its command
+// files), with the same confirmation.
 #[test]
-fn nothing_to_trust_without_widening_settings() {
-    let env = Env::new(Some("[permissions]\ndeny = [\"bash:curl*\"]\n"));
-    env.cmd()
-        .arg("trust")
-        .assert()
-        .success()
-        .stdout(contains("No project settings"));
+fn a_workspace_without_widening_settings_can_be_trusted() {
+    for project in [None, Some("[permissions]\ndeny = [\"bash:curl*\"]\n")] {
+        let env = Env::new(project);
+        env.cmd()
+            .arg("trust")
+            .assert()
+            .code(2)
+            .stdout(contains("No project settings"))
+            .stderr(contains("--yes"));
+        env.cmd()
+            .args(["trust", "--yes"])
+            .assert()
+            .success()
+            .stdout(contains("Trusted"));
+        env.cmd()
+            .args(["trust", "--revoke"])
+            .assert()
+            .success()
+            .stdout(contains("Revoked"));
+    }
 }
 
 #[test]
@@ -99,4 +114,31 @@ fn changing_trusted_settings_needs_trust_again() {
         .assert()
         .success()
         .stderr(contains("harness trust"));
+}
+
+// Re-review of fix wave 4, nit: a repository's directory names reach `harness trust`'s output,
+// so the paths it prints are made terminal-safe like any other text from the repository.
+#[test]
+fn trust_prints_directory_names_terminal_safe() {
+    let env = Env::new(None);
+    std::fs::create_dir(env.ws.path().join(".git")).unwrap();
+    let sub = env.ws.path().join("sub\u{1b}[2J");
+    std::fs::create_dir(&sub).unwrap();
+    let mut trust = env.cmd();
+    let output = trust
+        .current_dir(&sub)
+        .args(["trust", "--yes"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    assert!(stdout.contains("sub\\u{1b}[2J"), "{stdout:?}");
+    let revoke = env
+        .cmd()
+        .current_dir(&sub)
+        .args(["trust", "--revoke"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&revoke.stdout).contains('\u{1b}'));
 }

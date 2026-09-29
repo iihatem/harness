@@ -41,7 +41,8 @@ pub struct EngineConfig {
 }
 
 pub struct PermissionEngine {
-    mode: Mode,
+    /// The approval mode; `Agent::set_mode` may change it between turns.
+    mode: Mutex<Mode>,
     workspace: PathBuf,
     read_dirs: Vec<PathBuf>,
     /// Raw config rules, exactly as given: used only for bash filtering (`bash_rules`) and
@@ -67,16 +68,28 @@ pub struct PermissionEngine {
     /// paths rather than globs, so a literal `*` in an approved path is never treated as a
     /// wildcard over its siblings (a `glob_match` pattern has no escape syntax).
     session_paths: Mutex<HashSet<(&'static str, PathBuf)>>,
+    /// Rules for the current turn only (`set_turn_rules`), such as a command's `allowed-tools`.
+    turn: Mutex<TurnRules>,
 }
 
 /// A single `read:`/`write:` rule, expanded for matching. `display` is exactly what the user
 /// configured (after `~` expansion) — used in every message, so a denial always names the rule
 /// as written, never an internal resolved form. `globs` holds the glob(s) actually compared
 /// against a candidate path: just `display`, or `display` plus its symlink-resolved twin.
+#[derive(Clone)]
 struct PathRule {
     tool: &'static str,
     display: String,
     globs: Vec<String>,
+}
+
+/// Rules added for one turn, and their `read:`/`write:` rules expanded like the config's.
+#[derive(Default)]
+struct TurnRules {
+    rules: RuleSet,
+    allow_paths: Vec<PathRule>,
+    deny_paths: Vec<PathRule>,
+    confirm_paths: Vec<PathRule>,
 }
 
 /// Absolute, symlink-resolved form of `p` (which may not exist yet). If `p` is relative and
@@ -271,7 +284,7 @@ impl PermissionEngine {
         let confirm_paths = path_rules(&config.rules.confirm, home.as_deref(), true);
         let workspace = resolved(&config.workspace);
         PermissionEngine {
-            mode: config.mode,
+            mode: Mutex::new(config.mode),
             linked_gitdir: linked_gitdir(&workspace),
             workspace,
             read_dirs: config.read_dirs.iter().map(|d| resolved(d)).collect(),
@@ -283,11 +296,12 @@ impl PermissionEngine {
             writes_need_approval: config.writes_need_approval,
             session_bash: Mutex::new(Vec::new()),
             session_paths: Mutex::new(HashSet::new()),
+            turn: Mutex::new(TurnRules::default()),
         }
     }
 
     pub fn mode(&self) -> Mode {
-        self.mode
+        *self.mode.lock().expect("mode lock")
     }
 
     /// Rules whose tool is not `bash`, `read`, or `write` (they never match; the CLI warns about them).
@@ -303,15 +317,35 @@ impl PermissionEngine {
             .collect()
     }
 
-    /// Config allow rules plus bash prefixes added by approve-for-session.
+    /// Config allow rules, bash prefixes added by approve-for-session, and the turn's allow rules.
     fn allow_list(&self) -> Vec<String> {
         let session = self.session_bash.lock().expect("session bash lock");
+        let turn = self.turn.lock().expect("turn rules lock");
         self.rules
             .allow
             .iter()
             .chain(session.iter())
+            .chain(turn.rules.allow.iter())
             .cloned()
             .collect()
+    }
+
+    /// Config `read:`/`write:` allow rules plus the turn's.
+    fn allow_paths_now(&self) -> Vec<PathRule> {
+        let turn = self.turn.lock().expect("turn rules lock");
+        [self.allow_paths.as_slice(), &turn.allow_paths].concat()
+    }
+
+    /// Config `read:`/`write:` deny rules plus the turn's.
+    fn deny_paths_now(&self) -> Vec<PathRule> {
+        let turn = self.turn.lock().expect("turn rules lock");
+        [self.deny_paths.as_slice(), &turn.deny_paths].concat()
+    }
+
+    /// Config `read:`/`write:` confirm rules plus the turn's.
+    fn confirm_paths_now(&self) -> Vec<PathRule> {
+        let turn = self.turn.lock().expect("turn rules lock");
+        [self.confirm_paths.as_slice(), &turn.confirm_paths].concat()
     }
 
     /// First allow rule for `tool` matching `target` (the fully resolved path). Case-sensitive,
@@ -423,23 +457,25 @@ impl PermissionEngine {
             .contains(&(tool, target.to_path_buf()))
     }
 
-    fn check_read(&self, path: &Path) -> Decision {
+    fn check_read(&self, path: &Path, mode: Mode) -> Decision {
         let target = resolve_path(&self.workspace, path);
         let lexical = lexical_path(&self.workspace, path);
-        if let Some(rule) = self.deny_confirm_rule(&self.deny_paths, "read", &target, &lexical) {
+        if let Some(rule) =
+            self.deny_confirm_rule(&self.deny_paths_now(), "read", &target, &lexical)
+        {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
-        if self.mode != Mode::FullAccess
+        if mode != Mode::FullAccess
             && let Some(rule) =
-                self.deny_confirm_rule(&self.confirm_paths, "read", &target, &lexical)
+                self.deny_confirm_rule(&self.confirm_paths_now(), "read", &target, &lexical)
         {
             return Decision::Ask(format!("read {} (confirm rule `{rule}`)", target.display()));
         }
-        if self.mode == Mode::FullAccess
+        if mode == Mode::FullAccess
             || target.starts_with(&self.workspace)
             || self.read_dirs.iter().any(|d| target.starts_with(d))
             || self
-                .allow_rule(&self.allow_paths, "read", &target)
+                .allow_rule(&self.allow_paths_now(), "read", &target)
                 .is_some()
             || self.session_path_allowed("read", &target)
         {
@@ -448,17 +484,19 @@ impl PermissionEngine {
         Decision::Ask(format!("read outside the workspace: {}", target.display()))
     }
 
-    fn check_write(&self, path: &Path) -> Decision {
+    fn check_write(&self, path: &Path, mode: Mode) -> Decision {
         let target = resolve_path(&self.workspace, path);
         let lexical = lexical_path(&self.workspace, path);
-        if let Some(rule) = self.deny_confirm_rule(&self.deny_paths, "write", &target, &lexical) {
+        if let Some(rule) =
+            self.deny_confirm_rule(&self.deny_paths_now(), "write", &target, &lexical)
+        {
             return Decision::Deny(format!("denied by rule `{rule}`"));
         }
-        if self.mode == Mode::FullAccess {
+        if mode == Mode::FullAccess {
             return Decision::Allow;
         }
-        if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
-            return Decision::Deny(format!("file writes are not allowed in {} mode", self.mode));
+        if matches!(mode, Mode::Plan | Mode::ReadOnly) {
+            return Decision::Deny(format!("file writes are not allowed in {} mode", mode));
         }
         let Ok(inside) = target.strip_prefix(&self.workspace) else {
             return Decision::Ask(format!("write outside the workspace: {}", target.display()));
@@ -466,16 +504,17 @@ impl PermissionEngine {
         if let Some(reason) = self.protected_write(&target, &lexical) {
             return Decision::Ask(reason.into());
         }
-        if let Some(rule) = self.deny_confirm_rule(&self.confirm_paths, "write", &target, &lexical)
+        if let Some(rule) =
+            self.deny_confirm_rule(&self.confirm_paths_now(), "write", &target, &lexical)
         {
             return Decision::Ask(format!(
                 "write {} (confirm rule `{rule}`)",
                 inside.display()
             ));
         }
-        if (self.mode == Mode::Auto && !self.writes_need_approval)
+        if (mode == Mode::Auto && !self.writes_need_approval)
             || self
-                .allow_rule(&self.allow_paths, "write", &target)
+                .allow_rule(&self.allow_paths_now(), "write", &target)
                 .is_some()
             || self.session_path_allowed("write", &target)
         {
@@ -484,18 +523,22 @@ impl PermissionEngine {
         Decision::Ask(format!("write {}", inside.display()))
     }
 
-    /// The `Rules` harness-shell needs for `command`: config rules plus session-approved bash
-    /// prefixes, each filtered down to `bash:` patterns with the prefix removed.
+    /// The `Rules` harness-shell needs for `command`: config rules, session-approved bash
+    /// prefixes and the turn's rules, each filtered down to `bash:` patterns with the prefix
+    /// removed.
     fn bash_rules(&self) -> Rules {
         let allow = self.allow_list();
+        let turn = self.turn.lock().expect("turn rules lock");
+        let deny = [self.rules.deny.as_slice(), &turn.rules.deny].concat();
+        let confirm = [self.rules.confirm.as_slice(), &turn.rules.confirm].concat();
         Rules {
             allow: own(patterns(&allow, "bash")),
-            deny: own(patterns(&self.rules.deny, "bash")),
-            confirm: own(patterns(&self.rules.confirm, "bash")),
+            deny: own(patterns(&deny, "bash")),
+            confirm: own(patterns(&confirm, "bash")),
         }
     }
 
-    fn check_bash(&self, command: &str) -> Decision {
+    fn check_bash(&self, command: &str, mode: Mode) -> Decision {
         let rules = self.bash_rules();
         match harness_shell::evaluate(command, &rules, &self.workspace) {
             Verdict::Deny { reason } => Decision::Deny(reason),
@@ -506,9 +549,9 @@ impl PermissionEngine {
                 reason,
                 may_deny: true,
                 ..
-            } if self.mode == Mode::FullAccess => Decision::Ask(reason),
-            _ if self.mode == Mode::FullAccess => Decision::Allow,
-            _ if !self.sandbox_available && matches!(self.mode, Mode::Plan | Mode::ReadOnly) => {
+            } if mode == Mode::FullAccess => Decision::Ask(reason),
+            _ if mode == Mode::FullAccess => Decision::Allow,
+            _ if !self.sandbox_available && matches!(mode, Mode::Plan | Mode::ReadOnly) => {
                 Decision::Deny(
                     "shell commands need the OS sandbox in plan and read-only mode".into(),
                 )
@@ -519,7 +562,7 @@ impl PermissionEngine {
             )),
             Verdict::Ask { reason, .. } => Decision::Ask(reason),
             Verdict::Allow => Decision::Allow,
-            Verdict::Unlisted if self.mode == Mode::Ask => {
+            Verdict::Unlisted if mode == Mode::Ask => {
                 Decision::Ask(format!("run `{}`", short(command)))
             }
             Verdict::Unlisted => Decision::Allow,
@@ -561,8 +604,8 @@ impl PermissionEngine {
     /// write outside the workspace, to a protected path (`protected_write`), or matching a
     /// deny/confirm rule — none of those decisions can be changed by an approval, since they're
     /// checked before the session approvals in `check_write`.
-    fn remember_write(&self, path: &Path) -> bool {
-        if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
+    fn remember_write(&self, path: &Path, mode: Mode) -> bool {
+        if matches!(mode, Mode::Plan | Mode::ReadOnly) {
             return false;
         }
         let target = resolve_path(&self.workspace, path);
@@ -573,10 +616,10 @@ impl PermissionEngine {
             return false;
         }
         if self
-            .deny_confirm_rule(&self.deny_paths, "write", &target, &lexical)
+            .deny_confirm_rule(&self.deny_paths_now(), "write", &target, &lexical)
             .is_some()
             || self
-                .deny_confirm_rule(&self.confirm_paths, "write", &target, &lexical)
+                .deny_confirm_rule(&self.confirm_paths_now(), "write", &target, &lexical)
                 .is_some()
         {
             return false;
@@ -594,10 +637,10 @@ impl PermissionEngine {
         let target = resolve_path(&self.workspace, path);
         let lexical = lexical_path(&self.workspace, path);
         if self
-            .deny_confirm_rule(&self.deny_paths, "read", &target, &lexical)
+            .deny_confirm_rule(&self.deny_paths_now(), "read", &target, &lexical)
             .is_some()
             || self
-                .deny_confirm_rule(&self.confirm_paths, "read", &target, &lexical)
+                .deny_confirm_rule(&self.confirm_paths_now(), "read", &target, &lexical)
                 .is_some()
         {
             return false;
@@ -611,19 +654,38 @@ impl PermissionEngine {
 }
 
 impl PermissionPolicy for PermissionEngine {
+    // Each check and remember reads the mode once, so a mode switched meanwhile gives the answer
+    // of one mode or the other, never a mix.
     fn check(&self, action: &Action) -> Decision {
+        let mode = self.mode();
         match action {
-            Action::Read(path) => self.check_read(path),
-            Action::Write(path) => self.check_write(path),
-            Action::Bash(command) => self.check_bash(command),
+            Action::Read(path) => self.check_read(path, mode),
+            Action::Write(path) => self.check_write(path, mode),
+            Action::Bash(command) => self.check_bash(command, mode),
         }
     }
 
     fn remember(&self, action: &Action) -> bool {
+        let mode = self.mode();
         match action {
             Action::Bash(command) => self.remember_bash(command),
-            Action::Write(path) => self.remember_write(path),
+            Action::Write(path) => self.remember_write(path, mode),
             Action::Read(path) => self.remember_read(path),
         }
+    }
+
+    fn set_mode(&self, mode: Mode) {
+        *self.mode.lock().expect("mode lock") = mode;
+    }
+
+    fn set_turn_rules(&self, rules: Option<RuleSet>) {
+        let rules = rules.unwrap_or_default();
+        let home = home_dir();
+        *self.turn.lock().expect("turn rules lock") = TurnRules {
+            allow_paths: path_rules(&rules.allow, home.as_deref(), false),
+            deny_paths: path_rules(&rules.deny, home.as_deref(), true),
+            confirm_paths: path_rules(&rules.confirm, home.as_deref(), true),
+            rules,
+        };
     }
 }

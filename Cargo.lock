@@ -945,6 +945,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "harness-config",
+ "harness-context",
  "harness-core",
  "harness-providers",
  "harness-sandbox",
@@ -964,11 +965,23 @@ version = "0.1.0"
 dependencies = [
  "harness-core",
  "hex",
+ "libc",
  "serde",
  "sha2",
  "tempfile",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "harness-context"
+version = "0.1.0"
+dependencies = [
+ "harness-core",
+ "hex",
+ "libc",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -980,6 +993,8 @@ dependencies = [
  "harness-shell",
  "hex",
  "jsonschema",
+ "libc",
+ "nix",
  "serde",
  "serde_json",
  "sha2",
@@ -1039,6 +1054,7 @@ dependencies = [
  "similar 3.2.0",
  "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

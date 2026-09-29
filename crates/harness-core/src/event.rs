@@ -60,6 +60,20 @@ pub enum AgentEvent {
         reason: String,
         delay_ms: u64,
     },
+    /// Something the user should know that did not stop the turn.
+    Warning {
+        message: String,
+    },
+    /// The workspace was snapshotted before the turn's first change.
+    CheckpointCreated {
+        commit: String,
+    },
+    /// The older part of the conversation was replaced by `summary`.
+    Compacted {
+        summary: String,
+        tokens_before: u64,
+        tokens_after: u64,
+    },
     TurnFinished {
         reason: TurnEndReason,
     },

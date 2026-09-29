@@ -3,7 +3,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use harness_core::{agent::DEFAULT_MAX_STEPS, permission::Mode};
+use harness_core::{
+    agent::DEFAULT_MAX_STEPS,
+    compaction::{DEFAULT_KEEP_RECENT, DEFAULT_THRESHOLD},
+    permission::Mode,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -61,6 +65,68 @@ pub struct SandboxConfig {
     pub linux_git_protection: Option<LinuxGitProtection>,
 }
 
+/// The lowest compaction threshold, in percent, a project may set without workspace trust: below
+/// it harness would summarize, a paid request that replaces verbatim context, every few turns.
+pub const MIN_UNTRUSTED_THRESHOLD_PERCENT: u8 = 50;
+
+/// `[compaction]`: when the conversation is summarized, in percent of the context window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionSettings {
+    /// Compact when estimated usage reaches this share of the context window (1 to 100).
+    pub threshold_percent: Option<u8>,
+    /// Keep this share of the context window of recent messages as they are (below the
+    /// threshold).
+    pub keep_recent_percent: Option<u8>,
+}
+
+impl CompactionSettings {
+    /// The threshold as a fraction of the context window.
+    pub fn threshold(&self) -> f64 {
+        self.threshold_percent
+            .map_or(DEFAULT_THRESHOLD, |p| f64::from(p) / 100.0)
+    }
+
+    /// The share kept as recent messages, as a fraction of the context window.
+    pub fn keep_recent(&self) -> f64 {
+        self.keep_recent_percent
+            .map_or(DEFAULT_KEEP_RECENT, |p| f64::from(p) / 100.0)
+    }
+
+    /// Which value is outside 1 to 100, if any.
+    fn out_of_range(&self) -> Option<String> {
+        let bad = |p: Option<u8>| p.is_some_and(|p| p == 0 || p > 100);
+        if bad(self.threshold_percent) {
+            return Some("compaction.threshold_percent must be between 1 and 100".into());
+        }
+        if bad(self.keep_recent_percent) {
+            return Some("compaction.keep_recent_percent must be between 1 and 100".into());
+        }
+        None
+    }
+
+    /// These settings with `project`'s over them.
+    fn overlaid(&self, project: &CompactionSettings) -> CompactionSettings {
+        CompactionSettings {
+            threshold_percent: project.threshold_percent.or(self.threshold_percent),
+            keep_recent_percent: project.keep_recent_percent.or(self.keep_recent_percent),
+        }
+    }
+
+    /// What is wrong with these settings, if anything.
+    fn problem(&self) -> Option<String> {
+        if let Some(problem) = self.out_of_range() {
+            return Some(problem);
+        }
+        if self.keep_recent() >= self.threshold() {
+            return Some(
+                "compaction.keep_recent_percent must be below compaction.threshold_percent".into(),
+            );
+        }
+        None
+    }
+}
+
 /// One `config.toml` file as written by the user.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +140,8 @@ pub struct ConfigFile {
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    #[serde(default)]
+    pub compaction: CompactionSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +161,7 @@ pub struct Config {
     pub model: Option<String>,
     pub mode: Option<Mode>,
     pub max_steps: Option<u32>,
+    pub compaction: CompactionSettings,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
@@ -101,6 +170,10 @@ pub struct Config {
     pub writable_roots: Vec<PathBuf>,
     pub allow_localhost: bool,
     pub linux_git_protection: LinuxGitProtection,
+    /// Whether the user trusted this workspace with its project settings as they are now
+    /// (`harness trust`), so that their widening settings apply. A workspace with no such
+    /// settings can be trusted too. A project command file's `model` applies only then.
+    pub trusted: bool,
     pub warnings: Vec<String>,
 }
 
@@ -125,9 +198,10 @@ pub fn parse_file(path: &Path) -> Result<Option<ConfigFile>, ConfigError> {
 }
 
 /// Project settings that widen what the agent may do, and a fingerprint of them. Trust is granted to a
-/// fingerprint, so any change to these settings needs trust again.
+/// fingerprint, that of the empty set included, so any change to these settings needs trust again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Widening {
+    /// Empty when the project has no widening settings.
     pub items: Vec<String>,
     pub fingerprint: String,
 }
@@ -167,7 +241,7 @@ pub fn default_mode(workspace: &Path) -> Mode {
     }
 }
 
-fn widening(project: &ConfigFile, baseline: Baseline) -> Option<Widening> {
+fn widening(project: &ConfigFile, baseline: Baseline) -> Widening {
     let mut items = Vec::new();
     if let Some(mode) = project.mode.filter(|m| !m.grants_at_most(baseline.mode)) {
         items.push(format!("mode = \"{mode}\""));
@@ -201,31 +275,59 @@ fn widening(project: &ConfigFile, baseline: Baseline) -> Option<Widening> {
     {
         items.push("sandbox.linux_git_protection = \"best-effort\"".to_string());
     }
-    if items.is_empty() {
-        return None;
+    // It does not widen what the agent may do, but it needs trust all the same (ruling P3-R4).
+    if let Some(p) = low_threshold(project) {
+        items.push(format!("{THRESHOLD_ITEM}{p}"));
     }
+    // No item is empty, so only the empty set joins to "".
     let fingerprint = hex::encode(Sha256::digest(items.join("\n").as_bytes()));
-    Some(Widening { items, fingerprint })
+    Widening { items, fingerprint }
+}
+
+/// How a project's too-low compaction threshold is listed among the settings that need trust.
+const THRESHOLD_ITEM: &str = "compaction.threshold_percent = ";
+
+/// The project's compaction threshold when it is below [`MIN_UNTRUSTED_THRESHOLD_PERCENT`].
+fn low_threshold(project: &ConfigFile) -> Option<u8> {
+    project
+        .compaction
+        .threshold_percent
+        .filter(|&p| p < MIN_UNTRUSTED_THRESHOLD_PERCENT)
 }
 
 pub fn project_file(workspace: &Path) -> PathBuf {
     workspace.join(".harness").join("config.toml")
 }
 
-/// The widening settings in the workspace's project config, if any (shown by `harness trust`).
-/// Whether a mode or step limit widens depends on the global config, so it is read too.
-pub fn project_widening(
-    global_file: &Path,
-    workspace: &Path,
-) -> Result<Option<Widening>, ConfigError> {
-    let baseline = Baseline::new(parse_file(global_file)?.as_ref(), workspace);
-    Ok(parse_file(&project_file(workspace))?
-        .as_ref()
-        .and_then(|project| widening(project, baseline)))
+/// The widening settings in the workspace's project config, possibly none (shown and trusted by
+/// `harness trust`). Whether a mode or step limit widens depends on the global config, so it is
+/// read too.
+pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening, ConfigError> {
+    let global = parse_file(global_file)?;
+    let baseline = Baseline::new(global.as_ref(), workspace);
+    let path = project_file(workspace);
+    let project = parse_file(&path)?.unwrap_or_default();
+    // Settings that would be invalid once trusted cannot be trusted.
+    let global_compaction = global.map(|g| g.compaction).unwrap_or_default();
+    if let Some(message) = project
+        .compaction
+        .out_of_range()
+        .or_else(|| global_compaction.overlaid(&project.compaction).problem())
+    {
+        return Err(ConfigError::Parse { path, message });
+    }
+    Ok(widening(&project, baseline))
+}
+
+/// Whether the user trusts `dir`, as `harness trust` run there records it: trust for `dir` holds
+/// the fingerprint of `dir`'s own project settings. Settings that cannot be read are not trusted.
+pub fn is_trusted(global_file: &Path, dir: &Path, trust: &TrustStore) -> bool {
+    project_widening(global_file, dir).is_ok_and(|w| trust.is_trusted(dir, &w.fingerprint))
 }
 
 /// Loads the global config, then the workspace's `.harness/config.toml`. Project settings that narrow
-/// what the agent may do always apply; widening ones apply only when `trust` holds their fingerprint.
+/// what the agent may do always apply; widening ones apply only when `trust` holds their fingerprint,
+/// which also makes the workspace trusted (`Config::trusted`) when it has none.
 pub fn load(
     global_file: &Path,
     workspace: &Path,
@@ -236,6 +338,12 @@ pub fn load(
     let mut cfg = Config::default();
     let global = parse_file(global_file)?;
     let baseline = Baseline::new(global.as_ref(), workspace);
+    if let Some(message) = global.as_ref().and_then(|g| g.compaction.problem()) {
+        return Err(ConfigError::Parse {
+            path: global_file.to_path_buf(),
+            message,
+        });
+    }
     if let Some(global) = global {
         let base = global_file.parent().unwrap_or(Path::new("/"));
         cfg.model = global.model;
@@ -245,16 +353,55 @@ pub fn load(
         cfg.allow = global.permissions.allow;
         cfg.deny = global.permissions.deny;
         cfg.confirm = global.permissions.confirm;
+        cfg.compaction = global.compaction;
         cfg.read_dirs = expand_all(&global.permissions.read_dirs, base, home);
         cfg.writable_roots = expand_all(&global.sandbox.writable_roots, base, home);
         cfg.allow_localhost = global.sandbox.allow_localhost.unwrap_or(false);
         cfg.linux_git_protection = global.sandbox.linux_git_protection.unwrap_or_default();
     }
     let path = project_file(workspace);
-    if let Some(project) = parse_file(&path)? {
+    let project = parse_file(&path)?;
+    let widening = widening(project.as_ref().unwrap_or(&ConfigFile::default()), baseline);
+    cfg.trusted = trust.is_trusted(workspace, &widening.fingerprint);
+    if let Some(project) = project {
+        if let Some(message) = project.compaction.out_of_range() {
+            return Err(ConfigError::Parse { path, message });
+        }
         cfg.deny.extend(project.permissions.deny.iter().cloned());
         cfg.confirm
             .extend(project.permissions.confirm.iter().cloned());
+        // Compaction settings change when the conversation is summarized, not what the agent
+        // may do, so they apply without trust, except a threshold low enough to summarize (a paid
+        // request that drops verbatim context) every few turns (ruling P3-R4).
+        // The project's settings are checked as they would apply once trusted, so a config that
+        // is invalid then is invalid now too.
+        let as_trusted = cfg.compaction.overlaid(&project.compaction);
+        if let Some(message) = as_trusted.problem() {
+            return Err(ConfigError::Parse { path, message });
+        }
+        match low_threshold(&project).filter(|_| !cfg.trusted) {
+            None => cfg.compaction = as_trusted,
+            Some(p) => {
+                // The global threshold or the default applies, and the project's keep share
+                // with it only while it is below that threshold.
+                let with_keep = CompactionSettings {
+                    threshold_percent: cfg.compaction.threshold_percent,
+                    ..as_trusted
+                };
+                let mut ignored = format!("{THRESHOLD_ITEM}{p}");
+                if with_keep.problem().is_none() {
+                    cfg.compaction = with_keep;
+                } else if let Some(keep) = project.compaction.keep_recent_percent {
+                    ignored.push_str(&format!(" and keep_recent_percent = {keep}"));
+                }
+                cfg.warnings.push(format!(
+                    "{}: ignoring {ignored}: a project may compact below {MIN_UNTRUSTED_THRESHOLD_PERCENT}% of the context window only in a trusted workspace, so {}% applies, keeping {}%; run `harness trust` to review and apply it",
+                    path.display(),
+                    (cfg.compaction.threshold() * 100.0).round(),
+                    (cfg.compaction.keep_recent() * 100.0).round()
+                ));
+            }
+        }
         if let Some(steps) = project.max_steps.filter(|&n| n <= baseline.max_steps) {
             cfg.max_steps = Some(steps);
         }
@@ -267,9 +414,14 @@ pub fn load(
         if let Some(LinuxGitProtection::Required) = project.sandbox.linux_git_protection {
             cfg.linux_git_protection = LinuxGitProtection::Required;
         }
-        match widening(&project, baseline) {
-            None => {}
-            Some(w) if trust.is_trusted(workspace, &w.fingerprint) => {
+        // The threshold has its own warning above.
+        let widening_items: Vec<&String> = widening
+            .items
+            .iter()
+            .filter(|item| !item.starts_with(THRESHOLD_ITEM))
+            .collect();
+        if !widening_items.is_empty() {
+            if cfg.trusted {
                 if project.mode.is_some() {
                     cfg.mode = project.mode;
                 }
@@ -283,21 +435,26 @@ pub fn load(
                 cfg.read_dirs
                     .extend(expand_all(&project.permissions.read_dirs, workspace, home));
                 cfg.providers.extend(project.providers.clone());
-                cfg.writable_roots
-                    .extend(expand_all(&project.sandbox.writable_roots, workspace, home));
+                cfg.writable_roots.extend(expand_all(
+                    &project.sandbox.writable_roots,
+                    workspace,
+                    home,
+                ));
                 if let Some(allow) = project.sandbox.allow_localhost {
                     cfg.allow_localhost = allow;
                 }
                 if let Some(protection) = project.sandbox.linux_git_protection {
                     cfg.linux_git_protection = protection;
                 }
+            } else {
+                let items: Vec<&str> = widening_items.iter().map(|item| item.as_str()).collect();
+                cfg.warnings.push(format!(
+                    "{}: ignoring {} setting(s) that widen what the agent may do ({}); run `harness trust` to review and apply them",
+                    path.display(),
+                    items.len(),
+                    items.join("; ")
+                ));
             }
-            Some(w) => cfg.warnings.push(format!(
-                "{}: ignoring {} setting(s) that widen what the agent may do ({}); run `harness trust` to review and apply them",
-                path.display(),
-                w.items.len(),
-                w.items.join("; ")
-            )),
         }
     }
     Ok(cfg)

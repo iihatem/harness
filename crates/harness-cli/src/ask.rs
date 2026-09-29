@@ -25,6 +25,7 @@ use crate::{
 pub async fn run(
     model_flag: Option<String>,
     mode_flag: Option<Mode>,
+    session: crate::sessions::Choice,
     prompt_text: String,
     json: bool,
 ) -> u8 {
@@ -35,6 +36,18 @@ pub async fn run(
         .expect("failed to install a SIGINT handler");
     let setup = match setup::load() {
         Ok(setup) => setup,
+        Err(message) => {
+            eprintln!("error: {}", terminal_safe(&message));
+            return 2;
+        }
+    };
+    let commands = crate::slash::discover(&setup, &prompt_text);
+    if let Err(message) = crate::slash::check(&prompt_text, commands.as_ref()) {
+        eprintln!("error: {}", terminal_safe(&message));
+        return 2;
+    }
+    let session = match crate::sessions::open(&setup, &session) {
+        Ok(session) => session,
         Err(message) => {
             eprintln!("error: {}", terminal_safe(&message));
             return 2;
@@ -81,6 +94,7 @@ pub async fn run(
 
     // Only read (and potentially block on) stdin once we know we're actually going to run: a
     // missing model must exit 2 promptly even if a pipe into stdin is still open.
+    let typed = prompt_text.clone();
     let input = match with_piped_stdin(prompt_text, cancel.clone()).await {
         StdinOutcome::Ready(input) => input,
         // Cancelled while waiting on stdin: exit immediately, before any model call.
@@ -109,15 +123,16 @@ pub async fn run(
     let workspace_too_broad = mode.fs_access() == FsAccess::WorkspaceWrite
         && harness_sandbox::workspace_is_too_broad(&setup.workspace);
     let required = setup.config.linux_git_protection == LinuxGitProtection::Required;
+    let settings = harness_sandbox::SandboxSettings {
+        extra_writable: setup.config.writable_roots.clone(),
+        allow_localhost: setup.config.allow_localhost,
+        quarantine_dir: Some(setup.paths.data_dir.join("quarantine")),
+        require_full_git_protection: required,
+    };
     let detected = if mode == Mode::FullAccess || sandbox_disabled_by_env || workspace_too_broad {
         None
     } else {
-        harness_sandbox::detect(harness_sandbox::SandboxSettings {
-            extra_writable: setup.config.writable_roots.clone(),
-            allow_localhost: setup.config.allow_localhost,
-            quarantine_dir: Some(setup.paths.data_dir.join("quarantine")),
-            require_full_git_protection: required,
-        })
+        harness_sandbox::detect(settings.clone())
     };
     let choice = sandbox::choose(detected, mode.fs_access(), required);
     if let Some(warning) = &choice.warning {
@@ -126,7 +141,7 @@ pub async fn run(
     let sandbox = choice.sandbox;
     // From here on, however `run` is left, the sandbox's session ends: on Linux that ends what
     // sandboxed commands left running, and checks git metadata once more.
-    let session = SessionEnd::new(sandbox.clone());
+    let sandbox_session = SessionEnd::new(sandbox.clone());
     let sandboxed = sandbox.is_some();
     if mode != Mode::FullAccess && !sandboxed && choice.warning.is_none() {
         if sandbox_disabled_by_env {
@@ -168,12 +183,32 @@ pub async fn run(
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),
-        prompt::system_prompt(&setup.workspace, &prompt::today_utc(), mode, sandboxed),
+        crate::context::system_prompt(&setup, &prompt::base_prompt(mode, sandboxed)),
         output_dir,
     );
     if let Some(steps) = setup.config.max_steps {
         config.max_steps = steps;
     }
+    config.compaction = harness_core::compaction::CompactionConfig {
+        threshold: setup.config.compaction.threshold(),
+        keep_recent: setup.config.compaction.keep_recent(),
+    };
+    // `with_piped_stdin` returns the prompt with any piped text appended.
+    let turn = crate::slash::turn_input(
+        &typed,
+        &input[typed.len()..],
+        commands.as_ref(),
+        &setup,
+        &*policy,
+    );
+    // Sandboxed commands run without approval: what they can write to must not hold the
+    // checkpoint repository, which harness's own git reads outside the sandbox.
+    let writable = if sandboxed {
+        harness_sandbox::writable_roots(&settings, &setup.workspace)
+    } else {
+        Vec::new()
+    };
+    let checkpoints = crate::sessions::checkpoints(&setup, &session, &writable);
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin(),
@@ -181,11 +216,13 @@ pub async fn run(
         Arc::new(NonInteractive),
         config,
         ctx,
-    );
+    )
+    .with_session(session)
+    .with_checkpoints(checkpoints);
 
     let (tx, rx) = mpsc::unbounded_channel();
     let renderer = tokio::spawn(render(rx, json, cancel.clone()));
-    let reason = agent.run_turn(input, &tx, cancel).await;
+    let reason = agent.run_turn(turn, &tx, cancel).await;
     drop(tx);
     let (final_text, blocked) = renderer.await.unwrap_or_default();
     if !json && !final_text.is_empty() {
@@ -199,8 +236,15 @@ pub async fn run(
             terminal_safe_text(&final_text)
         );
     }
-    session.end();
+    end_run(agent, sandbox_session);
     exit_code(reason, blocked)
+}
+
+/// Ends the run: first the agent, which releases the session file, then the sandbox's session,
+/// which can take a few seconds, so a `-c` started once the answer prints finds the file free.
+fn end_run(agent: Agent, sandbox_session: SessionEnd) {
+    drop(agent);
+    sandbox_session.end();
 }
 
 /// Ends the sandbox's session ([`CommandSandbox::end_session`]) once: when [`end`](Self::end) is
@@ -372,6 +416,8 @@ async fn render(
 ) -> (String, bool) {
     let mut last_text = String::new();
     let mut blocked = false;
+    // What each `write` or `edit` call would change, to show it when the call is blocked.
+    let mut writes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut stdout_broken = false;
     while let Some(event) = rx.recv().await {
         if json && !stdout_broken {
@@ -385,17 +431,25 @@ async fn render(
             AgentEvent::AssistantMessage { content, .. } if !content.is_empty() => {
                 last_text = content.clone()
             }
-            AgentEvent::ActionBlocked { reason, .. } => {
+            AgentEvent::ActionBlocked { id, reason } => {
                 blocked = true;
                 if !json {
                     eprintln!("blocked: {}", terminal_safe(reason));
+                    if let Some(proposed) = writes.get(id) {
+                        eprintln!("{proposed}");
+                    }
                 }
             }
             AgentEvent::ToolCallRequested {
-                name, arguments, ..
+                id,
+                name,
+                arguments,
             } if !json => {
                 let shown: String = arguments.chars().take(120).collect();
                 eprintln!("-> {} {}", terminal_safe(name), terminal_safe(&shown));
+                if let Some(proposed) = proposed_change(name, arguments) {
+                    writes.insert(id.clone(), proposed);
+                }
             }
             AgentEvent::Retrying {
                 attempt,
@@ -410,6 +464,19 @@ async fn render(
             AgentEvent::Error { message, .. } if !json => {
                 eprintln!("error: {}", terminal_safe(message))
             }
+            AgentEvent::Warning { message } if !json => {
+                eprintln!("warning: {}", terminal_safe(message))
+            }
+            AgentEvent::Compacted {
+                summary,
+                tokens_before,
+                tokens_after,
+            } if !json => {
+                eprintln!(
+                    "compacted the conversation from about {tokens_before} to {tokens_after} tokens; summary:\n{}",
+                    terminal_safe_text(summary)
+                );
+            }
             AgentEvent::TurnFinished {
                 reason: TurnEndReason::StepLimit,
             } if !json => {
@@ -419,6 +486,33 @@ async fn render(
         }
     }
     (last_text, blocked)
+}
+
+/// What a `write` or `edit` call with `arguments` would change, as printed when it is blocked: the
+/// whole new content, or the text an edit replaces and its replacement. Only what the model sent
+/// is shown; the file itself is not read, since a blocked file may hold secrets.
+fn proposed_change(name: &str, arguments: &str) -> Option<String> {
+    let args = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    let path = terminal_safe(args["path"].as_str()?);
+    match name {
+        "write" => Some(format!(
+            "proposed content of {path}:\n{}",
+            terminal_safe_text(args["content"].as_str()?)
+        )),
+        "edit" => {
+            let every = if args["replace_all"].as_bool() == Some(true) {
+                " every occurrence of"
+            } else {
+                ""
+            };
+            Some(format!(
+                "proposed edit of {path}, replacing:{every}\n{}\nwith:\n{}",
+                terminal_safe_text(args["old_string"].as_str()?),
+                terminal_safe_text(args["new_string"].as_str()?)
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -532,6 +626,88 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = tool_context(dir.path(), None, FsAccess::WorkspaceWrite).await;
         assert!(ctx.sandbox.is_none());
+    }
+
+    /// Records, when its session ends, whether the harness session file at `path` could be
+    /// opened then.
+    #[derive(Debug)]
+    struct LockProbe {
+        path: std::path::PathBuf,
+        free: Mutex<Option<bool>>,
+    }
+
+    impl CommandSandbox for LockProbe {
+        fn name(&self) -> &'static str {
+            "lock probe"
+        }
+
+        fn command(
+            &self,
+            _access: FsAccess,
+            _workspace: &Path,
+            program: &str,
+            _args: &[&str],
+        ) -> std::io::Result<tokio::process::Command> {
+            Ok(tokio::process::Command::new(program))
+        }
+
+        fn is_denial(&self, _exit_code: Option<i32>, _output: &str) -> bool {
+            false
+        }
+
+        fn start_session(&self, _workspace: &Path) {}
+
+        fn end_session(&self) -> Option<String> {
+            let free = harness_core::session::Session::open(&self.path).is_ok();
+            *self.free.lock().unwrap() = Some(free);
+            None
+        }
+    }
+
+    // Review D M9: ending the sandbox's session takes a few seconds on Linux; the session file
+    // is released before, so a `-c` started as soon as the answer prints can use it.
+    #[test]
+    fn the_session_is_released_before_the_sandbox_session_ends() {
+        use harness_core::{
+            message::Message,
+            session::{EntryKind, Session},
+            testing::MockProvider,
+            tool::ToolRegistry,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(&dir.path().join("sessions"), dir.path());
+        session.append(EntryKind::Message {
+            message: Message::User {
+                content: "hi".into(),
+            },
+            display: None,
+            note: false,
+        });
+        let path = session.path().unwrap().to_path_buf();
+        let policy = Arc::new(PermissionEngine::new(EngineConfig {
+            mode: Mode::Auto,
+            workspace: dir.path().to_path_buf(),
+            read_dirs: vec![],
+            rules: RuleSet::default(),
+            sandbox_available: false,
+            writes_need_approval: false,
+        }));
+        let agent = Agent::new(
+            MockProvider::new(vec![]),
+            ToolRegistry::new(vec![]),
+            policy,
+            Arc::new(NonInteractive),
+            AgentConfig::new("mock/m", "m", "system", dir.path().join("out")),
+            ToolContext::new(dir.path()),
+        )
+        .with_session(session);
+        let probe = Arc::new(LockProbe {
+            path,
+            free: Mutex::new(None),
+        });
+        let shared: Arc<dyn CommandSandbox> = probe.clone();
+        end_run(agent, SessionEnd::new(Some(shared)));
+        assert_eq!(*probe.free.lock().unwrap(), Some(true));
     }
 
     #[test]

@@ -49,3 +49,17 @@ fn malformed_trust_store_returns_error() {
     let err = TrustStore::load(&data).unwrap_err().to_string();
     assert!(err.contains("trust.toml"), "{err}");
 }
+
+// Final review, important 2: the data directory holds sessions, checkpoints and the trust list,
+// so when harness makes it, only the user may read it, whichever part of harness makes it first.
+#[test]
+fn a_data_directory_made_for_the_trust_list_is_private() {
+    unsafe { libc::umask(0o022) };
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("share/harness");
+    let ws = dir.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    TrustStore::load(&data).unwrap().trust(&ws, "fp").unwrap();
+    let mode = std::fs::metadata(&data).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700);
+}

@@ -109,6 +109,36 @@ pub fn workspace_is_too_broad(workspace: &Path) -> bool {
     roots::safe_root(workspace, roots::home_dir().as_deref()).is_none()
 }
 
+/// The directories a sandboxed command that may write the workspace can write to, devices aside:
+/// the workspace, the temp directories (on macOS, the per-user ones too; on Linux, `/dev/shm`) and
+/// the configured `writable_roots`. Each is canonicalized when it exists, so that a canonical path inside one
+/// starts with it. What harness keeps outside the sandbox's reach must not be in any of them.
+pub fn writable_roots(settings: &SandboxSettings, workspace: &Path) -> Vec<PathBuf> {
+    let home = roots::home_dir();
+    let mut out = vec![workspace.to_path_buf()];
+    out.extend(fixed_writable_roots(cfg!(target_os = "linux")));
+    out.extend(
+        std::env::var_os("TMPDIR")
+            .and_then(|dir| roots::safe_root(Path::new(&dir), home.as_deref())),
+    );
+    #[cfg(target_os = "macos")]
+    out.extend(macos::user_writable_roots());
+    out.extend(settings.extra_writable.iter().cloned());
+    out.into_iter()
+        .map(|root| std::fs::canonicalize(&root).unwrap_or(root))
+        .collect()
+}
+
+/// The directories the sandbox always makes writable in workspace-write modes: the temp
+/// directories, and on Linux `/dev/shm`, which Python's `multiprocessing` needs.
+fn fixed_writable_roots(linux: bool) -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
+    if linux {
+        roots.push(PathBuf::from("/dev/shm"));
+    }
+    roots
+}
+
 /// Why [`detect`] finds no sandbox on this host, for `harness sandbox doctor`.
 pub fn unavailable_reason() -> String {
     #[cfg(target_os = "macos")]
@@ -164,6 +194,35 @@ pub fn detect(settings: SandboxSettings) -> Option<Arc<dyn CommandSandbox>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Re-review E, nit b: the Linux sandbox makes /dev/shm writable in workspace-write modes, for
+    // Python's multiprocessing.
+    #[test]
+    fn dev_shm_is_a_writable_root_on_linux_only() {
+        assert!(fixed_writable_roots(true).contains(&PathBuf::from("/dev/shm")));
+        assert!(!fixed_writable_roots(false).contains(&PathBuf::from("/dev/shm")));
+        for linux in [true, false] {
+            assert!(fixed_writable_roots(linux).contains(&PathBuf::from("/tmp")));
+        }
+    }
+
+    #[test]
+    fn writable_roots_cover_the_workspace_the_temp_directories_and_the_configured_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let extra = dir.path().join("extra");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&extra).unwrap();
+        let settings = SandboxSettings {
+            extra_writable: vec![extra.clone()],
+            ..SandboxSettings::default()
+        };
+        let roots = writable_roots(&settings, &workspace);
+        for expected in [&workspace, &extra, Path::new("/tmp")] {
+            let expected = std::fs::canonicalize(expected).unwrap();
+            assert!(roots.contains(&expected), "{expected:?} not in {roots:?}");
+        }
+    }
 
     #[test]
     fn root_home_and_its_ancestors_are_too_broad_for_a_workspace() {

@@ -36,15 +36,17 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 - [x] 2.14 P2 follow-ups from the final review: here-document tracking in the fallback scan must not turn deny matches into prompts; a quote-aware heredoc pre-screen so quoted `<<` patterns stay decomposable; escape config parse errors before printing; the write tool asks before editing dotfiles when the workspace is `$HOME`; fix the design.md wording on nested symlinked gitdirs
 - [x] 2.15 Shell-analysis follow-ups: on macOS, make `harness-shell` read a here-document inside `$(…)` the way `/bin/bash` 3.2 does without making the common `git commit -m "$(cat <<'EOF' …)"` idiom ask; bound the rough scan's memory on very large commands (1 MB of input can take about 500 MB)
 - [x] 2.16 Rough-scan follow-up from the 2.15 review: when a redirection comes before the command name (`>/dev/null curl x`) in text that cannot be fully decomposed, also check a reading with redirection operators and their targets removed, so deny rules see the real command name (verdicts can only get stricter); verify with a differential against master
+- [ ] 2.17 Here-document follow-up from the 2.16 review: a here-document operator split by a backslash-newline (`cat <\⏎<EOF` … `curl x`) must be joined before here-document tracking, so a denied command after the body is denied rather than asked about; both bashes run it; verify with a differential against master
+- [ ] 2.18 Shell-analysis gaps from the P3 reviews, for commands the model writes: treat `${…@op}` transforms of runtime values (`@P` evaluates on bash 4.4+) as not fully decomposed; analyse or ask for the strings `trap`, `compgen -W/-C` and `complete -W/-C` evaluate later; don't let arithmetic text with single-quoted content pass under an `echo` allow rule; verify with a differential against master
 
-## 3. P3 Memory (plan written after P2)
+## 3. P3 Memory (`docs/superpowers/plans/2026-09-27-m1-p3-memory.md`)
 
-- [ ] 3.1 `AGENTS.md`/`CLAUDE.md` discovery with confined `@` imports; verify the project-context discovery and import scenarios as tests
-- [ ] 3.2 Cache-stable prompt assembly with session-start environment capture and oversize warning; verify byte-identical prefixes across turns in a test
-- [ ] 3.3 Slash commands: built-in registry, Markdown discovery and namespacing, frontmatter, placeholders, headless use; verify `/opsx:propose` expands from `.claude/commands` in an e2e test
-- [ ] 3.4 Sessions: incremental JSONL tree, resume (`-c`, `--resume`), truncated-file tolerance; verify the sessions scenarios as tests
-- [ ] 3.5 Checkpoints: shadow-repository snapshots, rewind of code/conversation/both, undo last rewind, degradation; verify the checkpoints scenarios as tests
-- [ ] 3.6 Compaction (automatic, `/compact`, overflow retry) and `/init`; verify the compaction scenarios with the mock provider
+- [x] 3.1 `AGENTS.md`/`CLAUDE.md` discovery with confined `@` imports; verify the project-context discovery and import scenarios as tests
+- [x] 3.2 Cache-stable prompt assembly with session-start environment capture and oversize warning; verify byte-identical prefixes across turns in a test
+- [x] 3.3 Slash commands: built-in registry, Markdown discovery and namespacing, frontmatter, placeholders, headless use; verify `/opsx:propose` expands from `.claude/commands` in an e2e test
+- [x] 3.4 Sessions: incremental JSONL tree, resume (`-c`, `--resume`), truncated-file tolerance; verify the sessions scenarios as tests
+- [x] 3.5 Checkpoints: shadow-repository snapshots, rewind of code/conversation/both, undo last rewind, degradation; verify the checkpoints scenarios as tests
+- [x] 3.6 Compaction (automatic, `/compact`, overflow retry) and `/init`; verify the compaction scenarios with the mock provider (on-demand compaction is an API here; the interactive `/compact` command comes with the terminal UI in 5.7)
 
 ## 4. P4 Providers (plan written after P3)
 
@@ -64,7 +66,7 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 - [ ] 5.4 Interactive approvals with diffs, re-run-unsandboxed offer, and Shift+Tab mode cycling; verify with scripted-input tests
 - [ ] 5.5 Steering (queued vs send-now input) in the runtime and UI; verify the agent-runtime steering scenarios as tests
 - [ ] 5.6 Plan mode flow (Build / Edit in `$EDITOR` / Keep planning); verify the plan-mode scenarios as tests
-- [ ] 5.7 `/rewind` picker, model and session pickers, first-run model choice; verify with scripted-input tests
+- [ ] 5.7 `/rewind` picker, `/compact`, `/resume` and `/mode`, model and session pickers, first-run model choice; verify with scripted-input tests
 - [ ] 5.8 Desktop notifications (OSC 9 + bell); verify emitted escape sequences in a test
 
 ## 6. M1 acceptance

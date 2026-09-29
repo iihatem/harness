@@ -47,9 +47,25 @@ The system SHALL apply project-level settings that widen what the agent may do (
 - **WHEN** a trusted workspace's project config later gains `providers.x.base_url`
 - **THEN** the widening settings are ignored with a warning until the workspace is trusted again
 
+### Requirement: Compaction settings
+The system SHALL read `[compaction] threshold_percent` (default 80) and `keep_recent_percent` (default 20) as whole percentages of the context window. Each MUST be between 1 and 100, and the kept share below the threshold; other values MUST be errors naming the file. A project's `threshold_percent` below 50 MUST apply only in a trusted workspace, and is shown and fingerprinted by `harness trust` with the widening settings; otherwise the global value, or the default, applies, with a warning naming the project file. The global config, and a trusted workspace's project config, MAY set any valid value; the project's other compaction settings apply without trust. Project settings MUST be checked as they would apply once trusted, so a project config that is invalid then is an error while untrusted too; while its low threshold is ignored, its `keep_recent_percent` applies only when it is below the threshold that applies instead.
+
+#### Scenario: A project asks to compact early
+- **WHEN** an untrusted project config sets `threshold_percent = 30` and the global config sets no threshold
+- **THEN** compaction starts at 80% of the context window, and a warning names `.harness/config.toml` and the ignored setting
+
+#### Scenario: Keeping nothing
+- **WHEN** a config sets `keep_recent_percent = 0`
+- **THEN** harness reports the invalid value with its file
+
 ### Requirement: Trusting a workspace from the command line
-The system SHALL provide `harness trust`, which displays the workspace's widening project settings and records trust after the user confirms interactively or passes `--yes`, and `harness trust --revoke`, which removes it. Without a terminal and without `--yes`, `harness trust` MUST exit with code 2 and explain how to confirm.
+The system SHALL provide `harness trust`, which displays the workspace's widening project settings and records trust after the user confirms interactively or passes `--yes`, and `harness trust --revoke`, which removes it. A workspace with no widening settings MUST be trustable too: its trust is recorded as the fingerprint of the empty set, so it lasts until a widening setting appears. Without a terminal and without `--yes`, `harness trust` MUST exit with code 2 and explain how to confirm.
 
 #### Scenario: Trusting non-interactively
 - **WHEN** the user runs `harness trust --yes` in a workspace whose project config has an `allow` rule
 - **THEN** later runs in that workspace apply the rule without a warning
+
+#### Scenario: Trusting a workspace that has only command files
+- **WHEN** a repository has `.claude/commands/pick.md` with `model: other/model`, no project config, and the user runs `harness trust --yes`
+- **THEN** later runs of `/pick` use `other/model`
+- **AND** once the project config gains an `allow` rule, the workspace is untrusted until trusted again

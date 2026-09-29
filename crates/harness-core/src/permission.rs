@@ -7,6 +7,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::RuleSet;
+
 /// Approval mode. See the permissions-sandbox spec for the exact semantics of each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -173,4 +175,15 @@ pub trait PermissionPolicy: Send + Sync {
     fn remember(&self, _action: &Action) -> bool {
         false
     }
+
+    /// Switches the approval mode for later checks. Policies without modes ignore it.
+    ///
+    /// Internal to the agent: frontends call `Agent::set_mode`, which also gives shell commands
+    /// the new mode's sandbox access and records the change in the conversation. Calling this
+    /// directly would leave commands running with the old mode's access.
+    fn set_mode(&self, _mode: Mode) {}
+
+    /// Adds rules for the current turn only, or with `None` removes them. They never override
+    /// deny rules, destructive-command confirmation or the sandbox.
+    fn set_turn_rules(&self, _rules: Option<RuleSet>) {}
 }

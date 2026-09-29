@@ -1743,3 +1743,45 @@ fn plain_glob_match() {
     assert!(glob_match("src/*.rs", "src/a/b.rs"));
     assert!(!glob_match("src/*.rs", "tests/a.rs"));
 }
+
+// Ruling P3-R5: a command file's shell command gets its arguments from a prelude harness writes,
+// `ARGUMENTS='…'; set -- '…' …;`. Bash gives `ARGUMENTS` no meaning, so a single-quoted literal
+// assigned to it alone changes nothing the analysis relies on; every other bare assignment
+// still cannot be analysed.
+#[test]
+fn a_literal_arguments_assignment_does_not_hide_anything() {
+    let git_log = rules(
+        &["git log", "git log *", "set --", "set -- *"],
+        &["git push*"],
+        &[],
+    );
+    check(
+        &git_log,
+        &[
+            (
+                "ARGUMENTS='a b'; set -- 'a' 'b'; git log --grep \"$1\"",
+                Want::Allow,
+            ),
+            (
+                "ARGUMENTS=''; set --; git log --grep \"$ARGUMENTS\"",
+                Want::Allow,
+            ),
+            (
+                "ARGUMENTS='x'\\''$(touch p)`q`'; set -- 'x'\\''$(touch p)'; git log --grep \"$1\"",
+                Want::Allow,
+            ),
+            ("ARGUMENTS='a'; git status", Want::Unlisted),
+            ("ARGUMENTS='x'; set -- 'x'; git push \"$1\"", Want::Deny),
+            // Anything else is as before.
+            ("ARGUMENTS=$(date); git log", Want::Ask),
+            ("ARGUMENTS=\"$HOME\"; git log", Want::Ask),
+            ("ARGUMENTS=a$b; git log", Want::Ask),
+            ("ARGUMENTS+='a'; git log", Want::Ask),
+            ("ARGUMENTS[0]='a'; git log", Want::Ask),
+            ("ARGUMENTS='a' B='b'; git log", Want::Ask),
+            ("ARGUMENTS='a' >out; git log", Want::Ask),
+            ("PATH='/tmp'; git log", Want::Ask),
+            ("X='a'; git log", Want::Ask),
+        ],
+    );
+}

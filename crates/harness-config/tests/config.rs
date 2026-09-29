@@ -11,6 +11,13 @@ fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
     move |k| map.get(k).cloned()
 }
 
+/// The workspace's widening settings, which must not be empty.
+fn widening_of(global: &std::path::Path, ws: &std::path::Path) -> config::Widening {
+    let widening = config::project_widening(global, ws).unwrap();
+    assert!(!widening.items.is_empty(), "no widening settings");
+    widening
+}
+
 #[test]
 fn defaults_follow_xdg_under_home() {
     let p = Paths::from_env(env(&[("HOME", "/home/u")])).unwrap();
@@ -144,9 +151,7 @@ fn trusted_project_widening_settings_apply() {
         "model = \"ollama/b\"\n[permissions]\nallow = [\"bash:make*\"]\nread_dirs = [\"vendor-docs\"]\n[sandbox]\nwritable_roots = [\"cache\"]\nallow_localhost = true\n",
     )
     .unwrap();
-    let widening = config::project_widening(&dir.path().join("none.toml"), &ws)
-        .unwrap()
-        .expect("project has widening settings");
+    let widening = widening_of(&dir.path().join("none.toml"), &ws);
     let mut trust = TrustStore::load(&data).unwrap();
     trust.trust(&ws, &widening.fingerprint).unwrap();
 
@@ -170,10 +175,7 @@ fn changed_project_settings_need_trust_again() {
     trust
         .trust(
             &ws,
-            &config::project_widening(&dir.path().join("none.toml"), &ws)
-                .unwrap()
-                .unwrap()
-                .fingerprint,
+            &widening_of(&dir.path().join("none.toml"), &ws).fingerprint,
         )
         .unwrap();
 
@@ -186,6 +188,30 @@ fn changed_project_settings_need_trust_again() {
     assert!(cfg.allow.is_empty());
     assert!(!cfg.providers.contains_key("x"));
     assert_eq!(cfg.warnings.len(), 1);
+}
+
+#[test]
+fn the_workspace_counts_as_trusted_only_while_its_trusted_settings_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let none = dir.path().join("none.toml");
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    // No project settings, so nothing was trusted.
+    assert!(!config::load(&none, &ws, &trust).unwrap().trusted);
+    let project = ws.join(".harness/config.toml");
+    std::fs::write(&project, "[permissions]\nallow = [\"bash:make*\"]\n").unwrap();
+    assert!(!config::load(&none, &ws, &trust).unwrap().trusted);
+    let widening = widening_of(&none, &ws);
+    trust.trust(&ws, &widening.fingerprint).unwrap();
+    assert!(config::load(&none, &ws, &trust).unwrap().trusted);
+    // Changed settings need trust again, and until then the workspace is not trusted.
+    std::fs::write(
+        &project,
+        "[permissions]\nallow = [\"bash:make*\", \"bash:npm*\"]\n",
+    )
+    .unwrap();
+    assert!(!config::load(&none, &ws, &trust).unwrap().trusted);
 }
 
 #[test]
@@ -224,12 +250,8 @@ fn widening_fingerprint_is_not_fooled_by_embedded_newlines() {
     )
     .unwrap();
 
-    let widening_a = config::project_widening(&dir.path().join("none.toml"), &ws_a)
-        .unwrap()
-        .expect("config a has widening");
-    let widening_b = config::project_widening(&dir.path().join("none.toml"), &ws_b)
-        .unwrap()
-        .expect("config b has widening");
+    let widening_a = widening_of(&dir.path().join("none.toml"), &ws_a);
+    let widening_b = widening_of(&dir.path().join("none.toml"), &ws_b);
 
     assert_ne!(
         widening_a.fingerprint, widening_b.fingerprint,
@@ -260,12 +282,8 @@ fn provider_names_cannot_forge_fingerprint_items() {
     )
     .unwrap();
 
-    let widening_a = config::project_widening(&dir.path().join("none.toml"), &ws_a)
-        .unwrap()
-        .expect("config a has widening");
-    let widening_b = config::project_widening(&dir.path().join("none.toml"), &ws_b)
-        .unwrap()
-        .expect("config b has widening");
+    let widening_a = widening_of(&dir.path().join("none.toml"), &ws_a);
+    let widening_b = widening_of(&dir.path().join("none.toml"), &ws_b);
 
     assert_ne!(
         widening_a.fingerprint, widening_b.fingerprint,
@@ -321,7 +339,8 @@ fn load_project(
     }
     std::fs::write(ws.join(".harness/config.toml"), project).unwrap();
     let cfg = config::load(&global_file, &ws, &TrustStore::default()).unwrap();
-    let widening = config::project_widening(&global_file, &ws).unwrap();
+    let widening =
+        Some(config::project_widening(&global_file, &ws).unwrap()).filter(|w| !w.items.is_empty());
     (cfg, widening)
 }
 
@@ -439,9 +458,7 @@ fn trusted_project_mode_and_max_steps_apply_even_when_wider() {
         "mode = \"auto\"\nmax_steps = 80\n",
     )
     .unwrap();
-    let widening = config::project_widening(&global, &ws)
-        .unwrap()
-        .expect("mode and max_steps widen");
+    let widening = widening_of(&global, &ws);
     let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
     trust.trust(&ws, &widening.fingerprint).unwrap();
     let cfg = config::load(&global, &ws, &trust).unwrap();
@@ -532,10 +549,225 @@ fn a_trusted_project_may_relax_required_git_protection() {
         "[sandbox]\nlinux_git_protection = \"best-effort\"\n",
     )
     .unwrap();
-    let widening = config::project_widening(&global, &ws).unwrap().unwrap();
+    let widening = widening_of(&global, &ws);
     let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
     trust.trust(&ws, &widening.fingerprint).unwrap();
     let cfg = config::load(&global, &ws, &trust).unwrap();
     assert_eq!(cfg.linux_git_protection, LinuxGitProtection::BestEffort);
     assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+}
+
+#[test]
+fn compaction_settings_default_and_are_read_as_percentages() {
+    let (cfg, _) = load_project(None, "", true);
+    assert_eq!(cfg.compaction.threshold(), 0.8);
+    assert_eq!(cfg.compaction.keep_recent(), 0.2);
+    let (cfg, widening) = load_project(
+        Some("[compaction]\nthreshold_percent = 70\n"),
+        "[compaction]\nkeep_recent_percent = 10\n",
+        true,
+    );
+    assert_eq!(cfg.compaction.threshold(), 0.7);
+    assert_eq!(cfg.compaction.keep_recent(), 0.1);
+    assert_eq!(widening, None, "compaction settings need no trust");
+}
+
+#[test]
+fn impossible_compaction_settings_are_errors_naming_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.toml");
+    for (text, problem) in [
+        ("[compaction]\nthreshold_percent = 0\n", "between 1 and 100"),
+        (
+            "[compaction]\nthreshold_percent = 150\n",
+            "between 1 and 100",
+        ),
+        (
+            "[compaction]\nthreshold_percent = 50\nkeep_recent_percent = 60\n",
+            "below compaction.threshold_percent",
+        ),
+        ("[compaction]\nkeep = 5\n", "unknown field"),
+        (
+            "[compaction]\nkeep_recent_percent = 0\n",
+            "keep_recent_percent must be between 1 and 100",
+        ),
+        (
+            "[compaction]\nkeep_recent_percent = 101\n",
+            "keep_recent_percent must be between 1 and 100",
+        ),
+    ] {
+        std::fs::write(&file, text).unwrap();
+        let err = config::load(&file, dir.path(), &TrustStore::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("config.toml") && err.contains(problem),
+            "{err}"
+        );
+    }
+}
+
+// Ruling P3-R1: a workspace with no widening settings can be trusted, so that its command files
+// may choose their model. Trust covers the empty set, so a widening setting added later needs
+// trust again.
+#[test]
+fn a_workspace_without_widening_settings_can_be_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let none = dir.path().join("none.toml");
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    assert!(!config::load(&none, &ws, &trust).unwrap().trusted);
+
+    let widening = config::project_widening(&none, &ws).unwrap();
+    assert!(widening.items.is_empty(), "{:?}", widening.items);
+    trust.trust(&ws, &widening.fingerprint).unwrap();
+    let cfg = config::load(&none, &ws, &trust).unwrap();
+    assert!(cfg.trusted);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+
+    // Narrowing settings are not in the set, so the workspace stays trusted.
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    let project = ws.join(".harness/config.toml");
+    std::fs::write(&project, "[permissions]\ndeny = [\"bash:curl*\"]\n").unwrap();
+    assert!(config::load(&none, &ws, &trust).unwrap().trusted);
+
+    std::fs::write(&project, "[permissions]\nallow = [\"bash:make*\"]\n").unwrap();
+    let cfg = config::load(&none, &ws, &trust).unwrap();
+    assert!(!cfg.trusted);
+    assert!(cfg.allow.is_empty());
+    assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
+    assert!(
+        cfg.warnings[0].contains("harness trust"),
+        "{}",
+        cfg.warnings[0]
+    );
+}
+
+// Ruling P3-R4: a project may not make harness compact early (below 50% of the window) unless the
+// workspace is trusted; the global config may.
+#[test]
+fn a_project_compaction_threshold_below_50_needs_trust() {
+    let project = "[compaction]\nthreshold_percent = 30\n";
+    let (cfg, widening) = load_project(None, project, true);
+    assert_eq!(cfg.compaction.threshold(), 0.8);
+    assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
+    let warning = &cfg.warnings[0];
+    for needle in [
+        ".harness/config.toml",
+        "compaction.threshold_percent = 30",
+        "trusted workspace",
+        "harness trust",
+    ] {
+        assert!(warning.contains(needle), "{warning}");
+    }
+    assert_eq!(
+        widening.expect("a low threshold needs trust").items,
+        ["compaction.threshold_percent = 30"]
+    );
+    // Without trust, the global value applies.
+    let (cfg, _) = load_project(
+        Some("[compaction]\nthreshold_percent = 70\n"),
+        project,
+        true,
+    );
+    assert_eq!(cfg.compaction.threshold(), 0.7);
+    // From 50 up, a project's value applies without trust.
+    let (cfg, widening) = load_project(None, "[compaction]\nthreshold_percent = 50\n", true);
+    assert_eq!(cfg.compaction.threshold(), 0.5);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+    assert_eq!(widening, None);
+    // The global config may set any valid value.
+    let (cfg, _) = load_project(
+        Some("[compaction]\nthreshold_percent = 10\nkeep_recent_percent = 5\n"),
+        "",
+        true,
+    );
+    assert_eq!(cfg.compaction.threshold(), 0.1);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+    // An impossible project value is still an error, trusted or not.
+    let (_dir, ws, none) = project_dir("[compaction]\nthreshold_percent = 0\n");
+    let err = config::load(&none, &ws, &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(".harness/config.toml") && err.contains("between 1 and 100"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_trusted_project_may_set_any_valid_compaction_threshold() {
+    let (dir, ws, none) =
+        project_dir("[compaction]\nthreshold_percent = 30\nkeep_recent_percent = 10\n");
+    let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    trust
+        .trust(&ws, &widening_of(&none, &ws).fingerprint)
+        .unwrap();
+    let cfg = config::load(&none, &ws, &trust).unwrap();
+    assert!(cfg.trusted);
+    assert_eq!(cfg.compaction.threshold(), 0.3);
+    assert_eq!(cfg.compaction.keep_recent(), 0.1);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+}
+
+/// A workspace with the project config `project`, and a global config file that does not exist.
+fn project_dir(project: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    std::fs::write(ws.join(".harness/config.toml"), project).unwrap();
+    let none = dir.path().join("none.toml");
+    (dir, ws, none)
+}
+
+// Re-review C, P3-R4 minor: a project config that is invalid once trusted is rejected while
+// untrusted too, even though its low threshold is not applied then.
+#[test]
+fn a_project_keep_share_is_checked_against_the_projects_own_threshold() {
+    let project = "[compaction]\nthreshold_percent = 30\nkeep_recent_percent = 40\n";
+    let (dir, ws, none) = project_dir(project);
+    let err = config::load(&none, &ws, &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(".harness/config.toml")
+            && err.contains("keep_recent_percent must be below compaction.threshold_percent"),
+        "{err}"
+    );
+    // The same config is rejected once trusted, and `harness trust` cannot trust it.
+    let err = config::project_widening(&none, &ws)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("keep_recent_percent must be below"), "{err}");
+    drop(dir);
+}
+
+// A valid project pair whose threshold is ignored keeps its keep share only while that share is
+// below the threshold that applies instead.
+#[test]
+fn an_ignored_low_threshold_takes_a_keep_share_it_cannot_hold_with_it() {
+    let global = "[compaction]\nthreshold_percent = 20\nkeep_recent_percent = 10\n";
+    let (cfg, _) = load_project(
+        Some(global),
+        "[compaction]\nthreshold_percent = 30\nkeep_recent_percent = 25\n",
+        true,
+    );
+    assert_eq!(cfg.compaction.threshold(), 0.2);
+    assert_eq!(cfg.compaction.keep_recent(), 0.1);
+    assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
+    assert!(
+        cfg.warnings[0].contains("compaction.threshold_percent = 30")
+            && cfg.warnings[0].contains("keep_recent_percent = 25"),
+        "{}",
+        cfg.warnings[0]
+    );
+    // One that fits under the threshold that applies is kept.
+    let (cfg, _) = load_project(
+        None,
+        "[compaction]\nthreshold_percent = 30\nkeep_recent_percent = 25\n",
+        true,
+    );
+    assert_eq!(cfg.compaction.threshold(), 0.8);
+    assert_eq!(cfg.compaction.keep_recent(), 0.25);
 }

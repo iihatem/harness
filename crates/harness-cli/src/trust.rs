@@ -1,6 +1,7 @@
 use std::io::{BufRead, IsTerminal, Write};
 
 use harness_config::{config, paths::Paths, trust::TrustStore};
+use harness_context::project::project_root;
 
 use crate::term::terminal_safe;
 
@@ -32,11 +33,17 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
     if revoke {
         return match store.revoke(&workspace) {
             Ok(true) => {
-                println!("Revoked trust for {}.", workspace.display());
+                println!(
+                    "Revoked trust for {}.",
+                    terminal_safe(&workspace.display().to_string())
+                );
                 0
             }
             Ok(false) => {
-                println!("{} was not trusted.", workspace.display());
+                println!(
+                    "{} was not trusted.",
+                    terminal_safe(&workspace.display().to_string())
+                );
                 0
             }
             Err(e) => {
@@ -46,22 +53,40 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
         };
     }
     let widening = match config::project_widening(&paths.global_config_file(), &workspace) {
-        Ok(Some(widening)) => widening,
-        Ok(None) => {
-            println!("No project settings in {} need trust.", workspace.display());
-            return 0;
-        }
+        Ok(widening) => widening,
         Err(e) => {
             eprintln!("error: {}", terminal_safe(&e.to_string()));
             return 2;
         }
     };
-    println!(
-        "{} contains settings that widen what the agent may do:",
-        config::project_file(&workspace).display()
-    );
-    for item in &widening.items {
-        println!("  - {item}");
+    // Command files come from the project root: trust given here covers them only there.
+    let root = project_root(&workspace);
+    if widening.items.is_empty() && root == workspace {
+        // Trust still matters: a trusted workspace's command files may choose their model.
+        println!(
+            "No project settings in {} widen what the agent may do. Trusting it lets its command files choose their model, until such settings appear.",
+            terminal_safe(&workspace.display().to_string())
+        );
+    } else if widening.items.is_empty() {
+        println!(
+            "No project settings in {} widen what the agent may do.",
+            terminal_safe(&workspace.display().to_string())
+        );
+    } else {
+        println!(
+            "{} contains settings that need trust:",
+            terminal_safe(&config::project_file(&workspace).display().to_string())
+        );
+        for item in &widening.items {
+            println!("  - {}", terminal_safe(item));
+        }
+    }
+    if root != workspace {
+        println!(
+            "Trusting {} does not cover the command files used there: they come from {}; run `harness trust` there to let them choose their model.",
+            terminal_safe(&workspace.display().to_string()),
+            terminal_safe(&root.display().to_string())
+        );
     }
     if !yes {
         if !std::io::stdin().is_terminal() {
@@ -79,7 +104,10 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
     }
     match store.trust(&workspace, &widening.fingerprint) {
         Ok(()) => {
-            println!("Trusted {}.", workspace.display());
+            println!(
+                "Trusted {}.",
+                terminal_safe(&workspace.display().to_string())
+            );
             0
         }
         Err(e) => {

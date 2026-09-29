@@ -10,6 +10,7 @@ use harness_core::tool::CommandSandbox;
 
 pub use availability::seatbelt_available;
 pub use command::seatbelt_command;
+pub(crate) use profile::user_writable_roots;
 
 use crate::{FsAccess, SandboxSettings, looks_like_sandbox_denial};
 

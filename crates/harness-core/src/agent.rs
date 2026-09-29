@@ -1578,7 +1578,23 @@ impl Agent {
 
         let action = tool.action(&args, &self.ctx);
         let mutating = self.is_mutating(&action);
-        match self.policy.check(&action) {
+        let decision = self.policy.check(&action);
+        // A sandbox that can no longer run this command (Linux, git protection required, after a
+        // drop to the basic tier) leaves one way to run it: outside the sandbox, if approved.
+        if let (Decision::Allow | Decision::Ask(_), Action::Bash(command)) = (&decision, &action)
+            && !self.ctx.unsandboxed
+            && let Some(why) = self
+                .ctx
+                .sandbox
+                .as_ref()
+                .and_then(|sandbox| sandbox.cannot_run(self.ctx.access))
+        {
+            let command = command.clone();
+            return self
+                .run_outside_sandbox(call, &tool, args, &command, &why, mutating, events)
+                .await;
+        }
+        match decision {
             Decision::Allow => {}
             Decision::Deny(reason) => return ToolOutput::error(format!("denied: {reason}")),
             Decision::Ask(reason) => {
@@ -1651,6 +1667,65 @@ impl Agent {
                 .await;
         }
         output
+    }
+
+    /// The sandbox cannot run `command` now, for the reason `why`: asks whether to run it outside
+    /// the sandbox, once. Nobody to ask blocks it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "what executing the call knows, passed on"
+    )]
+    async fn run_outside_sandbox(
+        &mut self,
+        call: &ToolCall,
+        tool: &Arc<dyn Tool>,
+        args: Value,
+        command: &str,
+        why: &str,
+        mutating: bool,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> ToolOutput {
+        let shown: String = command.chars().take(80).collect();
+        let reason = format!("{why}; run `{shown}` without the sandbox?");
+        let _ = events.send(AgentEvent::ApprovalNeeded {
+            id: call.id.clone(),
+            reason: reason.clone(),
+        });
+        let request = ApprovalRequest {
+            call_id: call.id.clone(),
+            tool: call.name.clone(),
+            action: Action::Bash(command.to_string()),
+            reason,
+            kind: ApprovalKind::RunUnsandboxed,
+        };
+        match self.approver.decide(&request).await {
+            ApprovalDecision::Approve | ApprovalDecision::ApproveForSession => {
+                if mutating {
+                    self.checkpoint(events).await;
+                }
+                let mut ctx = self.ctx.clone();
+                ctx.unsandboxed = true;
+                tool.run(args, &ctx).await
+            }
+            ApprovalDecision::Deny {
+                feedback: Some(note),
+            } => ToolOutput::error(format!(
+                "the user declined to run it without the sandbox: {note}"
+            )),
+            ApprovalDecision::Deny { feedback: None } => {
+                ToolOutput::error("the user declined to run it without the sandbox")
+            }
+            ApprovalDecision::Unavailable => {
+                let blocked = format!(
+                    "{why}, and no user is available to approve running the command without the sandbox"
+                );
+                let _ = events.send(AgentEvent::ActionBlocked {
+                    id: call.id.clone(),
+                    reason: blocked.clone(),
+                });
+                ToolOutput::error(format!("blocked: {blocked}"))
+            }
+        }
     }
 
     /// A command failed inside the sandbox in a way that looks like a denial: ask whether to run

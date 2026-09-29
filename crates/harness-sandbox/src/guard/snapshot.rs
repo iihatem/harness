@@ -120,24 +120,20 @@ pub(crate) struct Snapshot {
 
 impl Snapshot {
     /// Records `roots` (below `tree`) and everything below them, without
-    /// following symlinks. With `everything`, every entry is recorded and
-    /// regular files' bytes are saved (up to the size limits). Without it,
-    /// only what a read-only mount cannot protect is: symlinks, which cannot
-    /// be mounted over, and regular files with more than one hard link,
-    /// which can be written through another name.
+    /// following symlinks: every entry is recorded and regular files' bytes
+    /// are saved (up to the size limits).
     ///
     /// What `leave_out` picks is not recorded, and so counts as new in a
     /// directory recorded whole.
     pub(crate) fn take(
         tree: &Tree,
         roots: &[PathBuf],
-        everything: bool,
         leave_out: impl Fn(&Path) -> bool,
     ) -> Snapshot {
         let mut snapshot = Snapshot::default();
         for root in roots {
             if let Ok((parent, name)) = tree.parent(root) {
-                snapshot.record(&parent, &name, root, 0, everything, &leave_out);
+                snapshot.record(&parent, &name, root, 0, &leave_out);
             }
         }
         snapshot
@@ -151,7 +147,6 @@ impl Snapshot {
         name: &OsStr,
         path: &Path,
         depth: usize,
-        everything: bool,
         leave_out: &dyn Fn(&Path) -> bool,
     ) -> bool {
         if leave_out(path) {
@@ -164,7 +159,7 @@ impl Snapshot {
             return false;
         };
         let node = match stat.kind {
-            Kind::File if everything || stat.nlink > 1 => {
+            Kind::File => {
                 let content = match self.save(parent, name, &stat) {
                     Some(bytes) => Content::Saved(bytes),
                     None => Content::Unsaved(Stamp::of(&stat)),
@@ -175,27 +170,22 @@ impl Snapshot {
                 }
             }
             Kind::Dir => {
-                return self.record_dir(parent, name, path, &stat, depth, everything, leave_out);
+                return self.record_dir(parent, name, path, &stat, depth, leave_out);
             }
             Kind::Symlink => match parent.read_link(name) {
                 Ok(target) => Node::Symlink { target },
                 Err(_) => return false,
             },
-            Kind::Other if everything => Node::Other {
+            Kind::Other => Node::Other {
                 dev: stat.dev,
                 ino: stat.ino,
                 birth: stat.birth,
             },
-            Kind::File | Kind::Other => return false,
         };
         self.nodes.insert(path.to_path_buf(), node);
         true
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the walk's state, passed down as it goes"
-    )]
     fn record_dir(
         &mut self,
         parent: &Dir,
@@ -203,16 +193,13 @@ impl Snapshot {
         path: &Path,
         stat: &Stat,
         depth: usize,
-        everything: bool,
         leave_out: &dyn Fn(&Path) -> bool,
     ) -> bool {
-        if everything {
-            let node = Node::Dir {
-                mode: stat.mode,
-                whole: false,
-            };
-            self.nodes.insert(path.to_path_buf(), node);
-        }
+        let node = Node::Dir {
+            mode: stat.mode,
+            whole: false,
+        };
+        self.nodes.insert(path.to_path_buf(), node);
         let listed = parent.open_dir(name).and_then(|dir| {
             if dir.stat_self()?.same_entry(stat) {
                 Ok((dir.entries()?, dir))
@@ -226,8 +213,7 @@ impl Snapshot {
                 let mut whole = true;
                 for child in names {
                     let child_path = path.join(&child);
-                    whole &=
-                        self.record(&dir, &child, &child_path, depth + 1, everything, leave_out);
+                    whole &= self.record(&dir, &child, &child_path, depth + 1, leave_out);
                 }
                 whole
             }
@@ -239,7 +225,7 @@ impl Snapshot {
         {
             *recorded = whole;
         }
-        everything
+        true
     }
 
     /// The bytes of the regular file `name` in `parent`, when they fit.
@@ -576,14 +562,14 @@ mod tests {
     #[test]
     fn nothing_changed_means_no_differences() {
         let (_d, tree, git) = gitdir();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         assert!(snapshot.differences(&tree).is_empty());
     }
 
     #[test]
     fn changes_deletions_and_additions_are_found_and_undone() {
         let (_d, tree, git) = gitdir();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         std::fs::write(git.join("config"), "[core]\n\thooksPath = /tmp\n").unwrap();
         std::fs::remove_file(git.join("hooks/pre-commit")).unwrap();
         std::fs::write(git.join("hooks/post-checkout"), "evil\n").unwrap();
@@ -617,7 +603,7 @@ mod tests {
     #[test]
     fn a_directory_replaced_by_a_file_is_changed() {
         let (_d, tree, git) = gitdir();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         std::fs::remove_dir_all(git.join("hooks")).unwrap();
         std::fs::write(git.join("hooks"), "not a directory").unwrap();
         let found = snapshot.differences(&tree);
@@ -638,7 +624,7 @@ mod tests {
         let (_d, tree, git) = gitdir();
         let hook = git.join("hooks/pre-commit");
         std::fs::set_permissions(&hook, PermissionsExt::from_mode(0o644)).unwrap();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         std::fs::set_permissions(&hook, PermissionsExt::from_mode(0o755)).unwrap();
         assert_eq!(
             snapshot.differences(&tree),
@@ -656,48 +642,11 @@ mod tests {
     }
 
     #[test]
-    fn without_everything_only_hard_linked_files_and_symlinks_are_recorded() {
-        let (_d, tree, git) = gitdir();
-        std::fs::hard_link(git.join("config"), git.parent().unwrap().join("alias")).unwrap();
-        symlink("../shared-hooks", git.join("hooks/link")).unwrap();
-        let snapshot = Snapshot::take(&tree, &roots(&git), false, |_| false);
-        std::fs::write(git.join("hooks/pre-commit"), "changed\n").unwrap();
-        std::fs::write(git.join("hooks/new"), "added\n").unwrap();
-        assert!(
-            snapshot.differences(&tree).is_empty(),
-            "other hooks are not recorded"
-        );
-        std::fs::remove_file(git.join("hooks/link")).unwrap();
-        symlink("/tmp/evil", git.join("hooks/link")).unwrap();
-        assert_eq!(
-            snapshot.differences(&tree),
-            vec![(git.join("hooks/link"), Difference::Changed)]
-        );
-        std::fs::remove_file(git.join("hooks/link")).unwrap();
-        snapshot.restore(&tree, &git.join("hooks/link")).unwrap();
-        std::fs::write(
-            git.parent().unwrap().join("alias"),
-            "[core]\n\tfsmonitor = x\n",
-        )
-        .unwrap();
-        assert_eq!(
-            snapshot.differences(&tree),
-            vec![(git.join("config"), Difference::Changed)]
-        );
-        std::fs::remove_file(git.join("config")).unwrap();
-        snapshot.restore(&tree, &git.join("config")).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(git.join("config")).unwrap(),
-            "[core]\n"
-        );
-    }
-
-    #[test]
     fn a_large_file_is_compared_but_cannot_be_restored() {
         let (_d, tree, git) = gitdir();
         let big = vec![b'x'; (MAX_FILE_BYTES + 1) as usize];
         std::fs::write(git.join("hooks/big"), &big).unwrap();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         std::fs::write(git.join("hooks/big"), b"small").unwrap();
         assert_eq!(
             snapshot.differences(&tree),
@@ -711,7 +660,7 @@ mod tests {
     #[test]
     fn a_fifo_swapped_in_is_changed_and_never_blocks() {
         let (_d, tree, git) = gitdir();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         std::fs::remove_file(git.join("config")).unwrap();
         mkfifo(&git.join("config"));
         let found = bounded(move || snapshot.differences(&tree));
@@ -722,7 +671,7 @@ mod tests {
     fn a_symlink_is_restored_with_its_target() {
         let (_d, tree, git) = gitdir();
         symlink("../shared-hooks", git.join("hooks/link")).unwrap();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         std::fs::remove_file(git.join("hooks/link")).unwrap();
         symlink("/tmp/evil", git.join("hooks/link")).unwrap();
         assert_eq!(
@@ -744,7 +693,7 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("pre-commit"), "outside\n").unwrap();
         std::fs::write(outside.join("post-checkout"), "outside hook\n").unwrap();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         std::fs::rename(git.join("hooks"), git.join("hooks-old")).unwrap();
         symlink(&outside, git.join("hooks")).unwrap();
         assert_eq!(
@@ -770,7 +719,7 @@ mod tests {
     #[test]
     fn a_restore_never_replaces_what_is_there() {
         let (_d, tree, git) = gitdir();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         std::fs::write(git.join("config"), "[core]\n\tfsmonitor = x\n").unwrap();
         let err = snapshot.restore(&tree, &git.join("config")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
@@ -790,7 +739,7 @@ mod tests {
         // A directory whose permissions are put back can be looked into
         // again, in the same walk.
         let (_d, tree, git) = gitdir();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         let hooks = git.join("hooks");
         std::fs::write(hooks.join("post-checkout"), "evil\n").unwrap();
         std::fs::set_permissions(&hooks, PermissionsExt::from_mode(0o000)).unwrap();
@@ -831,7 +780,7 @@ mod tests {
     #[test]
     fn an_entry_made_reachable_again_is_looked_at_again() {
         let (_d, tree, git) = gitdir();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         std::fs::write(git.join("hooks/post-checkout"), "evil\n").unwrap();
         std::fs::set_permissions(&git, PermissionsExt::from_mode(0o000)).unwrap();
         let mut found = Vec::new();
@@ -866,7 +815,7 @@ mod tests {
         }
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("file"), "deep\n").unwrap();
-        let snapshot = Snapshot::take(&tree, &roots(&git), true, |_| false);
+        let snapshot = Snapshot::take(&tree, &roots(&git), |_| false);
         assert!(snapshot.differences(&tree).is_empty());
     }
 }

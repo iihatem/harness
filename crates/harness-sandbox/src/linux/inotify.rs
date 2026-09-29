@@ -457,7 +457,7 @@ mod tests {
         std::fs::write(ws.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
         std::fs::write(ws.join(".git/hooks/pre-commit"), "exit 0\n").unwrap();
         let session = GuardSession::new(&base.join("quarantine"));
-        let guard = session.begin(&ws, true, |_| {});
+        let guard = session.begin(&ws, |_| {});
         let checks = Arc::new(AtomicUsize::new(0));
         let target = CountingHandle(guard.watch_handle(), Arc::clone(&checks));
         let watcher = Watcher::start(&ws, target, Lifetime::Command).unwrap();

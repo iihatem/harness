@@ -368,16 +368,15 @@ impl CommandSandbox for LinuxSandbox {
         // `begin` asks the probe only when an earlier command left something
         // to check, so orphans are reaped here as well.
         procs::look_and_reap();
-        // Every protected file is saved in the full tier too: a rename or an
-        // unlink from outside the command's namespace detaches its bind
+        // The guard saves every protected file in the full tier too: a rename
+        // or an unlink from outside the command's namespace detaches its bind
         // there, and a process an earlier command left keeps its own
-        // namespace, where what appeared since has no mount.
-        let save_all = true;
-        // The plan is made from the guard's index, after the scan and before
-        // the guard records which protected names exist, so the guard takes
-        // the `hooks/` placeholders for existing ones.
+        // namespace, where what appeared since has no mount. The plan is made
+        // from the guard's index, after the scan and before the guard records
+        // which protected names exist, so the guard takes the `hooks/`
+        // placeholders for existing ones.
         let mut planned = None;
-        let guard = self.guards.begin(&workspace, save_all, |index| {
+        let guard = self.guards.begin(&workspace, |index| {
             if full {
                 planned = mountplan::plan(&workspace, index);
             }
@@ -390,7 +389,7 @@ impl CommandSandbox for LinuxSandbox {
             // this) is not lost, exactly as the `mounted_command` error path
             // below does for a setup failure.
             let message = format!(
-                "git metadata protection is required (sandbox.linux_git_protection = \"required\"), but the full tier is unavailable: {reason}; restart harness to have every command ask first"
+                "git metadata protection is required (sandbox.linux_git_protection = \"required\"), but the full tier is unavailable: {reason}; the command did not run"
             );
             let report = self.after(workspace).finished(guard.finish());
             return Err(match report {
@@ -437,6 +436,21 @@ impl CommandSandbox for LinuxSandbox {
 
     fn git_protection(&self) -> GitProtection {
         lock(&self.tier).clone()
+    }
+
+    /// A command that may write, once the session dropped to the basic tier while full git
+    /// protection is required: the agent asks to run it outside the sandbox instead, as
+    /// `prepare` would refuse it.
+    fn cannot_run(&self, access: FsAccess) -> Option<String> {
+        if access != FsAccess::WorkspaceWrite || !self.settings.require_full_git_protection {
+            return None;
+        }
+        match self.git_protection() {
+            GitProtection::Basic { reason } => Some(format!(
+                "git metadata protection is required (sandbox.linux_git_protection = \"required\"), but the sandbox dropped to the basic tier ({reason})"
+            )),
+            GitProtection::Full => None,
+        }
     }
 
     /// As harness exits: stops the watchers between commands, ends the
@@ -762,6 +776,29 @@ mod tests {
         )
     }
 
+    // 2.13 final review M1: after a drop to the basic tier with "required", the agent asks to
+    // run a writing command outside the sandbox, as a session that started so does.
+    #[test]
+    fn only_writing_commands_after_a_drop_with_required_protection_cannot_run() {
+        let required = crate::SandboxSettings {
+            require_full_git_protection: true,
+            ..crate::SandboxSettings::default()
+        };
+        let dropped = LinuxSandbox::with_git_protection(
+            required.clone(),
+            GitProtection::Basic {
+                reason: "the full tier's setup failed during the session: x".into(),
+            },
+        );
+        let why = dropped.cannot_run(FsAccess::WorkspaceWrite).unwrap();
+        assert!(why.contains("linux_git_protection = \"required\""), "{why}");
+        assert!(why.contains("setup failed during the session: x"), "{why}");
+        assert_eq!(dropped.cannot_run(FsAccess::ReadOnly), None);
+        let full = LinuxSandbox::with_git_protection(required, GitProtection::Full);
+        assert_eq!(full.cannot_run(FsAccess::WorkspaceWrite), None);
+        assert_eq!(sandbox().cannot_run(FsAccess::WorkspaceWrite), None);
+    }
+
     #[test]
     fn a_watcher_that_cannot_start_is_said_once_in_the_next_report() {
         let _serial = procs::serial();
@@ -847,7 +884,7 @@ mod tests {
             GitProtection::Full,
         );
         let workspace = ws.path().canonicalize().unwrap();
-        let guard = sandbox.guards.begin(&workspace, false, |_| {});
+        let guard = sandbox.guards.begin(&workspace, |_| {});
         let guard = Box::new(LinuxGuard {
             guard,
             registration: Registration::new(),

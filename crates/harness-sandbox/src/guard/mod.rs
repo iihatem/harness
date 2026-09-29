@@ -8,13 +8,11 @@
 //! - before it, moves to quarantine protected names that appeared in a known
 //!   gitdir, or at the top of the workspace, since the previous command
 //!   ended (a process that command left running may have planted them), and,
-//!   when such processes were running and every protected file was saved
-//!   (`save_all`), restores the protected files they changed
-//!   ([`GuardSession::set_survivor_probe`]);
+//!   when such processes were running, restores the protected files they
+//!   changed ([`GuardSession::set_survivor_probe`]);
 //! - indexes the workspace ([`discover`](crate::gitmeta::discover), with the
-//!   ignore rules read once per session: [`GuardSession::prime`]) and records
-//!   which protected names exist, and with `save_all` saves the protected
-//!   files;
+//!   ignore rules read once per session: [`GuardSession::prime`]), records
+//!   which protected names exist, and saves the protected files;
 //! - while it runs (a watcher calls [`WatchHandle::check`]) and after it
 //!   ends, moves to quarantine every new protected name, new gitdir and
 //!   replaced `.git`, and restores changed protected files;
@@ -171,9 +169,8 @@ impl GuardSession {
 
     /// Sets what says whether processes that sandboxed commands started are
     /// still running. When it says so as a command's guard finishes, or at
-    /// any check after that, a guard that saved every protected file
-    /// (`save_all`) restores the protected files those processes change
-    /// before the next command begins (and whenever
+    /// any check after that, the guard restores the protected files those
+    /// processes change before the next command begins (and whenever
     /// [`between_commands`](Self::between_commands)' handle checks).
     pub fn set_survivor_probe(&self, probe: SurvivorProbe) {
         *lock(&self.probe) = probe;
@@ -224,14 +221,11 @@ impl GuardSession {
     /// Starts guarding one command in the canonical `workspace`: see the
     /// module docs. `placeholders` runs after the workspace is indexed and
     /// before the existing protected names are recorded (the Linux full tier
-    /// creates empty `hooks/` directories there). With `save_all`, every
-    /// protected file is saved so it can be restored (both Linux tiers);
-    /// without it, only protected symlinks and files with more than one hard
-    /// link are.
+    /// creates empty `hooks/` directories there). Every protected file is
+    /// saved so it can be restored, in both Linux tiers.
     pub fn begin(
         self: &Arc<Self>,
         workspace: &Path,
-        save_all: bool,
         placeholders: impl FnOnce(&GitIndex),
     ) -> GitGuard {
         let rules = self.rules(workspace);
@@ -317,7 +311,7 @@ impl GuardSession {
             .collect();
         // Entries still to be moved are left out, so they count as new; what
         // is still to be restored or put back keeps its earlier version.
-        let mut snapshot = Snapshot::take(&tree, &roots, save_all, unknown);
+        let mut snapshot = Snapshot::take(&tree, &roots, unknown);
         if let Some(earlier) = &earlier {
             if baseline.is_some() {
                 snapshot.adopt_all(earlier);
@@ -333,7 +327,6 @@ impl GuardSession {
         let mut state = State {
             workspace: workspace.to_path_buf(),
             tree,
-            save_all,
             index,
             gitdirs,
             nested,
@@ -725,7 +718,6 @@ impl WatchHandle {
 struct State {
     workspace: PathBuf,
     tree: Tree,
-    save_all: bool,
     index: GitIndex,
     /// The gitdirs checked: the ones indexed, and [`nested`](Self::nested).
     gitdirs: BTreeSet<PathBuf>,
@@ -867,7 +859,6 @@ impl State {
             candidates,
             existing,
             snapshot: std::mem::take(&mut self.snapshot),
-            save_all: self.save_all,
             detached: self.detached.clone(),
             identities: std::mem::take(&mut self.identities),
             survivors,
@@ -1390,11 +1381,8 @@ struct Kept {
     gitdirs: BTreeSet<PathBuf>,
     candidates: BTreeSet<PathBuf>,
     existing: BTreeSet<PathBuf>,
-    /// The snapshot taken before the command: every protected file with
-    /// `save_all`, only protected symlinks and multiply linked files without.
+    /// The snapshot taken before the command: every protected file.
     snapshot: Snapshot,
-    /// Whether the snapshot holds every protected file (`save_all`).
-    save_all: bool,
     /// Below these, the snapshot is not compared: see [`State::detached`].
     detached: BTreeSet<PathBuf>,
     /// What each `.git` entry, gitdir and link was, and is expected to be:
@@ -1417,9 +1405,9 @@ impl Kept {
     /// Does what the checks left undone first; then, if processes the
     /// command left running may have changed things, puts back or moves a
     /// `.git` entry, gitdir or link they replaced; moves protected names
-    /// planted since the command ended to quarantine; and, with `save_all`
-    /// if processes may have changed things, or whenever restores were left
-    /// undone, undoes the changes to the protected files and gitfiles.
+    /// planted since the command ended to quarantine; and, if processes may
+    /// have changed things, or whenever restores were left undone, undoes
+    /// the changes to the protected files and gitfiles.
     fn check(
         &mut self,
         tree: &Tree,
@@ -1488,7 +1476,7 @@ impl Kept {
             .undone
             .values()
             .any(|undone| matches!(undone.todo, Todo::Restore));
-        if (self.survivors && self.save_all) || restores_left {
+        if self.survivors || restores_left {
             let detached = &self.detached;
             pass.undo(
                 &self.snapshot,

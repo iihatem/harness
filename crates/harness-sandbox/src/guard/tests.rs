@@ -54,7 +54,7 @@ fn while_finish_scans(env: &Env) {
 fn with_survivors_what_is_written_while_finish_scans_is_undone_at_the_next_begin() {
     let env = env();
     env.session.set_survivor_probe(Arc::new(|| true));
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     while_finish_scans(&env);
     assert_eq!(guard.finish(), None);
     assert_eq!(
@@ -64,7 +64,7 @@ fn with_survivors_what_is_written_while_finish_scans_is_undone_at_the_next_begin
     );
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(!report.blocked, "{}", report.message);
@@ -88,18 +88,18 @@ fn with_survivors_what_is_written_while_finish_scans_is_undone_at_the_next_begin
         "[core]\n\tbare = false\n"
     );
     // And it stays that way.
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
 }
 
 #[test]
 fn without_survivors_a_name_planted_while_finish_scans_is_still_caught_at_the_next_begin() {
     let env = env();
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     while_finish_scans(&env);
     assert_eq!(guard.finish(), None);
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(!report.blocked, "{}", report.message);
@@ -119,7 +119,7 @@ fn a_name_the_guard_could_not_move_is_tried_again_at_the_next_begin() {
     let env = env();
     let commondir = env.ws.join(".git/commondir");
     lock(&env.session.hooks).stuck.insert(commondir.clone());
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     std::fs::write(&commondir, "/tmp/evil\n").unwrap();
     let report = guard.finish().expect("a report");
     assert!(report.blocked);
@@ -134,7 +134,7 @@ fn a_name_the_guard_could_not_move_is_tried_again_at_the_next_begin() {
     lock(&env.session.hooks).stuck.clear();
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(
@@ -175,7 +175,7 @@ fn incomplete_env() -> Env {
 #[test]
 fn after_an_incomplete_scan_known_submodule_and_worktree_gitdirs_are_left_alone() {
     let env = incomplete_env();
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     let index = guard.index();
     assert!(index.incomplete, "{index:?}");
     assert!(
@@ -198,7 +198,7 @@ fn after_an_incomplete_scan_known_submodule_and_worktree_gitdirs_are_left_alone(
 #[test]
 fn after_an_incomplete_scan_a_new_nested_gitdir_is_listed_and_left_in_place() {
     let env = incomplete_env();
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     std::fs::create_dir_all(env.ws.join(".git/worktrees/new")).unwrap();
     let report = guard.finish().expect("a report");
     assert!(!report.blocked, "{}", report.message);
@@ -218,7 +218,7 @@ fn after_an_incomplete_scan_a_new_nested_gitdir_is_listed_and_left_in_place() {
 #[test]
 fn after_an_incomplete_scan_names_planted_in_known_nested_gitdirs_are_still_caught() {
     let env = incomplete_env();
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     let planted = env.ws.join(".git/modules/sub/commondir");
     std::fs::write(&planted, "/tmp/evil\n").unwrap();
     let report = guard.finish().expect("a report");
@@ -236,7 +236,7 @@ fn after_an_incomplete_scan_names_planted_in_known_nested_gitdirs_are_still_caug
 #[test]
 fn twenty_thousand_planted_hooks_take_bounded_work_and_a_bounded_report() {
     let env = env();
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     let hooks = env.ws.join(".git/hooks");
     for i in 0..20_000 {
         std::fs::write(hooks.join(format!("h{i:05}")), "x").unwrap();
@@ -280,7 +280,7 @@ fn twenty_thousand_planted_hooks_take_bounded_work_and_a_bounded_report() {
     // The next command's guard goes on where this one stopped.
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(
@@ -294,7 +294,7 @@ fn twenty_thousand_planted_hooks_take_bounded_work_and_a_bounded_report() {
 #[test]
 fn the_same_name_planted_again_and_again_is_not_searched_for_a_free_name() {
     let env = env();
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     let handle = guard.watch_handle();
     for _ in 0..500 {
         std::fs::write(env.ws.join("HEAD"), "ref: x\n").unwrap();
@@ -335,7 +335,7 @@ fn cap(env: &Env, max: usize) {
 fn a_repository_past_the_cap_is_named_and_moved_before_the_next_command() {
     let env = env();
     cap(&env, 3);
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     for decoy in ["a1", "a2", "a3"] {
         std::fs::create_dir_all(env.ws.join(decoy).join(".git")).unwrap();
     }
@@ -353,7 +353,7 @@ fn a_repository_past_the_cap_is_named_and_moved_before_the_next_command() {
     assert!(env.ws.join("zz/.git").exists());
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(!report.blocked, "{}", report.message);
@@ -372,7 +372,7 @@ fn a_repository_past_the_cap_is_named_and_moved_before_the_next_command() {
 fn a_nested_gitdir_past_the_cap_is_moved_before_the_next_command() {
     let env = env();
     cap(&env, 3);
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     let worktrees = env.ws.join(".git/worktrees");
     for name in ["a1", "a2", "a3", "zz"] {
         std::fs::create_dir_all(worktrees.join(name)).unwrap();
@@ -395,7 +395,7 @@ fn a_nested_gitdir_past_the_cap_is_moved_before_the_next_command() {
     );
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(
@@ -413,7 +413,7 @@ fn what_is_left_undone_between_commands_is_moved_while_survivors_live() {
     let env = env();
     cap(&env, 3);
     env.session.set_survivor_probe(Arc::new(|| true));
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     for name in ["a1", "a2", "a3", "zz"] {
         std::fs::create_dir_all(env.ws.join(name).join(".git")).unwrap();
     }
@@ -434,13 +434,13 @@ fn what_is_left_undone_stays_unknown_until_it_is_moved() {
     let env = env();
     cap(&env, 1);
     let planted = env.ws.join("zz/.git");
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     std::fs::create_dir_all(env.ws.join("a1/.git")).unwrap();
     std::fs::create_dir_all(&planted).unwrap();
     assert!(guard.finish().expect("a report").blocked);
     lock(&env.session.hooks).max_changes = None;
     lock(&env.session.hooks).stuck.insert(planted.clone());
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     assert!(!guard.index().dot_gits.contains(&planted));
     let report = guard.finish().expect("a report");
     assert!(report.blocked, "{}", report.message);
@@ -454,7 +454,7 @@ fn what_is_left_undone_stays_unknown_until_it_is_moved() {
     lock(&env.session.hooks).stuck.clear();
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(
@@ -476,7 +476,7 @@ fn uncap(env: &Env) {
 fn a_capped_config_change_is_restored_at_the_next_begin() {
     let env = env();
     cap(&env, 0);
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     std::fs::write(env.ws.join(".git/config"), EVIL).unwrap();
     let report = guard.finish().expect("a report");
     assert!(
@@ -487,7 +487,7 @@ fn a_capped_config_change_is_restored_at_the_next_begin() {
     uncap(&env);
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(
@@ -501,7 +501,7 @@ fn a_capped_config_change_is_restored_at_the_next_begin() {
         read(&env.ws.join(".git/config")),
         "[core]\n\tbare = false\n"
     );
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
 }
 
 #[test]
@@ -509,7 +509,7 @@ fn a_failed_config_move_is_retried_at_the_next_begin() {
     let env = env();
     let config = env.ws.join(".git/config");
     lock(&env.session.hooks).stuck.insert(config.clone());
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     std::fs::write(&config, EVIL).unwrap();
     let report = guard.finish().expect("a report");
     assert!(report.blocked);
@@ -523,7 +523,7 @@ fn a_failed_config_move_is_retried_at_the_next_begin() {
     lock(&env.session.hooks).stuck.clear();
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(
@@ -545,7 +545,7 @@ fn a_replaced_gitfile_left_undone_is_put_back_at_the_next_begin() {
     let gitfile = env.ws.join("sub/.git");
     std::fs::write(&gitfile, "gitdir: ../.git/modules/sub\n").unwrap();
     cap(&env, 0);
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     // Renamed over it, so its inode differs whatever the filesystem reuses.
     std::fs::write(env.ws.join("sub/new"), "gitdir: /tmp/evil\n").unwrap();
     std::fs::rename(env.ws.join("sub/new"), &gitfile).unwrap();
@@ -558,7 +558,7 @@ fn a_replaced_gitfile_left_undone_is_put_back_at_the_next_begin() {
     uncap(&env);
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(
@@ -569,17 +569,17 @@ fn a_replaced_gitfile_left_undone_is_put_back_at_the_next_begin() {
         report.message
     );
     assert_eq!(read(&gitfile), "gitdir: ../.git/modules/sub\n");
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
 }
 
 #[test]
-fn a_capped_restore_in_the_full_tier_is_done_at_the_next_command() {
+fn a_capped_restore_of_a_symlink_is_done_at_the_next_command() {
     let env = env();
     let hooks = env.ws.join(".git/hooks");
     std::fs::rename(&hooks, env.ws.join("tracked-hooks")).unwrap();
     std::os::unix::fs::symlink("../tracked-hooks", &hooks).unwrap();
     cap(&env, 0);
-    let guard = env.session.begin(&env.ws, false, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     std::fs::remove_file(&hooks).unwrap();
     let report = guard.finish().expect("a report");
     assert!(report.blocked);
@@ -591,7 +591,7 @@ fn a_capped_restore_in_the_full_tier_is_done_at_the_next_command() {
     uncap(&env);
     let report = env
         .session
-        .begin(&env.ws, false, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(!report.blocked, "{}", report.message);
@@ -606,7 +606,7 @@ fn a_capped_restore_in_the_full_tier_is_done_at_the_next_command() {
         std::fs::read_link(&hooks).unwrap(),
         PathBuf::from("../tracked-hooks")
     );
-    assert_eq!(env.session.begin(&env.ws, false, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
 }
 
 #[test]
@@ -616,7 +616,7 @@ fn a_restore_nothing_can_do_is_reported_once_then_dropped() {
     std::fs::write(env.ws.join("sub/.git/HEAD"), "ref: x\n").unwrap();
     std::fs::write(env.ws.join("sub/.git/config"), "[core]\n").unwrap();
     cap(&env, 0);
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     std::fs::write(env.ws.join("sub/.git/config"), EVIL).unwrap();
     assert!(guard.finish().expect("a report").blocked);
     // The user removes the repository between commands.
@@ -624,7 +624,7 @@ fn a_restore_nothing_can_do_is_reported_once_then_dropped() {
     uncap(&env);
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert_eq!(
@@ -643,7 +643,7 @@ fn a_restore_nothing_can_do_is_reported_once_then_dropped() {
         "{}",
         report.message
     );
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
 }
 
 /// How many lookups in the undone record the next `begin` makes, with `n`
@@ -651,13 +651,13 @@ fn a_restore_nothing_can_do_is_reported_once_then_dropped() {
 fn lookups_at_begin(n: usize) -> usize {
     let env = env();
     cap(&env, 0);
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     for i in 0..n {
         std::fs::write(env.ws.join(format!(".git/hooks/h{i:05}")), "x").unwrap();
     }
     let _ = guard.finish();
     LOOKUPS.with(|looks| looks.set(0));
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     let looks = LOOKUPS.with(std::cell::Cell::get);
     assert_eq!(lock(&guard.state).undone.len(), n);
     looks
@@ -680,7 +680,7 @@ fn a_move_that_keeps_failing_blocks_only_the_first_command() {
     let env = env();
     let planted = env.ws.join("zz/.git");
     lock(&env.session.hooks).stuck.insert(planted.clone());
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     std::fs::create_dir_all(&planted).unwrap();
     let report = guard.finish().expect("a report");
     assert!(report.blocked);
@@ -694,7 +694,7 @@ fn a_move_that_keeps_failing_blocks_only_the_first_command() {
     for _ in 0..2 {
         let report = env
             .session
-            .begin(&env.ws, true, |_| {})
+            .begin(&env.ws, |_| {})
             .finish()
             .expect("a reminder");
         assert!(!report.blocked, "{}", report.message);
@@ -706,7 +706,7 @@ fn a_move_that_keeps_failing_blocks_only_the_first_command() {
     lock(&env.session.hooks).stuck.clear();
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(
@@ -777,7 +777,7 @@ fn what_was_renamed_in_place_is_left_as_it_is_by_later_checks() {
     std::fs::write(base.join("quarantine"), "not a directory\n").unwrap();
     let session = GuardSession::new(&base.join("quarantine"));
     session.set_survivor_probe(Arc::new(|| true));
-    let guard = session.begin(&ws, true, |_| {});
+    let guard = session.begin(&ws, |_| {});
     let handle = guard.watch_handle();
     std::fs::write(ws.join(".git/hooks/post-checkout"), "echo pwned\n").unwrap();
     for _ in 0..5 {
@@ -805,7 +805,7 @@ fn what_was_renamed_in_place_is_left_as_it_is_by_later_checks() {
         between.check();
     }
     assert_eq!(names_in(&ws.join(".git/hooks")), renamed);
-    assert_eq!(session.begin(&ws, true, |_| {}).finish(), None);
+    assert_eq!(session.begin(&ws, |_| {}).finish(), None);
     assert_eq!(names_in(&ws.join(".git/hooks")), renamed);
 }
 
@@ -818,7 +818,7 @@ fn once_survivors_are_gone_changes_between_commands_are_the_users() {
         probe.load(std::sync::atomic::Ordering::SeqCst)
     }));
     let original = read(&env.ws.join(".git/config"));
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
     let between = env.session.between_commands(&env.ws).expect("survivors");
     // A survivor changes the config, then exits: the last check puts it back.
     std::fs::write(env.ws.join(".git/config"), EVIL).unwrap();
@@ -831,7 +831,7 @@ fn once_survivors_are_gone_changes_between_commands_are_the_users() {
     std::fs::write(env.ws.join(".git/config"), mine).unwrap();
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("what the last check did");
     assert!(!report.blocked, "{}", report.message);
@@ -849,7 +849,7 @@ fn once_survivors_are_gone_changes_between_commands_are_the_users() {
 fn what_the_checks_between_commands_found_is_said_once_with_the_next_result() {
     let env = env();
     env.session.set_survivor_probe(Arc::new(|| true));
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
     let between = env.session.between_commands(&env.ws).expect("survivors");
     std::fs::write(env.ws.join(".git/commondir"), "/tmp/evil\n").unwrap();
     between.check();
@@ -870,7 +870,7 @@ fn what_the_checks_between_commands_found_is_said_once_with_the_next_result() {
     );
     assert_eq!(env.session.found_between(&env.ws), None, "said once");
     assert_eq!(
-        env.session.begin(&env.ws, true, |_| {}).finish(),
+        env.session.begin(&env.ws, |_| {}).finish(),
         None,
         "not said again"
     );
@@ -886,7 +886,7 @@ fn a_survivor_that_writes_while_finish_scans_and_then_exits_is_still_undone() {
     env.session.set_survivor_probe(Arc::new(move || {
         probe.load(std::sync::atomic::Ordering::SeqCst)
     }));
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     let ws = env.ws.clone();
     let exits = Arc::clone(&alive);
     lock(&env.session.hooks).after_scan = Some(Box::new(move || {
@@ -896,7 +896,7 @@ fn a_survivor_that_writes_while_finish_scans_and_then_exits_is_still_undone() {
     assert_eq!(guard.finish(), None);
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(!report.blocked, "{}", report.message);
@@ -917,7 +917,7 @@ fn a_survivor_that_writes_while_finish_scans_and_then_exits_is_still_undone() {
 fn what_survivors_change_while_begin_scans_is_undone_at_that_begin() {
     let env = env();
     env.session.set_survivor_probe(Arc::new(|| true));
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
     // Runs during the next `begin`'s scan, after its first check.
     let ws = env.ws.clone();
     lock(&env.session.hooks).after_scan = Some(Box::new(move || {
@@ -925,7 +925,7 @@ fn what_survivors_change_while_begin_scans_is_undone_at_that_begin() {
         std::fs::write(ws.join(".git/config"), EVIL).unwrap();
         std::fs::write(ws.join(".git/hooks/post-checkout"), "evil\n").unwrap();
     }));
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     // Undone before the command runs.
     assert_eq!(
         read(&env.ws.join(".git/config")),
@@ -953,7 +953,7 @@ fn what_survivors_change_while_begin_scans_is_undone_at_that_begin() {
 fn with_survivors_a_dot_git_replaced_by_a_symlink_between_commands_is_quarantined() {
     let env = env();
     env.session.set_survivor_probe(Arc::new(|| true));
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
     // A survivor swaps the repository for a symlink to a gitdir outside the
     // workspace.
     let outside = env.ws.parent().unwrap().join("outside-git");
@@ -961,7 +961,7 @@ fn with_survivors_a_dot_git_replaced_by_a_symlink_between_commands_is_quarantine
     std::os::unix::fs::symlink(&outside, env.ws.join(".git")).unwrap();
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(!report.blocked, "{}", report.message);
@@ -981,7 +981,7 @@ fn with_survivors_a_repointed_dot_git_symlink_is_put_back_between_commands() {
     std::fs::rename(env.ws.join(".git"), env.ws.join("real")).unwrap();
     std::os::unix::fs::symlink("real", env.ws.join(".git")).unwrap();
     env.session.set_survivor_probe(Arc::new(|| true));
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
     std::fs::remove_file(env.ws.join(".git")).unwrap();
     std::os::unix::fs::symlink("/tmp", env.ws.join(".git")).unwrap();
     let handle = env
@@ -995,7 +995,7 @@ fn with_survivors_a_repointed_dot_git_symlink_is_put_back_between_commands() {
     );
     let report = env
         .session
-        .begin(&env.ws, true, |_| {})
+        .begin(&env.ws, |_| {})
         .finish()
         .expect("a report");
     assert!(
@@ -1011,7 +1011,7 @@ fn with_survivors_a_repointed_dot_git_symlink_is_put_back_between_commands() {
 fn a_real_dot_git_the_user_moves_back_is_not_quarantined() {
     let env = env();
     cap(&env, 0);
-    let guard = env.session.begin(&env.ws, true, |_| {});
+    let guard = env.session.begin(&env.ws, |_| {});
     std::fs::rename(env.ws.join(".git"), env.ws.join(".git-away")).unwrap();
     std::fs::create_dir_all(env.ws.join(".git/hooks")).unwrap();
     let report = guard.finish().expect("a report");
@@ -1024,7 +1024,7 @@ fn a_real_dot_git_the_user_moves_back_is_not_quarantined() {
     std::fs::remove_dir_all(env.ws.join(".git")).unwrap();
     std::fs::rename(env.ws.join(".git-away"), env.ws.join(".git")).unwrap();
     uncap(&env);
-    let report = env.session.begin(&env.ws, true, |_| {}).finish();
+    let report = env.session.begin(&env.ws, |_| {}).finish();
     assert!(
         report
             .as_ref()
@@ -1070,7 +1070,7 @@ fn undone_at_exit(env: &Env, report: Option<GuardReport>) {
 fn at_exit_what_survivors_seen_since_the_last_command_changed_is_undone_and_said() {
     let env = env();
     env.session.set_survivor_probe(Arc::new(|| true));
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
     changed_after_the_last_command(&env);
     undone_at_exit(&env, env.session.end_session(false));
 }
@@ -1078,7 +1078,7 @@ fn at_exit_what_survivors_seen_since_the_last_command_changed_is_undone_and_said
 #[test]
 fn at_exit_what_survivors_found_then_changed_is_undone_and_said() {
     let env = env();
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
     changed_after_the_last_command(&env);
     undone_at_exit(&env, env.session.end_session(true));
 }
@@ -1086,7 +1086,7 @@ fn at_exit_what_survivors_found_then_changed_is_undone_and_said() {
 #[test]
 fn at_exit_without_survivors_a_config_change_since_the_last_command_is_the_users() {
     let env = env();
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
     std::fs::write(env.ws.join(".git/config"), EVIL).unwrap();
     assert_eq!(env.session.end_session(false), None);
     assert_eq!(read(&env.ws.join(".git/config")), EVIL);
@@ -1096,6 +1096,6 @@ fn at_exit_without_survivors_a_config_change_since_the_last_command_is_the_users
 fn a_session_that_ends_with_nothing_changed_has_nothing_to_say() {
     let env = env();
     assert_eq!(env.session.end_session(true), None);
-    assert_eq!(env.session.begin(&env.ws, true, |_| {}).finish(), None);
+    assert_eq!(env.session.begin(&env.ws, |_| {}).finish(), None);
     assert_eq!(env.session.end_session(true), None);
 }

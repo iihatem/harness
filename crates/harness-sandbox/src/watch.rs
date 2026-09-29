@@ -1056,7 +1056,7 @@ mod tests {
         std::fs::write(ws.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
         std::fs::write(ws.join(".git/hooks/pre-commit"), "exit 0\n").unwrap();
         let session = crate::guard::GuardSession::new(&base.join("quarantine"));
-        let guard = session.begin(&ws, true, |_| {});
+        let guard = session.begin(&ws, |_| {});
         let w = world(&[]);
         let watcher = Watch::new(
             Fake(Arc::clone(&w), Instant::now()),

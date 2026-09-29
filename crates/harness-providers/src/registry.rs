@@ -115,6 +115,9 @@ pub enum ResolveError {
     NotSignedIn { provider: String, profile: String },
     #[error("this build of harness was made without ChatGPT sign-in (the `chatgpt-login` feature)")]
     SignInUnavailable,
+    /// A test hook's value that is not an http(s) URL.
+    #[error("{var} is `{value}`, which is not an http(s) URL")]
+    BadHook { var: String, value: String },
 }
 
 /// The command that signs in to `provider` under `profile`.
@@ -298,9 +301,19 @@ pub fn resolve(
     })
 }
 
+/// A test hook: the value of `var`, in debug builds only, so that no release build can be
+/// pointed elsewhere by its environment.
+pub fn test_hook(var: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if cfg!(debug_assertions) {
+        env(var).filter(|value| !value.is_empty())
+    } else {
+        None
+    }
+}
+
 /// A `chatgpt/*` model, for the account signed in under the provider's active profile.
 /// `HARNESS_CHATGPT_ISSUER` and `HARNESS_CHATGPT_BASE_URL` point sign-in and requests elsewhere,
-/// for tests.
+/// for tests, in debug builds only.
 #[cfg(feature = "chatgpt-login")]
 fn chatgpt(model_id: &str, model: &str, secrets: &impl Secrets) -> Result<Resolved, ResolveError> {
     use crate::chatgpt::{
@@ -320,18 +333,29 @@ fn chatgpt(model_id: &str, model: &str, secrets: &impl Secrets) -> Result<Resolv
         profile: profile.clone(),
     };
     let credentials = credentials.ok_or_else(not_signed_in)?;
-    let issuer = secrets
-        .env("HARNESS_CHATGPT_ISSUER")
-        .unwrap_or_else(|| ISSUER.to_string());
-    let mut auth = ChatGptAuth::load(credentials, &profile, OAuth::new(&issuer))
+    let hook = |var: &str| test_hook(var, |var| secrets.env(var));
+    let bad_hook = |var: &str, value: String| ResolveError::BadHook {
+        var: var.to_string(),
+        value,
+    };
+    let oauth = match hook("HARNESS_CHATGPT_ISSUER") {
+        Some(issuer) => {
+            OAuth::new(&issuer).map_err(|_| bad_hook("HARNESS_CHATGPT_ISSUER", issuer))?
+        }
+        None => OAuth::new(ISSUER).expect("the issuer is a URL"),
+    };
+    let base_url = hook("HARNESS_CHATGPT_BASE_URL").unwrap_or_else(|| BASE_URL.to_string());
+    if !reqwest::Url::parse(&base_url)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+    {
+        return Err(bad_hook("HARNESS_CHATGPT_BASE_URL", base_url));
+    }
+    let mut auth = ChatGptAuth::load(credentials, &profile, oauth)
         .map_err(|e| store_error(CHATGPT, e))?
         .ok_or_else(not_signed_in)?;
     if let Some(redactor) = secrets.redactor() {
         auth = auth.with_redactor(redactor);
     }
-    let base_url = secrets
-        .env("HARNESS_CHATGPT_BASE_URL")
-        .unwrap_or_else(|| BASE_URL.to_string());
     Ok(Resolved {
         provider: Arc::new(OpenAiResponses::chatgpt(base_url.clone(), Arc::new(auth))),
         model: model.to_string(),

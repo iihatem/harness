@@ -95,7 +95,7 @@ impl Signed {
         ChatGptAuth::load(
             self.credentials.clone(),
             &self.profile(),
-            OAuth::new(&server.uri()),
+            OAuth::new(&server.uri()).unwrap(),
         )
         .unwrap()
         .expect("signed in")
@@ -218,6 +218,8 @@ async fn a_401_refreshes_the_token_and_retries_once() {
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
         .and(body_string_contains(r#""refresh_token":"rt-1""#))
+        // Review C, M8: refreshes identify as the Codex CLI too.
+        .and(header("originator", "codex_cli_rs"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"access_token": new, "refresh_token": "rt-2"})),
@@ -645,9 +647,13 @@ async fn only_a_refused_refresh_token_means_signing_in_again() {
     let issuer = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
     let signed = Signed::new(&tokens(&access_token("old", 60), "rt-1"));
-    let auth = ChatGptAuth::load(signed.credentials.clone(), "default", OAuth::new(&issuer))
-        .unwrap()
-        .unwrap();
+    let auth = ChatGptAuth::load(
+        signed.credentials.clone(),
+        "default",
+        OAuth::new(&issuer).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
     let error = auth.current().await.unwrap_err();
     assert!(error.is_retryable(), "{error}");
     assert!(!error.to_string().contains("harness login"), "{error}");

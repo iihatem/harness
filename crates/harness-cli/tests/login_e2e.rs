@@ -143,6 +143,10 @@ async fn a_device_sign_in_lets_chatgpt_models_answer_until_logout() {
             .assert()
             .success()
             .stderr(contains("not a contractual guarantee"))
+            // Review C, M8.
+            .stderr(contains(
+                "signs in with the Codex CLI's OAuth client and identifies to OpenAI as the Codex CLI",
+            ))
             .stderr(contains("ABCD-1234"))
             .stderr(contains("/codex/device"))
             .stdout(contains(
@@ -347,4 +351,33 @@ async fn a_renewal_that_cannot_be_stored_is_announced() {
         stderr.contains("warning: the renewed ChatGPT sign-in could not be stored"),
         "{stderr}"
     );
+}
+
+// Review C, M4: the test hooks take only a URL; anything else is an error, never a panic.
+#[test]
+fn a_test_hook_that_is_not_a_url_is_an_error() {
+    let env = Env::new("http://127.0.0.1:9");
+    env.cmd()
+        .env("HARNESS_CHATGPT_ISSUER", "not a url")
+        .args(["login", "chatgpt", "--device"])
+        .assert()
+        .failure()
+        .stderr(contains("not an http(s) URL"))
+        .stderr(contains("panicked").not());
+    let data = env.home.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let tokens = json!({"access_token": access_token(), "refresh_token": "rt-1"});
+    std::fs::write(
+        env.credentials(),
+        json!({"credentials": {"chatgpt/default": tokens.to_string()}}).to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(env.credentials(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    env.cmd()
+        .env("HARNESS_CHATGPT_BASE_URL", "not a url")
+        .args(["--model", "chatgpt/gpt-5.5", "ask", "hi"])
+        .assert()
+        .code(2)
+        .stderr(contains("not an http(s) URL"))
+        .stderr(contains("panicked").not());
 }

@@ -7,7 +7,7 @@ use crate::{setup::Setup, term::terminal_safe};
 
 /// What every ChatGPT sign-in says first.
 #[cfg(feature = "chatgpt-login")]
-pub const NOTICE: &str = "Signing in with ChatGPT lets harness use the models your ChatGPT plan includes. OpenAI allows this in third-party tools today, but that is its current practice, not a contractual guarantee: it can change at any time.";
+pub const NOTICE: &str = "Signing in with ChatGPT lets harness use the models your ChatGPT plan includes. OpenAI allows this in third-party tools today, but that is its current practice, not a contractual guarantee: it can change at any time. harness signs in with the Codex CLI's OAuth client and identifies to OpenAI as the Codex CLI.";
 
 /// `harness login <provider> [--profile <name>] [--device]`.
 pub async fn run(provider: &str, profile: &str, device: bool) -> u8 {
@@ -76,9 +76,17 @@ async fn sign_in(setup: &Setup, profile: &str, device: bool) -> u8 {
         registry::CHATGPT,
     };
     eprintln!("{NOTICE}");
-    // A test hook: a mock authorization server.
-    let issuer = crate::setup::env("HARNESS_CHATGPT_ISSUER").unwrap_or_else(|| ISSUER.to_string());
-    let oauth = OAuth::new(&issuer);
+    // A test hook, in debug builds only: a mock authorization server.
+    let issuer =
+        harness_providers::registry::test_hook("HARNESS_CHATGPT_ISSUER", crate::setup::env)
+            .unwrap_or_else(|| ISSUER.to_string());
+    let oauth = match OAuth::new(&issuer) {
+        Ok(oauth) => oauth,
+        Err(e) => {
+            eprintln!("error: {}", terminal_safe(&e.to_string()));
+            return 2;
+        }
+    };
     let device = device || wants_device_flow(crate::setup::env);
     let tokens = tokio::select! {
         tokens = flows::sign_in(&oauth, device) => tokens,
@@ -196,16 +204,21 @@ mod flows {
         open(&url)
             .await
             .map_err(|e| Browser::CannotOpen(e.to_string()))?;
-        eprintln!(
-            "Sign in in the browser window that opened. If none did, open:\n  {}",
-            terminal_safe(&url)
-        );
+        eprintln!("{}", waiting_message(&url));
         let code = tokio::time::timeout(BROWSER_WAIT, callback.wait_for_code(&state))
             .await
             .map_err(|_| OAuthError::TimedOut)??;
         Ok(oauth
             .exchange_code(&code, &callback.redirect_uri(), &pkce.verifier)
             .await?)
+    }
+
+    /// What the browser flow says while it waits for the user at `url`.
+    pub fn waiting_message(url: &str) -> String {
+        format!(
+            "Sign in in the browser window that opened. If none did, open:\n  {}\nharness waits 10 minutes for the browser to come back to 127.0.0.1. Where a browser cannot reach this machine's 127.0.0.1 (in a container, a remote editor), press Ctrl+C and sign in with a device code instead: add --device.",
+            terminal_safe(url)
+        )
     }
 
     /// Opens `url` in the default browser.
@@ -247,6 +260,14 @@ mod tests {
     fn ssh_sessions_use_the_device_flow() {
         assert!(wants_device_flow(env(&[("SSH_CONNECTION", "a b c d")])));
         assert!(wants_device_flow(env(&[("SSH_TTY", "/dev/pts/1")])));
+    }
+
+    // Review C, M11.
+    #[test]
+    fn the_browser_wait_offers_the_device_flow() {
+        let message = flows::waiting_message("https://auth.example/oauth/authorize?x=1");
+        assert!(message.contains("10 minutes"), "{message}");
+        assert!(message.contains("--device"), "{message}");
     }
 
     #[test]

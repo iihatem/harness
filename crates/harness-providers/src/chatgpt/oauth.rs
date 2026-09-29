@@ -33,6 +33,9 @@ pub const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 /// CLI's own originator, not harness's. harness signs in with the Codex CLI's OAuth client and
 /// identifies to OpenAI as it, rather than presenting itself as a distinct client.
 pub const ORIGINATOR: &str = "codex_cli_rs";
+/// What ChatGPT may append to the `state` it sends back, followed by a value (Codex strips
+/// `.onboarding_entrypoint=life_sciences`).
+const ONBOARDING_SUFFIX: &str = ".onboarding_entrypoint=";
 /// How long a device code stays valid.
 pub const DEVICE_CODE_WAIT: Duration = Duration::from_secs(15 * 60);
 
@@ -53,6 +56,8 @@ pub enum OAuthError {
     Denied(String),
     #[error("sign-in timed out")]
     TimedOut,
+    #[error("the sign-in server's address `{0}` is not an http(s) URL")]
+    BadIssuer(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
@@ -186,22 +191,37 @@ pub struct OAuth {
 }
 
 impl OAuth {
-    pub fn new(issuer: &str) -> OAuth {
-        OAuth {
+    /// The endpoints of the authorization server at `issuer`, an http(s) URL. Every request
+    /// carries the Codex CLI's `originator`, as Codex's own client does, and harness's
+    /// User-Agent.
+    pub fn new(issuer: &str) -> Result<OAuth, OAuthError> {
+        let issuer = issuer.trim_end_matches('/');
+        let valid = reqwest::Url::parse(&format!("{issuer}/oauth/authorize"))
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host());
+        if !valid {
+            return Err(OAuthError::BadIssuer(issuer.to_string()));
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "originator",
+            reqwest::header::HeaderValue::from_static(ORIGINATOR),
+        );
+        Ok(OAuth {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .user_agent(concat!("harness/", env!("CARGO_PKG_VERSION")))
+                .default_headers(headers)
                 .build()
                 .expect("an HTTP client builds"),
-            issuer: issuer.trim_end_matches('/').to_string(),
+            issuer: issuer.to_string(),
             client_id: CLIENT_ID.to_string(),
-        }
+        })
     }
 
     /// Where the browser goes to sign in.
     pub fn authorize_url(&self, redirect_uri: &str, pkce: &Pkce, state: &str) -> String {
         let mut url = reqwest::Url::parse(&format!("{}/oauth/authorize", self.issuer))
-            .expect("the issuer is a URL");
+            .expect("checked by OAuth::new");
         url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.client_id)
@@ -274,13 +294,16 @@ impl OAuth {
     }
 
     /// Waits, up to `max_wait`, for the user to enter the device code, then exchanges the code
-    /// the server issues for tokens.
+    /// the server issues for tokens. A server that is busy (429) or failing (5xx) meanwhile is
+    /// waited out, a little longer each time it is, until the code expires.
     pub async fn poll_device_code(
         &self,
         device: &DeviceCode,
         max_wait: Duration,
     ) -> Result<Tokens, OAuthError> {
         let started = Instant::now();
+        let interval = device.interval.max(Duration::from_millis(100));
+        let mut pause = interval;
         loop {
             let response = self
                 .client
@@ -289,13 +312,20 @@ impl OAuth {
                 .send()
                 .await
                 .map_err(|e| OAuthError::Network(e.to_string()))?;
-            // Not approved yet.
-            if matches!(response.status().as_u16(), 403 | 404) {
+            let status = response.status().as_u16();
+            // Not approved yet (403, 404), or the server cannot say now (429, 5xx).
+            let not_yet = matches!(status, 403 | 404);
+            let busy = status == 429 || (500..600).contains(&status);
+            if not_yet || busy {
+                pause = if busy {
+                    (pause * 2).min(Duration::from_secs(30))
+                } else {
+                    interval
+                };
                 let waited = started.elapsed();
                 if waited >= max_wait {
                     return Err(OAuthError::TimedOut);
                 }
-                let pause = device.interval.max(Duration::from_millis(100));
                 tokio::time::sleep(pause.min(max_wait - waited)).await;
                 continue;
             }
@@ -383,7 +413,8 @@ pub struct CallbackServer {
 }
 
 impl CallbackServer {
-    /// Listens at the first of `ports` that is free (`0`: any).
+    /// Listens at the first of `ports` that is free (`0`: any). When none is, the error names
+    /// them and suggests the device flow, which needs no port.
     pub async fn bind(ports: &[u16]) -> std::io::Result<CallbackServer> {
         let mut last = None;
         for &port in ports {
@@ -395,7 +426,17 @@ impl CallbackServer {
                 Err(e) => last = Some(e),
             }
         }
-        Err(last.unwrap_or_else(|| std::io::Error::other("no port to listen on")))
+        let Some(last) = last else {
+            return Err(std::io::Error::other("no port to listen on"));
+        };
+        let names: Vec<String> = ports.iter().map(u16::to_string).collect();
+        Err(std::io::Error::new(
+            last.kind(),
+            format!(
+                "cannot listen for the browser's return on 127.0.0.1, port {} ({last}); sign in with a device code instead: add --device",
+                names.join(" or ")
+            ),
+        ))
     }
 
     pub fn port(&self) -> u16 {
@@ -424,7 +465,12 @@ impl CallbackServer {
                 }
             };
             let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
-            if query.get("state").map(String::as_str) != Some(state) {
+            // ChatGPT may append onboarding metadata to the state; Codex strips it too.
+            let returned = query.get("state").map(|s| {
+                s.split_once(ONBOARDING_SUFFIX)
+                    .map_or(s.as_str(), |(s, _)| s)
+            });
+            if returned != Some(state) {
                 respond(
                     &mut stream,
                     400,

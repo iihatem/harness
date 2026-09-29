@@ -12,7 +12,7 @@ use harness_providers::chatgpt::oauth::{
     CLIENT_ID, CallbackServer, OAuth, OAuthError, Pkce, Tokens,
 };
 use serde_json::{Value, json};
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_string_contains, header, header_regex, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 fn jwt(claims: Value) -> String {
@@ -58,7 +58,7 @@ fn the_pkce_challenge_is_the_verifiers_sha256_in_base64url() {
 
 #[test]
 fn the_authorize_url_asks_for_a_code_with_pkce() {
-    let oauth = OAuth::new("https://auth.example");
+    let oauth = OAuth::new("https://auth.example").unwrap();
     let pkce = Pkce::from_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
     let url = reqwest::Url::parse(&oauth.authorize_url(
         "http://127.0.0.1:1455/auth/callback",
@@ -116,6 +116,9 @@ async fn the_browser_flow_exchanges_the_code_from_the_callback() {
         .and(body_string_contains(
             format!("client_id={CLIENT_ID}").as_str(),
         ))
+        // Review C, M8: as the Codex CLI, with harness's own User-Agent.
+        .and(header("originator", "codex_cli_rs"))
+        .and(header_regex("user-agent", "^harness/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(token_response()))
         .expect(1)
         .mount(&server)
@@ -129,7 +132,7 @@ async fn the_browser_flow_exchanges_the_code_from_the_callback() {
     let (status, page) = browser.await.unwrap();
     assert_eq!(status, 200);
     assert!(page.contains("signed in"), "{page}");
-    let oauth = OAuth::new(&server.uri());
+    let oauth = OAuth::new(&server.uri()).unwrap();
     let pkce = Pkce::from_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
     let tokens = oauth
         .exchange_code(&code, &redirect_uri, &pkce.verifier)
@@ -199,6 +202,7 @@ async fn mock_usercode(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/api/accounts/deviceauth/usercode"))
         .and(body_string_contains(CLIENT_ID))
+        .and(header("originator", "codex_cli_rs"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "device_auth_id": "device-auth-123",
             "user_code": "CODE-12345",
@@ -218,6 +222,7 @@ async fn the_device_flow_polls_until_the_user_approves() {
     Mock::given(method("POST"))
         .and(path("/api/accounts/deviceauth/token"))
         .and(body_string_contains("device-auth-123"))
+        .and(header("originator", "codex_cli_rs"))
         .respond_with(move |_: &Request| {
             if counter.fetch_add(1, Ordering::SeqCst) == 0 {
                 ResponseTemplate::new(403)
@@ -242,7 +247,7 @@ async fn the_device_flow_polls_until_the_user_approves() {
         .respond_with(ResponseTemplate::new(200).set_body_json(token_response()))
         .mount(&server)
         .await;
-    let oauth = OAuth::new(&server.uri());
+    let oauth = OAuth::new(&server.uri()).unwrap();
     let device = oauth.request_device_code().await.unwrap();
     assert_eq!(device.user_code, "CODE-12345");
     assert_eq!(
@@ -273,7 +278,7 @@ async fn the_device_flow_gives_up_after_its_time_limit() {
         .respond_with(ResponseTemplate::new(404))
         .mount(&server)
         .await;
-    let oauth = OAuth::new(&server.uri());
+    let oauth = OAuth::new(&server.uri()).unwrap();
     let device = oauth.request_device_code().await.unwrap();
     let error = oauth
         .poll_device_code(&device, Duration::from_millis(200))
@@ -292,12 +297,13 @@ async fn a_refresh_keeps_what_the_server_did_not_replace() {
         .and(body_string_contains(
             format!(r#""client_id":"{CLIENT_ID}""#).as_str(),
         ))
+        .and(header("originator", "codex_cli_rs"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": jwt(json!({"exp": 4_102_444_900u64})),
         })))
         .mount(&server)
         .await;
-    let oauth = OAuth::new(&server.uri());
+    let oauth = OAuth::new(&server.uri()).unwrap();
     let before = Tokens {
         access_token: "old".into(),
         refresh_token: "rt-1".into(),
@@ -323,7 +329,7 @@ async fn a_rejected_refresh_carries_the_servers_code() {
         )
         .mount(&server)
         .await;
-    let oauth = OAuth::new(&server.uri());
+    let oauth = OAuth::new(&server.uri()).unwrap();
     let tokens = Tokens {
         access_token: "old".into(),
         refresh_token: "rt-used".into(),
@@ -353,4 +359,113 @@ fn tokens_round_trip_through_storage_and_never_print() {
     let shown = format!("{tokens:?}");
     assert!(!shown.contains("secret"), "{shown}");
     assert!(Tokens::from_json("{}").is_none());
+}
+
+// Review C, M6: ChatGPT may append onboarding metadata to the state, which Codex strips before
+// comparing.
+#[tokio::test]
+async fn a_callback_state_with_the_onboarding_suffix_is_accepted() {
+    let callback = CallbackServer::bind(&[0]).await.unwrap();
+    let redirect_uri = callback.redirect_uri();
+    let browser = tokio::spawn(async move {
+        let forged = browser_returns(
+            &redirect_uri,
+            "code=forged&state=other.onboarding_entrypoint=x",
+        )
+        .await;
+        let real = browser_returns(
+            &redirect_uri,
+            "code=real&state=st-5.onboarding_entrypoint%3Dlife_sciences",
+        )
+        .await;
+        (forged, real)
+    });
+    assert_eq!(callback.wait_for_code("st-5").await.unwrap(), "real");
+    let ((forged, _), (real, _)) = browser.await.unwrap();
+    assert_eq!(forged, 400);
+    assert_eq!(real, 200);
+}
+
+// Review C, M11: with both callback ports in use, the error names them and offers the device
+// flow.
+#[tokio::test]
+async fn both_callback_ports_taken_names_them_and_suggests_a_device_code() {
+    let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ports = [
+        first.local_addr().unwrap().port(),
+        second.local_addr().unwrap().port(),
+    ];
+    let error = CallbackServer::bind(&ports).await.err().expect("an error");
+    let text = error.to_string();
+    assert!(text.contains(&ports[0].to_string()), "{text}");
+    assert!(text.contains(&ports[1].to_string()), "{text}");
+    assert!(text.contains("--device"), "{text}");
+}
+
+// Review C, M11: a server that is busy or failing while the user enters the code is waited out.
+#[tokio::test]
+async fn device_code_polling_waits_out_a_busy_server() {
+    let server = MockServer::start().await;
+    mock_usercode(&server).await;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let counter = polls.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/accounts/deviceauth/token"))
+        .respond_with(
+            move |_: &Request| match counter.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(429),
+                1 => ResponseTemplate::new(503),
+                2 => ResponseTemplate::new(403),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "authorization_code": "poll-code",
+                    "code_verifier": "poll-verifier"
+                })),
+            },
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_response()))
+        .mount(&server)
+        .await;
+    let oauth = OAuth::new(&server.uri()).unwrap();
+    let device = oauth.request_device_code().await.unwrap();
+    let tokens = oauth
+        .poll_device_code(&device, Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert_eq!(tokens.account_id.as_deref(), Some("acct-123"));
+    assert_eq!(polls.load(Ordering::SeqCst), 4);
+    // One that keeps failing until the code expires ends in a timeout.
+    let failing = MockServer::start().await;
+    mock_usercode(&failing).await;
+    Mock::given(method("POST"))
+        .and(path("/api/accounts/deviceauth/token"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&failing)
+        .await;
+    let oauth = OAuth::new(&failing.uri()).unwrap();
+    let device = oauth.request_device_code().await.unwrap();
+    let error = oauth
+        .poll_device_code(&device, Duration::from_millis(500))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OAuthError::TimedOut), "{error:?}");
+}
+
+// Review C, M4: an issuer that is not a URL is an error, never a panic.
+#[test]
+fn an_issuer_that_is_not_a_url_is_an_error() {
+    for issuer in ["not a url", "ftp://auth.example", ""] {
+        assert!(OAuth::new(issuer).is_err(), "{issuer}");
+    }
+    let oauth = OAuth::new("http://127.0.0.1:1455/").unwrap();
+    let pkce = Pkce::from_verifier("v");
+    assert!(
+        oauth
+            .authorize_url("http://127.0.0.1:1455/auth/callback", &pkce, "st")
+            .starts_with("http://127.0.0.1:1455/oauth/authorize?")
+    );
 }

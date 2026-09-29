@@ -54,7 +54,8 @@ impl ProviderError {
     }
 
     /// Whether this is a 429 that reports an exhausted quota or plan limit: ChatGPT's
-    /// `usage_limit_reached` and `usage_not_included`, or OpenAI's `insufficient_quota`.
+    /// `usage_limit_reached` and `usage_not_included`, or OpenAI's `insufficient_quota`, and the
+    /// credit and spend limits Codex counts as quotas too.
     pub fn is_quota_exhausted(&self) -> bool {
         let ProviderError::Http {
             status: 429, body, ..
@@ -69,7 +70,14 @@ impl ProviderError {
         [&error["type"], &error["code"]].iter().any(|v| {
             matches!(
                 v.as_str(),
-                Some("usage_limit_reached" | "usage_not_included" | "insufficient_quota")
+                Some(
+                    "usage_limit_reached"
+                        | "usage_not_included"
+                        | "insufficient_quota"
+                        | "credit_balance_exhausted"
+                        | "organization_spend_limit_exceeded"
+                        | "project_spend_limit_exceeded"
+                )
             )
         })
     }

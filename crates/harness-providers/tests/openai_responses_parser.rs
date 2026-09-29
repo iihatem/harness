@@ -286,6 +286,9 @@ fn an_exhausted_quota_in_the_stream_is_reported_as_one() {
         "insufficient_quota",
         "usage_limit_reached",
         "usage_not_included",
+        "credit_balance_exhausted",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
     ] {
         let error = failed(
             json!({"code": code, "message": "You exceeded your current quota",

@@ -68,6 +68,21 @@ pub fn checkpoints(
     }
 }
 
+/// Whether every assistant message of `session` so far came from a model `is_local` says runs
+/// locally, so that continuing it on a hosted model sends it off the machine for the first time.
+/// A session without answers holds nothing to send.
+pub fn held_only_locally(session: &Session, is_local: impl Fn(&str) -> bool) -> bool {
+    let models: Vec<String> = session
+        .messages()
+        .into_iter()
+        .filter_map(|(_, message)| match message {
+            harness_core::message::Message::Assistant { model, .. } => Some(model),
+            _ => None,
+        })
+        .collect();
+    !models.is_empty() && models.iter().all(|model| is_local(model))
+}
+
 /// Opens the session to run in, printing any warnings about its file. Errors are user-facing
 /// messages (exit code 2).
 pub fn open(setup: &Setup, choice: &Choice) -> Result<Session, String> {

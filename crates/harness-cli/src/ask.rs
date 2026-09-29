@@ -13,7 +13,11 @@ use harness_core::{
     permission::{FsAccess, Mode},
     tool::{CommandSandbox, ToolContext},
 };
-use harness_providers::{profiles, registry};
+use harness_providers::{
+    profiles,
+    registry::{self, BUILTIN_PROVIDERS},
+    window::{self, LOAD_TIMEOUT, PROBE_TIMEOUT},
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -182,7 +186,30 @@ pub async fn run(
     let ctx = tool_context(&setup.workspace, sandbox, mode.fs_access()).await;
     let local = profiles::is_local(&resolved.id, &resolved.base_url);
     let profile = profiles::resolve(&resolved.id, local, &setup.config.profiles);
-    let context_window = context_window(&resolved.id, &profile);
+    // The window the server really runs the model with, when it is a local server that says.
+    let provider = resolved.id.split('/').next().unwrap_or_default();
+    let server = window::Server::of(provider, &setup.config.providers);
+    let running = match server {
+        Some(server) => tokio::select! {
+            tokens = window::running_context(server, &resolved.base_url, &resolved.model, PROBE_TIMEOUT, LOAD_TIMEOUT) => tokens,
+            _ = cancel.cancelled() => return exit_code(TurnEndReason::Interrupted, false),
+        },
+        None => None,
+    };
+    let window = window::effective_window(&resolved.id, &profile, running, server);
+    for warning in &window.warnings {
+        eprintln!("warning: {}", terminal_safe(warning));
+    }
+    let context_window = window.tokens;
+    if !profile.local
+        && crate::sessions::held_only_locally(&session, |id| model_is_local(&setup, id))
+    {
+        eprintln!(
+            "warning: this conversation ran on local models so far; continuing it on {} sends it, tool output included, to {}",
+            terminal_safe(&resolved.id),
+            terminal_safe(provider)
+        );
+    }
     let mut config = AgentConfig::new(
         resolved.id.clone(),
         resolved.model.clone(),
@@ -249,18 +276,24 @@ pub async fn run(
     exit_code(reason, blocked)
 }
 
-/// The context window of model `id`, from its profile; when no profile knows it, the fallback,
-/// with a warning that says how to set it.
-fn context_window(id: &str, profile: &profiles::ModelProfile) -> u64 {
-    profile.context_window.unwrap_or_else(|| {
-        eprintln!(
-            "warning: the context window of {} is unknown; assuming {} tokens. Set it with `context_window` under [profiles.\"{}\"] in config.toml",
-            terminal_safe(id),
-            profiles::FALLBACK_CONTEXT_WINDOW,
-            terminal_safe(id)
-        );
-        profiles::FALLBACK_CONTEXT_WINDOW
-    })
+/// Whether model `id` runs on a server of the user's own, by its provider's address and its
+/// profile.
+fn model_is_local(setup: &setup::Setup, id: &str) -> bool {
+    let provider = id.split('/').next().unwrap_or_default();
+    let base_url = match setup.config.providers.get(provider) {
+        Some(cfg) => cfg.base_url.clone(),
+        None => BUILTIN_PROVIDERS
+            .iter()
+            .find(|b| b.name == provider)
+            .map(|b| b.base_url.to_string())
+            .unwrap_or_default(),
+    };
+    profiles::resolve(
+        id,
+        profiles::is_local(id, &base_url),
+        &setup.config.profiles,
+    )
+    .local
 }
 
 /// Ends the run: first the agent, which releases the session file, then the sandbox's session,

@@ -10,3 +10,4 @@ pub mod openai_responses;
 pub mod profiles;
 pub mod registry;
 mod sse;
+pub mod window;

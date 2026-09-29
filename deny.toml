@@ -4,6 +4,11 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# bincode 1.3.3 is unmaintained (its team calls it complete). syntect decodes with it only the
+# syntax and theme dumps built into harness, never input from outside.
+ignore = [
+  { id = "RUSTSEC-2025-0141", reason = "syntect decodes only the syntax and theme dumps built into harness with bincode" },
+]
 
 [licenses]
 version = 2

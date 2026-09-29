@@ -1,0 +1,427 @@
+//! Markdown, as the model writes it, rendered as styled lines of a given width: paragraphs,
+//! headings, emphasis, inline code, fenced code blocks with syntax highlighting, lists, block
+//! quotes, links, tables and rules. Everything drawn is sanitized first.
+
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use ratatui::{
+    style::{Modifier, Style},
+    text::{Line, Span},
+};
+
+use crate::{
+    highlight::highlight,
+    style::Theme,
+    text::{sanitize, width as text_width, wrap},
+};
+
+/// `markdown` as lines at most `width` columns wide.
+pub fn render(markdown: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let options =
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+    let mut renderer = Renderer {
+        theme,
+        width: width.max(8),
+        out: Vec::new(),
+        line: Vec::new(),
+        styles: Vec::new(),
+        containers: Vec::new(),
+        code: None,
+        table: None,
+        links: Vec::new(),
+        needs_blank: false,
+    };
+    for event in Parser::new_ext(markdown, options) {
+        renderer.event(event);
+    }
+    renderer.flush();
+    renderer.out
+}
+
+enum Container {
+    Quote,
+    List { next: Option<u64> },
+    Item { marker: String, first: bool },
+}
+
+struct Code {
+    language: String,
+    text: String,
+}
+
+#[derive(Default)]
+struct Table {
+    rows: Vec<Vec<String>>,
+    row: Vec<String>,
+    cell: String,
+    head_rows: usize,
+}
+
+struct Renderer<'t> {
+    theme: &'t Theme,
+    width: usize,
+    out: Vec<Line<'static>>,
+    /// The line being built.
+    line: Vec<Span<'static>>,
+    /// Inline styles that apply now, innermost last.
+    styles: Vec<Style>,
+    containers: Vec<Container>,
+    code: Option<Code>,
+    table: Option<Table>,
+    /// For each open link: its address, and where its text starts in `line`.
+    links: Vec<(String, usize)>,
+    /// A blank line goes before the next block.
+    needs_blank: bool,
+}
+
+impl Renderer<'_> {
+    fn style(&self) -> Style {
+        self.styles
+            .iter()
+            .fold(Style::default(), |acc, s| acc.patch(*s))
+    }
+
+    fn push(&mut self, text: &str, style: Style) {
+        let text = sanitize(text).replace('\n', " ");
+        if text.is_empty() {
+            return;
+        }
+        if let Some(table) = &mut self.table {
+            table.cell.push_str(&text);
+            return;
+        }
+        self.line.push(Span::styled(text, style));
+    }
+
+    /// The prefixes of the first line and of later lines, from the enclosing quotes and lists.
+    fn prefixes(&self) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+        let mut first = Vec::new();
+        let mut rest = Vec::new();
+        for container in &self.containers {
+            match container {
+                Container::Quote => {
+                    first.push(Span::styled("│ ", self.theme.quote()));
+                    rest.push(Span::styled("│ ", self.theme.quote()));
+                }
+                Container::List { .. } => {}
+                Container::Item {
+                    marker,
+                    first: at_start,
+                } => {
+                    let blank = " ".repeat(text_width(marker));
+                    if *at_start {
+                        first.push(Span::styled(marker.clone(), self.theme.accent()));
+                    } else {
+                        first.push(Span::raw(blank.clone()));
+                    }
+                    rest.push(Span::raw(blank));
+                }
+            }
+        }
+        (first, rest)
+    }
+
+    fn items_started(&mut self) {
+        for container in &mut self.containers {
+            if let Container::Item { first, .. } = container {
+                *first = false;
+            }
+        }
+    }
+
+    /// Wraps and emits the line being built, if any.
+    fn flush(&mut self) {
+        if self.line.is_empty() {
+            return;
+        }
+        let spans = std::mem::take(&mut self.line);
+        let (first, rest) = self.prefixes();
+        self.out
+            .extend(wrap(&Line::from(spans), self.width, &first, &rest));
+        self.items_started();
+    }
+
+    /// Starts a block: a blank line after the previous one.
+    fn block(&mut self) {
+        self.flush();
+        if self.needs_blank && !self.out.is_empty() {
+            let (_, rest) = self.prefixes();
+            let quotes: Vec<Span<'static>> = rest
+                .into_iter()
+                .filter(|s| s.content.trim() == "│")
+                .collect();
+            self.out.push(Line::from(quotes));
+        }
+        self.needs_blank = false;
+    }
+
+    fn in_item(&self) -> bool {
+        self.containers
+            .iter()
+            .any(|c| matches!(c, Container::Item { .. }))
+    }
+
+    fn event(&mut self, event: Event<'_>) {
+        if let Some(code) = &mut self.code {
+            match event {
+                Event::Text(text) => code.text.push_str(&text),
+                Event::End(TagEnd::CodeBlock) => self.end_code(),
+                _ => {}
+            }
+            return;
+        }
+        match event {
+            Event::Start(tag) => self.start(tag),
+            Event::End(tag) => self.end(tag),
+            Event::Text(text) => self.push(&text, self.style()),
+            Event::Code(code) | Event::InlineMath(code) | Event::DisplayMath(code) => {
+                let style = self.style().patch(self.theme.code());
+                if self.theme.color {
+                    self.push(&code, style);
+                } else {
+                    self.push(&format!("`{code}`"), style);
+                }
+            }
+            Event::Html(html) | Event::InlineHtml(html) => {
+                self.push(html.trim_end_matches('\n'), self.theme.dim())
+            }
+            Event::FootnoteReference(label) => self.push(&format!("[^{label}]"), self.style()),
+            Event::SoftBreak => self.push(" ", self.style()),
+            Event::HardBreak => self.flush(),
+            Event::Rule => {
+                self.block();
+                let (first, _) = self.prefixes();
+                let used: usize = first.iter().map(|s| text_width(&s.content)).sum();
+                let mut spans = first;
+                spans.push(Span::styled(
+                    "─".repeat(self.width.saturating_sub(used).min(40)),
+                    self.theme.dim(),
+                ));
+                self.out.push(Line::from(spans));
+                self.needs_blank = true;
+            }
+            Event::TaskListMarker(done) => {
+                self.push(if done { "[x] " } else { "[ ] " }, self.theme.dim())
+            }
+        }
+    }
+
+    fn start(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph => self.block(),
+            Tag::Heading { level, .. } => {
+                self.block();
+                let style = if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+                    self.theme.heading()
+                } else {
+                    self.theme.bold()
+                };
+                self.styles.push(style);
+            }
+            Tag::BlockQuote(_) => {
+                self.block();
+                self.containers.push(Container::Quote);
+            }
+            Tag::CodeBlock(kind) => {
+                self.block();
+                let language = match kind {
+                    CodeBlockKind::Fenced(info) => {
+                        info.split([' ', ',', '{']).next().unwrap_or("").to_string()
+                    }
+                    CodeBlockKind::Indented => String::new(),
+                };
+                self.code = Some(Code {
+                    language,
+                    text: String::new(),
+                });
+            }
+            Tag::List(start) => {
+                if self.in_item() {
+                    self.flush();
+                } else {
+                    self.block();
+                }
+                self.containers.push(Container::List { next: start });
+            }
+            Tag::Item => {
+                self.flush();
+                let marker = match self.containers.last_mut() {
+                    Some(Container::List { next: Some(n) }) => {
+                        let marker = format!("{n}. ");
+                        *n += 1;
+                        marker
+                    }
+                    _ => "- ".to_string(),
+                };
+                self.containers.push(Container::Item {
+                    marker,
+                    first: true,
+                });
+            }
+            Tag::Table(_) => {
+                self.block();
+                self.table = Some(Table::default());
+            }
+            Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
+            Tag::Emphasis => self.styles.push(self.theme.italic()),
+            Tag::Strong => self.styles.push(self.theme.bold()),
+            Tag::Strikethrough => self
+                .styles
+                .push(Style::default().add_modifier(Modifier::CROSSED_OUT)),
+            Tag::Link { dest_url, .. } => {
+                self.links.push((dest_url.to_string(), self.line.len()));
+                self.styles.push(self.theme.link());
+            }
+            Tag::Image { dest_url, .. } => {
+                self.push("[image: ", self.theme.dim());
+                self.links.push((dest_url.to_string(), self.line.len()));
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph => {
+                self.flush();
+                self.needs_blank = true;
+            }
+            TagEnd::Heading(_) => {
+                self.styles.pop();
+                self.flush();
+                self.needs_blank = true;
+            }
+            TagEnd::BlockQuote(_) => {
+                self.flush();
+                self.containers.pop();
+                self.needs_blank = true;
+            }
+            TagEnd::List(_) => {
+                self.flush();
+                self.containers.pop();
+                if !self.in_item() {
+                    self.needs_blank = true;
+                }
+            }
+            TagEnd::Item => {
+                self.flush();
+                self.containers.pop();
+            }
+            TagEnd::TableCell => {
+                if let Some(table) = &mut self.table {
+                    let cell = std::mem::take(&mut table.cell);
+                    table.row.push(cell.trim().to_string());
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(table) = &mut self.table {
+                    let row = std::mem::take(&mut table.row);
+                    table.rows.push(row);
+                    table.head_rows = table.rows.len();
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(table) = &mut self.table {
+                    let row = std::mem::take(&mut table.row);
+                    table.rows.push(row);
+                }
+            }
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    self.end_table(table);
+                }
+                self.needs_blank = true;
+            }
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                self.styles.pop();
+            }
+            TagEnd::Link => {
+                self.styles.pop();
+                if let Some((url, start)) = self.links.pop() {
+                    let text: String = self.line[start.min(self.line.len())..]
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect();
+                    if !url.is_empty() && text != url && format!("mailto:{text}") != url {
+                        self.push(&format!(" ({url})"), self.theme.dim());
+                    }
+                }
+            }
+            TagEnd::Image => {
+                if let Some((url, _)) = self.links.pop() {
+                    self.push(&format!("] ({url})"), self.theme.dim());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn end_code(&mut self) {
+        let Some(code) = self.code.take() else {
+            return;
+        };
+        let text = code.text.strip_suffix('\n').unwrap_or(&code.text);
+        let lines = highlight(text, &code.language, self.theme).unwrap_or_else(|| {
+            text.split('\n')
+                .map(|l| Line::from(Span::styled(sanitize(l), self.theme.plain())))
+                .collect()
+        });
+        let (first, rest) = self.prefixes();
+        let indent = Span::raw("  ");
+        for (i, line) in lines.iter().enumerate() {
+            let mut first_prefix = if i == 0 { first.clone() } else { rest.clone() };
+            first_prefix.push(indent.clone());
+            let mut rest_prefix = rest.clone();
+            rest_prefix.push(indent.clone());
+            self.out
+                .extend(wrap(line, self.width, &first_prefix, &rest_prefix));
+        }
+        self.items_started();
+        self.needs_blank = true;
+    }
+
+    fn end_table(&mut self, table: Table) {
+        let columns = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+        if columns == 0 {
+            return;
+        }
+        let mut widths = vec![0; columns];
+        for row in &table.rows {
+            for (i, cell) in row.iter().enumerate() {
+                widths[i] = widths[i].max(text_width(cell));
+            }
+        }
+        let (first, rest) = self.prefixes();
+        let prefix_width: usize = rest.iter().map(|s| text_width(&s.content)).sum();
+        let total: usize = widths.iter().sum::<usize>() + 3 * (columns - 1);
+        let fits = prefix_width + total <= self.width;
+        for (r, row) in table.rows.iter().enumerate() {
+            let style = if r < table.head_rows {
+                self.theme.bold()
+            } else {
+                self.theme.plain()
+            };
+            let mut spans = Vec::new();
+            for (i, cell) in row.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(" │ ", self.theme.dim()));
+                }
+                let pad = if fits && i + 1 < row.len() {
+                    widths[i] - text_width(cell)
+                } else {
+                    0
+                };
+                spans.push(Span::styled(format!("{cell}{}", " ".repeat(pad)), style));
+            }
+            let lead = if r == 0 { &first } else { &rest };
+            self.out
+                .extend(wrap(&Line::from(spans), self.width, lead, &rest));
+            if fits && r + 1 == table.head_rows {
+                let rule: Vec<String> = widths.iter().map(|w| "─".repeat(*w)).collect();
+                let mut spans = rest.clone();
+                spans.push(Span::styled(rule.join("─┼─"), self.theme.dim()));
+                self.out.push(Line::from(spans));
+            }
+        }
+        self.items_started();
+    }
+}

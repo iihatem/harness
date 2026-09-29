@@ -18,6 +18,7 @@ harness-providers = { path = "crates/harness-providers", default-features = fals
 harness-sandbox = { path = "crates/harness-sandbox" }
 harness-shell = { path = "crates/harness-shell" }
 harness-tools = { path = "crates/harness-tools" }
+harness-tui = { path = "crates/harness-tui" }
 async-stream = "0.3"
 base64 = "0.23.1"
 async-trait = "0.1.92"
@@ -34,6 +35,8 @@ keyring-core = "1.0.0"
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }
 nix = { version = "0.31.3", features = ["signal", "process"] }
+pulldown-cmark = { version = "0.13.4", default-features = false }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 regex = "1"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls"] }
 seccompiler = "=0.5.0"
@@ -41,10 +44,12 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 similar = "3.2.0"
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = "0.7.19"
 toml = "1.1.6"
+unicode-width = "0.2.2"
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"

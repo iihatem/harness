@@ -1,0 +1,216 @@
+//! Markdown, code and diffs as they appear on screen, drawn into ratatui's `TestBackend`.
+
+use harness_tui::{diff, markdown, style::Theme, text};
+use ratatui::{
+    Terminal,
+    backend::TestBackend,
+    buffer::Buffer,
+    style::Color,
+    text::{Line, Span},
+    widgets::Paragraph,
+};
+
+/// `lines` drawn on a screen `width` columns wide and as tall as they are.
+fn draw(lines: Vec<Line<'static>>, width: u16) -> Buffer {
+    let height = (lines.len() as u16).max(1);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| frame.render_widget(Paragraph::new(lines), frame.area()))
+        .unwrap();
+    terminal.backend().buffer().clone()
+}
+
+/// Each row of `buffer` as text, without trailing spaces.
+fn rows(buffer: &Buffer) -> Vec<String> {
+    let width = buffer.area.width as usize;
+    buffer
+        .content
+        .chunks(width)
+        .map(|row| {
+            let text: String = row.iter().map(|cell| cell.symbol()).collect();
+            text.trim_end().to_string()
+        })
+        .collect()
+}
+
+fn colours(buffer: &Buffer) -> Vec<Color> {
+    buffer
+        .content
+        .iter()
+        .flat_map(|cell| [cell.fg, cell.bg])
+        .filter(|c| *c != Color::Reset)
+        .collect()
+}
+
+const SAMPLE: &str = "\
+# Plan
+
+Add a **rate limiter** to the login handler, so that repeated failures slow down.
+
+- read `src/login.rs`
+- change it:
+  1. count failures
+  2. sleep after three
+> Keep the old behaviour behind a flag.
+
+```rust
+fn main() {}
+```
+
+| name | lines |
+|------|-------|
+| a.rs | 12 |
+
+See [the docs](https://example.com/docs).
+";
+
+#[test]
+fn markdown_renders_headings_lists_code_quotes_and_tables_at_a_width() {
+    let buffer = draw(markdown::render(SAMPLE, 40, &Theme::colored()), 40);
+    assert_eq!(
+        rows(&buffer),
+        [
+            "Plan",
+            "",
+            "Add a rate limiter to the login handler,",
+            "so that repeated failures slow down.",
+            "",
+            "- read src/login.rs",
+            "- change it:",
+            "  1. count failures",
+            "  2. sleep after three",
+            "",
+            "│ Keep the old behaviour behind a flag.",
+            "",
+            "  fn main() {}",
+            "",
+            "name │ lines",
+            "─────┼──────",
+            "a.rs │ 12",
+            "",
+            "See the docs (https://example.com/docs).",
+        ]
+    );
+}
+
+#[test]
+fn long_words_and_list_items_wrap_under_their_text() {
+    let lines = markdown::render(
+        "- one two three four five six seven\n- abcdefghijklmnopqrstuvwxyz",
+        16,
+        &Theme::colored(),
+    );
+    assert_eq!(
+        rows(&draw(lines, 16)),
+        [
+            "- one two three",
+            "  four five six",
+            "  seven",
+            "- abcdefghijklmn",
+            "  opqrstuvwxyz",
+        ]
+    );
+}
+
+#[test]
+fn code_blocks_are_highlighted_only_with_colour_and_a_known_language() {
+    let code = "```rust\nlet x = \"hi\";\n```\n";
+    let coloured = draw(markdown::render(code, 30, &Theme::colored()), 30);
+    let distinct: std::collections::HashSet<_> = colours(&coloured).into_iter().collect();
+    assert!(distinct.len() >= 2, "{distinct:?}");
+    assert!(distinct.iter().all(|c| matches!(c, Color::Rgb(..))));
+    // Without 24-bit colour, the nearest of the 256 standard colours.
+    let theme = Theme::from_vars(None, None);
+    let indexed = draw(markdown::render(code, 30, &theme), 30);
+    assert!(
+        colours(&indexed)
+            .iter()
+            .all(|c| matches!(c, Color::Indexed(_)))
+    );
+    // An unknown language is shown as it is.
+    let unknown = draw(
+        markdown::render("```nosuchlang\nlet x = 1;\n```\n", 30, &Theme::colored()),
+        30,
+    );
+    assert!(colours(&unknown).is_empty());
+    assert_eq!(rows(&unknown), ["  let x = 1;"]);
+}
+
+#[test]
+fn no_color_draws_no_colour_and_keeps_code_and_diff_markers() {
+    let theme = Theme::from_vars(Some("1"), Some("truecolor"));
+    assert!(!theme.color);
+    let buffer = draw(markdown::render(SAMPLE, 40, &theme), 40);
+    assert!(colours(&buffer).is_empty(), "{:?}", colours(&buffer));
+    assert!(rows(&buffer).contains(&"- read `src/login.rs`".to_string()));
+    let diff = draw(diff::unified("a\nb\n", "a\nc\n", 1, &theme), 20);
+    assert!(colours(&diff).is_empty());
+    assert_eq!(rows(&diff), ["@@ -1,2 +1,2 @@", " a", "-b", "+c"]);
+    // An empty NO_COLOR does not count.
+    assert!(Theme::from_vars(Some(""), None).color);
+}
+
+#[test]
+fn a_diff_shows_hunks_with_coloured_marked_lines() {
+    let theme = Theme::colored();
+    let old = "one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
+    let new = "one\n2\nthree\nfour\nfive\nsix\nseven\neight\n";
+    let buffer = draw(diff::unified(old, new, 1, &theme), 20);
+    assert_eq!(
+        rows(&buffer),
+        [
+            "@@ -1,3 +1,3 @@",
+            " one",
+            "-two",
+            "+2",
+            " three",
+            "@@ -7 +7,2 @@",
+            " seven",
+            "+eight",
+        ]
+    );
+    let row = |y: u16| &buffer[(0, y)];
+    assert_eq!(row(2).fg, Color::Red);
+    assert_eq!(row(3).fg, Color::Green);
+    assert_eq!(diff::counts(old, new), (2, 1));
+    assert!(diff::unified("same\n", "same\n", 3, &theme).is_empty());
+}
+
+#[test]
+fn control_characters_from_the_model_are_shown_escaped() {
+    let buffer = draw(
+        markdown::render(
+            "evil \u{1b}[2J text \u{202e}reversed and a \u{7} bell\n\n```\n\u{1b}]0;title\u{7}\n```",
+            60,
+            &Theme::colored(),
+        ),
+        60,
+    );
+    let screen = rows(&buffer).join("\n");
+    assert!(
+        !screen.chars().any(|c| c.is_control() && c != '\n'),
+        "{screen:?}"
+    );
+    assert!(
+        screen.contains("evil \\u{1b}[2J text \\u{202e}reversed"),
+        "{screen}"
+    );
+    assert!(screen.contains("\\u{1b}]0;title\\u{7}"), "{screen}");
+    assert_eq!(text::sanitize("a\tb\r\nc"), "a    b\nc");
+}
+
+#[test]
+fn wrapping_keeps_styles_and_prefixes() {
+    let line = Line::from(vec![
+        Span::styled(
+            "red words ",
+            ratatui::style::Style::default().fg(Color::Red),
+        ),
+        Span::raw("plain words here"),
+    ]);
+    let wrapped = text::wrap(&line, 12, &[Span::raw("> ")], &[Span::raw("  ")]);
+    let texts: Vec<String> = wrapped.iter().map(text::plain).collect();
+    assert_eq!(texts, ["> red words", "  plain", "  words here"]);
+    assert_eq!(wrapped[0].spans[1].style.fg, Some(Color::Red));
+    assert_eq!(text::width("日本"), 4);
+}

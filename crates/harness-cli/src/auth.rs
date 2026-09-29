@@ -175,17 +175,17 @@ fn choose(setup: &Setup, provider: &str, profile: &str) -> u8 {
 }
 
 /// `harness logout <provider> [--profile <name>]`: the named profile, or the one in use.
-pub fn logout(provider: &str, profile: Option<&str>) -> u8 {
+pub async fn logout(provider: &str, profile: Option<&str>) -> u8 {
     let setup = match load() {
         Ok(setup) => setup,
         Err(code) => return code,
     };
-    let code = remove(&setup, provider, profile);
+    let code = remove(&setup, provider, profile).await;
     setup.print_credential_warnings();
     code
 }
 
-fn remove(setup: &Setup, provider: &str, profile: Option<&str>) -> u8 {
+async fn remove(setup: &Setup, provider: &str, profile: Option<&str>) -> u8 {
     let profile = match profile {
         Some(profile) => profile.to_string(),
         None => match setup.credentials.active_profile(provider) {
@@ -196,7 +196,20 @@ fn remove(setup: &Setup, provider: &str, profile: Option<&str>) -> u8 {
     if let Err(code) = check_names(provider, &profile) {
         return code;
     }
-    match setup.credentials.remove(provider, &profile) {
+    // A renewal in flight in another run would store the tokens it renewed again.
+    let renewing = if provider == registry::CHATGPT {
+        setup
+            .credentials
+            .lock_renewal(provider, &profile, "signing out of ChatGPT", |note| {
+                eprintln!("note: {}", terminal_safe(&note))
+            })
+            .await
+    } else {
+        None
+    };
+    let removed = setup.credentials.remove(provider, &profile);
+    drop(renewing);
+    match removed {
         Ok(true) => {
             println!("Removed the stored credentials for {provider} (profile {profile}).");
             0

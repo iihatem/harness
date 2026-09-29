@@ -470,9 +470,14 @@ async fn with_piped_stdin(
     }
 }
 
+/// How often what the credential store warns about is looked for while no event comes.
+const CREDENTIAL_WARNINGS_EVERY: Duration = Duration::from_millis(250);
+
 /// Passes `events` on, each after what the credential store has had to warn about by then, as
 /// warning events: a sign-in renewed during the turn that could not be stored, say, is told
-/// before what the provider sent after the renewal.
+/// before what the provider sent after the renewal. While no event comes, what it warns about is
+/// passed on within [`CREDENTIAL_WARNINGS_EVERY`]: a renewal waiting for another process's says
+/// so while it waits.
 fn with_credential_warnings(
     mut events: mpsc::UnboundedReceiver<AgentEvent>,
     credentials: Arc<Credentials>,
@@ -484,9 +489,15 @@ fn with_credential_warnings(
                 let _ = tx.send(AgentEvent::Warning { message });
             }
         };
-        while let Some(event) = events.recv().await {
-            warnings(&tx);
-            let _ = tx.send(event);
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    warnings(&tx);
+                    let _ = tx.send(event);
+                }
+                _ = tokio::time::sleep(CREDENTIAL_WARNINGS_EVERY) => warnings(&tx),
+            }
         }
         warnings(&tx);
     });
@@ -872,6 +883,28 @@ mod tests {
         let shared: Arc<dyn CommandSandbox> = probe.clone();
         end_run(agent, SessionEnd::new(Some(shared)));
         assert_eq!(*probe.free.lock().unwrap(), Some(true));
+    }
+
+    // Re-review B+C, R5: a renewal waiting for another process says so while it waits, before any
+    // event follows.
+    #[tokio::test]
+    async fn credential_warnings_are_passed_on_while_no_event_comes() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(Credentials::with_keychain(dir.path(), None));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut rx = with_credential_warnings(rx, credentials.clone());
+        credentials.warn("waiting for another harness process".into());
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("passed on while no event comes");
+        assert_eq!(
+            event,
+            Some(AgentEvent::Warning {
+                message: "waiting for another harness process".into()
+            })
+        );
+        drop(tx);
+        assert_eq!(rx.recv().await, None);
     }
 
     // Review F M6: a logs directory left readable by others is made private again.

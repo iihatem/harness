@@ -263,7 +263,7 @@ fn main() -> ExitCode {
                 device,
             }) => login::run(&provider, &profile, device).await,
             Some(Command::Logout { provider, profile }) => {
-                auth::logout(&provider, profile.as_deref())
+                auth::logout(&provider, profile.as_deref()).await
             }
             Some(Command::Trust { yes, revoke }) => trust::run(yes, revoke),
             Some(Command::Sandbox {

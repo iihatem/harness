@@ -742,3 +742,82 @@ async fn a_refresh_failing_for_an_unknown_reason_says_what_to_do_if_it_persists(
         assert_eq!(signed.stored(), before);
     }
 }
+
+// Re-review B+C, R5: waiting for another process's renewal (up to 180 s) is not silent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewal_waiting_for_another_process_says_so_once() {
+    let server = MockServer::start().await;
+    mock_refresh(&server, "rt-1", &access_token("new", 7200), "rt-2").await;
+    let signed = Signed::new(&tokens(&access_token("old", 60), "rt-1"));
+    // That the test store has no keychain.
+    signed.credentials.take_warnings();
+    let other = signed.another_process();
+    let held = other
+        .credentials
+        .try_lock_renewal("chatgpt", "default")
+        .unwrap()
+        .expect("the renewal lock");
+    let auth = Arc::new(signed.auth(&server));
+    let renewal = tokio::spawn({
+        let auth = auth.clone();
+        async move { auth.current().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(signed.credentials.take_warnings().is_empty());
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let warnings = signed.credentials.take_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    for part in [
+        "waiting for another harness process",
+        "ChatGPT sign-in",
+        "profile `default`",
+    ] {
+        assert!(warnings[0].contains(part), "{part}: {warnings:?}");
+    }
+    drop(held);
+    renewal.await.unwrap().unwrap();
+    let warnings = signed.credentials.take_warnings();
+    assert!(
+        !warnings.iter().any(|w| w.contains("waiting")),
+        "{warnings:?}"
+    );
+}
+
+// Re-review B+C, R3: a sign-out that lands while a renewal is in flight waits for it, instead of
+// having the renewal store its tokens over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_out_during_a_renewal_is_not_undone() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(
+                    json!({"access_token": access_token("new", 7200), "refresh_token": "rt-2"}),
+                )
+                .set_delay(std::time::Duration::from_millis(600)),
+        )
+        .mount(&server)
+        .await;
+    let signed = Signed::new(&tokens(&access_token("old", 60), "rt-1"));
+    let auth = Arc::new(signed.auth(&server));
+    let renewal = tokio::spawn({
+        let auth = auth.clone();
+        async move { auth.current().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let other = signed.another_process();
+    let mut notes = Vec::new();
+    let lock = other
+        .credentials
+        .lock_renewal("chatgpt", "default", "signing out of ChatGPT", |note| {
+            notes.push(note)
+        })
+        .await;
+    assert!(lock.is_some());
+    assert!(other.credentials.remove("chatgpt", "default").unwrap());
+    drop(lock);
+    renewal.await.unwrap().unwrap();
+    assert_eq!(signed.credentials.get("chatgpt", "default").unwrap(), None);
+    assert!(notes.is_empty(), "{notes:?}");
+}

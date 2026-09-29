@@ -102,7 +102,23 @@ async fn sign_in(setup: &Setup, profile: &str, device: bool) -> u8 {
             return 1;
         }
     };
-    match setup.credentials.set(CHATGPT, profile, &tokens.to_json()) {
+    // A renewal in flight in another run would store its tokens over these.
+    let renewing = setup.credentials.lock_renewal(
+        CHATGPT,
+        profile,
+        "storing the new ChatGPT sign-in",
+        |note| eprintln!("note: {}", terminal_safe(&note)),
+    );
+    let renewing = tokio::select! {
+        lock = renewing => lock,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("sign-in cancelled");
+            return 130;
+        }
+    };
+    let stored = setup.credentials.set(CHATGPT, profile, &tokens.to_json());
+    drop(renewing);
+    match stored {
         Ok(place) => {
             setup.print_credential_warnings();
             let who = tokens

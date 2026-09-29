@@ -9,10 +9,7 @@
 //! session ends at its next renewal. Fresh tokens are used even when they cannot be stored, with a
 //! warning, and storing them is tried again at the next renewal.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use harness_core::{provider::ProviderError, redact::Redactor, time::now_unix};
 use tokio::sync::Mutex;
@@ -29,9 +26,6 @@ pub const PROVIDER: &str = "chatgpt";
 pub const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 /// Refresh the access token when it expires within this long.
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
-/// How long a renewal waits for another process's to finish before going on without the lock:
-/// longer than one can take (each keychain operation, and the refresh, give up after 30 s).
-const RENEWAL_WAIT: Duration = Duration::from_secs(180);
 
 pub struct ChatGptAuth {
     oauth: OAuth,
@@ -172,32 +166,19 @@ impl ChatGptAuth {
         }
     }
 
-    /// Takes the renewal lock, waiting for another process's renewal to end. Without the lock
-    /// (it cannot be taken, or another process holds it too long), the renewal goes on, with a
-    /// warning: the stored tokens are read again all the same.
+    /// Takes the renewal lock, waiting for another process's renewal to end, which is told as a
+    /// warning once it takes a while. Without the lock (it cannot be taken, or another process
+    /// holds it too long), the renewal goes on, with a warning: the stored tokens are read again
+    /// all the same.
     async fn lock(&self) -> Option<RenewalLock> {
-        let started = Instant::now();
-        loop {
-            match self.credentials.try_lock_renewal(PROVIDER, &self.profile) {
-                Ok(Some(lock)) => return Some(lock),
-                Ok(None) if started.elapsed() < RENEWAL_WAIT => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Ok(None) => {
-                    self.credentials.warn(format!(
-                        "another harness process has been renewing the ChatGPT sign-in for over {} s; renewing without waiting for it",
-                        RENEWAL_WAIT.as_secs()
-                    ));
-                    return None;
-                }
-                Err(e) => {
-                    self.credentials.warn(format!(
-                        "renewing the ChatGPT sign-in without the lock that keeps other harness processes from renewing it at the same time: {e}"
-                    ));
-                    return None;
-                }
-            }
-        }
+        self.credentials
+            .lock_renewal(
+                PROVIDER,
+                &self.profile,
+                "renewing the ChatGPT sign-in",
+                |note| self.credentials.warn(note),
+            )
+            .await
     }
 
     /// The error that ends a session whose profile has been signed out.

@@ -110,7 +110,11 @@ impl Env {
     }
 
     fn cmd(&self) -> Command {
-        let mut cmd = Command::new(BIN);
+        Command::from_std(self.std_cmd())
+    }
+
+    fn std_cmd(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(BIN);
         cmd.current_dir(self.ws.path())
             .env("HARNESS_HOME", self.home.path())
             .isolate()
@@ -382,4 +386,125 @@ fn a_test_hook_that_is_not_a_url_is_an_error() {
         .code(2)
         .stderr(contains("not an http(s) URL"))
         .stderr(contains("panicked").not());
+}
+
+/// Another harness process renewing the ChatGPT sign-in of `profile`: it holds the profile's
+/// renewal lock until the returned file is dropped.
+fn renewal_elsewhere(env: &Env, profile: &str) -> std::fs::File {
+    let data = env.home.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(data.join(format!("chatgpt+{profile}.lock")))
+        .unwrap();
+    lock.lock().unwrap();
+    lock
+}
+
+/// Whether the credential file holds a sign-in for `account`.
+fn holds(env: &Env, account: &str) -> bool {
+    std::fs::read_to_string(env.credentials())
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|file| file["credentials"].get(account).is_some())
+}
+
+const WAIT_NOTE: &str = "note: waiting for another harness process to finish renewing the ChatGPT sign-in (profile `default`)";
+
+/// Runs `harness <args>` while another process renews the default profile's sign-in: once the
+/// run says it waits for that renewal, `while_waiting` is called, then the renewal ends. Returns
+/// the run's exit code, standard output and standard error.
+fn run_during_a_renewal(
+    env: &Env,
+    args: &[&str],
+    while_waiting: impl FnOnce(),
+) -> (Option<i32>, String, String) {
+    use std::io::{BufRead, Read};
+    let renewing = renewal_elsewhere(env, "default");
+    let mut child = env
+        .std_cmd()
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (lines, waiting) = std::sync::mpsc::channel();
+    let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let reader = std::thread::spawn(move || {
+        let mut all = String::new();
+        for line in stderr.lines() {
+            let line = line.unwrap();
+            let _ = lines.send(line.clone());
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match waiting.recv_timeout(left) {
+            Ok(line) if line.contains(WAIT_NOTE) => break,
+            Ok(_) => {}
+            Err(e) => panic!("the run never said it waits for the renewal: {e}"),
+        }
+    }
+    while_waiting();
+    drop(renewing);
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let status = child.wait().unwrap();
+    (status.code(), stdout, reader.join().unwrap())
+}
+
+// Re-review B+C, R3: a sign-in that lands while another process renews the profile waits for that
+// renewal, which would otherwise store the tokens it renewed over the new sign-in.
+#[tokio::test(flavor = "multi_thread")]
+async fn login_waits_for_a_renewal_in_flight() {
+    let server = MockServer::start().await;
+    mock_sign_in(&server).await;
+    let env = Env::new(&server.uri());
+    tokio::task::spawn_blocking(move || {
+        let (code, stdout, stderr) =
+            run_during_a_renewal(&env, &["login", "chatgpt", "--device"], || {
+                assert!(!holds(&env, "chatgpt/default"));
+            });
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(stdout.contains("Signed in to ChatGPT"), "{stderr}");
+        assert!(holds(&env, "chatgpt/default"));
+    })
+    .await
+    .unwrap();
+}
+
+// Re-review B+C, R3: so does a sign-out, which the renewal would otherwise undo.
+#[test]
+fn logout_waits_for_a_renewal_in_flight() {
+    let env = Env::new("http://127.0.0.1:9");
+    let data = env.home.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let tokens = json!({"access_token": access_token(), "refresh_token": "rt-1"});
+    std::fs::write(
+        env.credentials(),
+        json!({"credentials": {"chatgpt/default": tokens.to_string()}}).to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(env.credentials(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (code, stdout, stderr) = run_during_a_renewal(&env, &["logout", "chatgpt"], || {
+        assert!(holds(&env, "chatgpt/default"));
+    });
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains("Removed the stored credentials for chatgpt"),
+        "{stderr}"
+    );
+    assert!(!holds(&env, "chatgpt/default"));
 }

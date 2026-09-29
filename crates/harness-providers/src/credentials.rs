@@ -11,7 +11,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,11 @@ pub const NO_KEYCHAIN_ENV: &str = "HARNESS_TEST_NO_KEYCHAIN";
 /// How long a keychain operation may take: long enough to answer an unlock prompt, but a
 /// prompt nobody sees (on a desktop, over SSH) does not hold harness up for good.
 pub const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a wait for another process's renewal lasts before going on without the lock: longer
+/// than one can take (each keychain operation, and the refresh, give up after 30 s).
+pub const RENEWAL_WAIT: Duration = Duration::from_secs(180);
+/// How long a wait for another process's renewal goes on before it is worth a note.
+pub const RENEWAL_NOTE_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
@@ -727,6 +732,56 @@ impl Credentials {
                 source,
                 hint: "",
             }),
+        }
+    }
+
+    /// Takes the renewal lock of `provider`'s `profile` (see
+    /// [`try_lock_renewal`](Self::try_lock_renewal)), waiting for another process's renewal to
+    /// end, so that it cannot store its tokens over what the caller, `doing` it, stores or
+    /// removes. `note` is told once what is waited for when that takes longer than
+    /// [`RENEWAL_NOTE_AFTER`]. Without the lock (it cannot be taken, or another process holds it
+    /// longer than [`RENEWAL_WAIT`]), `None`, with a warning: the caller goes on without it.
+    pub async fn lock_renewal(
+        &self,
+        provider: &str,
+        profile: &str,
+        doing: &str,
+        note: impl FnOnce(String),
+    ) -> Option<RenewalLock> {
+        let what = if provider == "chatgpt" {
+            "the ChatGPT sign-in".to_string()
+        } else {
+            format!("the {provider} credential")
+        };
+        let started = Instant::now();
+        let mut note = Some(note);
+        loop {
+            match self.try_lock_renewal(provider, profile) {
+                Ok(Some(lock)) => return Some(lock),
+                Ok(None) if started.elapsed() < RENEWAL_WAIT => {
+                    if started.elapsed() >= RENEWAL_NOTE_AFTER
+                        && let Some(note) = note.take()
+                    {
+                        note(format!(
+                            "waiting for another harness process to finish renewing {what} (profile `{profile}`)"
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok(None) => {
+                    self.warn(format!(
+                        "another harness process has been renewing {what} (profile `{profile}`) for over {} s; {doing} without waiting for it",
+                        RENEWAL_WAIT.as_secs()
+                    ));
+                    return None;
+                }
+                Err(e) => {
+                    self.warn(format!(
+                        "{doing} without the lock that keeps harness processes from changing {what} (profile `{profile}`) at the same time: {e}"
+                    ));
+                    return None;
+                }
+            }
         }
     }
 

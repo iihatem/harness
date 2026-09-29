@@ -86,6 +86,45 @@ async fn ollamas_small_running_context_is_used_and_explained() {
     .unwrap();
 }
 
+// Review D M2: a model Ollama does not have gets one clear message, Ollama's own, rather than a
+// warning that its window is unknown first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_ollama_does_not_have_gets_one_message() {
+    let server = MockServer::start().await;
+    let refusal = json!({"error": "model \"nope\" not found, try pulling it first"});
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(refusal.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": {
+            "message": "model \"nope\" not found, try pulling it first",
+            "type": "api_error", "param": null, "code": null}})))
+        .mount(&server)
+        .await;
+    let env = Env::new(&format!(
+        "model = \"ollama/nope\"\n[providers.ollama]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n",
+        server.uri()
+    ));
+    tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .args(["ask", "hi"])
+            .assert()
+            .failure()
+            .stderr(contains("not found, try pulling it first"))
+            .stderr(contains("context window").not());
+    })
+    .await
+    .unwrap();
+}
+
 // Decision 14: continuing a conversation held on local models with a hosted model says nothing
 // about it (the behaviour before P4); harness does not flag it.
 #[tokio::test(flavor = "multi_thread")]

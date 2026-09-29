@@ -217,7 +217,7 @@ pub async fn run(
             tokens = window::running_context(server, &resolved.base_url, &resolved.model, PROBE_TIMEOUT, LOAD_TIMEOUT) => tokens,
             _ = cancel.cancelled() => return exit_code(TurnEndReason::Interrupted, false),
         },
-        None => None,
+        None => window::Running::Unknown,
     };
     let window = window::effective_window(&resolved.id, &profile, running, server);
     for warning in &window.warnings {

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use harness_config::config::{Protocol, ProviderConfig};
 use harness_providers::profiles::{self, FALLBACK_CONTEXT_WINDOW};
-use harness_providers::window::{Server, effective_window, running_context};
+use harness_providers::window::{Running, Server, effective_window, running_context};
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -36,9 +36,9 @@ async fn ollama_reports_a_loaded_models_context() {
         let base = base(&server);
         async move { running_context(Server::Ollama, &base, model, PROBE, LOAD).await }
     };
-    assert_eq!(found("qwen3-coder:30b").await, Some(4096));
+    assert_eq!(found("qwen3-coder:30b").await, Running::Tokens(4096));
     // A name without a tag is Ollama's `latest`.
-    assert_eq!(found("llama3.1").await, Some(131_072));
+    assert_eq!(found("llama3.1").await, Running::Tokens(131_072));
 }
 
 #[tokio::test]
@@ -75,7 +75,7 @@ async fn ollama_loads_a_model_that_is_not_running_yet() {
             LOAD
         )
         .await,
-        Some(8192)
+        Running::Tokens(8192)
     );
 }
 
@@ -93,7 +93,7 @@ async fn llama_cpp_reports_its_slot_context() {
         .await;
     assert_eq!(
         running_context(Server::LlamaCpp, &base(&server), "qwen", PROBE, LOAD).await,
-        Some(16_384)
+        Running::Tokens(16_384)
     );
 }
 
@@ -113,11 +113,11 @@ async fn lm_studio_reports_a_loaded_instance_only() {
     let base = base(&server);
     assert_eq!(
         running_context(Server::LmStudio, &base, "qwen/qwen3-coder-30b", PROBE, LOAD).await,
-        Some(4096)
+        Running::Tokens(4096)
     );
     assert_eq!(
         running_context(Server::LmStudio, &base, "google/gemma-3-12b", PROBE, LOAD).await,
-        None
+        Running::Unknown
     );
 }
 
@@ -128,7 +128,7 @@ async fn a_server_that_does_not_answer_reports_nothing_in_time() {
     let started = Instant::now();
     assert_eq!(
         running_context(Server::LlamaCpp, "http://127.0.0.1:9/v1", "m", PROBE, LOAD).await,
-        None
+        Running::Unknown
     );
     let slow = MockServer::start().await;
     Mock::given(method("GET"))
@@ -137,7 +137,7 @@ async fn a_server_that_does_not_answer_reports_nothing_in_time() {
         .await;
     assert_eq!(
         running_context(Server::LlamaCpp, &base(&slow), "m", PROBE, LOAD).await,
-        None
+        Running::Unknown
     );
     assert!(
         started.elapsed() < Duration::from_secs(3),
@@ -153,7 +153,7 @@ fn a_small_running_context_wins_and_is_warned_about() {
     let window = effective_window(
         "ollama/qwen3-coder:30b",
         &profile,
-        Some(4096),
+        Running::Tokens(4096),
         Some(Server::Ollama),
     );
     assert_eq!(window.tokens, 4096);
@@ -169,7 +169,7 @@ fn the_smaller_of_server_and_profile_is_used() {
     let bigger = effective_window(
         "llamacpp/qwen3-coder",
         &profile,
-        Some(1_000_000),
+        Running::Tokens(1_000_000),
         Some(Server::LlamaCpp),
     );
     assert_eq!(bigger.tokens, 262_144);
@@ -177,7 +177,7 @@ fn the_smaller_of_server_and_profile_is_used() {
     let smaller = effective_window(
         "llamacpp/qwen3-coder",
         &profile,
-        Some(16_384),
+        Running::Tokens(16_384),
         Some(Server::LlamaCpp),
     );
     assert_eq!(smaller.tokens, 16_384);
@@ -192,7 +192,7 @@ fn the_smaller_of_server_and_profile_is_used() {
 #[test]
 fn an_unknown_window_falls_back_with_one_warning() {
     let profile = profiles::resolve("mine/new-model", true, &BTreeMap::new());
-    let window = effective_window("mine/new-model", &profile, None, None);
+    let window = effective_window("mine/new-model", &profile, Running::Unknown, None);
     assert_eq!(window.tokens, FALLBACK_CONTEXT_WINDOW);
     assert_eq!(window.warnings.len(), 1, "{:?}", window.warnings);
     assert!(
@@ -212,13 +212,110 @@ fn a_profile_below_its_minimum_is_warned_about_without_a_server() {
         },
     )]);
     let profile = profiles::resolve("mine/model", false, &mine);
-    let window = effective_window("mine/model", &profile, None, None);
+    let window = effective_window("mine/model", &profile, Running::Unknown, None);
     assert_eq!(window.tokens, 8_192);
     assert_eq!(window.warnings.len(), 1, "{:?}", window.warnings);
     assert!(
         window.warnings[0].contains("context_window"),
         "{:?}",
         window.warnings
+    );
+}
+
+// Review D M1: a profile's own `min_context` moves the threshold, either way, and the remedy
+// asks for it.
+#[test]
+fn a_profiles_min_context_sets_the_threshold() {
+    let mine = |min: u64| {
+        BTreeMap::from([(
+            "mine/*".to_string(),
+            harness_config::config::ProfileSettings {
+                context_window: Some(40_000),
+                min_context: Some(min),
+                ..Default::default()
+            },
+        )])
+    };
+    let strict = profiles::resolve("mine/model", false, &mine(65_536));
+    let window = effective_window("mine/model", &strict, Running::Unknown, None);
+    assert_eq!(window.tokens, 40_000);
+    assert_eq!(window.warnings.len(), 1, "{:?}", window.warnings);
+    assert!(
+        window.warnings[0].contains("below the 65536 tokens"),
+        "{:?}",
+        window.warnings
+    );
+    let ollama = effective_window(
+        "mine/model",
+        &strict,
+        Running::Tokens(20_000),
+        Some(Server::Ollama),
+    );
+    assert!(
+        ollama.warnings[0].contains("OLLAMA_CONTEXT_LENGTH=65536"),
+        "{:?}",
+        ollama.warnings
+    );
+    // Below the default minimum, but not below this profile's.
+    let lenient = profiles::resolve("mine/model", false, &mine(16_384));
+    let window = effective_window("mine/model", &lenient, Running::Tokens(20_000), None);
+    assert_eq!(window.tokens, 20_000);
+    assert!(window.warnings.is_empty(), "{:?}", window.warnings);
+}
+
+/// A mock Ollama that runs no model yet and answers a request to load `model` with `load`.
+async fn ollama_loading(load: ResponseTemplate) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ps(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .respond_with(load)
+        .mount(&server)
+        .await;
+    server
+}
+
+// Review D M2: when Ollama cannot load the model (not pulled, or too big), or is not there, the
+// request to it fails and says why: nothing is said about the window before that.
+#[tokio::test]
+async fn a_model_ollama_cannot_load_gets_no_window_warning() {
+    let not_pulled = ollama_loading(
+        ResponseTemplate::new(404)
+            .set_body_json(json!({"error": "model \"nope\" not found, try pulling it first"})),
+    )
+    .await;
+    let too_big = ollama_loading(ResponseTemplate::new(500).set_body_json(
+        json!({"error": "model requires more system memory (40.0 GiB) than is available (16.0 GiB)"}),
+    ))
+    .await;
+    for base in [
+        base(&not_pulled),
+        base(&too_big),
+        "http://127.0.0.1:9/v1".to_string(),
+    ] {
+        let running = running_context(Server::Ollama, &base, "nope", PROBE, LOAD).await;
+        assert_eq!(running, Running::LoadFailed, "{base}");
+    }
+    let profile = profiles::resolve("ollama/nope", true, &BTreeMap::new());
+    let window = effective_window(
+        "ollama/nope",
+        &profile,
+        Running::LoadFailed,
+        Some(Server::Ollama),
+    );
+    assert_eq!(window.tokens, FALLBACK_CONTEXT_WINDOW);
+    assert!(window.warnings.is_empty(), "{:?}", window.warnings);
+
+    // A server that is not Ollama's own API, whatever its name, is only not reporting.
+    let other =
+        ollama_loading(ResponseTemplate::new(404).set_body_string("404 page not found")).await;
+    assert_eq!(
+        running_context(Server::Ollama, &base(&other), "m", PROBE, LOAD).await,
+        Running::Unknown
     );
 }
 

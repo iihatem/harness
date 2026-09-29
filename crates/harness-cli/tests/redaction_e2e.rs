@@ -99,20 +99,36 @@ struct Run {
     requests: Vec<Request>,
 }
 
+/// Where a [`Run`] runs, besides its defaults.
+#[derive(Default)]
+struct Scenario<'a> {
+    /// More environment variables.
+    vars: &'a [(&'a str, &'a str)],
+    /// Files in the workspace, `(path, content)`.
+    workspace: &'a [(&'a str, &'a str)],
+    /// Files in `HARNESS_HOME`, `(path, content)`.
+    home: &'a [(&'a str, &'a str)],
+    /// More of the global configuration.
+    config: &'a str,
+}
+
 impl Run {
     /// Runs `harness <args>` against a mock provider that answers with `replies`, with `KEY` as
     /// its API key and `vars` in the environment.
     async fn new(replies: Vec<ResponseTemplate>, vars: &[(&str, &str)], args: &[&str]) -> Run {
-        Run::in_workspace(replies, vars, args, &[]).await
+        Run::with(
+            replies,
+            args,
+            Scenario {
+                vars,
+                ..Scenario::default()
+            },
+        )
+        .await
     }
 
-    /// [`Run::new`], in a workspace that holds `files`, `(path, content)`.
-    async fn in_workspace(
-        replies: Vec<ResponseTemplate>,
-        vars: &[(&str, &str)],
-        args: &[&str],
-        files: &[(&str, &str)],
-    ) -> Run {
+    /// [`Run::new`], in `scenario`.
+    async fn with(replies: Vec<ResponseTemplate>, args: &[&str], scenario: Scenario<'_>) -> Run {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(Replies {
@@ -127,18 +143,25 @@ impl Run {
         std::fs::write(
             home.path().join("config/config.toml"),
             format!(
-                "model = \"mock/m\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\napi_key_env = \"MOCK_API_KEY\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n",
-                server.uri()
+                "model = \"mock/m\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\napi_key_env = \"MOCK_API_KEY\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n{}",
+                server.uri(),
+                scenario.config
             ),
         )
         .unwrap();
         std::fs::create_dir(ws.path().join(".git")).unwrap();
-        for (path, content) in files {
-            let path = ws.path().join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, content).unwrap();
+        for (dir, files) in [
+            (ws.path(), scenario.workspace),
+            (home.path(), scenario.home),
+        ] {
+            for (path, content) in files {
+                let path = dir.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, content).unwrap();
+            }
         }
-        let vars: Vec<(String, String)> = vars
+        let vars: Vec<(String, String)> = scenario
+            .vars
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
@@ -357,21 +380,71 @@ async fn a_password_in_a_tool_call_is_written_nowhere() {
     }
 }
 
+// Review F M1: every key and sign-in token harness holds is a secret from the start, not only
+// the key this run uses: a command that prints the credential file, and the key variable of a
+// configured provider whose name no rule marks, writes none of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_credentials_the_run_does_not_use_are_secrets_too() {
+    const STORED: &str = "sk-stored-openai-mvbqzrtkwx";
+    const ACCESS: &str = "access-jwt-hdkqzmvbtr";
+    const REFRESH: &str = "refresh-rt-pxwqlzmnvc";
+    const OTHER: &str = "other-cred-kzqwmvbxtr";
+    let signed_in =
+        json!({"access_token": ACCESS, "refresh_token": REFRESH, "account_id": "acct-1"});
+    let credentials = json!({"credentials": {
+        "openai/default": STORED,
+        "chatgpt/work": signed_in.to_string(),
+    }})
+    .to_string();
+    let command = r#"cat "$HARNESS_HOME/data/credentials.json"; printenv OTHER_CRED"#;
+    let run = Run::with(
+        vec![
+            sse(&[tool_calls(&[("c1", "bash", json!({"command": command}))])]),
+            sse(&[
+                text(&format!("It holds {STORED}, {ACCESS} and {OTHER}.")),
+                stop(),
+            ]),
+        ],
+        &["--debug", "ask", "--json", "show the credentials"],
+        Scenario {
+            vars: &[("OTHER_CRED", OTHER)],
+            home: &[("data/credentials.json", &credentials)],
+            config: "[providers.other]\nprotocol = \"openai-chat\"\nbase_url = \"http://127.0.0.1:9/v1\"\napi_key_env = \"OTHER_CRED\"\n",
+            ..Scenario::default()
+        },
+    )
+    .await;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    // The model saw them: they were printed.
+    let seen = String::from_utf8_lossy(&run.requests[1].body);
+    assert!(seen.contains(STORED) && seen.contains(ACCESS) && seen.contains(OTHER));
+    for (what, text) in run.written() {
+        if what.ends_with("/data/credentials.json") {
+            continue;
+        }
+        for secret in [STORED, ACCESS, REFRESH, OTHER] {
+            assert!(!text.contains(secret), "{what} holds {secret}:\n{text}");
+        }
+    }
+}
+
 // Review F M8: the warnings printed before the agent starts (here from the configuration, from
 // `ask` itself and from reading the instruction files) are in the debug log too, redacted.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_debug_log_holds_the_warnings_printed_at_startup() {
-    let run = Run::in_workspace(
+    let run = Run::with(
         vec![sse(&[text("hi"), stop()])],
-        &[],
         &["--debug", "--mode", "full-access", "ask", "hi"],
-        &[
-            (
-                ".harness/config.toml",
-                "[permissions]\nallow = [\"bash:make*\"]\n",
-            ),
-            ("AGENTS.md", &format!("Be brief.\n@{KEY}.md\n")),
-        ],
+        Scenario {
+            workspace: &[
+                (
+                    ".harness/config.toml",
+                    "[permissions]\nallow = [\"bash:make*\"]\n",
+                ),
+                ("AGENTS.md", &format!("Be brief.\n@{KEY}.md\n")),
+            ],
+            ..Scenario::default()
+        },
     )
     .await;
     assert_eq!(run.code, Some(0), "{}", run.stderr);

@@ -822,3 +822,26 @@ pub fn check_name(what: &'static str, name: &str) -> Result<(), CredentialError>
         })
     }
 }
+
+impl Credentials {
+    /// Every secret the credential file holds, whichever provider and profile it belongs to: each
+    /// stored key, and each token of a stored sign-in (`*token` fields of a JSON value). Only the
+    /// file is read, never the keychain, and nothing is created: without a file, or with one
+    /// that cannot be read, there are none.
+    pub fn file_secrets(&self) -> Vec<String> {
+        let Ok(file) = self.file.read() else {
+            return Vec::new();
+        };
+        let mut secrets = Vec::new();
+        for value in file.credentials.into_values() {
+            if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(&value) {
+                secrets.extend(fields.into_iter().filter_map(|(name, field)| match field {
+                    serde_json::Value::String(token) if name.ends_with("token") => Some(token),
+                    _ => None,
+                }));
+            }
+            secrets.push(value);
+        }
+        secrets
+    }
+}

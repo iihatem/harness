@@ -86,7 +86,7 @@ pub fn load() -> Result<Setup, String> {
     }
     let credentials = Arc::new(Credentials::open(&paths.data_dir, env));
     let redactor = Arc::new(Redactor::default());
-    redactor.add_env(std::env::vars_os());
+    register_secrets(&redactor, &config, &credentials);
     Ok(Setup {
         paths,
         config,
@@ -95,6 +95,25 @@ pub fn load() -> Result<Setup, String> {
         credentials,
         redactor,
     })
+}
+
+/// Registers, from the start of the run, the secrets in the environment, those in the credential
+/// file, and the key variable of every configured provider, whether or not this run uses them.
+/// The keychain is not read for this: a key harness reads from it is registered when it is read.
+fn register_secrets(redactor: &Redactor, config: &Config, credentials: &Credentials) {
+    redactor.add_env(std::env::vars_os());
+    for secret in credentials.file_secrets() {
+        redactor.add(&secret);
+    }
+    for var in config
+        .providers
+        .values()
+        .filter_map(|p| p.api_key_env.as_deref())
+    {
+        if let Some(value) = std::env::var_os(var) {
+            redactor.add(&value.to_string_lossy());
+        }
+    }
 }
 
 pub fn env(key: &str) -> Option<String> {

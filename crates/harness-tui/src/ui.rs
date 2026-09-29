@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::{Action, App, Host, Options},
+    approval::{Reply, Requests},
     inline::InlineTerminal,
 };
 
@@ -43,6 +44,7 @@ pub struct Ui<B: Backend> {
     contexts: mpsc::UnboundedReceiver<ContextUsage>,
     /// A job was sent whose context update has not come yet.
     awaiting_context: bool,
+    approvals: Requests,
     runner: Option<JoinHandle<()>>,
     /// Cancels the running turn.
     cancel: Option<CancellationToken>,
@@ -53,12 +55,14 @@ where
     B: Backend,
     B::Error: Send + Sync + 'static,
 {
-    /// Starts the session: `agent` moves to a task of its own.
+    /// Starts the session: `agent` moves to a task of its own. `approvals` are the requests of
+    /// the agent's [`ChannelApprover`](crate::approval::ChannelApprover).
     pub fn start(
         agent: Agent,
         host: Box<dyn Host>,
         term: InlineTerminal<B>,
         options: Options,
+        approvals: Requests,
     ) -> Self {
         let (jobs, mut queue) = mpsc::unbounded_channel::<Job>();
         let (events_tx, events) = mpsc::unbounded_channel();
@@ -84,6 +88,7 @@ where
             events,
             contexts,
             awaiting_context: false,
+            approvals,
             runner: Some(runner),
             cancel: None,
         }
@@ -116,10 +121,7 @@ where
             for (i, line) in lines.iter().enumerate() {
                 buf.set_line(area.x, area.y + i as u16, line, area.width);
             }
-            Some(ratatui::layout::Position::new(
-                area.x + cursor.x,
-                area.y + cursor.y,
-            ))
+            cursor.map(|c| ratatui::layout::Position::new(area.x + c.x, area.y + c.y))
         })
     }
 
@@ -178,6 +180,20 @@ where
         Ok(Flow::Continue)
     }
 
+    /// Shows an approval request, after the events that came before it.
+    fn approval(
+        &mut self,
+        request: harness_core::agent::ApprovalRequest,
+        reply: Reply,
+    ) -> io::Result<Flow> {
+        while let Ok(event) = self.events.try_recv() {
+            self.app.on_event(&event);
+        }
+        self.app.on_approval(request, reply);
+        self.draw()?;
+        Ok(Flow::Continue)
+    }
+
     /// Takes in where the context goes after a job, and redraws the status line.
     fn context(&mut self, context: ContextUsage) -> io::Result<Flow> {
         self.awaiting_context = false;
@@ -194,13 +210,26 @@ where
                 None => Ok(Flow::Quit),
             },
             Some(context) = self.contexts.recv() => self.context(context),
+            Some((request, reply)) = self.approvals.recv() => self.approval(request, reply),
         }
     }
 
+    /// Takes in the agent's events until `done` holds.
+    pub async fn until(&mut self, done: impl Fn(&App) -> bool) -> io::Result<()> {
+        while !done(&self.app) {
+            if self.next().await? == Flow::Quit {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Takes in the agent's events until no turn is running and the runner has said where the
-    /// context goes after it.
+    /// context goes after it, or until an approval waits for the user.
     pub async fn settle(&mut self) -> io::Result<()> {
-        while self.app.busy() || self.awaiting_context || !self.events.is_empty() {
+        while self.app.prompt().is_none()
+            && (self.app.busy() || self.awaiting_context || !self.events.is_empty())
+        {
             if self.next().await? == Flow::Quit {
                 break;
             }
@@ -229,6 +258,7 @@ where
                     None => Flow::Quit,
                 },
                 Some(context) = self.contexts.recv() => self.context(context)?,
+                Some((request, reply)) = self.approvals.recv() => self.approval(request, reply)?,
             };
             if flow == Flow::Quit {
                 break;

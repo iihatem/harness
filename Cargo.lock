@@ -1494,9 +1494,11 @@ dependencies = [
 name = "harness-tui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "harness-context",
  "harness-core",
+ "harness-tools",
  "ignore",
  "nucleo-matcher",
  "pulldown-cmark",

@@ -115,12 +115,23 @@ impl AgentConfig {
     }
 }
 
+/// What an approval decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalKind {
+    /// Whether the action may run: once, for the rest of the session, or not.
+    Action,
+    /// Whether a command may run without the sandbox: once, or not. It is never approved for
+    /// the session.
+    RunUnsandboxed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub call_id: String,
     pub tool: String,
     pub action: Action,
     pub reason: String,
+    pub kind: ApprovalKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1487,11 +1498,18 @@ impl Agent {
                     tool: call.name.clone(),
                     action,
                     reason: reason.clone(),
+                    kind: ApprovalKind::Action,
                 };
                 match self.approver.decide(&request).await {
                     ApprovalDecision::Approve => {}
                     ApprovalDecision::ApproveForSession => {
-                        self.policy.remember(&request.action);
+                        if !self.policy.remember(&request.action) {
+                            let _ = events.send(AgentEvent::Warning {
+                                message: format!(
+                                    "approved once: {reason} cannot be approved for the rest of the session, so harness will ask again next time"
+                                ),
+                            });
+                        }
                     }
                     ApprovalDecision::Deny {
                         feedback: Some(note),
@@ -1563,6 +1581,7 @@ impl Agent {
             tool: call.name.clone(),
             action: tool.action(&args, &self.ctx),
             reason,
+            kind: ApprovalKind::RunUnsandboxed,
         };
         let note = match self.approver.decide(&request).await {
             ApprovalDecision::Approve | ApprovalDecision::ApproveForSession => {

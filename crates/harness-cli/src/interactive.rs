@@ -5,10 +5,11 @@ use std::{io::IsTerminal, sync::Arc};
 use crossterm::event::EventStream;
 use harness_config::config;
 use harness_context::{commands::Commands, project::project_root};
-use harness_core::{agent::NonInteractive, engine::PermissionEngine, permission::Mode};
+use harness_core::{engine::PermissionEngine, permission::Mode};
 use harness_providers::registry;
 use harness_tui::{
     app::{Host, Options, Prepared},
+    approval::{ChannelApprover, Requests},
     inline::InlineTerminal,
     style::Theme,
     terminal::{CrosstermRawMode, Modes},
@@ -121,6 +122,7 @@ pub async fn run(
     for warning in &commands.warnings {
         notices.warn(warning);
     }
+    let (approver, approvals) = ChannelApprover::new();
     // Nothing cancels the start: Ctrl+C before the terminal UI ends the process.
     let Some(Started {
         agent,
@@ -132,7 +134,7 @@ pub async fn run(
             mode,
             model: resolved,
             session,
-            approver: Arc::new(NonInteractive),
+            approver,
             interactive: true,
             run_id: start::run_id(),
             cancel: CancellationToken::new(),
@@ -159,7 +161,7 @@ pub async fn run(
         commands,
         policy,
     };
-    let result = terminal_session(agent, Box::new(host), options).await;
+    let result = terminal_session(agent, Box::new(host), options, approvals).await;
     sandbox_session.end();
     match result {
         Ok(()) => 0,
@@ -175,6 +177,7 @@ async fn terminal_session(
     agent: harness_core::agent::Agent,
     host: Box<dyn Host>,
     options: Options,
+    approvals: Requests,
 ) -> std::io::Result<()> {
     // Asked before any events are read: both queries read the terminal's answer from stdin.
     let keyboard = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -182,7 +185,7 @@ async fn terminal_session(
     let top = if column == 0 { row } else { row + 1 };
     let _modes = Modes::enter(std::io::stdout(), CrosstermRawMode, keyboard)?;
     let term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)?;
-    let ui = Ui::start(agent, host, term, options);
+    let ui = Ui::start(agent, host, term, options, approvals);
     ui.run(EventStream::new()).await
 }
 

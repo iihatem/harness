@@ -13,6 +13,7 @@ use harness_core::{
 };
 use harness_tui::{
     app::{Host, Options, Prepared},
+    approval::ChannelApprover,
     inline::InlineTerminal,
     status::{self, Totals},
     style::Theme,
@@ -64,7 +65,13 @@ fn start(provider: Arc<MockProvider>, dir: &Path, system: &str) -> Ui<TestBacken
         window_note: Some("assumed".into()),
     };
     let term = InlineTerminal::new(TestBackend::new(70, 20), 0).unwrap();
-    let mut ui = Ui::start(agent, Box::new(NoCommands), term, options);
+    let mut ui = Ui::start(
+        agent,
+        Box::new(NoCommands),
+        term,
+        options,
+        ChannelApprover::new().1,
+    );
     ui.draw().unwrap();
     ui
 }

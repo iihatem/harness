@@ -67,6 +67,11 @@ impl Transcript {
         self.busy
     }
 
+    /// The arguments of tool call `id`, while it runs.
+    pub fn arguments(&self, id: &str) -> Option<&Value> {
+        self.calls.get(id).map(|call| &call.arguments)
+    }
+
     /// The finished lines not yet written, which are then forgotten.
     pub fn take_finished(&mut self) -> Vec<Line<'static>> {
         std::mem::take(&mut self.pending)

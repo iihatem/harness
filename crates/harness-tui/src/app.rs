@@ -6,7 +6,12 @@
 use std::time::{Duration, Instant};
 
 use harness_context::commands::{is_builtin, parse_invocation};
-use harness_core::{agent::ContextUsage, event::AgentEvent, permission::Mode, turn::TurnInput};
+use harness_core::{
+    agent::{ApprovalDecision, ApprovalRequest, ContextUsage},
+    event::AgentEvent,
+    permission::Mode,
+    turn::TurnInput,
+};
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::Position,
@@ -14,6 +19,7 @@ use ratatui::{
 };
 
 use crate::{
+    approval::{Answered, Prompt, Reply},
     complete::{self, Completer, Offer},
     editor::{Edit, Editor},
     status::{self, Totals},
@@ -112,6 +118,9 @@ pub struct App {
     totals: Totals,
     instruction_files: Vec<(String, u64)>,
     window_note: Option<String>,
+    /// An approval waiting for the user's answer.
+    prompt: Option<Prompt>,
+    workspace: std::path::PathBuf,
     width: usize,
 }
 
@@ -132,6 +141,8 @@ impl App {
             totals: Totals::default(),
             instruction_files: options.instruction_files,
             window_note: options.window_note,
+            prompt: None,
+            workspace: options.workspace,
             width,
         }
     }
@@ -143,6 +154,40 @@ impl App {
     /// The screen's width changed.
     pub fn set_width(&mut self, width: usize) {
         self.width = width;
+    }
+
+    /// The agent asks the user to approve `request`.
+    pub fn on_approval(&mut self, request: ApprovalRequest, reply: Reply) {
+        let arguments = self.transcript.arguments(&request.call_id).cloned();
+        let theme = self.theme();
+        self.prompt = Some(Prompt::new(
+            request,
+            reply,
+            arguments.as_ref(),
+            &self.workspace,
+            &theme,
+        ));
+    }
+
+    /// The approval waiting for an answer.
+    pub fn prompt(&self) -> Option<&Prompt> {
+        self.prompt.as_ref()
+    }
+
+    /// Answers the waiting approval, and notes the answer in the transcript.
+    fn answer(&mut self, answered: Answered) {
+        let Some(mut prompt) = self.prompt.take() else {
+            return;
+        };
+        let line = prompt.outcome(&answered, &self.theme());
+        let decision = match answered {
+            Answered::Decided(decision) => decision,
+            Answered::Interrupt => ApprovalDecision::Deny {
+                feedback: Some("the user stopped the turn".into()),
+            },
+        };
+        prompt.answer(decision);
+        self.transcript.push_lines(vec![line], self.width);
     }
 
     pub fn editor(&self) -> &Editor {
@@ -203,6 +248,12 @@ impl App {
         }
         self.ctrl_c = None;
         self.hint = None;
+        if let Some(prompt) = &mut self.prompt {
+            let answered = prompt.key(key)?;
+            let interrupt = answered == Answered::Interrupt;
+            self.answer(answered);
+            return interrupt.then_some(Action::Interrupt);
+        }
         if ctrl && key.code == KeyCode::Char('d') && self.editor.is_empty() {
             return Some(Action::Quit);
         }
@@ -233,6 +284,9 @@ impl App {
         }
         self.ctrl_c = Some(now);
         self.hint = Some("press Ctrl+C again to exit".into());
+        if self.prompt.is_some() {
+            self.answer(Answered::Interrupt);
+        }
         if self.busy() {
             return Some(Action::Interrupt);
         }
@@ -390,12 +444,21 @@ impl App {
         )
     }
 
-    /// The live region's lines, at most `rows`, and where the cursor is in them.
-    pub fn live(&self, rows: usize) -> (Vec<Line<'static>>, Position) {
+    /// The live region's lines, at most `rows`, and where the cursor is in them (none while an
+    /// approval waits).
+    pub fn live(&self, rows: usize) -> (Vec<Line<'static>>, Option<Position>) {
         let theme = self.theme();
         let width = self.width;
-        let (editor, cursor) = self.editor.render("› ", width, &theme);
         let mut below: Vec<Line<'static>> = Vec::new();
+        below.extend(wrap(&self.status(), width, &[], &[]));
+        if let Some(prompt) = &self.prompt {
+            let mut lines = prompt.render(width, rows.saturating_sub(below.len()), &theme);
+            lines.extend(below);
+            let skip = lines.len().saturating_sub(rows);
+            return (lines.split_off(skip), None);
+        }
+        below.clear();
+        let (editor, cursor) = self.editor.render("› ", width, &theme);
         if let Some(completion) = &self.completion {
             below.extend(complete::render(
                 &completion.offer,
@@ -421,6 +484,6 @@ impl App {
             cursor.x,
             (cursor.y as usize + top).saturating_sub(skip) as u16,
         );
-        (lines.split_off(skip), cursor)
+        (lines.split_off(skip), Some(cursor))
     }
 }

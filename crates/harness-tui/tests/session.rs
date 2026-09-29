@@ -21,6 +21,7 @@ use harness_core::{
 };
 use harness_tui::{
     app::{App, Host, Options, Prepared},
+    approval::ChannelApprover,
     inline::InlineTerminal,
     style::Theme,
     terminal::{Modes, RawMode},
@@ -92,7 +93,13 @@ fn options(dir: &Path) -> Options {
 
 fn start(provider: Arc<MockProvider>, dir: &Path) -> Ui<TestBackend> {
     let term = InlineTerminal::new(TestBackend::new(60, 16), 0).unwrap();
-    let mut ui = Ui::start(agent(provider, dir), Box::new(TestHost), term, options(dir));
+    let mut ui = Ui::start(
+        agent(provider, dir),
+        Box::new(TestHost),
+        term,
+        options(dir),
+        ChannelApprover::new().1,
+    );
     ui.draw().unwrap();
     ui
 }

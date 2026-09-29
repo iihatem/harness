@@ -317,6 +317,12 @@ struct Splitter {
     /// Open `((…))` arithmetic commands.
     arithmetic_commands: usize,
     heredocs: Vec<Heredoc>,
+    /// The `<<`, `<<-` or `<<<` operator just read was only recognized because a
+    /// backslash-newline was skipped to find its second or third character (or the `-` of
+    /// `<<-`): recognizing it this way is right, but a body a degenerate input like this
+    /// forms is not trusted, so its data is also read as program text, which can only add
+    /// readings (see [`Splitter::lost`]).
+    joined_operator: bool,
     /// Open `${…}`/`$[…]` expansions of the current substitution.
     braces: Vec<Brace>,
     /// Whether here-documents are tracked at all.
@@ -385,6 +391,7 @@ impl Splitter {
             arithmetic: false,
             arithmetic_commands: 0,
             heredocs: Vec::new(),
+            joined_operator: false,
             braces: Vec::new(),
             track: true,
             lost: None,
@@ -454,7 +461,10 @@ impl Splitter {
             }
             if !self.legacy {
                 self.expansion(c);
-                if c == '<' && self.peek() == Some('<') && !self.braces.is_empty() {
+                if c == '<'
+                    && self.src.get(self.after_continuations(self.at)) == Some(&'<')
+                    && !self.braces.is_empty()
+                {
                     self.expansion_heredoc = true;
                 }
             }
@@ -487,7 +497,12 @@ impl Splitter {
                         self.at += 1;
                     }
                 }
-                '<' if self.peek() == Some('<') => {
+                // bash removes a backslash-newline before reading the second `<` of the
+                // operator, so one there does not hide it (`<\`⏎`<EOF` is `<<EOF`).
+                '<' if self.src.get(self.after_continuations(self.at)) == Some(&'<') => {
+                    let next = self.after_continuations(self.at);
+                    self.joined_operator |= next != self.at;
+                    self.at = next;
                     let redirects = self.redirects();
                     // After `<<-` and a blank, the `-` is a word of its own, as written.
                     let dash = self.src.get(self.at + 1) == Some(&'-')
@@ -847,8 +862,15 @@ impl Splitter {
     /// A `<<` in `${…}` or `$[…]` is text, but the scan once took it for an operator, so
     /// it still gives restart points.
     fn redirection(&mut self) {
+        // Consumed here so it never leaks into a later, unrelated operator: only the
+        // caller just above sets it, once per operator read.
+        let mut joined = take(&mut self.joined_operator);
         self.at += 1;
-        if self.next_if_eq('<') {
+        // A backslash-newline before the third `<` does not hide a here-string
+        // (`<<\`⏎`<x` is `<<<x`), as bash removes it before reading the operator.
+        let here_string = self.src.get(self.after_continuations(self.at)) == Some(&'<');
+        if here_string {
+            self.at = self.after_continuations(self.at) + 1;
             return;
         }
         if self.legacy {
@@ -857,10 +879,20 @@ impl Splitter {
         if self.arithmetic || !self.track {
             return;
         }
-        let strip_tabs = self.peek() == Some('-');
+        // Likewise for the `-` of `<<-`.
+        let strip_next = self.after_continuations(self.at);
+        let strip_tabs = self.src.get(strip_next) == Some(&'-');
+        if strip_tabs {
+            joined |= strip_next != self.at;
+            self.at = strip_next;
+        }
         let operator = self.braces.is_empty();
-        // bash reads backtick text only when it runs it, and may end `((…))` elsewhere.
+        // bash reads backtick text only when it runs it, and may end `((…))` elsewhere. A
+        // degenerate input where recognizing the operator itself needed a backslash-newline
+        // is not trusted either: its body is also read as program text (see
+        // [`Splitter::lost`]), which can only add readings, never hide one.
         let trusted = operator
+            && !joined
             && self.lost.is_none()
             && self.arithmetic_commands == 0
             && self.depth < MAX_HEREDOC_DEPTH

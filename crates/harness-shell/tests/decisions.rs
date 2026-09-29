@@ -1166,6 +1166,44 @@ fn rough_scan_sees_past_redirections_split_by_line_continuations() {
 }
 
 #[test]
+fn rough_scan_tracks_here_documents_split_by_line_continuations() {
+    use Want::Deny;
+    // bash removes a backslash-newline before it reads a here-document operator, so one
+    // splitting `<<`, `<<-` or `<<<` does not hide it. Each program is refused as a whole
+    // (by the trailing `(`), so the rough scan decides; an unterminated quote in the body
+    // shows the operator was tracked, since otherwise nothing bounds where the body ends
+    // and the quote swallows `curl x` into one opaque word (asking instead of denying).
+    let table = [
+        // `<<` split between its two `<`.
+        ("cat <\\\n<EOF\n\"\nEOF\ncurl x\n(", Deny),
+        // `<<-` split between its two `<`, before the `-`.
+        ("cat <\\\n<-EOF\n\"\n\tEOF\ncurl x\n(", Deny),
+        // `<<-` split between `<<` and `-`.
+        ("cat <<\\\n-EOF\n\"\n\tEOF\ncurl x\n(", Deny),
+        // `<<<` (here-string) split between its 2nd and 3rd `<`.
+        ("cat <\\\n<<x\ncurl x\n(", Deny),
+        ("echo <\\\n<<'y'\ncurl x\n(", Deny),
+    ];
+    check(&default_rules(), &table);
+}
+
+#[test]
+fn a_heredoc_operator_only_found_by_joining_a_continuation_is_not_trusted() {
+    use Want::Deny;
+    // A mutfuzz find: recognizing `<<'EOF'` here needs the same join as above, but this
+    // program is a syntax error to bash (an unmatched `(` right after the delimiter), so
+    // nothing bash would call the body ever runs. Trusting the delimiter anyway would read
+    // `zzmark` after it as here-document data (never denied, only asked, since data may
+    // hide a command bash disagrees about) instead of a command of its own, turning the
+    // old Deny into an Ask: looser. Not trusting a delimiter recognized this way falls back
+    // to reading the text line by line, which still finds `zzmark` as its own line.
+    check(
+        &rules(&[], &["zzmark*"], &[]),
+        &[("echo $<\\\n<'EOF'(\n# c)\nzzmar\\\nk\n)", Deny)],
+    );
+}
+
+#[test]
 fn process_substitutions_after_redirection_operators_stay_substitutions() {
     use Want::{Deny, Destructive};
     // `>(` after `>`, `<`, `&>` or `&>>` is a process substitution. bash 3.2 has no `&>>`

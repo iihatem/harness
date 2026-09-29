@@ -183,6 +183,10 @@ pub trait PermissionPolicy: Send + Sync {
     /// directly would leave commands running with the old mode's access.
     fn set_mode(&self, _mode: Mode) {}
 
+    /// Whether shell commands run in an OS sandbox from now on. Internal to the agent, like
+    /// [`set_mode`](Self::set_mode), which it goes with.
+    fn set_sandbox_available(&self, _available: bool) {}
+
     /// Adds rules for the current turn only, or with `None` removes them. They never override
     /// deny rules, destructive-command confirmation or the sandbox.
     fn set_turn_rules(&self, _rules: Option<RuleSet>) {}

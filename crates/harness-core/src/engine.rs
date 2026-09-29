@@ -6,7 +6,10 @@ use std::{
     ffi::OsStr,
     io::Read,
     path::{Component, Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use harness_shell::{Rules, Verdict};
@@ -57,7 +60,9 @@ pub struct PermissionEngine {
     deny_paths: Vec<PathRule>,
     /// Config `read:`/`write:` confirm rules, expanded the same way as `deny_paths`.
     confirm_paths: Vec<PathRule>,
-    sandbox_available: bool,
+    /// Whether shell commands run in an OS sandbox in the current mode; `Agent::set_mode` may
+    /// change it with the mode.
+    sandbox_available: AtomicBool,
     writes_need_approval: bool,
     /// Where `<workspace>/.git` sends git when it is a symlink or a `gitdir:` file, resolved.
     /// Writes under it are guarded like writes under `.git`.
@@ -292,7 +297,7 @@ impl PermissionEngine {
             allow_paths,
             deny_paths,
             confirm_paths,
-            sandbox_available: config.sandbox_available,
+            sandbox_available: AtomicBool::new(config.sandbox_available),
             writes_need_approval: config.writes_need_approval,
             session_bash: Mutex::new(Vec::new()),
             session_paths: Mutex::new(HashSet::new()),
@@ -302,6 +307,10 @@ impl PermissionEngine {
 
     pub fn mode(&self) -> Mode {
         *self.mode.lock().expect("mode lock")
+    }
+
+    fn sandboxed(&self) -> bool {
+        self.sandbox_available.load(Ordering::SeqCst)
     }
 
     /// Rules whose tool is not `bash`, `read`, or `write` (they never match; the CLI warns about them).
@@ -551,12 +560,12 @@ impl PermissionEngine {
                 ..
             } if mode == Mode::FullAccess => Decision::Ask(reason),
             _ if mode == Mode::FullAccess => Decision::Allow,
-            _ if !self.sandbox_available && matches!(mode, Mode::Plan | Mode::ReadOnly) => {
+            _ if !self.sandboxed() && matches!(mode, Mode::Plan | Mode::ReadOnly) => {
                 Decision::Deny(
                     "shell commands need the OS sandbox in plan and read-only mode".into(),
                 )
             }
-            _ if !self.sandbox_available => Decision::Ask(format!(
+            _ if !self.sandboxed() => Decision::Ask(format!(
                 "run `{}` (no sandbox is available on this system)",
                 short(command)
             )),
@@ -578,7 +587,7 @@ impl PermissionEngine {
     /// `glob_match` has no escape syntax, so storing it as a glob would turn the literal
     /// character into a wildcard.
     fn remember_bash(&self, command: &str) -> bool {
-        if !self.sandbox_available {
+        if !self.sandboxed() {
             return false;
         }
         let Some(prefixes) = harness_shell::session_prefixes(command) else {
@@ -676,6 +685,10 @@ impl PermissionPolicy for PermissionEngine {
 
     fn set_mode(&self, mode: Mode) {
         *self.mode.lock().expect("mode lock") = mode;
+    }
+
+    fn set_sandbox_available(&self, available: bool) {
+        self.sandbox_available.store(available, Ordering::SeqCst);
     }
 
     fn set_turn_rules(&self, rules: Option<RuleSet>) {

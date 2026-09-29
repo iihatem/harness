@@ -73,12 +73,12 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         notices.warn("full-access mode: commands run without approval or sandbox");
     }
     let output_dir = setup.paths.state_dir.join("tool-output").join(run_id);
-    let sandbox_disabled_by_env =
-        std::env::var("HARNESS_SANDBOX").as_deref() == Ok("none") && mode != Mode::FullAccess;
+    let env_says_none = std::env::var("HARNESS_SANDBOX").as_deref() == Ok("none");
+    let sandbox_disabled_by_env = env_says_none && mode != Mode::FullAccess;
     // Write access to `/`, `$HOME` or an ancestor of it would cover the user's dotfiles. Plan and
     // read-only modes keep their read-only sandbox.
-    let workspace_too_broad = mode.fs_access() == FsAccess::WorkspaceWrite
-        && harness_sandbox::workspace_is_too_broad(&setup.workspace);
+    let workspace_too_broad = harness_sandbox::workspace_is_too_broad(&setup.workspace);
+    let write_too_broad = mode.fs_access() == FsAccess::WorkspaceWrite && workspace_too_broad;
     let required = setup.config.linux_git_protection == LinuxGitProtection::Required;
     let settings = harness_sandbox::SandboxSettings {
         extra_writable: setup.config.writable_roots.clone(),
@@ -86,26 +86,41 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         quarantine_dir: Some(setup.paths.data_dir.join("quarantine")),
         require_full_git_protection: required,
     };
-    let detected = if mode == Mode::FullAccess || sandbox_disabled_by_env || workspace_too_broad {
-        None
+    // `harness ask` needs a sandbox for its one mode only. The interactive session looks for one
+    // in every mode, since the user may switch to a mode that uses it.
+    let look = if interactive {
+        !env_says_none
     } else {
-        harness_sandbox::detect(settings.clone())
+        !(mode == Mode::FullAccess || sandbox_disabled_by_env || write_too_broad)
     };
-    let choice = sandbox::choose(detected, mode.fs_access(), required);
-    if let Some(warning) = &choice.warning {
+    let detected = if look {
+        harness_sandbox::detect(settings.clone())
+    } else {
+        None
+    };
+    let (sandboxes, write_warning) =
+        sandbox::for_modes(detected.clone(), workspace_too_broad, required);
+    let sandbox = sandboxes.for_mode(mode);
+    // Only a mode that writes through the sandbox has anything to warn about.
+    let warning = write_warning.filter(|_| matches!(mode, Mode::Ask | Mode::Auto));
+    if let Some(warning) = &warning {
         notices.warn(warning);
     }
-    let sandbox = choice.sandbox;
     // From here on, however the run is left, the sandbox's session ends: on Linux that ends what
     // sandboxed commands left running, and checks git metadata once more.
-    let sandbox_session = SessionEnd::new(sandbox.clone());
+    let session_sandbox = if interactive {
+        detected
+    } else {
+        sandbox.clone()
+    };
+    let sandbox_session = SessionEnd::new(session_sandbox.clone());
     let sandboxed = sandbox.is_some();
-    if mode != Mode::FullAccess && !sandboxed && choice.warning.is_none() {
+    if mode != Mode::FullAccess && !sandboxed && warning.is_none() {
         if sandbox_disabled_by_env {
             notices.warn(
                 "the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval",
             );
-        } else if workspace_too_broad {
+        } else if write_too_broad {
             notices.warn(&format!(
                 "the workspace {} is your home directory or above, where the sandbox would make your dotfiles writable, so it is off; every shell command will need approval",
                 setup.workspace.display()
@@ -134,6 +149,12 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         ));
     }
     let ctx = tool_context(&setup.workspace, sandbox, mode.fs_access()).await;
+    // A session that starts without a sandbox may switch to a mode that uses one.
+    if ctx.sandbox.is_none()
+        && let Some(sandbox) = session_sandbox
+    {
+        start_sandbox_session(&ctx.workspace, sandbox).await;
+    }
     let local = profiles::is_local(&resolved.id, &resolved.base_url);
     let profile = profiles::resolve(&resolved.id, local, &setup.config.profiles);
     // The window the server really runs the model with, when it is a local server that says.
@@ -180,7 +201,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         Vec::new()
     };
     let checkpoints = crate::sessions::checkpoints(setup, &session, &writable, notices);
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin(),
         policy.clone(),
@@ -191,6 +212,9 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     .with_redactor(setup.redactor.clone())
     .with_session(session)
     .with_checkpoints(checkpoints);
+    if interactive {
+        agent = agent.with_sandboxes(sandboxes);
+    }
     Some(Started {
         agent,
         sandbox_session,
@@ -246,11 +270,16 @@ pub async fn tool_context(
 ) -> ToolContext {
     let ctx = ToolContext::new(workspace).with_sandbox(sandbox, access);
     if let Some(sandbox) = ctx.sandbox.clone() {
-        let workspace = ctx.workspace.clone();
-        // It may walk the whole workspace. Should it fail, the first command reads what it needs.
-        let _ = tokio::task::spawn_blocking(move || sandbox.start_session(&workspace)).await;
+        start_sandbox_session(&ctx.workspace, sandbox).await;
     }
     ctx
+}
+
+/// Starts `sandbox`'s session for `workspace`, off the async runtime: it may walk the whole
+/// workspace. Should it fail, the first command reads what it needs.
+async fn start_sandbox_session(workspace: &Path, sandbox: Arc<dyn CommandSandbox>) {
+    let workspace = workspace.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || sandbox.start_session(&workspace)).await;
 }
 
 #[cfg(test)]

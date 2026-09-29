@@ -32,6 +32,7 @@ enum Job {
         input: TurnInput,
         cancel: CancellationToken,
     },
+    SetMode(harness_core::permission::Mode),
 }
 
 /// The interactive session on a terminal.
@@ -77,6 +78,7 @@ where
                     Job::Turn { input, cancel } => {
                         agent.run_turn(input, &events_tx, cancel).await;
                     }
+                    Job::SetMode(mode) => agent.set_mode(mode),
                 }
                 let _ = contexts_tx.send(agent.context_usage());
             }
@@ -136,6 +138,13 @@ where
                 }
                 Flow::Continue
             }
+            Action::SetMode(mode) => {
+                if let Some(jobs) = &self.jobs {
+                    let _ = jobs.send(Job::SetMode(mode));
+                    self.awaiting_context = true;
+                }
+                Flow::Continue
+            }
             Action::Interrupt => {
                 if let Some(cancel) = &self.cancel {
                     cancel.cancel();
@@ -170,11 +179,15 @@ where
         Ok(flow)
     }
 
-    /// Takes in an event from the agent, and the others already waiting.
+    /// Takes in an event from the agent, and the others already waiting; once a turn has
+    /// ended, switches to the mode chosen during it.
     fn agent_event(&mut self, event: AgentEvent) -> io::Result<Flow> {
         self.app.on_event(&event);
         while let Ok(event) = self.events.try_recv() {
             self.app.on_event(&event);
+        }
+        if let Some(action) = self.app.take_pending_mode() {
+            self.dispatch(action);
         }
         self.draw()?;
         Ok(Flow::Continue)

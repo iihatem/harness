@@ -25,7 +25,7 @@ use crate::{
     retry::RetryPolicy,
     session::{Entry, EntryKind, RewindScope, Session},
     tokens::DEFAULT_CONTEXT_WINDOW,
-    tool::{Tool, ToolContext, ToolOutput, ToolRegistry},
+    tool::{CommandSandbox, Tool, ToolContext, ToolOutput, ToolRegistry},
     turn::{InputPart, TurnInput, TurnModel},
 };
 
@@ -111,6 +111,27 @@ impl AgentConfig {
             compaction: CompactionConfig::default(),
             request: RequestOptions::default(),
             text_tool_calls: false,
+        }
+    }
+}
+
+/// The OS sandbox shell commands get in each mode, for a session whose mode can change: one for
+/// read-only access (`plan`, `read-only`) and one for workspace-write access (`ask`, `auto`).
+/// Either may be missing: a workspace too broad to make writable has no workspace-write sandbox,
+/// and neither has a system without one. `full-access` never uses one.
+#[derive(Debug, Clone, Default)]
+pub struct Sandboxes {
+    pub read_only: Option<Arc<dyn CommandSandbox>>,
+    pub workspace_write: Option<Arc<dyn CommandSandbox>>,
+}
+
+impl Sandboxes {
+    /// The sandbox for `mode`.
+    pub fn for_mode(&self, mode: Mode) -> Option<Arc<dyn CommandSandbox>> {
+        match mode {
+            Mode::Plan | Mode::ReadOnly => self.read_only.clone(),
+            Mode::Ask | Mode::Auto => self.workspace_write.clone(),
+            Mode::FullAccess => None,
         }
     }
 }
@@ -301,6 +322,8 @@ pub struct Agent {
     redactor: Option<Arc<Redactor>>,
     /// The current turn's model calls, for its stats.
     stats: Stats,
+    /// The sandbox for each mode, when switching modes also switches the sandbox.
+    sandboxes: Option<Sandboxes>,
 }
 
 impl Agent {
@@ -345,6 +368,7 @@ impl Agent {
             auto_compaction_paused: false,
             redactor: None,
             stats: Stats::default(),
+            sandboxes: None,
         }
     }
 
@@ -433,6 +457,14 @@ impl Agent {
                 "harness stopped before {answered} tool call(s) in this conversation finished; the model is told their effects are unknown"
             ));
         }
+    }
+
+    /// Gives shell commands the sandbox for the mode whenever the mode changes
+    /// ([`set_mode`](Self::set_mode)). Without it, a mode change keeps the sandbox the agent
+    /// started with.
+    pub fn with_sandboxes(mut self, sandboxes: Sandboxes) -> Self {
+        self.sandboxes = Some(sandboxes);
+        self
     }
 
     /// Snapshots the workspace before each turn's first change, so it can be rewound.
@@ -726,9 +758,15 @@ impl Agent {
         self.invalid_calls
     }
 
-    /// Switches the approval mode between turns. The system prompt stays as it is, so providers
-    /// keep reusing their prompt caches; the change is appended to the conversation as a note.
+    /// Switches the approval mode between turns, and with [`with_sandboxes`](Self::with_sandboxes)
+    /// the sandbox with it. The system prompt stays as it is, so providers keep reusing their
+    /// prompt caches; the change is appended to the conversation as a note.
     pub fn set_mode(&mut self, mode: Mode) {
+        if let Some(sandboxes) = &self.sandboxes {
+            self.ctx.sandbox = sandboxes.for_mode(mode);
+            self.policy
+                .set_sandbox_available(self.ctx.sandbox.is_some());
+        }
         self.policy.set_mode(mode);
         self.ctx.access = mode.fs_access();
         self.record(

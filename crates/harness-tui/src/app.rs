@@ -87,6 +87,8 @@ pub struct Options {
 pub enum Action {
     /// Start a turn.
     Run(TurnInput),
+    /// Switch the approval mode.
+    SetMode(Mode),
     /// Stop the running turn.
     Interrupt,
     /// Leave harness.
@@ -120,6 +122,8 @@ pub struct App {
     window_note: Option<String>,
     /// An approval waiting for the user's answer.
     prompt: Option<Prompt>,
+    /// The mode chosen while a turn runs, to switch to when it ends.
+    pending_mode: Option<Mode>,
     workspace: std::path::PathBuf,
     width: usize,
 }
@@ -142,6 +146,7 @@ impl App {
             instruction_files: options.instruction_files,
             window_note: options.window_note,
             prompt: None,
+            pending_mode: None,
             workspace: options.workspace,
             width,
         }
@@ -263,6 +268,7 @@ impl App {
         match key.code {
             KeyCode::Esc if self.busy() => return Some(Action::Interrupt),
             KeyCode::Esc => return None,
+            KeyCode::BackTab => return self.cycle_mode(),
             _ => {}
         }
         match self.editor.key(key) {
@@ -271,6 +277,32 @@ impl App {
             Edit::Ignored => {}
         }
         None
+    }
+
+    /// Shift+Tab: the next of plan, ask and auto, now, or when the running turn ends.
+    fn cycle_mode(&mut self) -> Option<Action> {
+        let next = next_mode(self.pending_mode.unwrap_or(self.mode));
+        if self.busy() {
+            self.pending_mode = (next != self.mode).then_some(next);
+            return None;
+        }
+        self.switch_mode(next)
+    }
+
+    fn switch_mode(&mut self, mode: Mode) -> Option<Action> {
+        self.mode = mode;
+        self.transcript
+            .push_note(&format!("switched to {mode} mode"), self.width);
+        Some(Action::SetMode(mode))
+    }
+
+    /// The mode chosen during the turn that just ended, to switch to now.
+    pub fn take_pending_mode(&mut self) -> Option<Action> {
+        if self.busy() {
+            return None;
+        }
+        let mode = self.pending_mode.take()?;
+        self.switch_mode(mode)
     }
 
     /// Ctrl+C: interrupts a running turn, or clears the input; pressed again within
@@ -435,13 +467,20 @@ impl App {
 
     /// The status line.
     fn status(&self) -> Line<'static> {
-        status::status_line(
+        let mut line = status::status_line(
             &self.model,
             self.mode,
             &self.context,
             &self.totals,
             &self.theme(),
-        )
+        );
+        if let Some(next) = self.pending_mode {
+            line.spans.push(Span::styled(
+                format!(" · {next} mode after this turn"),
+                self.theme().accent(),
+            ));
+        }
+        line
     }
 
     /// The live region's lines, at most `rows`, and where the cursor is in them (none while an
@@ -485,5 +524,15 @@ impl App {
             (cursor.y as usize + top).saturating_sub(skip) as u16,
         );
         (lines.split_off(skip), Some(cursor))
+    }
+}
+
+/// The mode Shift+Tab switches to from `mode`: plan, ask and auto in turn. From read-only it
+/// goes to ask, and from full-access to plan; it never goes to either.
+pub fn next_mode(mode: Mode) -> Mode {
+    match mode {
+        Mode::Plan | Mode::ReadOnly => Mode::Ask,
+        Mode::Ask => Mode::Auto,
+        Mode::Auto | Mode::FullAccess => Mode::Plan,
     }
 }

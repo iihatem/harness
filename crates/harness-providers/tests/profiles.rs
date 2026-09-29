@@ -164,6 +164,13 @@ fn a_profile_gives_the_request_options() {
             max_output_tokens: Some(8_000),
             temperature: Some(0.3),
             reasoning_effort: Some("high".into()),
+            local: false,
         }
+    );
+    // Ruling on review A M7: a local model's requests say so, and wait longer for a reply.
+    assert!(
+        resolve("ollama/qwen3-coder:30b", true, &mine)
+            .request_options()
+            .local
     );
 }

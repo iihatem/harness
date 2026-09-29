@@ -125,6 +125,64 @@ async fn a_model_ollama_does_not_have_gets_one_message() {
     .unwrap();
 }
 
+// Ruling on review A M7: a local server may take 30 minutes to start its reply (a long prompt on
+// a CPU), and Ctrl+C still ends that wait at once. The server sends its headers, then nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_c_ends_the_wait_for_a_slow_local_server() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (asked, request_arrived) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let _ = socket.read(&mut [0; 65_536]);
+        let _ = socket.write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+        );
+        let _ = asked.send(());
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    });
+    let env = Env::new(&format!(
+        "model = \"mock/slow\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n"
+    ));
+    let mut child = std::process::Command::new(BIN)
+        .args(["ask", "hi"])
+        .current_dir(env.ws.path())
+        .env("HARNESS_HOME", env.home.path())
+        .env("HARNESS_CREDENTIAL_STORE", "file")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // The request arrived, so the SIGINT handler, installed first, is live.
+    let arrived = tokio::task::spawn_blocking(move || {
+        request_arrived.recv_timeout(std::time::Duration::from_secs(10))
+    })
+    .await
+    .unwrap();
+    if arrived.is_err() {
+        let _ = child.kill();
+        panic!("the server never got the request");
+    }
+    // Waiting, well within the first 30 minutes.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .unwrap();
+    let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
 // Decision 14: continuing a conversation held on local models with a hosted model says nothing
 // about it (the behaviour before P4); harness does not flag it.
 #[tokio::test(flavor = "multi_thread")]

@@ -36,6 +36,7 @@ impl ModelProfile {
             max_output_tokens: self.max_output_tokens,
             temperature: self.temperature,
             reasoning_effort: self.reasoning_effort.clone(),
+            local: self.local,
         }
     }
 }

@@ -50,6 +50,9 @@ pub struct RequestOptions {
     pub temperature: Option<f64>,
     /// For models that reason: `minimal`, `low`, `medium` or `high`, as the provider names it.
     pub reasoning_effort: Option<String>,
+    /// Whether the model runs on a server of the user's own (its profile's `local`), which may
+    /// take long to start a reply: it may load the model and read a long prompt on a CPU first.
+    pub local: bool,
 }
 
 /// Everything a provider needs for one model call.

@@ -561,6 +561,7 @@ async fn the_configured_request_options_reach_the_provider() {
         max_output_tokens: Some(1000),
         temperature: Some(0.3),
         reasoning_effort: Some("low".into()),
+        ..RequestOptions::default()
     };
     agent.config_mut().request = options.clone();
     run(&mut agent, "hi").await;

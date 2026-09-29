@@ -593,6 +593,7 @@ fn profile_options_reach_the_request() {
         max_output_tokens: Some(4096),
         temperature: Some(0.2),
         reasoning_effort: Some("high".into()),
+        ..RequestOptions::default()
     };
     let body = request_body(&req);
     assert_eq!(body["max_tokens"], 4096);

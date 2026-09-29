@@ -247,6 +247,7 @@ fn profile_options_reach_the_chat_request() {
             max_output_tokens: Some(2048),
             temperature: Some(0.2),
             reasoning_effort: Some("low".into()),
+            ..RequestOptions::default()
         },
         ..plain
     };

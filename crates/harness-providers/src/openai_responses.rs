@@ -437,7 +437,11 @@ impl Provider for OpenAiResponses {
                     drop_summary(&mut body);
                     send(&body).await
                 };
-                sse::events(response, ResponsesStreamParser::default())
+                sse::events(
+                    response,
+                    ResponsesStreamParser::default(),
+                    request.options.local,
+                )
             }
             #[cfg(feature = "chatgpt-login")]
             Auth::ChatGpt(auth) => {
@@ -465,7 +469,8 @@ impl Provider for OpenAiResponses {
                     }
                     Ok(second)
                 };
-                sse::events(response, ResponsesStreamParser::default())
+                // ChatGPT's backend is hosted.
+                sse::events(response, ResponsesStreamParser::default(), false)
             }
         }
     }

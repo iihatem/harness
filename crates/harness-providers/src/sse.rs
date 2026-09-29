@@ -21,50 +21,103 @@ pub trait EventParser: Send + 'static {
     }
 }
 
-/// How long a response may send nothing before the server counts as no longer responding. The
-/// wait for the response to start is not counted: a local server may first load the model.
+/// How long a response may send nothing, once its first data came, before the server counts as
+/// no longer responding.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a hosted provider may take, from the request, to send its reply's first data.
+pub const FIRST_DATA_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a local server may take: it may first load the model, and read a long prompt on a
+/// CPU.
+pub const LOCAL_FIRST_DATA_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// How long a response may keep the reader waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Waits {
+    /// For the first data, from the request on, headers included.
+    first: Duration,
+    /// Between pieces of data after that.
+    idle: Duration,
+}
+
+impl Waits {
+    /// The waits for a local server (`local`, as the model's profile says) or a hosted provider.
+    fn for_server(local: bool) -> Waits {
+        Waits {
+            first: if local {
+                LOCAL_FIRST_DATA_TIMEOUT
+            } else {
+                FIRST_DATA_TIMEOUT
+            },
+            idle: IDLE_TIMEOUT,
+        }
+    }
+}
 
 /// Awaits `response`, then streams its events through `parser`. An error status ends the stream
-/// with [`ProviderError::Http`]; a stream that ends before the reply finished, or that sends
-/// nothing for [`IDLE_TIMEOUT`], with [`ProviderError::Network`].
+/// with [`ProviderError::Http`]; a stream that ends before the reply finished, or that keeps the
+/// reader waiting too long, with [`ProviderError::Network`]: one that sends no data within
+/// [`FIRST_DATA_TIMEOUT`] of the request ([`LOCAL_FIRST_DATA_TIMEOUT`] for a `local` server), or
+/// nothing for [`IDLE_TIMEOUT`] after that. Any data counts, a keep-alive comment included.
 pub fn events<P: EventParser>(
     response: impl Future<Output = Result<reqwest::Response, ProviderError>> + Send + 'static,
     parser: P,
+    local: bool,
 ) -> ProviderStream {
-    events_within(response, parser, IDLE_TIMEOUT)
+    events_within(response, parser, Waits::for_server(local))
 }
 
 /// Why reading a response's body stopped.
 enum Read {
+    /// No data came within the first wait.
+    NoStart,
     /// Nothing arrived for the idle limit.
     Idle,
     Failed(reqwest::Error),
 }
 
-/// [`events`], with `idle` as the idle limit.
+/// [`events`], with these `waits`.
 fn events_within<P: EventParser>(
     response: impl Future<Output = Result<reqwest::Response, ProviderError>> + Send + 'static,
     mut parser: P,
-    idle: Duration,
+    waits: Waits,
 ) -> ProviderStream {
+    let no_start = move || {
+        ProviderError::Network(format!(
+            "the server did not start its reply within {}",
+            duration(waits.first)
+        ))
+    };
     // The if/else keeps `response` used within one branch: `http_error` takes it by value.
     Box::pin(async_stream::try_stream! {
-        let response = response.await?;
+        // The first wait runs from the request on: the headers can be what is slow.
+        let first = tokio::time::Instant::now() + waits.first;
+        let response = tokio::time::timeout_at(first, response)
+            .await
+            .map_err(|_| no_start())??;
         if response.status().is_success() {
             let mut body = response.bytes_stream();
-            // Each wait for bytes is limited, not the whole reply.
+            // Each wait for data is limited, not the whole reply: until the first data, to what is
+            // left of the first wait; after it, to the idle limit.
             let chunks = async_stream::stream! {
+                let mut started = false;
                 loop {
-                    match tokio::time::timeout(idle, body.next()).await {
-                        Ok(Some(Ok(chunk))) => yield Ok(chunk),
+                    let next = if started {
+                        tokio::time::timeout(waits.idle, body.next()).await
+                    } else {
+                        tokio::time::timeout_at(first, body.next()).await
+                    };
+                    match next {
+                        Ok(Some(Ok(chunk))) => {
+                            started = true;
+                            yield Ok(chunk);
+                        }
                         Ok(Some(Err(e))) => {
                             yield Err(Read::Failed(e));
                             break;
                         }
                         Ok(None) => break,
                         Err(_) => {
-                            yield Err(Read::Idle);
+                            yield Err(if started { Read::Idle } else { Read::NoStart });
                             break;
                         }
                     }
@@ -73,9 +126,10 @@ fn events_within<P: EventParser>(
             let mut events = Box::pin(chunks).eventsource();
             while let Some(event) = events.next().await {
                 let event = event.map_err(|e| match e {
+                    EventStreamError::Transport(Read::NoStart) => no_start(),
                     EventStreamError::Transport(Read::Idle) => ProviderError::Network(format!(
                         "the server stopped responding: nothing arrived for {}",
-                        duration(idle)
+                        duration(waits.idle)
                     )),
                     EventStreamError::Transport(Read::Failed(e)) => network_error(e),
                     EventStreamError::Utf8(e) => ProviderError::Network(e.to_string()),
@@ -104,10 +158,14 @@ fn events_within<P: EventParser>(
     })
 }
 
-/// `duration` as a person reads it: in seconds, or in milliseconds below one.
+/// `duration` as a person reads it: in whole minutes from ten minutes on, in seconds from one
+/// second, and in milliseconds below that.
 fn duration(duration: Duration) -> String {
-    if duration >= Duration::from_secs(1) {
-        format!("{} s", duration.as_secs())
+    let secs = duration.as_secs();
+    if secs >= 600 && secs.is_multiple_of(60) {
+        format!("{} min", secs / 60)
+    } else if secs >= 1 {
+        format!("{secs} s")
     } else {
         format!("{} ms", duration.as_millis())
     }
@@ -224,11 +282,38 @@ mod tests {
         url
     }
 
-    async fn collect(url: &str, idle: Duration) -> Vec<Result<ProviderEvent, ProviderError>> {
+    async fn collect(url: &str, waits: Waits) -> Vec<Result<ProviderEvent, ProviderError>> {
         let request = reqwest::Client::new().get(url);
-        events_within(send(request), Lines::default(), idle)
+        events_within(send(request), Lines::default(), waits)
             .collect()
             .await
+    }
+
+    fn waits(first: Duration, idle: Duration) -> Waits {
+        Waits { first, idle }
+    }
+
+    fn network_message(events: &[Result<ProviderEvent, ProviderError>]) -> String {
+        match events.last() {
+            Some(Err(error @ ProviderError::Network(message))) => {
+                assert!(error.is_retryable());
+                message.clone()
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // Ruling on review A M7: a hosted provider starts its reply within 300 s, a local server
+    // (one that may load the model and read a long prompt on a CPU first) within 30 minutes;
+    // after that, 300 s without data means the server stopped.
+    #[test]
+    fn a_local_server_gets_longer_to_start_its_reply() {
+        let hosted = Waits::for_server(false);
+        let local = Waits::for_server(true);
+        assert_eq!(hosted.first, Duration::from_secs(300));
+        assert_eq!(local.first, Duration::from_secs(30 * 60));
+        assert_eq!(hosted.idle, Duration::from_secs(300));
+        assert_eq!(local.idle, Duration::from_secs(300));
     }
 
     // Review A M7: a server that stops sending without closing the connection must not hang a
@@ -237,31 +322,53 @@ mod tests {
     async fn a_server_that_stops_sending_ends_the_stream_as_a_retryable_error() {
         let url = serve(ms(0), vec![(ms(0), "one")], false).await;
         let started = Instant::now();
-        let events = collect(&url, ms(300)).await;
+        let events = collect(&url, waits(ms(5_000), ms(300))).await;
         assert_eq!(events[0], Ok(ProviderEvent::TextDelta("one".into())));
-        let error = events.last().unwrap().clone().unwrap_err();
+        let message = network_message(&events);
         assert!(
-            matches!(&error, ProviderError::Network(m) if m.contains("the server stopped responding")),
-            "{error:?}"
+            message.contains("the server stopped responding: nothing arrived for 300 ms"),
+            "{message}"
         );
-        assert!(error.is_retryable());
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
-    // The limit is on silence, not on the whole reply; and the wait for the response to start
-    // (Ollama loading a model, say) is not counted.
+    // The limit is on silence between pieces, not on the whole reply.
     #[tokio::test]
-    async fn a_slow_but_steady_stream_and_a_slow_start_are_not_cut() {
+    async fn a_slow_but_steady_stream_is_not_cut() {
         let steady = vec![
             (ms(0), "one"),
             (ms(200), "two"),
             (ms(200), "three"),
             (ms(200), "end"),
         ];
-        let url = serve(ms(700), steady, false).await;
-        let events = collect(&url, ms(500)).await;
+        let url = serve(ms(0), steady, false).await;
+        let events = collect(&url, waits(ms(2_000), ms(500))).await;
         assert!(events.iter().all(Result::is_ok), "{events:?}");
         assert_eq!(events.len(), 4, "{events:?}");
+    }
+
+    // Before the first data, only the first wait counts, from the request on, whether the server
+    // pauses before its headers (Ollama loading the model) or after them (llama.cpp reading the
+    // prompt).
+    #[tokio::test]
+    async fn the_first_data_has_a_wait_of_its_own() {
+        for (before_headers, after_headers) in [(ms(700), ms(0)), (ms(0), ms(700))] {
+            let reply = || vec![(after_headers, "one"), (ms(0), "end")];
+            // Longer than the idle limit, within the first wait: the reply comes.
+            let url = serve(before_headers, reply(), false).await;
+            let events = collect(&url, waits(ms(2_000), ms(300))).await;
+            assert!(events.iter().all(Result::is_ok), "{events:?}");
+            // Longer than the first wait: it ends, saying so.
+            let url = serve(before_headers, reply(), false).await;
+            let started = Instant::now();
+            let events = collect(&url, waits(ms(300), ms(5_000))).await;
+            let message = network_message(&events);
+            assert!(
+                message.contains("the server did not start its reply within 300 ms"),
+                "{message}"
+            );
+            assert!(started.elapsed() < ms(650), "{:?}", started.elapsed());
+        }
     }
 
     // Review A M8: a key kept in the URL's query never appears in a network error.
@@ -285,7 +392,11 @@ mod tests {
 
         // Also when the connection breaks in the middle of the reply.
         let url = serve(ms(0), vec![(ms(0), "one")], true).await;
-        let events = collect(&format!("{url}/v1?key=SECRETQ"), ms(2_000)).await;
+        let events = collect(
+            &format!("{url}/v1?key=SECRETQ"),
+            waits(ms(2_000), ms(2_000)),
+        )
+        .await;
         let error = events.last().unwrap().clone().unwrap_err();
         assert!(matches!(error, ProviderError::Network(_)), "{error:?}");
         assert!(!error.to_string().contains("SECRETQ"), "{error}");

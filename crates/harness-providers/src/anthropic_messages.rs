@@ -370,6 +370,7 @@ impl Provider for AnthropicMessages {
         if let Some(key) = &self.api_key {
             http = http.header("x-api-key", key);
         }
-        sse::events(sse::send(http), MessagesStreamParser::default())
+        let local = request.options.local;
+        sse::events(sse::send(http), MessagesStreamParser::default(), local)
     }
 }

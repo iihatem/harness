@@ -1,5 +1,5 @@
 //! Secrets harness knows, kept out of everything it writes: session files, tool-output files, the
-//! debug log, NDJSON and what it prints. They are the API keys and tokens it uses and the values
+//! debug log, NDJSON and what it prints. They are the API keys and tokens it holds and the values
 //! of environment variables whose names mark them as secrets. What the model is sent is left as
 //! it is, so a file it reads and writes back keeps its real contents.
 

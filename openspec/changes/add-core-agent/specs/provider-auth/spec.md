@@ -89,7 +89,7 @@ The system MUST NOT read, store, request, or use Claude.ai subscription credenti
 - **THEN** harness refuses it with an explanation and sends no request
 
 ### Requirement: Secrets are redacted everywhere
-The system MUST NOT write API keys, OAuth access tokens, or refresh tokens to logs, session files, tool-output files, NDJSON output, error messages, or anything else it prints. The values of environment variables whose names end in `KEY`, `TOKEN`, `SECRET` or `PASSWORD` MUST be treated as secrets too.
+The system MUST NOT write the API keys, OAuth access tokens, or refresh tokens it holds to logs, session files, tool-output files, NDJSON output, error messages, or anything else it prints, whether they appear whole in one place, in pieces across streamed deltas, or JSON-escaped inside a tool call's arguments. They are those in the environment (each configured provider's key variable included), every one in the credential file, whichever provider and profile it belongs to, and those read from the keychain or refreshed during the run; the keychain is not read only to learn keys the run does not use. The values of environment variables whose names end in `KEY`, `TOKEN`, `SECRET`, `PASSWORD` or their plurals, `PASSPHRASE`, `CREDENTIALS`, `_PASS` or `_PWD`, and the password of any URL an environment variable holds, MUST be treated as secrets too, when they are eight characters or longer.
 
 #### Scenario: Debug logging
 - **WHEN** a turn runs with `--debug` using an API key provider
@@ -98,3 +98,11 @@ The system MUST NOT write API keys, OAuth access tokens, or refresh tokens to lo
 #### Scenario: A command prints the environment
 - **WHEN** the model runs `printenv` through the `bash` tool while `OPENAI_API_KEY` is set
 - **THEN** the session file, the tool-output files and the NDJSON output show `[redacted]` in place of the key's value
+
+#### Scenario: The model repeats a key in a streamed answer
+- **WHEN** the model's streamed answer holds an API key split across several deltas
+- **THEN** the NDJSON output and the debug log show `[redacted]` in its place, and no part of the key
+
+#### Scenario: A password in a tool call
+- **WHEN** the model runs a command holding the value of `DB_PASSWORD`, which contains a quote and a backslash
+- **THEN** neither the session file, the NDJSON output, the debug log nor what harness prints on stderr contains it

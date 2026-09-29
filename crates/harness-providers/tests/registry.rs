@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use harness_config::config::{Protocol, ProviderConfig};
+use harness_providers::credentials::CredentialError;
 use harness_providers::registry::{
     ResolveError, Secrets, configured_endpoints, local_endpoints, resolve,
 };
@@ -61,6 +62,7 @@ fn reports_bad_ids_unknown_providers_and_missing_keys() {
         resolve("openrouter/m", &none, env(&[])).err(),
         Some(ResolveError::MissingKey {
             provider: "openrouter".into(),
+            profile: "default".into(),
             var: "OPENROUTER_API_KEY".into()
         })
     );
@@ -138,6 +140,7 @@ fn builtin_openai_speaks_the_responses_protocol_with_its_key() {
         resolve("openai/gpt-5", &BTreeMap::new(), env(&[])).err(),
         Some(ResolveError::MissingKey {
             provider: "openai".into(),
+            profile: "default".into(),
             var: "OPENAI_API_KEY".into()
         })
     );
@@ -170,6 +173,7 @@ fn builtin_anthropic_speaks_the_messages_protocol_with_its_key() {
         resolve("anthropic/claude-sonnet-4-5", &BTreeMap::new(), env(&[])).err(),
         Some(ResolveError::MissingKey {
             provider: "anthropic".into(),
+            profile: "default".into(),
             var: "ANTHROPIC_API_KEY".into()
         })
     );
@@ -185,6 +189,8 @@ fn builtin_anthropic_speaks_the_messages_protocol_with_its_key() {
 struct Keys {
     env: HashMap<String, String>,
     stored: HashMap<String, String>,
+    /// The profile every provider uses.
+    profile: String,
 }
 
 impl Keys {
@@ -198,6 +204,7 @@ impl Keys {
         Keys {
             env: map(env),
             stored: map(stored),
+            profile: "default".into(),
         }
     }
 }
@@ -207,8 +214,12 @@ impl Secrets for Keys {
         self.env.get(var).cloned()
     }
 
-    fn stored(&self, provider: &str) -> Option<String> {
-        self.stored.get(provider).cloned()
+    fn profile(&self, _provider: &str) -> Result<String, CredentialError> {
+        Ok(self.profile.clone())
+    }
+
+    fn stored(&self, provider: &str) -> Result<Option<String>, CredentialError> {
+        Ok(self.stored.get(provider).cloned())
     }
 }
 
@@ -249,6 +260,92 @@ fn a_missing_key_says_how_to_add_one() {
         error.to_string(),
         "provider `openai` needs an API key: set $OPENAI_API_KEY or run `harness auth add openai`"
     );
+}
+
+// Review B, M4: `harness auth add <provider>` alone stores under `default`, which does not help
+// a provider that uses another profile.
+#[test]
+fn a_missing_key_names_the_profile_in_use() {
+    let mut keys = Keys::new(&[], &[]);
+    keys.profile = "work".into();
+    let error = resolve("openai/gpt-5", &BTreeMap::new(), keys).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("`harness auth add openai --profile work`"),
+        "{error}"
+    );
+}
+
+/// A credential store that cannot be read.
+struct Damaged;
+
+impl Secrets for Damaged {
+    fn env(&self, _var: &str) -> Option<String> {
+        None
+    }
+
+    fn stored(&self, _provider: &str) -> Result<Option<String>, CredentialError> {
+        Err(CredentialError::Damaged {
+            path: "/data/credentials.json".into(),
+            at: " at line 1, column 2".into(),
+            recovery: "fix it, or delete it",
+        })
+    }
+}
+
+// Review B, M3: a store that cannot be read says so, rather than that the key is missing (with
+// advice to add one that would fail as well).
+#[test]
+fn a_store_that_cannot_be_read_is_reported_as_such() {
+    let error = resolve("openai/gpt-5", &BTreeMap::new(), Damaged).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("/data/credentials.json"), "{text}");
+    assert!(text.contains("fix it, or delete it"), "{text}");
+    assert!(
+        !matches!(error, ResolveError::MissingKey { .. }),
+        "{error:?}"
+    );
+    // Listing models goes on without that provider.
+    assert!(configured_endpoints(&BTreeMap::new(), Damaged).is_empty());
+}
+
+// Review B, M5: a Claude subscription token is never a valid key for any provider, so it is
+// refused whatever the protocol, even behind a byte-order mark or spaces.
+#[test]
+fn claude_subscription_tokens_are_refused_for_every_provider() {
+    let none = BTreeMap::new();
+    for token in [
+        "sk-ant-oat01-abc",
+        "\u{feff}sk-ant-oat01-abc",
+        " \tsk-ant-oat01-abc\n",
+    ] {
+        assert_eq!(
+            resolve(
+                "openrouter/some/model",
+                &none,
+                env(&[("OPENROUTER_API_KEY", token)])
+            )
+            .err(),
+            Some(ResolveError::SubscriptionToken {
+                provider: "openrouter".into()
+            }),
+            "{token:?}"
+        );
+        let stored = Keys::new(&[], &[("openai", token)]);
+        assert!(
+            matches!(
+                resolve("openai/gpt-5", &none, stored),
+                Err(ResolveError::SubscriptionToken { .. })
+            ),
+            "{token:?}"
+        );
+        let found = configured_endpoints(&none, env(&[("OPENROUTER_API_KEY", token)]));
+        assert!(found.is_empty(), "{found:?}");
+    }
+    assert!(harness_providers::registry::is_claude_subscription_token(
+        "\u{feff}sk-ant-oat01-abc"
+    ));
 }
 
 // Spec: "A subscription token in the environment".

@@ -4,7 +4,6 @@
 
 use std::io::{BufRead, IsTerminal, Read};
 
-use harness_config::config::Protocol;
 use harness_providers::{
     credentials::{self, CredentialError},
     registry::{self, BUILTIN_PROVIDERS, ResolveError},
@@ -17,8 +16,8 @@ use crate::{
 
 /// What a provider needs to be used.
 enum Needs {
-    /// An API key, sent over this protocol.
-    Key(Protocol),
+    /// An API key.
+    Key,
     /// Signing in (`harness login`).
     SignIn,
     /// Nothing: a local server.
@@ -33,13 +32,13 @@ fn needs(setup: &Setup, provider: &str) -> Option<Needs> {
     }
     if let Some(cfg) = setup.config.providers.get(provider) {
         return Some(match cfg.api_key_env {
-            Some(_) => Needs::Key(cfg.protocol),
+            Some(_) => Needs::Key,
             None => Needs::Nothing,
         });
     }
     let builtin = BUILTIN_PROVIDERS.iter().find(|b| b.name == provider)?;
     Some(match builtin.key_env {
-        Some(_) => Needs::Key(builtin.protocol),
+        Some(_) => Needs::Key,
         None => Needs::Nothing,
     })
 }
@@ -79,7 +78,7 @@ pub fn add(provider: &str, profile: &str) -> u8 {
     if let Err(code) = check_names(provider, profile) {
         return code;
     }
-    let protocol = match needs(&setup, provider) {
+    match needs(&setup, provider) {
         None => return unknown(provider),
         Some(Needs::SignIn) => {
             eprintln!(
@@ -93,8 +92,8 @@ pub fn add(provider: &str, profile: &str) -> u8 {
             );
             return 2;
         }
-        Some(Needs::Key(protocol)) => protocol,
-    };
+        Some(Needs::Key) => {}
+    }
     let key = match read_key(provider) {
         Ok(key) => key,
         Err(e) => {
@@ -106,7 +105,8 @@ pub fn add(provider: &str, profile: &str) -> u8 {
         eprintln!("error: no API key was given on standard input");
         return 2;
     }
-    if protocol == Protocol::AnthropicMessages && registry::is_claude_subscription_token(&key) {
+    // Never a valid key for any provider, whatever its protocol.
+    if registry::is_claude_subscription_token(&key) {
         let refused = ResolveError::SubscriptionToken {
             provider: provider.to_string(),
         };
@@ -208,7 +208,7 @@ fn read_key(provider: &str) -> std::io::Result<String> {
     };
     Ok(text
         .lines()
-        .map(str::trim)
+        .map(|line| line.trim_matches(|c: char| c == '\u{feff}' || c.is_whitespace()))
         .find(|line| !line.is_empty())
         .unwrap_or_default()
         .to_string())

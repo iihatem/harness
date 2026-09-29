@@ -340,3 +340,47 @@ fn chatgpt_models_need_a_signed_in_account() {
     let error = resolve("chatgpt/gpt-5.5", &none, Stored(credentials)).unwrap_err();
     assert!(error.to_string().contains("--profile work"), "{error}");
 }
+
+// Review B, I3 (and C, M3): a damaged `accounts.toml` must not quietly send the requests as the
+// default profile's account.
+#[test]
+fn a_damaged_accounts_file_never_falls_back_to_the_default_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(Credentials::with_keychain(dir.path(), None));
+    credentials
+        .set("chatgpt", "default", &tokens("at-default", "rt").to_json())
+        .unwrap();
+    credentials
+        .set("chatgpt", "work", &tokens("at-work", "rt").to_json())
+        .unwrap();
+    credentials.use_profile("chatgpt", "work").unwrap();
+    std::fs::write(
+        dir.path().join("accounts.toml"),
+        "[active]\nchatgpt = work\n",
+    )
+    .unwrap();
+    let error =
+        resolve("chatgpt/gpt-5.5", &BTreeMap::new(), Stored(credentials)).expect_err("an error");
+    let text = error.to_string();
+    assert!(text.contains("accounts.toml"), "{text}");
+    assert!(text.contains("line 2"), "{text}");
+    assert!(
+        !matches!(error, ResolveError::NotSignedIn { .. }),
+        "{error:?}"
+    );
+}
+
+// Review C, M3: nor does a damaged credentials file read as "not signed in".
+#[test]
+fn a_damaged_credentials_file_is_not_taken_for_a_sign_out() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("credentials.json"), "{not json").unwrap();
+    let credentials = Arc::new(Credentials::with_keychain(dir.path(), None));
+    let error =
+        resolve("chatgpt/gpt-5.5", &BTreeMap::new(), Stored(credentials)).expect_err("an error");
+    assert!(error.to_string().contains("credentials.json"), "{error}");
+    assert!(
+        !matches!(error, ResolveError::NotSignedIn { .. }),
+        "{error:?}"
+    );
+}

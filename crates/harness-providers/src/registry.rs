@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use harness_core::redact::Redactor;
 
-use crate::credentials::Credentials;
+use crate::credentials::{CredentialError, Credentials, DEFAULT_PROFILE};
 
 use harness_config::config::{Protocol, ProviderConfig};
 use harness_core::provider::Provider;
@@ -96,9 +96,17 @@ pub enum ResolveError {
     #[error("unknown provider `{0}`; define it under [providers.{0}] in config.toml")]
     UnknownProvider(String),
     #[error(
-        "provider `{provider}` needs an API key: set ${var} or run `harness auth add {provider}`"
+        "provider `{provider}` needs an API key: set ${var} or run `{}`", auth_add_command(.provider, .profile)
     )]
-    MissingKey { provider: String, var: String },
+    MissingKey {
+        provider: String,
+        /// The profile the provider uses, which the key is looked for under.
+        profile: String,
+        var: String,
+    },
+    /// The credential store could not be read: the file, what is wrong, and how to recover.
+    #[error("cannot read the stored credentials for `{provider}`: {message}")]
+    Store { provider: String, message: String },
     #[error(
         "the key for `{provider}` is a Claude subscription token, which only Claude Code may use; harness needs an Anthropic API key (from console.anthropic.com)"
     )]
@@ -110,11 +118,28 @@ pub enum ResolveError {
 }
 
 /// The command that signs in to `provider` under `profile`.
-fn login_command(provider: &str, profile: &str) -> String {
-    if profile == crate::credentials::DEFAULT_PROFILE {
-        format!("harness login {provider}")
+pub fn login_command(provider: &str, profile: &str) -> String {
+    with_profile(&format!("harness login {provider}"), profile)
+}
+
+/// The command that stores a key for `provider` under `profile`.
+pub fn auth_add_command(provider: &str, profile: &str) -> String {
+    with_profile(&format!("harness auth add {provider}"), profile)
+}
+
+/// `command`, with `--profile <profile>` unless the profile is `default`.
+fn with_profile(command: &str, profile: &str) -> String {
+    if profile == DEFAULT_PROFILE {
+        command.to_string()
     } else {
-        format!("harness login {provider} --profile {profile}")
+        format!("{command} --profile {profile}")
+    }
+}
+
+fn store_error(provider: &str, error: CredentialError) -> ResolveError {
+    ResolveError::Store {
+        provider: provider.to_string(),
+        message: error.to_string(),
     }
 }
 
@@ -122,9 +147,13 @@ fn login_command(provider: &str, profile: &str) -> String {
 /// A closure over environment variables is a `Secrets` with nothing stored.
 pub trait Secrets {
     fn env(&self, var: &str) -> Option<String>;
+    /// The account profile `provider` uses.
+    fn profile(&self, _provider: &str) -> Result<String, CredentialError> {
+        Ok(DEFAULT_PROFILE.to_string())
+    }
     /// The key stored for `provider`'s active profile.
-    fn stored(&self, _provider: &str) -> Option<String> {
-        None
+    fn stored(&self, _provider: &str) -> Result<Option<String>, CredentialError> {
+        Ok(None)
     }
 
     /// The credential store, for providers that sign in (`chatgpt`).
@@ -145,24 +174,32 @@ impl<F: Fn(&str) -> Option<String>> Secrets for F {
     }
 }
 
-/// Whether `key` is a Claude subscription (OAuth) token rather than an API key.
+/// Whether `key` is a Claude subscription (OAuth) token rather than an API key, even behind a
+/// byte-order mark or whitespace.
 pub fn is_claude_subscription_token(key: &str) -> bool {
-    key.trim_start().starts_with("sk-ant-oat")
+    key.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace())
+        .starts_with("sk-ant-oat")
 }
 
 /// The key for provider `name`, whose key is in the environment variable `key_env`: that
 /// variable, else the stored key. A provider without a key variable takes no key, and nothing
 /// stored is looked up for it.
-fn api_key(name: &str, key_env: Option<&str>, secrets: &impl Secrets) -> Option<String> {
+fn api_key(
+    name: &str,
+    key_env: Option<&str>,
+    secrets: &impl Secrets,
+) -> Result<Option<String>, CredentialError> {
     // What is stored for `chatgpt` is a sign-in, which is never sent as a key.
     if name == CHATGPT {
-        return None;
+        return Ok(None);
     }
-    let var = key_env?;
-    secrets
-        .env(var)
-        .filter(|v| !v.is_empty())
-        .or_else(|| secrets.stored(name).filter(|v| !v.is_empty()))
+    let Some(var) = key_env else {
+        return Ok(None);
+    };
+    if let Some(key) = secrets.env(var).filter(|v| !v.is_empty()) {
+        return Ok(Some(key));
+    }
+    Ok(secrets.stored(name)?.filter(|v| !v.is_empty()))
 }
 
 /// A ready-to-use provider for one model id.
@@ -214,20 +251,20 @@ pub fn resolve(
     } else {
         return Err(ResolveError::UnknownProvider(name.to_string()));
     };
-    let api_key = api_key(name, key_env.as_deref(), &secrets);
+    let api_key = api_key(name, key_env.as_deref(), &secrets).map_err(|e| store_error(name, e))?;
     if let (None, Some(var)) = (&api_key, key_env) {
         return Err(ResolveError::MissingKey {
             provider: name.to_string(),
+            profile: secrets.profile(name).map_err(|e| store_error(name, e))?,
             var,
         });
     }
     if let (Some(redactor), Some(key)) = (secrets.redactor(), &api_key) {
         redactor.add(key);
     }
-    // Claude Free/Pro/Max credentials may only be used by Claude Code itself.
-    if protocol == Protocol::AnthropicMessages
-        && api_key.as_deref().is_some_and(is_claude_subscription_token)
-    {
+    // Claude Free/Pro/Max credentials may only be used by Claude Code itself, and are never a
+    // valid key for any other provider.
+    if api_key.as_deref().is_some_and(is_claude_subscription_token) {
         return Err(ResolveError::SubscriptionToken {
             provider: name.to_string(),
         });
@@ -261,10 +298,13 @@ fn chatgpt(model_id: &str, model: &str, secrets: &impl Secrets) -> Result<Resolv
         oauth::{ISSUER, OAuth},
     };
     let credentials = secrets.credentials();
-    let profile = credentials
-        .as_ref()
-        .and_then(|c| c.active_profile(CHATGPT).ok())
-        .unwrap_or_else(|| crate::credentials::DEFAULT_PROFILE.to_string());
+    // A store that cannot be read is an error: never the default profile's account instead.
+    let profile = match &credentials {
+        Some(c) => c
+            .active_profile(CHATGPT)
+            .map_err(|e| store_error(CHATGPT, e))?,
+        None => DEFAULT_PROFILE.to_string(),
+    };
     let not_signed_in = || ResolveError::NotSignedIn {
         provider: CHATGPT.to_string(),
         profile: profile.clone(),
@@ -274,8 +314,7 @@ fn chatgpt(model_id: &str, model: &str, secrets: &impl Secrets) -> Result<Resolv
         .env("HARNESS_CHATGPT_ISSUER")
         .unwrap_or_else(|| ISSUER.to_string());
     let mut auth = ChatGptAuth::load(credentials, &profile, OAuth::new(&issuer))
-        .ok()
-        .flatten()
+        .map_err(|e| store_error(CHATGPT, e))?
         .ok_or_else(not_signed_in)?;
     if let Some(redactor) = secrets.redactor() {
         auth = auth.with_redactor(redactor);
@@ -327,7 +366,7 @@ pub fn configured_endpoints(
         .iter()
         .filter(|(name, _)| *name != CHATGPT)
         .filter_map(|(name, cfg)| {
-            let api_key = api_key(name, cfg.api_key_env.as_deref(), &secrets);
+            let api_key = listed_key(name, cfg.api_key_env.as_deref(), &secrets)?;
             if cfg.api_key_env.is_some() && api_key.is_none() {
                 return None;
             }
@@ -347,7 +386,7 @@ pub fn configured_endpoints(
         if builtin.key_env.is_none() {
             continue;
         }
-        if let Some(api_key) = api_key(builtin.name, builtin.key_env, &secrets) {
+        if let Some(Some(api_key)) = listed_key(builtin.name, builtin.key_env, &secrets) {
             endpoints.push(Endpoint {
                 provider: builtin.name.to_string(),
                 base_url: builtin.base_url.to_string(),
@@ -358,11 +397,26 @@ pub fn configured_endpoints(
     }
     // A Claude subscription token is never sent anywhere, not even to list models.
     endpoints.retain(|e| {
-        e.protocol != Protocol::AnthropicMessages
-            || !e
-                .api_key
-                .as_deref()
-                .is_some_and(is_claude_subscription_token)
+        !e.api_key
+            .as_deref()
+            .is_some_and(is_claude_subscription_token)
     });
     endpoints
+}
+
+/// The key a listing of `name`'s models is sent with, or `None` to leave `name` out: a store
+/// that cannot be read leaves it out, with a warning.
+fn listed_key(name: &str, key_env: Option<&str>, secrets: &impl Secrets) -> Option<Option<String>> {
+    match api_key(name, key_env, secrets) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            if let Some(credentials) = secrets.credentials() {
+                credentials.warn(format!(
+                    "leaving out {name}'s models: {}",
+                    store_error(name, e)
+                ));
+            }
+            None
+        }
+    }
 }

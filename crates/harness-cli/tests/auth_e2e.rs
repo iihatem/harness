@@ -153,11 +153,12 @@ async fn profiles_are_chosen_with_auth_use_and_removed_with_logout() {
             .stdout(contains(
                 "Removed the stored credentials for mock (profile work)",
             ));
+        // Review B, M4: the hint stores under the profile in use, not under `default`.
         env.cmd()
             .args(["--model", "mock/m", "ask", "hi"])
             .assert()
             .code(2)
-            .stderr(contains("harness auth add mock"));
+            .stderr(contains("`harness auth add mock --profile work`"));
         env.cmd()
             .args(["logout", "mock", "--profile", "work"])
             .assert()
@@ -273,4 +274,23 @@ fn a_config_cannot_define_the_chatgpt_provider() {
             .stderr(contains("reserved for ChatGPT sign-in"));
     }
     assert!(!env.credentials().exists());
+}
+
+// Review B, M5: a Claude subscription token is refused for every provider, whatever its
+// protocol, even behind a byte-order mark.
+#[test]
+fn auth_add_refuses_claude_subscription_tokens_for_every_provider() {
+    let env = Env::new("http://127.0.0.1:9", "");
+    for token in ["sk-ant-oat01-CANARY\n", "\u{feff}sk-ant-oat01-CANARY\n"] {
+        for provider in ["openrouter", "mock"] {
+            env.add(provider, None, token)
+                .code(2)
+                .stderr(contains("Claude subscription token"));
+        }
+    }
+    assert!(!env.credentials().exists());
+    // A key is stored without the mark.
+    env.add("mock", None, "\u{feff}sk-marked\n").success();
+    let stored = std::fs::read_to_string(env.credentials()).unwrap();
+    assert!(stored.contains("\"sk-marked\""), "{stored:?}");
 }

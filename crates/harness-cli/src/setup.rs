@@ -6,7 +6,10 @@ use harness_config::{
     trust::TrustStore,
 };
 use harness_core::redact::Redactor;
-use harness_providers::{credentials::Credentials, registry::Secrets};
+use harness_providers::{
+    credentials::{CredentialError, Credentials},
+    registry::Secrets,
+};
 
 /// Everything a command needs about where it runs.
 pub struct Setup {
@@ -44,17 +47,12 @@ impl Secrets for Keys<'_> {
         env(var)
     }
 
-    fn stored(&self, provider: &str) -> Option<String> {
-        match self.credentials.active(provider) {
-            Ok(key) => key,
-            Err(e) => {
-                eprintln!(
-                    "warning: cannot read the stored credentials: {}",
-                    crate::term::terminal_safe(&e.to_string())
-                );
-                None
-            }
-        }
+    fn profile(&self, provider: &str) -> Result<String, CredentialError> {
+        self.credentials.active_profile(provider)
+    }
+
+    fn stored(&self, provider: &str) -> Result<Option<String>, CredentialError> {
+        self.credentials.active(provider)
     }
 
     fn credentials(&self) -> Option<Arc<Credentials>> {

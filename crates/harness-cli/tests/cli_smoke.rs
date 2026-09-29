@@ -151,3 +151,12 @@ fn session_flags_with_the_credential_commands_are_refused() {
     }
     assert!(!home.path().join("data/credentials.json").exists());
 }
+
+#[test]
+fn help_lists_the_debug_flag() {
+    Command::new(env!("CARGO_BIN_EXE_harness"))
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(contains("--debug").and(contains("secrets redacted")));
+}

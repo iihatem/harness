@@ -9,6 +9,7 @@ pub mod message;
 pub mod output;
 pub mod permission;
 pub mod provider;
+pub mod redact;
 pub mod retry;
 pub mod session;
 pub mod subprocess;

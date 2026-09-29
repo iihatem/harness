@@ -5,6 +5,7 @@ use harness_config::{
     paths::Paths,
     trust::TrustStore,
 };
+use harness_core::redact::Redactor;
 use harness_providers::{credentials::Credentials, registry::Secrets};
 
 /// Everything a command needs about where it runs.
@@ -16,6 +17,9 @@ pub struct Setup {
     pub trust: TrustStore,
     /// Stored API keys and sign-in tokens.
     pub credentials: Arc<Credentials>,
+    /// The secrets nothing harness writes may hold: those in the environment from the start, and
+    /// each key or token a provider is given.
+    pub redactor: Arc<Redactor>,
 }
 
 impl Setup {
@@ -23,6 +27,7 @@ impl Setup {
     pub fn keys(&self) -> Keys<'_> {
         Keys {
             credentials: &self.credentials,
+            redactor: &self.redactor,
         }
     }
 }
@@ -31,6 +36,7 @@ impl Setup {
 #[derive(Clone, Copy)]
 pub struct Keys<'a> {
     credentials: &'a Arc<Credentials>,
+    redactor: &'a Arc<Redactor>,
 }
 
 impl Secrets for Keys<'_> {
@@ -54,6 +60,10 @@ impl Secrets for Keys<'_> {
     fn credentials(&self) -> Option<Arc<Credentials>> {
         Some(self.credentials.clone())
     }
+
+    fn redactor(&self) -> Option<Arc<Redactor>> {
+        Some(self.redactor.clone())
+    }
 }
 
 /// Loads paths and configuration. Errors are user-facing messages (exit code 2).
@@ -69,12 +79,15 @@ pub fn load() -> Result<Setup, String> {
         eprintln!("warning: {}", crate::term::terminal_safe(warning));
     }
     let credentials = Arc::new(Credentials::open(&paths.data_dir, env));
+    let redactor = Arc::new(Redactor::default());
+    redactor.add_env(std::env::vars());
     Ok(Setup {
         paths,
         config,
         workspace,
         trust,
         credentials,
+        redactor,
     })
 }
 

@@ -11,6 +11,7 @@ use harness_core::{
     engine::{EngineConfig, PermissionEngine, RuleSet},
     event::{AgentEvent, TurnEndReason},
     permission::{FsAccess, Mode},
+    redact::Redactor,
     tool::{CommandSandbox, ToolContext},
 };
 use harness_providers::{
@@ -32,6 +33,7 @@ pub async fn run(
     session: crate::sessions::Choice,
     prompt_text: String,
     json: bool,
+    debug: bool,
 ) -> u8 {
     // Registered as the very first thing this function does (a plain synchronous call, not an
     // awaited future): once it returns, the OS delivers SIGINT to tokio's signal driver instead of
@@ -119,6 +121,20 @@ pub async fn run(
             .unwrap_or(0),
         std::process::id()
     );
+    let log = if debug {
+        match open_log(&setup.paths.state_dir, &run_id) {
+            Ok((file, path)) => {
+                eprintln!("debug log: {}", terminal_safe(&path.display().to_string()));
+                Some(file)
+            }
+            Err(e) => {
+                eprintln!("warning: cannot write the debug log: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let output_dir = setup.paths.state_dir.join("tool-output").join(run_id);
     let sandbox_disabled_by_env =
         std::env::var("HARNESS_SANDBOX").as_deref() == Ok("none") && mode != Mode::FullAccess;
@@ -254,11 +270,18 @@ pub async fn run(
         config,
         ctx,
     )
+    .with_redactor(setup.redactor.clone())
     .with_session(session)
     .with_checkpoints(checkpoints);
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let renderer = tokio::spawn(render(rx, json, cancel.clone()));
+    let renderer = tokio::spawn(render(
+        rx,
+        json,
+        cancel.clone(),
+        setup.redactor.clone(),
+        log,
+    ));
     let reason = agent.run_turn(turn, &tx, cancel).await;
     drop(tx);
     let (final_text, blocked) = renderer.await.unwrap_or_default();
@@ -461,7 +484,28 @@ async fn with_piped_stdin(prompt_text: String, cancel: CancellationToken) -> Std
     }
 }
 
-/// Prints events as they arrive. Returns the last assistant text and whether an action was blocked.
+/// Opens `<state>/logs/<run_id>.log` for `--debug`, readable only by its owner.
+fn open_log(
+    state_dir: &Path,
+    run_id: &str,
+) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let dir = state_dir.join("logs");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    let path = dir.join(format!("{run_id}.log"));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    Ok((file, path))
+}
+
+/// Prints events as they arrive, and writes them to the debug `log`, with every secret
+/// `redactor` knows replaced. Returns the last assistant text and whether an action was blocked.
 ///
 /// If stdout is closed (e.g. the reader end of a pipe exits early), writing must not panic: it sets
 /// `stdout_broken` and cancels the run so it stops promptly, but keeps draining events (so `blocked`
@@ -470,6 +514,8 @@ async fn render(
     mut rx: mpsc::UnboundedReceiver<AgentEvent>,
     json: bool,
     cancel: CancellationToken,
+    redactor: Arc<Redactor>,
+    mut log: Option<std::fs::File>,
 ) -> (String, bool) {
     let mut last_text = String::new();
     let mut blocked = false;
@@ -477,13 +523,18 @@ async fn render(
     let mut writes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut stdout_broken = false;
     while let Some(event) = rx.recv().await {
-        if json && !stdout_broken {
-            let line = serde_json::to_string(&event).expect("events serialize");
-            if writeln!(std::io::stdout().lock(), "{line}").is_err() {
-                stdout_broken = true;
-                cancel.cancel();
-            }
+        let line = redactor.redact(&serde_json::to_string(&event).expect("events serialize"));
+        if let Some(file) = log.as_mut() {
+            let _ = writeln!(file, "{line}");
         }
+        if json && !stdout_broken && writeln!(std::io::stdout().lock(), "{line}").is_err() {
+            stdout_broken = true;
+            cancel.cancel();
+        }
+        // Everything shown below comes from the redacted event.
+        let event: AgentEvent = serde_json::from_str(&line).unwrap_or(AgentEvent::Warning {
+            message: "an event was left out because it could not be shown without a secret".into(),
+        });
         match &event {
             AgentEvent::AssistantMessage { content, .. } if !content.is_empty() => {
                 last_text = content.clone()

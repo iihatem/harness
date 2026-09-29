@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use harness_core::redact::Redactor;
+
 use crate::credentials::Credentials;
 
 use harness_config::config::{Protocol, ProviderConfig};
@@ -129,6 +131,12 @@ pub trait Secrets {
     fn credentials(&self) -> Option<Arc<Credentials>> {
         None
     }
+
+    /// Where the keys and tokens a provider is given are registered as secrets, so that nothing
+    /// harness writes holds them.
+    fn redactor(&self) -> Option<Arc<Redactor>> {
+        None
+    }
 }
 
 impl<F: Fn(&str) -> Option<String>> Secrets for F {
@@ -208,6 +216,9 @@ pub fn resolve(
             var,
         });
     }
+    if let (Some(redactor), Some(key)) = (secrets.redactor(), &api_key) {
+        redactor.add(key);
+    }
     // Claude Free/Pro/Max credentials may only be used by Claude Code itself.
     if protocol == Protocol::AnthropicMessages
         && api_key.as_deref().is_some_and(is_claude_subscription_token)
@@ -257,10 +268,13 @@ fn chatgpt(model_id: &str, model: &str, secrets: &impl Secrets) -> Result<Resolv
     let issuer = secrets
         .env("HARNESS_CHATGPT_ISSUER")
         .unwrap_or_else(|| ISSUER.to_string());
-    let auth = ChatGptAuth::load(credentials, &profile, OAuth::new(&issuer))
+    let mut auth = ChatGptAuth::load(credentials, &profile, OAuth::new(&issuer))
         .ok()
         .flatten()
         .ok_or_else(not_signed_in)?;
+    if let Some(redactor) = secrets.redactor() {
+        auth = auth.with_redactor(redactor);
+    }
     let base_url = secrets
         .env("HARNESS_CHATGPT_BASE_URL")
         .unwrap_or_else(|| BASE_URL.to_string());

@@ -2,13 +2,18 @@
 
 A terminal-first, open-source coding agent written in Rust, built for **hybrid development**: mix local models with frontier models so you get work done while saving subscription usage.
 
-> **Status: early development.** Milestone 1, phases P1 (foundation), P2 (safety) and P3 (memory) are complete: a headless `harness ask` that runs multi-step coding tasks against any OpenAI-compatible model in a sandboxed environment, with project instructions, slash commands, saved sessions and checkpoints. More providers and the interactive terminal UI are in progress. Not ready for daily use yet.
+> **Status: early development.** Milestone 1, phases P1 (foundation), P2 (safety), P3 (memory) and P4 (providers) are complete: a headless `harness ask` that runs multi-step coding tasks in a sandboxed environment against local models, OpenAI, Anthropic, OpenRouter or a ChatGPT plan, with project instructions, slash commands, saved sessions and checkpoints. The interactive terminal UI is in progress. Not ready for daily use yet.
 
 ## What works today
 
 - `harness ask "<prompt>"`: runs one task to completion with six tools (`read`, `write`, `edit`, `bash`, `grep`, `glob`). Piped stdin is appended to the prompt; `--json` streams every event as NDJSON.
-- `harness models`: lists models from local servers (Ollama, LM Studio, llama.cpp) and configured providers.
-- Providers: any OpenAI-compatible endpoint. Built in: `ollama`, `lmstudio`, `llamacpp`, `openrouter` (`OPENROUTER_API_KEY`).
+- `harness models`: lists models from local servers (Ollama, LM Studio, llama.cpp) and from providers with a key.
+- Providers: any endpoint speaking the OpenAI Chat Completions (`openai-chat`), OpenAI Responses (`openai-responses`) or Anthropic Messages (`anthropic-messages`) protocol. Built in: `ollama`, `lmstudio`, `llamacpp`, `openrouter` (`OPENROUTER_API_KEY`), `openai` (`OPENAI_API_KEY`), `anthropic` (`ANTHROPIC_API_KEY`) and `chatgpt` (signed in).
+- API keys: `harness auth add <provider>` reads a key from standard input (typed without echo, or piped from a password manager) and stores it in the macOS Keychain or the Secret Service keyring on Linux, or, where there is none, in `~/.local/share/harness/credentials.json`, readable only by you. An environment variable wins over a stored key. `--profile <name>` stores more than one account; `harness auth use <provider> <profile>` picks one; `harness logout <provider>` removes one.
+- ChatGPT: `harness login chatgpt` signs in with your ChatGPT account in the browser (`--device` for a code to enter on another device, as over SSH), and `--model chatgpt/<model>` then uses the models your plan includes. OpenAI allows this in third-party tools today, but that is its current practice, not a guarantee.
+- Model profiles: `[profiles."<glob>"]` sets a model's context window, output limit, temperature, reasoning effort and whether tool calls it writes as text are run. Built-in profiles cover common open-weight coding models (Qwen3-Coder, Devstral, gpt-oss and others) and the hosted families. Local servers are asked what context they really run a model with, and a window too small for agentic work is warned about with the fix (`OLLAMA_CONTEXT_LENGTH`, `llama-server -c`).
+- Local models: tool calls written as text (`<tool_call>` blocks, or a message that is only a call's JSON) run like native ones, and a reply cut off at the output limit never runs a partial tool call; the model is asked to continue in smaller steps.
+- Secrets: API keys, sign-in tokens and environment variables whose names end in `KEY`, `TOKEN`, `SECRET` or `PASSWORD` are replaced by `[redacted]` in session files, tool-output files, `--json` output and everything harness prints. `--debug` writes the run's events, redacted too, to `~/.local/state/harness/logs/`.
 - Approval modes: `plan`, `read-only`, `ask`, `auto`, `full-access`. Default is `auto` inside a git repository and `ask` elsewhere.
 - Exit codes for scripting: `0` success, `1` runtime error, `2` invalid usage or no model, `3` an action was blocked for lack of approval, `130` interrupted.
 - Project instructions: `AGENTS.md` (or `CLAUDE.md` where a directory has no `AGENTS.md`) from `~/.config/harness/`, the repository root, and each directory down to the working directory, with `@path` import lines. They go into a system prompt that stays the same for the whole run, so model servers can reuse their prompt caches.
@@ -36,6 +41,10 @@ Configuration lives in `~/.config/harness/config.toml` (XDG directories; `HARNES
 ```toml
 model = "ollama/qwen3:14b"
 
+[profiles."ollama/qwen3*"]
+context_window = 40960    # what the model takes; harness also asks Ollama what it runs with
+temperature = 0.6
+
 [providers.work]
 protocol = "openai-chat"
 base_url = "https://llm.example.com/v1"
@@ -56,7 +65,7 @@ threshold_percent = 80    # summarize at this share of the context window
 keep_recent_percent = 20  # keep this share of recent messages as they are
 ```
 
-Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, `read_dirs`, model, providers, sandbox settings, a `mode` wider than your global or default mode, a `max_steps` above your global limit) only apply after `harness trust`, and so does a `[compaction] threshold_percent` below 50. The same trust lets a project's command files choose their own `model`; a repository with command files and no project settings can be trusted too.
+Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, `read_dirs`, model, providers, model profiles, sandbox settings, a `mode` wider than your global or default mode, a `max_steps` above your global limit) only apply after `harness trust`, and so does a `[compaction] threshold_percent` below 50. The same trust lets a project's command files choose their own `model`; a repository with command files and no project settings can be trusted too.
 
 ## Known limitations
 
@@ -76,7 +85,11 @@ Project-level `.harness/config.toml` settings that widen what the agent may do (
 - **Hard links:** on macOS, files with more than one hard link cannot be modified inside the sandbox. On Linux, hard links that already point outside the workspace stay writable.
 - **Git inside the sandbox** cannot create repositories or worktrees in the workspace (`git init`, `git clone`, `git worktree add`); on Linux they are created and then moved to the quarantine. On macOS a nested repository can still be moved out of the workspace, edited and moved back. `.git/rebase-merge/git-rebase-todo` stays writable, so a sandboxed command could add `exec` lines that run the next time you continue a rebase (`git rebase --continue`). A workspace that is a linked worktree (its `.git` file points into another repository's `.git/worktrees/`) cannot commit inside the sandbox, because that gitdir is outside the workspace. A repository outside the workspace in a writable temp or `writable_roots` directory gets no protection.
 - **Path rules** are matched after resolving symlinks. On macOS, write `/private/tmp/...` rather than `/tmp/...` in `allow` rules.
-- **One context window for every model.** Until model profiles arrive, harness assumes 32,768 tokens: compaction starts at 80% of that, and instruction files over a quarter of it get a warning. A server with a smaller window that rejects a long request gets one compacted retry; one that silently truncates (Ollama's default) does not.
+- **Context windows.** A model no profile knows gets 8,192 tokens, with a warning that says how to set its `context_window`. Only the built-in `ollama`, `lmstudio` and `llamacpp` providers are asked what they run a model with: another server that silently truncates long requests is not noticed, and an LM Studio model that is not loaded yet counts as unknown. Asking Ollama loads the model, as the first request would.
+- **ChatGPT sign-in** uses the public OAuth client of OpenAI's open-source Codex CLI, as other third-party tools do; OpenAI could stop allowing that. `harness models` does not list ChatGPT's models: use a model your plan includes as `chatgpt/<model>`. Builds made with `--no-default-features` leave sign-in out.
+- **Claude subscriptions** (Free, Pro, Max) cannot be used: Anthropic allows them only in Claude Code, so harness refuses a subscription token (`sk-ant-oat…`) and needs an Anthropic API key.
+- **The keychain on Linux** is the Secret Service over D-Bus (GNOME Keyring, KWallet); without one, keys go to `credentials.json` with a warning. A macOS keychain entry made by one build of harness may ask for your password once a rebuilt binary reads it.
+- **Redaction** covers what harness writes, not what the model is sent: a key a command prints still reaches the model, which may repeat it in a file it writes. Values shorter than eight characters are not redacted.
 - **Checkpoints** cover the working directory, not files over 10 MB, git-ignored files, `node_modules`, `target`, `.harness/` or a top-level `HEAD`, or what is inside nested repositories; a rewind leaves those alone, including a file that was ignored or too large when the checkpoint was taken. In a subdirectory of a repository, the repository's own ignore rules apply, unless they ignore that subdirectory itself (then only its own `.gitignore` files do); your global git excludes file does not. A checkpoint is restored only in the directory it was taken in, so a session continued from another directory can rewind its conversation but not those files. git stores only whether a file is executable: a restored file gets your umask's permissions, except files only you could read, which get theirs back. Checkpoints are off, with a warning, when harness's data directory is inside the workspace or a directory sandboxed commands can write to (a temp directory, or a `writable_roots` entry), and in a workspace whose first snapshot takes longer than 5 seconds. They need git 2.26 or later.
 - **Command files run with their own settings.** A command file's `allowed-tools` pre-approve the commands it names (never beyond deny rules, destructive-command confirmation or the sandbox). Its `model` answers its invocations if the file is your own (`~/.config/harness/commands`, `~/.claude/commands`); a project's command file chooses the model only once `harness trust` has trusted the directory the command files come from, the repository root (run it there, not in a subdirectory); otherwise a note says the session's model answers instead. In a command file's `` !`…` `` commands, the arguments are shell parameters set before the command runs: write `"$1"` or `"$ARGUMENTS"` in double quotes, as in any script (an unquoted `$1` is split and globbed, and `'$1'` is the text `$1`). A command that uses the arguments with a construct where bash may evaluate a value as code or arithmetic (`$((…))`, `$[…]`, `let`, `declare`, subscripts, `=(…)`, `eval`, `trap`, `read`, `printf -v`, `source`, `.`, `${!…}`, `${…@P}`, `compgen`, `complete`, `enable`, and a few more) is not run, with a warning. That list defends ordinary command bodies; one that deliberately hands an argument to something that runs it later, such as `PS4`, `PROMPT_COMMAND` or `BASH_ENV`, is the command author's responsibility, as in any script. Read command files from repositories you did not write before running them.
 - **Instruction files and command files are read when a run starts**; changes apply to the next run.
@@ -85,7 +98,7 @@ Project-level `.harness/config.toml` settings that widen what the agent may do (
 
 | Milestone | Scope |
 |---|---|
-| M1 Core agent | Phases P1 foundation, P2 safety and P3 memory (AGENTS.md, slash commands, sessions, checkpoints, compaction) done; P4 providers (ChatGPT sign-in, Anthropic, model profiles), P5 terminal UI (rewind picker, `/compact`, `/resume`) |
+| M1 Core agent | Phases P1 foundation, P2 safety, P3 memory (AGENTS.md, slash commands, sessions, checkpoints, compaction) and P4 providers (OpenAI, Anthropic, ChatGPT sign-in, credentials, model profiles) done; P5 terminal UI (rewind picker, `/compact`, `/resume`, `/model`) |
 | M2 Routing | Model roles, boundary-based switching, usage ledger and "$ saved", verification gates |
 | M3 Agents | Subagents, delegation to Claude Code and Codex, parallel agents in worktrees |
 | M4 Ecosystem | Hooks, MCP, Agent Skills, ACP server |

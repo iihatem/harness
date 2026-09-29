@@ -9,12 +9,13 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::{compaction, message::Message, time};
+use crate::{compaction, message::Message, redact::Redactor, time};
 
 /// The session file format written by this version. Version 2 added the workspace of each
 /// checkpoint: a harness that reads version 1 only would restore them in the wrong place. A file
@@ -134,6 +135,8 @@ pub struct Session {
     /// The file is in an older format than this harness writes, so a [`EntryKind::Version`]
     /// entry goes before the next entry appended.
     record_version: bool,
+    /// Keeps secrets out of the file; the entries in memory stay as they are.
+    redactor: Option<Arc<Redactor>>,
 }
 
 /// Where a session is saved. The file is created, and locked, when the first entry after the
@@ -186,6 +189,7 @@ impl Session {
             save_error: None,
             warnings: Vec::new(),
             record_version: false,
+            redactor: None,
         }
     }
 
@@ -290,6 +294,7 @@ impl Session {
             save_error: None,
             warnings: Vec::new(),
             record_version: newest < FORMAT_VERSION,
+            redactor: None,
         };
         if let Some(problem) = session.walk().1 {
             warnings.push(format!("{}: {problem}", path.display()));
@@ -368,10 +373,15 @@ impl Session {
         let Some(store) = self.store.as_mut() else {
             return;
         };
-        if let Err(e) = store.write(&self.entries, &mut self.warnings) {
+        if let Err(e) = store.write(&self.entries, &mut self.warnings, self.redactor.as_deref()) {
             self.store = None;
             self.save_error = Some(e);
         }
+    }
+
+    /// Keeps the secrets `redactor` knows out of the file from now on.
+    pub fn set_redactor(&mut self, redactor: Arc<Redactor>) {
+        self.redactor = Some(redactor);
     }
 
     /// Why the session stopped saving, the first time it is asked after that happened.
@@ -446,8 +456,14 @@ impl Session {
 }
 
 impl Store {
-    /// Writes the entries not yet in the file; a warning about it goes to `warnings`.
-    fn write(&mut self, entries: &[Entry], warnings: &mut Vec<String>) -> std::io::Result<()> {
+    /// Writes the entries not yet in the file, without the secrets `redactor` knows; a warning
+    /// about it goes to `warnings`.
+    fn write(
+        &mut self,
+        entries: &[Entry],
+        warnings: &mut Vec<String>,
+        redactor: Option<&Redactor>,
+    ) -> std::io::Result<()> {
         if self.file.is_none() {
             // Sessions hold prompts, code and tool output: only their owner may read them.
             if let Some(dir) = self.path.parent() {
@@ -470,7 +486,11 @@ impl Store {
         let file = self.file.as_mut().expect("opened above");
         let mut text = String::new();
         for entry in &entries[self.written..] {
-            text.push_str(&serde_json::to_string(entry).map_err(std::io::Error::other)?);
+            let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+            match redactor {
+                Some(redactor) => text.push_str(&redactor.redact(&line)),
+                None => text.push_str(&line),
+            }
             text.push('\n');
         }
         // One write per batch, so a crash leaves at most one incomplete line.

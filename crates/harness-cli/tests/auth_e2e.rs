@@ -21,12 +21,17 @@ fn answer(text: &str) -> ResponseTemplate {
     )
 }
 
-/// Answers with the key a request carried.
+/// Answers with which key a request carried, by name: an answer that repeated the key would be
+/// redacted.
 async fn echo_keys(server: &MockServer) {
-    for key in ["sk-stored", "sk-env", "sk-work"] {
+    for (key, name) in [
+        ("sk-stored", "the stored key"),
+        ("sk-env", "the environment's key"),
+        ("sk-work", "the work key"),
+    ] {
         Mock::given(method("POST"))
             .and(header("authorization", format!("Bearer {key}").as_str()))
-            .respond_with(answer(&format!("used {key}")))
+            .respond_with(answer(&format!("used {name}")))
             .mount(server)
             .await;
     }
@@ -109,13 +114,13 @@ async fn a_stored_key_is_used_unless_the_environment_has_one() {
             .args(["--model", "mock/m", "ask", "hi"])
             .assert()
             .success()
-            .stdout(contains("used sk-stored"));
+            .stdout(contains("used the stored key"));
         env.cmd()
             .env("MOCK_API_KEY", "sk-env")
             .args(["--model", "mock/m", "ask", "hi"])
             .assert()
             .success()
-            .stdout(contains("used sk-env"));
+            .stdout(contains("used the environment's key"));
     })
     .await
     .unwrap();
@@ -139,7 +144,7 @@ async fn profiles_are_chosen_with_auth_use_and_removed_with_logout() {
             .args(["--model", "mock/m", "ask", "hi"])
             .assert()
             .success()
-            .stdout(contains("used sk-work"));
+            .stdout(contains("used the work key"));
         env.cmd()
             .args(["logout", "mock"])
             .assert()
@@ -167,7 +172,7 @@ async fn profiles_are_chosen_with_auth_use_and_removed_with_logout() {
             .args(["--model", "mock/m", "ask", "hi"])
             .assert()
             .success()
-            .stdout(contains("used sk-stored"));
+            .stdout(contains("used the stored key"));
     })
     .await
     .unwrap();

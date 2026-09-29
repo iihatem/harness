@@ -33,6 +33,9 @@ struct Cli {
     /// Continue the most recent session in this project
     #[arg(short = 'c', long = "continue", global = true)]
     continue_session: bool,
+    /// Also write the run's events, secrets redacted, to a log file in the state directory
+    #[arg(long, global = true)]
+    debug: bool,
     /// Resume the session with this id; without an id, list this project's sessions
     #[arg(
         long,
@@ -227,7 +230,15 @@ fn main() -> ExitCode {
     let code = runtime.block_on(async move {
         match cli.command {
             Some(Command::Ask { json, prompt }) => {
-                ask::run(cli.model, cli.mode, session, prompt.join(" "), json).await
+                ask::run(
+                    cli.model,
+                    cli.mode,
+                    session,
+                    prompt.join(" "),
+                    json,
+                    cli.debug,
+                )
+                .await
             }
             Some(Command::Models) => models::run().await,
             Some(Command::Auth {

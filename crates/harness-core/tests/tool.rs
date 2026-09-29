@@ -71,7 +71,7 @@ fn context_canonicalizes_the_workspace_and_resolves_relative_paths() {
 fn small_output_is_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(
-        limit_output("hello", DEFAULT_OUTPUT_LIMIT, dir.path(), "c1"),
+        limit_output("hello", DEFAULT_OUTPUT_LIMIT, dir.path(), "c1", None),
         "hello"
     );
     assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
@@ -81,7 +81,7 @@ fn small_output_is_unchanged() {
 fn large_output_is_spilled_to_a_file_with_head_and_tail() {
     let dir = tempfile::tempdir().unwrap();
     let content: String = (1..=5000).map(|i| format!("line {i}\n")).collect();
-    let limited = limit_output(&content, 1000, dir.path(), "call/7");
+    let limited = limit_output(&content, 1000, dir.path(), "call/7", None);
     assert!(limited.starts_with("line 1\n"));
     assert!(limited.trim_end().ends_with("line 5000"));
     assert!(limited.contains("omitted"));
@@ -95,7 +95,7 @@ fn large_output_is_spilled_to_a_file_with_head_and_tail() {
 fn limiting_never_splits_a_multibyte_character() {
     let dir = tempfile::tempdir().unwrap();
     let content = "é".repeat(5000);
-    let limited = limit_output(&content, 999, dir.path(), "u");
+    let limited = limit_output(&content, 999, dir.path(), "u", None);
     assert!(limited.contains("omitted"));
 }
 

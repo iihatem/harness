@@ -5,7 +5,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use harness_core::{provider::ProviderError, time::now_unix};
+use harness_core::{provider::ProviderError, redact::Redactor, time::now_unix};
 use tokio::sync::Mutex;
 
 use super::oauth::{OAuth, OAuthError, Tokens};
@@ -23,6 +23,8 @@ pub struct ChatGptAuth {
     credentials: Arc<Credentials>,
     profile: String,
     tokens: Mutex<Tokens>,
+    /// Where the tokens, and those that replace them, are registered as secrets.
+    redactor: Option<Arc<Redactor>>,
 }
 
 impl ChatGptAuth {
@@ -40,7 +42,17 @@ impl ChatGptAuth {
             credentials,
             profile: profile.to_string(),
             tokens: Mutex::new(tokens),
+            redactor: None,
         }))
+    }
+
+    /// Registers the tokens, now and after each refresh, as secrets with `redactor`.
+    pub fn with_redactor(mut self, redactor: Arc<Redactor>) -> ChatGptAuth {
+        let tokens = self.tokens.get_mut();
+        redactor.add(&tokens.access_token);
+        redactor.add(&tokens.refresh_token);
+        self.redactor = Some(redactor);
+        self
     }
 
     /// The tokens for the next request, refreshed first when the access token is about to
@@ -65,18 +77,28 @@ impl ChatGptAuth {
         Ok(tokens.clone())
     }
 
+    /// Registers `tokens` as secrets.
+    fn register(&self, tokens: &Tokens) {
+        if let Some(redactor) = &self.redactor {
+            redactor.add(&tokens.access_token);
+            redactor.add(&tokens.refresh_token);
+        }
+    }
+
     /// Replaces `tokens`, whose access token `used` is no good: with the stored tokens when
     /// another process has renewed them, else with refreshed ones, which are then stored.
     async fn renew(&self, tokens: &mut Tokens, used: &str) -> Result<(), ProviderError> {
         if let Ok(Some(theirs)) = stored(&self.credentials, &self.profile)
             && theirs.access_token != used
         {
+            self.register(&theirs);
             *tokens = theirs;
             if !expiring(tokens) {
                 return Ok(());
             }
         }
         let fresh = self.oauth.refresh(tokens).await.map_err(refresh_error)?;
+        self.register(&fresh);
         self.credentials
             .set(PROVIDER, &self.profile, &fresh.to_json())
             .map_err(|e| {

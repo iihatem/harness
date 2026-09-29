@@ -20,6 +20,7 @@ use crate::{
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
     permission::{Action, Decision, FsAccess, Mode, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
+    redact::Redactor,
     retry::RetryPolicy,
     session::{Entry, EntryKind, RewindScope, Session},
     tokens::DEFAULT_CONTEXT_WINDOW,
@@ -238,6 +239,8 @@ pub struct Agent {
     /// compaction then waits until the estimate drops below it, rather than repeat at every step
     /// without shrinking anything.
     auto_compaction_paused: bool,
+    /// Keeps secrets out of the session file and tool-output files.
+    redactor: Option<Arc<Redactor>>,
 }
 
 impl Agent {
@@ -280,6 +283,7 @@ impl Agent {
             next_call_id: 0,
             turn_model: None,
             auto_compaction_paused: false,
+            redactor: None,
         }
     }
 
@@ -306,7 +310,18 @@ impl Agent {
     /// a stopped run left without results at the end of it get results, saved in the session.
     pub fn with_session(mut self, session: Session) -> Self {
         self.session = session;
+        if let Some(redactor) = &self.redactor {
+            self.session.set_redactor(redactor.clone());
+        }
         self.load_history(true);
+        self
+    }
+
+    /// Keeps the secrets `redactor` knows out of the session file and tool-output files. The
+    /// model is still sent everything as it is.
+    pub fn with_redactor(mut self, redactor: Arc<Redactor>) -> Self {
+        self.session.set_redactor(redactor.clone());
+        self.redactor = Some(redactor);
         self
     }
 
@@ -1260,6 +1275,7 @@ impl Agent {
             self.config.output_limit,
             &self.config.output_dir,
             &call.id,
+            self.redactor.as_deref(),
         );
         let output = ToolOutput { content, ..raw };
         let _ = events.send(AgentEvent::ToolCallFinished {

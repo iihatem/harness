@@ -151,6 +151,8 @@ pub async fn run(
         commands: commands.listing(),
         workspace: setup.workspace.clone(),
         history,
+        instruction_files: crate::context::instruction_files(&setup),
+        window_note: Some("assumed until model profiles report the model's own".into()),
     };
     let host = CliHost {
         setup: setup.clone(),

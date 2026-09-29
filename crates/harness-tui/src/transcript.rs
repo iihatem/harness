@@ -227,6 +227,26 @@ impl Transcript {
                     TurnEndReason::Completed | TurnEndReason::Error => {}
                 }
             }
+            AgentEvent::TurnStats {
+                model,
+                time_to_first_token_ms,
+                generation_ms,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+            } => {
+                let line = crate::status::stats_line(
+                    model,
+                    *time_to_first_token_ms,
+                    *generation_ms,
+                    *input_tokens,
+                    *output_tokens,
+                    *cached_tokens,
+                    &self.theme,
+                );
+                self.gap();
+                self.push_lines(vec![line], width);
+            }
             AgentEvent::ApprovalNeeded { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::CheckpointCreated { .. } => {}

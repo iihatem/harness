@@ -34,3 +34,21 @@ pub fn system_prompt(
     let environment = environment::capture(&setup.workspace, &today_utc());
     prompt::assemble(base, &loaded.files, &environment)
 }
+
+/// The instruction files in the session's system prompt and their estimated tokens, for
+/// `/context`: named relative to the workspace when inside it.
+pub fn instruction_files(setup: &Setup) -> Vec<(String, u64)> {
+    instructions::discover(&setup.workspace, &setup.paths.config_dir, home().as_deref())
+        .files
+        .into_iter()
+        .map(|file| {
+            let name = file
+                .path
+                .strip_prefix(&setup.workspace)
+                .unwrap_or(&file.path)
+                .display()
+                .to_string();
+            (name, harness_core::tokens::estimate(&file.content))
+        })
+        .collect()
+}

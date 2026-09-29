@@ -4,12 +4,13 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::{sync::mpsc::UnboundedSender, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -149,6 +150,32 @@ impl Approver for NonInteractive {
     }
 }
 
+/// Where the next request's tokens go, estimated, and the model's context window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextUsage {
+    /// The context window, in tokens.
+    pub window: u64,
+    /// The system prompt, instruction files and environment included.
+    pub system: u64,
+    /// The tool definitions.
+    pub tools: u64,
+    /// The conversation.
+    pub messages: u64,
+    /// The whole next request: from the input tokens the provider reported for the last one
+    /// where it did, else the sum of the estimates above.
+    pub total: u64,
+}
+
+/// What a turn's model calls took, for its [`AgentEvent::TurnStats`].
+#[derive(Debug, Default)]
+struct Stats {
+    /// The model that answered last; `None` until one was asked.
+    model: Option<String>,
+    time_to_first_token: Option<Duration>,
+    generation: Duration,
+    usage: Usage,
+}
+
 /// What one model call produced so far. Kept outside the stream future so partial output survives.
 #[derive(Debug, Default)]
 struct ModelReply {
@@ -159,6 +186,10 @@ struct ModelReply {
     emitted: bool,
     /// The token counts the provider reported for this call.
     usage: Option<Usage>,
+    /// When the request was sent, when the first output arrived, and when the stream ended.
+    started: Option<Instant>,
+    first_output: Option<Instant>,
+    ended: Option<Instant>,
     /// How much of `text` was sent as text deltas. With text tool calls on, text that may still
     /// turn out to be calls is held back, and shown once it cannot (see [`Self::show`]).
     shown: usize,
@@ -257,6 +288,8 @@ pub struct Agent {
     auto_compaction_paused: bool,
     /// Keeps secrets out of the session file and tool-output files.
     redactor: Option<Arc<Redactor>>,
+    /// The current turn's model calls, for its stats.
+    stats: Stats,
 }
 
 impl Agent {
@@ -300,6 +333,7 @@ impl Agent {
             turn_model: None,
             auto_compaction_paused: false,
             redactor: None,
+            stats: Stats::default(),
         }
     }
 
@@ -662,6 +696,20 @@ impl Agent {
         &mut self.config
     }
 
+    /// Where the next request's tokens would go.
+    pub fn context_usage(&self) -> ContextUsage {
+        let system = crate::tokens::estimate(&self.config.system_prompt);
+        let tools = compaction::request_tokens("", &self.tools.specs(), &[]);
+        let messages = self.history.iter().map(compaction::message_tokens).sum();
+        ContextUsage {
+            window: self.config.context_window,
+            system,
+            tools,
+            messages,
+            total: self.estimated_tokens(),
+        }
+    }
+
     /// Invalid tool calls (unknown tool, bad JSON, schema violations) in the current or last turn.
     pub fn invalid_calls_this_turn(&self) -> u32 {
         self.invalid_calls
@@ -692,6 +740,7 @@ impl Agent {
         let input = input.into();
         self.ctx.cancel = cancel.clone();
         self.invalid_calls = 0;
+        self.stats = Stats::default();
         self.turn_checkpointed = false;
         // Settings that apply to this turn only.
         self.turn_model = input.model.clone();
@@ -730,7 +779,13 @@ impl Agent {
             if !auto_compaction_failed {
                 auto_compaction_failed = !self.compact_automatically(events, &cancel).await;
             }
-            let reply = match self.call_model_compacting(events, &cancel).await {
+            let outcome = self.call_model_compacting(events, &cancel).await;
+            match &outcome {
+                ModelOutcome::Reply(reply)
+                | ModelOutcome::Failed(_, reply)
+                | ModelOutcome::Interrupted(reply) => self.tally(reply),
+            }
+            let reply = match outcome {
                 ModelOutcome::Reply(mut reply) => {
                     self.dedupe_call_ids(&mut reply.tool_calls);
                     // The reported input covers the request; the reply is estimated like any
@@ -1217,6 +1272,23 @@ impl Agent {
         self.record(message, None, false);
     }
 
+    /// Adds what a model call took to the turn's stats.
+    fn tally(&mut self, reply: &ModelReply) {
+        self.stats.model = Some(self.model_id().to_string());
+        if let (Some(started), Some(first)) = (reply.started, reply.first_output) {
+            if self.stats.time_to_first_token.is_none() {
+                self.stats.time_to_first_token = Some(first - started);
+            }
+            let ended = reply.ended.unwrap_or_else(Instant::now);
+            self.stats.generation += ended.saturating_duration_since(first);
+        }
+        if let Some(usage) = reply.usage {
+            self.stats.usage.input_tokens += usage.input_tokens;
+            self.stats.usage.output_tokens += usage.output_tokens;
+            self.stats.usage.cached_tokens += usage.cached_tokens;
+        }
+    }
+
     fn finish(
         &mut self,
         reason: TurnEndReason,
@@ -1224,6 +1296,17 @@ impl Agent {
     ) -> TurnEndReason {
         for message in self.warnings.drain(..) {
             let _ = events.send(AgentEvent::Warning { message });
+        }
+        let stats = std::mem::take(&mut self.stats);
+        if let Some(model) = stats.model {
+            let _ = events.send(AgentEvent::TurnStats {
+                model,
+                time_to_first_token_ms: stats.time_to_first_token.map(|d| d.as_millis() as u64),
+                generation_ms: stats.generation.as_millis() as u64,
+                input_tokens: stats.usage.input_tokens,
+                output_tokens: stats.usage.output_tokens,
+                cached_tokens: stats.usage.cached_tokens,
+            });
         }
         let _ = events.send(AgentEvent::TurnFinished { reason });
         reason
@@ -1275,9 +1358,20 @@ impl Agent {
             options,
             output_room,
         };
+        reply.started = Some(Instant::now());
         let mut stream = provider.stream(request);
         while let Some(item) = stream.next().await {
-            match item? {
+            let item = item?;
+            if matches!(
+                item,
+                ProviderEvent::TextDelta(_)
+                    | ProviderEvent::ReasoningDelta(_)
+                    | ProviderEvent::ToolCall(_)
+            ) && reply.first_output.is_none()
+            {
+                reply.first_output = Some(Instant::now());
+            }
+            match item {
                 ProviderEvent::TextDelta(text) => {
                     reply.text.push_str(&text);
                     // Tool calls written as text are not shown as text: what may still become
@@ -1304,6 +1398,7 @@ impl Agent {
                 ProviderEvent::Finished(reason) => reply.finish = Some(reason),
             }
         }
+        reply.ended = Some(Instant::now());
         Ok(())
     }
 

@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use harness_context::commands::{is_builtin, parse_invocation};
-use harness_core::{event::AgentEvent, permission::Mode, turn::TurnInput};
+use harness_core::{agent::ContextUsage, event::AgentEvent, permission::Mode, turn::TurnInput};
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::Position,
@@ -16,6 +16,7 @@ use ratatui::{
 use crate::{
     complete::{self, Completer, Offer},
     editor::{Edit, Editor},
+    status::{self, Totals},
     style::Theme,
     text::{sanitize, wrap},
     transcript::Transcript,
@@ -69,6 +70,10 @@ pub struct Options {
     pub workspace: std::path::PathBuf,
     /// Earlier inputs, oldest first, for Up.
     pub history: Vec<String>,
+    /// The instruction files in the system prompt, with their estimated tokens, for `/context`.
+    pub instruction_files: Vec<(String, u64)>,
+    /// Said next to the context window in `/context`, such as where its size comes from.
+    pub window_note: Option<String>,
 }
 
 /// What the session should do after a key.
@@ -102,6 +107,11 @@ pub struct App {
     ctrl_c: Option<Instant>,
     /// From the moment a turn is asked for until it has finished.
     running: bool,
+    /// Where the next request's tokens go, as of the end of the last turn.
+    context: ContextUsage,
+    totals: Totals,
+    instruction_files: Vec<(String, u64)>,
+    window_note: Option<String>,
     width: usize,
 }
 
@@ -118,6 +128,10 @@ impl App {
             hint: None,
             ctrl_c: None,
             running: false,
+            context: ContextUsage::default(),
+            totals: Totals::default(),
+            instruction_files: options.instruction_files,
+            window_note: options.window_note,
             width,
         }
     }
@@ -146,10 +160,17 @@ impl App {
 
     /// Takes in an event from the agent.
     pub fn on_event(&mut self, event: &AgentEvent) {
-        if let AgentEvent::TurnFinished { .. } = event {
-            self.running = false;
+        match event {
+            AgentEvent::TurnFinished { .. } => self.running = false,
+            AgentEvent::Usage { model, usage } => self.totals.add(model, usage),
+            _ => {}
         }
         self.transcript.on_event(event, self.width);
+    }
+
+    /// Where the next request's tokens go, now.
+    pub fn set_context(&mut self, context: ContextUsage) {
+        self.context = context;
     }
 
     /// Asks for a turn.
@@ -277,6 +298,23 @@ impl App {
             if name == "quit" {
                 return Some(Action::Quit);
             }
+            if name == "context" || name == "usage" {
+                self.editor.submit();
+                self.transcript.push_user(&full, width);
+                let theme = self.theme();
+                let lines = if name == "context" {
+                    status::context_report(
+                        &self.context,
+                        &self.instruction_files,
+                        self.window_note.as_deref(),
+                        &theme,
+                    )
+                } else {
+                    self.totals.report(&theme)
+                };
+                self.transcript.push_lines(lines, width);
+                return None;
+            }
             if let Some((_, when)) = LATER.iter().find(|(n, _)| *n == name) {
                 self.editor.submit();
                 self.transcript.push_user(&full, width);
@@ -343,11 +381,13 @@ impl App {
 
     /// The status line.
     fn status(&self) -> Line<'static> {
-        let theme = self.theme();
-        Line::from(Span::styled(
-            format!("{} · {}", sanitize(&self.model), self.mode),
-            theme.dim(),
-        ))
+        status::status_line(
+            &self.model,
+            self.mode,
+            &self.context,
+            &self.totals,
+            &self.theme(),
+        )
     }
 
     /// The live region's lines, at most `rows`, and where the cursor is in them.

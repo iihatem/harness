@@ -9,6 +9,7 @@ pub mod editor;
 pub mod highlight;
 pub mod inline;
 pub mod markdown;
+pub mod status;
 pub mod style;
 pub mod terminal;
 pub mod text;

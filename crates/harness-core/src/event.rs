@@ -74,6 +74,18 @@ pub enum AgentEvent {
         tokens_before: u64,
         tokens_after: u64,
     },
+    /// How the turn went, just before it finishes, when it called the model: the model that
+    /// answered last, how long its first output took, and the tokens the provider reported.
+    TurnStats {
+        model: String,
+        /// From the request to the first output, of the turn's first reply that had any.
+        time_to_first_token_ms: Option<u64>,
+        /// Time spent streaming output: from each reply's first output to its end.
+        generation_ms: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+    },
     TurnFinished {
         reason: TurnEndReason,
     },

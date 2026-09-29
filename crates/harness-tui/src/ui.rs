@@ -4,7 +4,11 @@
 use std::{io, time::Instant};
 
 use futures::{Stream, StreamExt};
-use harness_core::{agent::Agent, event::AgentEvent, turn::TurnInput};
+use harness_core::{
+    agent::{Agent, ContextUsage},
+    event::AgentEvent,
+    turn::TurnInput,
+};
 use ratatui::{backend::Backend, crossterm::event::Event};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -35,6 +39,10 @@ pub struct Ui<B: Backend> {
     term: InlineTerminal<B>,
     jobs: Option<mpsc::UnboundedSender<Job>>,
     events: mpsc::UnboundedReceiver<AgentEvent>,
+    /// Where the context goes, sent by the runner after each job.
+    contexts: mpsc::UnboundedReceiver<ContextUsage>,
+    /// A job was sent whose context update has not come yet.
+    awaiting_context: bool,
     runner: Option<JoinHandle<()>>,
     /// Cancels the running turn.
     cancel: Option<CancellationToken>,
@@ -54,6 +62,10 @@ where
     ) -> Self {
         let (jobs, mut queue) = mpsc::unbounded_channel::<Job>();
         let (events_tx, events) = mpsc::unbounded_channel();
+        let (contexts_tx, contexts) = mpsc::unbounded_channel();
+        let width = term.width() as usize;
+        let mut app = App::new(options, host, width);
+        app.set_context(agent.context_usage());
         let runner = tokio::spawn(async move {
             let mut agent = agent;
             while let Some(job) = queue.recv().await {
@@ -62,14 +74,16 @@ where
                         agent.run_turn(input, &events_tx, cancel).await;
                     }
                 }
+                let _ = contexts_tx.send(agent.context_usage());
             }
         });
-        let width = term.width() as usize;
         Ui {
-            app: App::new(options, host, width),
+            app,
             term,
             jobs: Some(jobs),
             events,
+            contexts,
+            awaiting_context: false,
             runner: Some(runner),
             cancel: None,
         }
@@ -116,6 +130,7 @@ where
                 self.cancel = Some(cancel.clone());
                 if let Some(jobs) = &self.jobs {
                     let _ = jobs.send(Job::Turn { input, cancel });
+                    self.awaiting_context = true;
                 }
                 Flow::Continue
             }
@@ -163,17 +178,29 @@ where
         Ok(Flow::Continue)
     }
 
-    /// Waits for the agent's next event and takes it in.
+    /// Takes in where the context goes after a job, and redraws the status line.
+    fn context(&mut self, context: ContextUsage) -> io::Result<Flow> {
+        self.awaiting_context = false;
+        self.app.set_context(context);
+        self.draw()?;
+        Ok(Flow::Continue)
+    }
+
+    /// Waits for the agent's next event, or the runner's next message, and takes it in.
     pub async fn next(&mut self) -> io::Result<Flow> {
-        match self.events.recv().await {
-            Some(event) => self.agent_event(event),
-            None => Ok(Flow::Quit),
+        tokio::select! {
+            event = self.events.recv() => match event {
+                Some(event) => self.agent_event(event),
+                None => Ok(Flow::Quit),
+            },
+            Some(context) = self.contexts.recv() => self.context(context),
         }
     }
 
-    /// Takes in the agent's events until no turn is running.
+    /// Takes in the agent's events until no turn is running and the runner has said where the
+    /// context goes after it.
     pub async fn settle(&mut self) -> io::Result<()> {
-        while self.app.busy() || !self.events.is_empty() {
+        while self.app.busy() || self.awaiting_context || !self.events.is_empty() {
             if self.next().await? == Flow::Quit {
                 break;
             }
@@ -201,6 +228,7 @@ where
                     Some(event) => self.agent_event(event)?,
                     None => Flow::Quit,
                 },
+                Some(context) = self.contexts.recv() => self.context(context)?,
             };
             if flow == Flow::Quit {
                 break;

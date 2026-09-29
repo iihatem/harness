@@ -85,6 +85,8 @@ fn options(dir: &Path) -> Options {
         ],
         workspace: dir.to_path_buf(),
         history: Vec::new(),
+        instruction_files: Vec::new(),
+        window_note: None,
     }
 }
 

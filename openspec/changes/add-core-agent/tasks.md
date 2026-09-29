@@ -41,12 +41,12 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 
 ## 3. P3 Memory (`docs/superpowers/plans/2026-09-27-m1-p3-memory.md`)
 
-- [ ] 3.1 `AGENTS.md`/`CLAUDE.md` discovery with confined `@` imports; verify the project-context discovery and import scenarios as tests
-- [ ] 3.2 Cache-stable prompt assembly with session-start environment capture and oversize warning; verify byte-identical prefixes across turns in a test
-- [ ] 3.3 Slash commands: built-in registry, Markdown discovery and namespacing, frontmatter, placeholders, headless use; verify `/opsx:propose` expands from `.claude/commands` in an e2e test
-- [ ] 3.4 Sessions: incremental JSONL tree, resume (`-c`, `--resume`), truncated-file tolerance; verify the sessions scenarios as tests
-- [ ] 3.5 Checkpoints: shadow-repository snapshots, rewind of code/conversation/both, undo last rewind, degradation; verify the checkpoints scenarios as tests
-- [ ] 3.6 Compaction (automatic, `/compact`, overflow retry) and `/init`; verify the compaction scenarios with the mock provider
+- [x] 3.1 `AGENTS.md`/`CLAUDE.md` discovery with confined `@` imports; verify the project-context discovery and import scenarios as tests
+- [x] 3.2 Cache-stable prompt assembly with session-start environment capture and oversize warning; verify byte-identical prefixes across turns in a test
+- [x] 3.3 Slash commands: built-in registry, Markdown discovery and namespacing, frontmatter, placeholders, headless use; verify `/opsx:propose` expands from `.claude/commands` in an e2e test
+- [x] 3.4 Sessions: incremental JSONL tree, resume (`-c`, `--resume`), truncated-file tolerance; verify the sessions scenarios as tests
+- [x] 3.5 Checkpoints: shadow-repository snapshots, rewind of code/conversation/both, undo last rewind, degradation; verify the checkpoints scenarios as tests
+- [x] 3.6 Compaction (automatic, `/compact`, overflow retry) and `/init`; verify the compaction scenarios with the mock provider (on-demand compaction is an API here; the interactive `/compact` command comes with the terminal UI in 5.7)
 
 ## 4. P4 Providers (plan written after P3)
 
@@ -66,7 +66,7 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 - [ ] 5.4 Interactive approvals with diffs, re-run-unsandboxed offer, and Shift+Tab mode cycling; verify with scripted-input tests
 - [ ] 5.5 Steering (queued vs send-now input) in the runtime and UI; verify the agent-runtime steering scenarios as tests
 - [ ] 5.6 Plan mode flow (Build / Edit in `$EDITOR` / Keep planning); verify the plan-mode scenarios as tests
-- [ ] 5.7 `/rewind` picker, model and session pickers, first-run model choice; verify with scripted-input tests
+- [ ] 5.7 `/rewind` picker, `/compact`, `/resume` and `/mode`, model and session pickers, first-run model choice; verify with scripted-input tests
 - [ ] 5.8 Desktop notifications (OSC 9 + bell); verify emitted escape sequences in a test
 
 ## 6. M1 acceptance

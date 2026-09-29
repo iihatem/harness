@@ -30,6 +30,8 @@ pub enum Protocol {
 pub struct ProviderConfig {
     pub protocol: Protocol,
     pub base_url: String,
+    /// The environment variable holding its key: a name (`[A-Za-z_][A-Za-z0-9_]*`), which
+    /// [`parse_file`] checks.
     pub api_key_env: Option<String>,
 }
 
@@ -305,7 +307,30 @@ pub fn parse_file(path: &Path) -> Result<Option<ConfigFile>, ConfigError> {
             ),
         });
     }
+    // A key pasted here would be printed wherever the variable is named; the error never echoes it.
+    if let Some(name) = file.providers.iter().find_map(|(name, provider)| {
+        provider
+            .api_key_env
+            .as_deref()
+            .is_some_and(|var| !is_variable_name(var))
+            .then_some(name)
+    }) {
+        return Err(ConfigError::Parse {
+            path: path.to_path_buf(),
+            message: format!(
+                "[providers.{name}]: `api_key_env` names an environment variable, not a key: give the variable's name (letters, digits and `_`), and keep the key in that variable, or store it with `harness auth add {name}`"
+            ),
+        });
+    }
     Ok(Some(file))
+}
+
+/// Whether `name` can name an environment variable: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_variable_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// What is wrong with `text`, which TOML could not read: where (line and column) and why, never

@@ -193,6 +193,36 @@ async fn piped_stdin_is_appended_to_the_prompt() {
     .unwrap();
 }
 
+// Final review, M-2: a key pasted as `api_key_env` is refused, and never printed, whether the
+// global config or a project's holds it, by `ask` and by `harness trust`.
+#[test]
+fn a_key_pasted_as_api_key_env_is_never_printed() {
+    let pasted = "[providers.x]\nprotocol = \"openai-chat\"\nbase_url = \"https://x.example/v1\"\napi_key_env = \"sk-proj-AbCdEfGhIjKlMnOpQrSt\"\n";
+    let env = Env::new("http://127.0.0.1:9", &format!("model = \"x/m\"\n{pasted}"));
+    env.cmd()
+        .args(["ask", "hi"])
+        .assert()
+        .code(2)
+        .stderr(contains("names an environment variable, not a key"))
+        .stderr(predicates::prelude::PredicateBooleanExt::not(contains(
+            "AbCdEf",
+        )));
+    let env = Env::new("http://127.0.0.1:9", "");
+    std::fs::create_dir_all(env.ws.path().join(".harness")).unwrap();
+    std::fs::write(env.ws.path().join(".harness/config.toml"), pasted).unwrap();
+    for args in [&["ask", "hi"][..], &["trust"]] {
+        env.cmd()
+            .args(args)
+            .write_stdin("n\n")
+            .assert()
+            .code(2)
+            .stderr(contains("names an environment variable, not a key"))
+            .stderr(predicates::prelude::PredicateBooleanExt::not(contains(
+                "AbCdEf",
+            )));
+    }
+}
+
 // Final review, M-3: a refused key is named by where it came from, with what fixes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_key_says_which_key_it_was() {

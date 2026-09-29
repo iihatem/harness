@@ -962,3 +962,62 @@ fn a_parse_error_never_quotes_the_line_it_could_not_read() {
         .to_string();
     assert!(err.contains("unknown field `api_key`"), "{err}");
 }
+
+// Final review, M-2: a key pasted as `api_key_env` (other tools take `api_key`) would be
+// printed in full: in "set $<value>", in untrusted-project warnings and by `harness trust`. It is
+// refused when the file is read, without echoing it.
+#[test]
+fn an_api_key_env_that_is_not_a_variable_name_is_refused_without_echoing_it() {
+    let pasted = "sk-proj-AbCdEfGhIjKlMnOpQrSt";
+    let provider = |var: &str| {
+        format!(
+            "[providers.x]\nprotocol = \"openai-chat\"\nbase_url = \"https://x.example/v1\"\napi_key_env = \"{var}\"\n"
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("config.toml");
+    std::fs::write(&global, provider(pasted)).unwrap();
+    let err = config::load(&global, dir.path(), &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&global.display().to_string()), "{err}");
+    assert!(err.contains("[providers.x]"), "{err}");
+    assert!(
+        err.contains("`api_key_env` names an environment variable, not a key"),
+        "{err}"
+    );
+    assert!(!err.contains("AbCdEf"), "{err}");
+
+    // In a project's config, untrusted: neither its warning nor `harness trust` lists it.
+    let (dir, ws, none) = project_dir(&provider(pasted));
+    for err in [
+        config::load(&none, &ws, &TrustStore::default())
+            .unwrap_err()
+            .to_string(),
+        config::project_widening(&none, &ws)
+            .unwrap_err()
+            .to_string(),
+    ] {
+        assert!(err.contains("names an environment variable"), "{err}");
+        assert!(!err.contains("AbCdEf"), "{err}");
+    }
+    drop(dir);
+
+    // A variable's name is fine.
+    for var in ["OPENAI_API_KEY", "_KEY2", "x"] {
+        std::fs::write(&global, provider(var)).unwrap();
+        let cfg = config::load(&global, dir_of(&global), &TrustStore::default()).unwrap();
+        assert_eq!(cfg.providers["x"].api_key_env.as_deref(), Some(var));
+    }
+    for bad in ["", "1KEY", "MY-KEY", "MY KEY", "$OPENAI_API_KEY"] {
+        std::fs::write(&global, provider(bad)).unwrap();
+        assert!(
+            config::load(&global, dir_of(&global), &TrustStore::default()).is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
+fn dir_of(file: &std::path::Path) -> &std::path::Path {
+    file.parent().unwrap()
+}

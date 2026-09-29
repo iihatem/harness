@@ -185,7 +185,7 @@ deny  = ["bash:git push*"]
 confirm = ["bash:terraform apply*"]
 ```
 
-Built-in providers need no config: `ollama`, `lmstudio`, `llamacpp` (discovered), `openai`, `anthropic`, `openrouter` (API keys), `chatgpt` (sign-in).
+Built-in providers need no config: `ollama`, `lmstudio`, `llamacpp` (discovered), `openai`, `anthropic`, `openrouter` (API keys), `chatgpt` (sign-in). A provider's `api_key_env` names the variable holding its key (`[A-Za-z_][A-Za-z0-9_]*`): anything else, such as a key pasted there, is refused when the file is read, with an error that does not echo it, so neither a missing-key hint, an untrusted-project warning nor `harness trust` can print it.
 
 ### D10. Headless mode and exit codes
 

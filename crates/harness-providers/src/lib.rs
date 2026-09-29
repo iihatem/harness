@@ -1,6 +1,8 @@
 //! Model provider adapters, local-server discovery, and model-id resolution.
 
 pub mod anthropic_messages;
+#[cfg(feature = "chatgpt-login")]
+pub mod chatgpt;
 pub mod credentials;
 pub mod discovery;
 pub mod openai_chat;

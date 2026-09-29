@@ -1,3 +1,6 @@
+mod common;
+use common::Isolate;
+
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -55,7 +58,7 @@ impl Env {
         let mut cmd = Command::new(BIN);
         cmd.current_dir(self.ws.path())
             .env("HARNESS_HOME", self.home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_STATE_HOME");
@@ -283,7 +286,7 @@ async fn ctrl_c_interrupts_the_run_and_exits_130() {
         .args(["ask", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
-        .env("HARNESS_CREDENTIAL_STORE", "file")
+        .isolate()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -332,7 +335,7 @@ async fn a_closed_stdout_pipe_does_not_panic_and_still_exits() {
         .args(["ask", "--json", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
-        .env("HARNESS_CREDENTIAL_STORE", "file")
+        .isolate()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -400,7 +403,7 @@ async fn missing_model_exits_2_promptly_even_with_an_open_stdin_pipe() {
         .args(["ask", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
-        .env("HARNESS_CREDENTIAL_STORE", "file")
+        .isolate()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -434,7 +437,7 @@ async fn idle_stdin_pipe_does_not_hang() {
         .args(["ask", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
-        .env("HARNESS_CREDENTIAL_STORE", "file")
+        .isolate()
         .env("HARNESS_STDIN_WAIT_MS", "300")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -478,7 +481,7 @@ async fn slowly_piped_stdin_is_still_included() {
         .args(["ask", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
-        .env("HARNESS_CREDENTIAL_STORE", "file")
+        .isolate()
         .env("HARNESS_STDIN_WAIT_MS", "2000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -561,7 +564,7 @@ async fn interrupt_while_stdin_stays_open(env: &Env, delay: Duration) -> std::pr
         .args(["--model", "mock/test-model", "ask", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
-        .env("HARNESS_CREDENTIAL_STORE", "file")
+        .isolate()
         .env("HARNESS_STDIN_WAIT_MS", "2000")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

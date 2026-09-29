@@ -1,3 +1,6 @@
+mod common;
+use common::Isolate;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;
@@ -51,7 +54,7 @@ fn resume_without_an_id_before_a_subcommand_is_an_error() {
         Command::new(env!("CARGO_BIN_EXE_harness"))
             .args(args)
             .env("HARNESS_HOME", home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .assert()
             .code(2)
             .stderr(contains("--resume needs an id"));
@@ -70,7 +73,7 @@ fn resume_taking_the_prompt_for_its_id_is_explained() {
         Command::new(env!("CARGO_BIN_EXE_harness"))
             .args(args)
             .env("HARNESS_HOME", home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .assert()
             .code(2)
             .stderr(contains("--resume needs an id, followed by the prompt"));
@@ -101,7 +104,7 @@ fn session_flags_with_another_subcommand_are_refused() {
         Command::new(env!("CARGO_BIN_EXE_harness"))
             .args(args)
             .env("HARNESS_HOME", home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .assert()
             .code(2)
             .stderr(contains(format!(
@@ -141,7 +144,7 @@ fn session_flags_with_the_credential_commands_are_refused() {
         Command::new(env!("CARGO_BIN_EXE_harness"))
             .args(args)
             .env("HARNESS_HOME", home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .write_stdin("sk-never-stored")
             .assert()
             .code(2)
@@ -159,4 +162,26 @@ fn help_lists_the_debug_flag() {
         .assert()
         .success()
         .stdout(contains("--debug").and(contains("secrets redacted")));
+}
+
+// Review B, M12: a suite that lists models would send the developer's own provider keys to the
+// real providers, so every run the suites start leaves them out.
+#[test]
+fn isolated_runs_carry_no_provider_key() {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_harness"));
+    for var in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"] {
+        cmd.env(var, "sk-developers-own");
+    }
+    cmd.isolate();
+    let envs: Vec<_> = cmd.get_envs().collect();
+    for var in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"] {
+        assert!(
+            envs.contains(&(std::ffi::OsStr::new(var), None)),
+            "{var}: {envs:?}"
+        );
+    }
+    assert!(envs.contains(&(
+        std::ffi::OsStr::new("HARNESS_CREDENTIAL_STORE"),
+        Some(std::ffi::OsStr::new("file"))
+    )));
 }

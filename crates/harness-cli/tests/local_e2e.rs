@@ -1,6 +1,9 @@
 //! Local models in `harness ask`: the window the server really runs the model with, and a
 //! conversation held on local models that is continued on a hosted one (which says nothing).
 
+mod common;
+use common::Isolate;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;
@@ -39,7 +42,7 @@ impl Env {
         let mut cmd = Command::new(BIN);
         cmd.current_dir(self.ws.path())
             .env("HARNESS_HOME", self.home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_STATE_HOME");

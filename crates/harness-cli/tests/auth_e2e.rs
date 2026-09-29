@@ -1,6 +1,9 @@
 //! `harness auth add`, `auth use` and `logout`, and which key requests carry. Credentials go to
 //! the file store (`HARNESS_CREDENTIAL_STORE=file`), so the tests never touch a real keychain.
 
+mod common;
+use common::Isolate;
+
 use std::os::unix::fs::PermissionsExt;
 
 use assert_cmd::Command;
@@ -70,13 +73,11 @@ impl Env {
         cmd.current_dir(self.ws.path())
             .env("HARNESS_HOME", self.home.path())
             .env("HOME", self.user_home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_STATE_HOME")
-            .env_remove("MOCK_API_KEY")
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("OPENAI_API_KEY");
+            .env_remove("MOCK_API_KEY");
         cmd
     }
 

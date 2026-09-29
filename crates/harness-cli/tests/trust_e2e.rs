@@ -1,3 +1,6 @@
+mod common;
+use common::Isolate;
+
 use assert_cmd::Command;
 use predicates::str::contains;
 use tempfile::TempDir;
@@ -26,7 +29,7 @@ impl Env {
         let mut cmd = Command::new(BIN);
         cmd.current_dir(self.ws.path())
             .env("HARNESS_HOME", self.home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_STATE_HOME");

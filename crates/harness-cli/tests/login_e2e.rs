@@ -2,6 +2,9 @@
 //! the device flow, which needs no browser; tokens go to the file store.
 #![cfg(feature = "chatgpt-login")]
 
+mod common;
+use common::Isolate;
+
 use std::os::unix::fs::PermissionsExt;
 
 use assert_cmd::Command;
@@ -108,7 +111,7 @@ impl Env {
         let mut cmd = Command::new(BIN);
         cmd.current_dir(self.ws.path())
             .env("HARNESS_HOME", self.home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .env("HARNESS_CHATGPT_ISSUER", &self.server_uri)
             .env(
                 "HARNESS_CHATGPT_BASE_URL",

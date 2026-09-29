@@ -1,3 +1,6 @@
+mod common;
+use common::Isolate;
+
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
@@ -112,7 +115,7 @@ impl Env {
         let mut cmd = Command::new(BIN);
         cmd.current_dir(self.ws.path())
             .env("HARNESS_HOME", self.home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .env_remove("HARNESS_SANDBOX")
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
@@ -392,7 +395,7 @@ fn sandbox_doctor_reports_the_mechanism_and_tier() {
         .args(["sandbox", "doctor"])
         .current_dir(ws.path())
         .env("HARNESS_HOME", home.path())
-        .env("HARNESS_CREDENTIAL_STORE", "file")
+        .isolate()
         .env_remove("HARNESS_SANDBOX")
         .output()
         .unwrap();

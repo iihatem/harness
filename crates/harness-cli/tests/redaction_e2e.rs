@@ -2,6 +2,9 @@
 //! reach the conversation through `printenv` leaves neither in the session file, the tool-output
 //! files, the debug log, the NDJSON output or what harness prints.
 
+mod common;
+use common::Isolate;
+
 use assert_cmd::Command;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -74,7 +77,7 @@ async fn no_secret_is_written_anywhere() {
         let output = Command::new(BIN)
             .current_dir(ws.path())
             .env("HARNESS_HOME", home.path())
-            .env("HARNESS_CREDENTIAL_STORE", "file")
+            .isolate()
             .env("MOCK_API_KEY", KEY)
             .env("DEPLOY_TOKEN", TOKEN)
             .env_remove("XDG_CONFIG_HOME")

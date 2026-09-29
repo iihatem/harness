@@ -2,6 +2,7 @@ use std::io::{BufRead, IsTerminal, Write};
 
 use harness_config::{config, paths::Paths, trust::TrustStore};
 use harness_context::project::project_root;
+use harness_providers::credentials::Credentials;
 
 use crate::term::terminal_safe;
 
@@ -55,7 +56,10 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
     let widening = match config::project_widening(&paths.global_config_file(), &workspace) {
         Ok(widening) => widening,
         Err(e) => {
-            eprintln!("error: {}", terminal_safe(&e.to_string()));
+            // What cannot be read can hold a key.
+            let credentials = Credentials::open(&paths.data_dir, crate::setup::env);
+            let redactor = crate::setup::known_secrets(&credentials);
+            eprintln!("error: {}", terminal_safe(&redactor.redact(&e.to_string())));
             return 2;
         }
     };

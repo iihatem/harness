@@ -358,6 +358,71 @@ async fn a_key_split_across_a_cut_off_reply_and_its_continuation_is_written_nowh
     holds_no_piece_of_a_secret(&plain);
 }
 
+// Re-review F, R2 (probe P6): the configuration is read before the providers' keys are known.
+// What it warns about (an untrusted project's settings, listed as they are written), or why it
+// cannot be read (TOML's own message quotes the line), was printed as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn configuration_warnings_and_errors_are_printed_redacted() {
+    let project = format!(
+        "[providers.proxy]\nprotocol = \"openai-chat\"\nbase_url = \"https://user:{KEY}@proxy.example/v1\"\n"
+    );
+    let run = Run::with(
+        vec![sse(&[text("hi"), stop()])],
+        &["--debug", "ask", "hi"],
+        Scenario {
+            workspace: &[(".harness/config.toml", &project)],
+            ..Scenario::default()
+        },
+    )
+    .await;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("https://user:[redacted]@proxy.example/v1"),
+        "{}",
+        run.stderr
+    );
+    holds_no_piece_of_a_secret(&run);
+    for config in [
+        // serde's message quotes the value.
+        format!("mode = \"{KEY}\"\nmodel = \"mock/m\"\n"),
+        // TOML's quotes the line.
+        format!("model = \"mock/m\"\napi_key = \"{KEY}\"\n"),
+        format!("model = \"mock/m\"\napi_key = {KEY}\n"),
+    ] {
+        // `harness trust` reads the configuration on its own.
+        for args in [&["ask", "hi"][..], &["trust", "--yes"]] {
+            let run = Run::with(
+                vec![sse(&[text("hi"), stop()])],
+                args,
+                Scenario {
+                    home: &[("config/config.toml", &config)],
+                    ..Scenario::default()
+                },
+            )
+            .await;
+            assert_eq!(run.code, Some(2), "{args:?}: {}", run.stderr);
+            assert!(
+                run.stderr.contains("config.toml: line "),
+                "{args:?}: {}",
+                run.stderr
+            );
+            for piece in pieces(KEY) {
+                assert!(
+                    !run.stderr.contains(piece),
+                    "{args:?} {config}: {}",
+                    run.stderr
+                );
+                assert!(
+                    !run.stdout.contains(piece),
+                    "{args:?} {config}: {}",
+                    run.stdout
+                );
+            }
+        }
+    }
+}
+
 /// The model runs a command that quotes [`PASSWORD`], then tries to write it outside the
 /// workspace, which is blocked (and shown on stderr in plain mode), then says it is done.
 fn password_replies() -> Vec<ResponseTemplate> {

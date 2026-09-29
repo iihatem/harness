@@ -291,7 +291,7 @@ pub fn parse_file(path: &Path) -> Result<Option<ConfigFile>, ConfigError> {
     };
     let file: ConfigFile = toml::from_str(&text).map_err(|e| ConfigError::Parse {
         path: path.to_path_buf(),
-        message: e.to_string(),
+        message: toml_error(&text, &e),
     })?;
     if let Some(name) = file
         .providers
@@ -306,6 +306,31 @@ pub fn parse_file(path: &Path) -> Result<Option<ConfigFile>, ConfigError> {
         });
     }
     Ok(Some(file))
+}
+
+/// What is wrong with `text`, which TOML could not read: where (line and column) and why, never
+/// the line itself, which TOML's own message quotes and which can hold a key (`api_key = "sk-…"`
+/// is a setting of other tools).
+pub fn toml_error(text: &str, error: &toml::de::Error) -> String {
+    let why = error.message().trim_end();
+    match error.span() {
+        Some(span) => {
+            let before = &text[..floor_char_boundary(text, span.start)];
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            format!("line {line}, column {column}: {}", why.replace('\n', "; "))
+        }
+        None => why.replace('\n', "; "),
+    }
+}
+
+/// The char boundary at or before `i` in `s`, or its end.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 /// Provider names no config may define: `chatgpt` is the account signed in with `harness login

@@ -72,21 +72,30 @@ impl Secrets for Keys<'_> {
     }
 }
 
-/// Loads paths and configuration. Errors are user-facing messages (exit code 2).
+/// Loads paths and configuration. Errors are user-facing messages (exit code 2), redacted.
+///
+/// The secrets harness knows before it reads the configuration (those in the environment and
+/// the credential file) are registered first, so that what the configuration warns about, or why
+/// it cannot be read, is printed without them; then the key variable of every configured
+/// provider is.
 pub fn load() -> Result<Setup, String> {
     let workspace = std::env::current_dir()
         .and_then(|dir| dir.canonicalize())
         .map_err(|e| format!("cannot determine the working directory: {e}"))?;
     let paths = Paths::from_process_env().map_err(|e| e.to_string())?;
-    let trust = TrustStore::load(&paths.data_dir).map_err(|e| e.to_string())?;
-    let config =
-        config::load(&paths.global_config_file(), &workspace, &trust).map_err(|e| e.to_string())?;
-    for warning in &config.warnings {
-        eprintln!("warning: {}", crate::term::terminal_safe(warning));
-    }
     let credentials = Arc::new(Credentials::open(&paths.data_dir, env));
-    let redactor = Arc::new(Redactor::default());
-    register_secrets(&redactor, &config, &credentials);
+    let redactor = Arc::new(known_secrets(&credentials));
+    let redacted = |message: String| redactor.redact(&message);
+    let trust = TrustStore::load(&paths.data_dir).map_err(|e| redacted(e.to_string()))?;
+    let config = config::load(&paths.global_config_file(), &workspace, &trust)
+        .map_err(|e| redacted(e.to_string()))?;
+    register_key_variables(&redactor, &config);
+    for warning in &config.warnings {
+        eprintln!(
+            "warning: {}",
+            crate::term::terminal_safe(&redactor.redact(warning))
+        );
+    }
     Ok(Setup {
         paths,
         config,
@@ -97,14 +106,20 @@ pub fn load() -> Result<Setup, String> {
     })
 }
 
-/// Registers, from the start of the run, the secrets in the environment, those in the credential
-/// file, and the key variable of every configured provider, whether or not this run uses them.
-/// The keychain is not read for this: a key harness reads from it is registered when it is read.
-fn register_secrets(redactor: &Redactor, config: &Config, credentials: &Credentials) {
+/// The secrets known from the start of the run: those in the environment and those in the
+/// credential file, whether or not this run uses them. The keychain is not read for this: a key
+/// harness reads from it is registered when it is read.
+pub fn known_secrets(credentials: &Credentials) -> Redactor {
+    let redactor = Redactor::default();
     redactor.add_env(std::env::vars_os());
     for secret in credentials.file_secrets() {
         redactor.add(&secret);
     }
+    redactor
+}
+
+/// Registers the key variable of every configured provider, whatever it is called.
+fn register_key_variables(redactor: &Redactor, config: &Config) {
     for var in config
         .providers
         .values()

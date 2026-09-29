@@ -63,3 +63,19 @@ fn a_data_directory_made_for_the_trust_list_is_private() {
     let mode = std::fs::metadata(&data).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o700);
 }
+
+// Re-review F, R2: a damaged trust file is reported like a damaged config file: where, never the
+// line itself.
+#[test]
+fn a_damaged_trust_file_never_quotes_its_line() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("trust.toml"),
+        "workspaces = sk-proj-SECRETVALUE123\n",
+    )
+    .unwrap();
+    let err = TrustStore::load(dir.path()).unwrap_err().to_string();
+    assert!(err.contains("trust.toml"), "{err}");
+    assert!(err.contains("line 1, column"), "{err}");
+    assert!(!err.contains("SECRETVALUE"), "{err}");
+}

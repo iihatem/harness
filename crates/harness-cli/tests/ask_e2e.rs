@@ -653,9 +653,10 @@ async fn control_characters_reach_the_terminal_only_escaped() {
     );
 }
 
-// Review Focus: a config parse error echoes a snippet of the offending source line. If that line
-// contains a raw control byte (e.g. pasted from a terminal capture), it must reach stderr escaped,
-// not raw — the same guarantee `terminal_safe` already gives rule text and model output.
+// Review Focus: a config parse error echoed a snippet of the offending source line. If that line
+// contains a raw control byte (e.g. pasted from a terminal capture), it must not reach stderr raw
+// — the same guarantee `terminal_safe` already gives rule text and model output. Since re-review
+// F, R2, the line is not echoed at all (it can hold a key): only where it is.
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_config_with_an_escape_byte_is_escaped_on_stderr() {
     let server = MockServer::start().await;
@@ -671,7 +672,8 @@ async fn invalid_config_with_an_escape_byte_is_escaped_on_stderr() {
         !stderr.contains('\u{1b}'),
         "raw ESC byte on stderr: {stderr:?}"
     );
-    assert!(stderr.contains("\\u{1b}"), "{stderr}");
+    assert!(stderr.contains("line 1, column 4"), "{stderr}");
+    assert!(!stderr.contains("mdo"), "{stderr}");
 }
 
 // Review Focus: `registry::resolve`'s errors (BadId/UnknownProvider) embed the raw model id or

@@ -924,3 +924,41 @@ fn the_provider_name_chatgpt_is_reserved_for_chatgpt_sign_in() {
     assert!(err.contains("reserved for ChatGPT sign-in"), "{err}");
     drop(dir);
 }
+
+// Re-review F, R2: TOML's error quotes the line it could not read, and `api_key = "sk-…"` (a
+// setting of other tools) is a common mistake. The error keeps the file, the line and the column,
+// and never the line.
+#[test]
+fn a_parse_error_never_quotes_the_line_it_could_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.toml");
+    for (text, at) in [
+        (
+            "model = \"ollama/a\"\n[providers.x]\napi_key = \"sk-proj-SECRETVALUE123\"\n",
+            "line 3, column 1",
+        ),
+        (
+            "model = \"ollama/a\"\napi_key = sk-proj-SECRETVALUE123\n",
+            "line 2, column 11",
+        ),
+    ] {
+        std::fs::write(&file, text).unwrap();
+        let err = config::load(&file, dir.path(), &TrustStore::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config.toml"), "{err}");
+        assert!(err.contains(at), "{err}");
+        assert!(!err.contains("SECRETVALUE"), "{err}");
+        assert!(!err.contains('\n'), "{err}");
+    }
+    // The name of an unknown setting is not the line.
+    std::fs::write(
+        &file,
+        "[providers.x]\napi_key = \"sk-proj-SECRETVALUE123\"\n",
+    )
+    .unwrap();
+    let err = config::load(&file, dir.path(), &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown field `api_key`"), "{err}");
+}

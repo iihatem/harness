@@ -35,7 +35,7 @@ The runtime SHALL execute requested tool calls and send their results back to th
 - **THEN** the runtime stops calling the model and finishes the turn with reason `step_limit`
 
 ### Requirement: User input during a turn is queued or steered
-The runtime SHALL accept user input while a turn is running. Input marked as queued MUST be delivered as the next user message after the turn finishes. Input marked as send-now MUST be delivered to the model at the next tool-result boundary within the running turn.
+The runtime SHALL accept user input while a turn is running. Input marked as queued MUST be delivered as the next user message after the turn finishes. Input marked as send-now MUST be delivered to the model at the next tool-result boundary within the running turn, and reported as a steered event; send-now input that no tool-result boundary took before the turn ended MUST be delivered as the next user message, before queued input. When the turn is interrupted, input not yet delivered MUST NOT be sent: the interactive frontend returns it to the input editor.
 
 #### Scenario: Queued message
 - **WHEN** the user submits "also update the README" as queued input while the agent is running tests
@@ -44,6 +44,10 @@ The runtime SHALL accept user input while a turn is running. Input marked as que
 #### Scenario: Steering mid-turn
 - **WHEN** the user submits "use the v2 API instead" as send-now input while a tool call is running
 - **THEN** the message is included with the next tool result sent to the model in the same turn
+
+#### Scenario: Send-now input after the last tool call
+- **WHEN** the user submits send-now input while the model writes a final answer that calls no tools
+- **THEN** the input is sent as the next user turn once that turn finishes
 
 ### Requirement: Turns can be interrupted
 The runtime SHALL accept an interrupt at any point in a turn. On interrupt it MUST cancel the in-flight model request, terminate any running tool process including its child processes, keep the partial output already received, and finish the turn with reason `interrupted`.

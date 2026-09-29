@@ -64,7 +64,7 @@ Except in `full-access`, the system SHALL require approval for `read`, `grep`, a
 - **THEN** the user is asked to approve before the file is read
 
 ### Requirement: Approval prompts offer once, session, or deny with feedback
-When approval is required interactively, the system SHALL offer: approve once; approve for the rest of the session for the same tool and command prefix or path pattern; or deny with an optional message returned to the model. Session approvals MUST NOT apply to destructive commands. Prompts for `write` and `edit` MUST show the diff.
+When approval is required interactively, the system SHALL offer: approve once; approve for the rest of the session for the same tool and command prefix or path pattern; or deny with an optional message returned to the model. Session approvals MUST NOT apply to destructive commands, and a session approval that cannot apply MUST be reported as applying once. Prompts for `write` and `edit` MUST show the diff. A prompt to run a command outside the sandbox MUST NOT offer approval for the session.
 
 #### Scenario: Approve for session
 - **WHEN** the user approves `cargo test` for the session and the model later runs `cargo test --all`
@@ -73,6 +73,10 @@ When approval is required interactively, the system SHALL offer: approve once; a
 #### Scenario: Session approval is scoped to the command prefix
 - **WHEN** the user approves `git status` for the session and the model later runs `git push`
 - **THEN** `git push` still requires approval
+
+#### Scenario: A destructive command approved for the session
+- **WHEN** the user approves `git reset --hard HEAD~1` for the session
+- **THEN** it runs once, the user is told the approval applied once, and the next `git reset --hard` asks again
 
 ### Requirement: Non-interactive runs deny actions that need approval
 When no user can answer an approval prompt, the system SHALL deny the action, tell the model it was denied for lack of approval, and record that an action was blocked.
@@ -135,7 +139,7 @@ In workspace-write sandboxes the system SHALL protect `.git/config`, `.git/hooks
 
 On macOS, and on Linux when unprivileged user namespaces are available (the full tier), writes to these paths MUST fail. On Linux, names that do not exist yet MUST be caught by a guard that moves them to a quarantine directory, never deleting them, and reports it in the tool result. The guard's scan for new repositories MUST use the ignore rules as they were when the session started, so that an ignore rule written during the session cannot hide a new repository.
 
-When user namespaces are unavailable (the basic tier), the system MUST warn at startup and point to `harness sandbox doctor`. The guard MUST restore changed protected files after each command, and, while a process started by an earlier sandboxed command is still running, also before each later command. When harness exits, it MUST end the processes sandboxed commands left running and check once more. With `sandbox.linux_git_protection = "required"`, the basic tier MUST require approval for every shell command in `ask` and `auto`.
+When user namespaces are unavailable (the basic tier), the system MUST warn at startup and point to `harness sandbox doctor`. The guard MUST restore changed protected files after each command, and, while a process started by an earlier sandboxed command is still running, also before each later command. When harness exits, it MUST end the processes sandboxed commands left running and check once more. With `sandbox.linux_git_protection = "required"`, the basic tier MUST require approval for every shell command in `ask` and `auto`, including in a session that drops to the basic tier after it started: such a command then runs outside the sandbox only once approved, and a headless run MUST count it as blocked.
 
 #### Scenario: Planting a hook
 - **WHEN** a sandboxed command runs `echo x > .git/hooks/pre-commit` in `auto` mode on macOS, or on Linux in the full tier
@@ -172,6 +176,10 @@ When user namespaces are unavailable (the basic tier), the system MUST warn at s
 #### Scenario: Strict git protection without user namespaces
 - **WHEN** user namespaces are blocked, `sandbox.linux_git_protection = "required"`, and the model runs `ls` in `auto` mode
 - **THEN** the user is asked to approve it
+
+#### Scenario: Strict git protection after a drop to the basic tier
+- **WHEN** a session in the full tier with `sandbox.linux_git_protection = "required"` drops to the basic tier and the model then runs `ls` in `auto` mode
+- **THEN** the user is asked whether to run it outside the sandbox, and a headless run exits with code 3 without running it
 
 ### Requirement: Commands run in bash without startup files
 The system SHALL run shell commands with `bash --noprofile --norc -c` with `BASH_ENV` and `ENV` removed from the environment. Bash MUST be looked for only at `/bin/bash`, `/usr/bin/bash`, and `/run/current-system/sw/bin/bash`, never on `PATH`, and `/bin/sh -c` MUST be used only when none of them exists.

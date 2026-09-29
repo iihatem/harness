@@ -58,7 +58,7 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 - [x] 4.6 Text tool-call recovery and truncation handling; verify the matching model-providers scenarios as tests
 - [x] 4.7 Secret-redaction audit across logs, sessions, tool output, and NDJSON; verify with a canary-key test
 
-## 5. P5 Terminal UI (plan written after P4)
+## 5. P5 Terminal UI (first half, P5a: `docs/superpowers/plans/2026-09-28-m1-p5a-terminal-ui.md`, written before P4 by the human's choice: 5.1 to 5.6 and 5.8, with the first-use trust prompt and the 2.13 final review's M1 and M4; the rest, 5.7 and what needs P4, is planned after P4)
 
 - [ ] 5.1 Inline renderer with native scrollback, Markdown and diff rendering, `NO_COLOR`; verify with ratatui `TestBackend` snapshots
 - [ ] 5.2 Input editor: history, multi-line, collapsed pastes, `/` and `@` completion; verify with snapshot and unit tests

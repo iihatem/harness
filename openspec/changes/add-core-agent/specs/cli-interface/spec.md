@@ -5,14 +5,18 @@ The command-line interface presents the agent to users, both as an interactive i
 ## ADDED Requirements
 
 ### Requirement: Interactive sessions render inline
-Interactive mode SHALL render into the terminal's normal screen: completed messages MUST be written into the terminal scrollback, and only the active region (input, streaming output, prompts) MUST be redrawn. Full-screen views MAY be used for pickers, `/rewind`, and long diffs and MUST return to inline mode when closed.
+Interactive mode SHALL render into the terminal's normal screen: completed messages MUST be written into the terminal scrollback, and only the active region (input, streaming output, prompts) MUST be redrawn. Full-screen views MAY be used for pickers, `/rewind`, and long diffs and MUST return to inline mode when closed. Interactive mode MUST need a terminal on standard input and standard output; without one, `harness` MUST exit with code 2 and name `harness ask`.
 
 #### Scenario: Scrollback preserved
 - **WHEN** a session produces more output than fits on screen
 - **THEN** earlier messages remain reachable with the terminal's own scrollback
 
+#### Scenario: No terminal
+- **WHEN** the user runs `harness` with standard input from a pipe
+- **THEN** harness exits with code 2 and says to use `harness ask`
+
 ### Requirement: Status line and per-turn stats
-Interactive mode SHALL display a status line showing the active model, approval mode, context usage as a percentage of the effective context window, and session token totals. After each turn it MUST show the model that answered, time to first token, output tokens per second, and prompt-cache hit rate when the provider reports cache usage.
+Interactive mode SHALL display a status line showing the active model, approval mode, context usage as a percentage of the effective context window, and session token totals. After each turn it MUST show the model that answered, time to first token, output tokens per second, and prompt-cache hit rate when the provider reports cached tokens. The runtime MUST report these per-turn statistics as an event before the turn finishes, so `harness ask --json` prints them too.
 
 #### Scenario: Status after switching model
 - **WHEN** the user switches to a model with a larger context window
@@ -23,7 +27,7 @@ Interactive mode SHALL display a status line showing the active model, approval 
 - **THEN** a stats line shows the model, time to first token, tokens per second, and cache hit rate
 
 ### Requirement: Keyboard interaction
-Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on empty input to open `/rewind`; Ctrl+C pressed twice within 2 seconds to exit; Shift+Tab to cycle approval modes; Alt+Enter or Shift+Enter to insert a newline; Up arrow to recall previous inputs; `/` at the start of input for command completion; `@` for fuzzy completion of workspace file paths; Enter while a turn is running to queue input; and Ctrl+S while a turn is running to send input immediately (steering).
+Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on empty input to open `/rewind`; Ctrl+C pressed twice within 2 seconds to exit; Shift+Tab to cycle approval modes; Alt+Enter or Shift+Enter to insert a newline, with Ctrl+J and a backslash before Enter as fallbacks for terminals that do not report Shift+Enter; Up arrow to recall previous inputs; `/` at the start of input for command completion; `@` for fuzzy completion of workspace file paths; Enter while a turn is running to queue input; and Ctrl+S while a turn is running to send input immediately (steering). An approval prompt MUST take y (approve once), a (approve for the session, when offered), n (deny, with an optional reason for the model) and Esc (deny and stop the turn).
 
 #### Scenario: File completion
 - **WHEN** the user types `@mainrs`
@@ -34,14 +38,18 @@ Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on 
 - **THEN** the message is delivered to the model at the next tool-result boundary
 
 ### Requirement: Desktop notifications
-Interactive mode SHALL emit an OSC 9 desktop notification and a terminal bell when a turn that ran longer than 10 seconds finishes, or when an approval is needed. Both MUST be configurable and MUST be disabled when stdout is not a terminal.
+Interactive mode SHALL emit an OSC 9 desktop notification and a terminal bell when a turn that ran 10 seconds or longer finishes, other than by the user's interruption, or when an approval is needed. Both MUST be configurable (`[notifications] desktop` and `bell`, on by default) and MUST be disabled when stdout is not a terminal. Text in a notification MUST have its control characters removed.
 
 #### Scenario: Long task completes
 - **WHEN** a turn runs for 3 minutes and finishes
 - **THEN** the terminal receives an OSC 9 notification and a bell
 
+#### Scenario: Notifications turned off
+- **WHEN** the configuration sets `[notifications] desktop = false`
+- **THEN** a long turn ends with a bell and no OSC 9 notification
+
 ### Requirement: Large pastes are collapsed
-Interactive mode SHALL display pasted text longer than 10 lines or 1,000 characters as a numbered placeholder showing its line count, let the user expand the placeholder to edit the text, and send the full text with the message.
+Interactive mode SHALL display pasted text longer than 10 lines or 1,000 characters as a numbered placeholder showing its line count, let the user expand the placeholder to edit the text (Ctrl+O), and send the full text with the message.
 
 #### Scenario: Pasting a stack trace
 - **WHEN** the user pastes a 200-line stack trace

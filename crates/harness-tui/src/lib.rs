@@ -3,6 +3,7 @@
 //! This crate draws with `ratatui`; `harness-cli` sets up the session and starts it.
 
 pub mod diff;
+pub mod editor;
 pub mod highlight;
 pub mod inline;
 pub mod markdown;

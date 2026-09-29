@@ -278,3 +278,24 @@ async fn keys_typed_ahead_of_the_session_picker_do_not_resume() {
     assert_eq!(*log.lock().unwrap(), ["enter", "leave"]);
     ui.finish().await.unwrap();
 }
+
+// `harness --resume` alone: the session starts with the session picker open.
+#[tokio::test]
+async fn the_session_picker_can_open_as_the_session_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let old = saved(&sessions, dir.path(), &[("old question", "old answer")]);
+    let provider = MockProvider::new(vec![Script::text("Resumed.")]);
+    let (mut ui, log) = open(provider.clone(), &sessions, dir.path());
+    ui.open_session_picker().unwrap();
+    assert_eq!(screen(&ui)[0], "Resume which session?");
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Enter);
+    settle(&mut ui).await;
+    assert_eq!(*log.lock().unwrap(), ["enter", "leave"]);
+    assert!(shows(&ui, &format!("resumed session {old}")));
+    send(&mut ui, "go on");
+    settle(&mut ui).await;
+    assert_eq!(user_messages(&provider)[0], "old question");
+    ui.finish().await.unwrap();
+}

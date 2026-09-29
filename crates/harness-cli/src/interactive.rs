@@ -3,6 +3,7 @@
 use std::{
     future::Future,
     io::{IsTerminal, Write},
+    path::Path,
     sync::Arc,
 };
 
@@ -16,6 +17,7 @@ use harness_tui::{
     inline::InlineTerminal,
     input::{Startup, TerminalInput, Unanswered, ask_at_startup},
     notify::TerminalNotifier,
+    picker::{Item, Picker, choose},
     plan::ExternalEditor,
     style::Theme,
     terminal::{CrosstermRawMode, Modes},
@@ -29,6 +31,7 @@ use crate::{
     host::CliHost,
     notices::Notices,
     sessions, setup,
+    setup::Setup,
     start::{self, Request, Started},
     term::terminal_safe,
 };
@@ -54,6 +57,119 @@ pub fn unfit_terminal(term: Option<&str>, size: Option<(u16, u16)>) -> Option<&'
         );
     }
     None
+}
+
+/// What the first run says when no model can be found.
+fn no_models(global: &Path) -> String {
+    format!(
+        "no model is configured, and harness found none to choose from. Start Ollama, LM Studio or llama.cpp; add an API key with `harness auth add openai` (or anthropic, openrouter); or sign in to ChatGPT with `harness login chatgpt`. Then run harness again, or set `model = \"<provider>/<model>\"` in {}.",
+        global.display()
+    )
+}
+
+/// The first run, with no model configured: the user chooses one of the models harness `found`
+/// in a picker on `term`, with the events `events` of the terminal's reader, and it is saved as
+/// the default model in the global config file `global`. Errors are what to print (exit code
+/// 2); so is a terminal that hung up meanwhile, which chose nothing.
+pub async fn choose_first_model<B, S, E>(
+    global: &Path,
+    found: Vec<String>,
+    term: &mut InlineTerminal<B>,
+    events: S,
+) -> Result<String, String>
+where
+    B: ratatui::backend::Backend,
+    B::Error: Send + Sync + 'static,
+    S: futures::Stream<Item = std::io::Result<E>> + Unpin,
+    E: Into<harness_tui::input::Timed>,
+{
+    if found.is_empty() {
+        return Err(no_models(global));
+    }
+    let items = found.iter().map(|id| Item::new(id, "")).collect();
+    let picker = Picker::new("Choose a model to start with", items).with_footer(vec![format!(
+        "It is saved as your default model in {}; /model switches in a session.",
+        global.display()
+    )]);
+    let chosen = choose(term, events, picker, &Theme::from_env())
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(id) = chosen.and_then(|i| found.get(i).cloned()) else {
+        return Err(format!(
+            "no model was chosen; pass one with --model, or set `model = \"<provider>/<model>\"` in {}",
+            global.display()
+        ));
+    };
+    config::save_default_model(global, &id)
+        .map_err(|e| format!("cannot save the model as the default: {e}"))?;
+    Ok(id)
+}
+
+/// How the first-run model choice went.
+enum FirstModel {
+    Chosen(String),
+    /// The session ended (a signal, or the terminal hung up) before a model was chosen.
+    Ended(Ending),
+}
+
+/// The first-run model choice on this process's terminal, with a terminal session of its own,
+/// which ends before the agent starts: the terminal is asked about itself and read only through
+/// the session's reader, as in the session, and a signal or a hangup ends it cleanly, a picker
+/// open or not.
+async fn first_model(setup: &Setup, notices: &mut Notices) -> Result<FirstModel, String> {
+    let found: Vec<String> = crate::models::available(setup)
+        .await
+        .into_iter()
+        .map(|model| model.id())
+        .collect();
+    for warning in setup.credentials.take_warnings() {
+        notices.warn(&warning);
+    }
+    let global = setup.paths.global_config_file();
+    if found.is_empty() {
+        return Err(no_models(&global));
+    }
+    let shutdown = shutdown_signals().map_err(|e| e.to_string())?;
+    tokio::pin!(shutdown);
+    let startup = tokio::select! {
+        biased;
+        ending = &mut shutdown => return Ok(FirstModel::Ended(ending)),
+        startup = ask_at_startup() => startup,
+    };
+    let Startup { keyboard, cursor } = match startup {
+        Ok(startup) => startup,
+        Err(Unanswered::HungUp) => return Ok(FirstModel::Ended(Ending::Hangup)),
+        Err(Unanswered::Stuck) => {
+            return Err("the terminal did not answer when asked about itself".into());
+        }
+    };
+    let top = cursor.map_or(
+        u16::MAX,
+        |(column, row)| if column == 0 { row } else { row + 1 },
+    );
+    let modes =
+        Modes::enter(std::io::stdout(), CrosstermRawMode, keyboard).map_err(|e| e.to_string())?;
+    modes.leave_on_panic(std::io::stdout, CrosstermRawMode);
+    let mut input = TerminalInput::start().map_err(|e| e.to_string())?;
+    let mut term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)
+        .map_err(|e| e.to_string())?
+        .with_alt_screen(Box::new(modes.alt_screen()));
+    let chosen = tokio::select! {
+        biased;
+        ending = &mut shutdown => Err(ending),
+        chosen = choose_first_model(&global, found, &mut term, &mut input) => Ok(chosen),
+    };
+    // The reader stops before the terminal's modes are undone, and the alternate screen, if a
+    // signal left it open, is left.
+    let _ = term.leave_full();
+    drop(term);
+    input.stop();
+    drop(modes);
+    match chosen {
+        Err(ending) => Ok(FirstModel::Ended(ending)),
+        Ok(Ok(id)) => Ok(FirstModel::Chosen(id)),
+        Ok(Err(message)) => Err(message),
+    }
 }
 
 /// What the interactive session does before the async runtime starts, while harness is one
@@ -99,6 +215,7 @@ pub async fn run(
     model_flag: Option<String>,
     mode_flag: Option<Mode>,
     choice: sessions::Choice,
+    pick_session: bool,
 ) -> u8 {
     let setup = match setup::load() {
         Ok(setup) => Arc::new(setup),
@@ -116,12 +233,23 @@ pub async fn run(
             return 2;
         }
     };
-    let Some(model_id) = model_flag.or_else(|| setup.config.model.clone()) else {
-        eprintln!(
-            "error: no model configured; pass one with --model, or set `model = \"<provider>/<model>\"` in {}; `harness models` lists the models harness finds",
-            setup.paths.global_config_file().display()
-        );
-        return 2;
+    let model_id = match model_flag.or_else(|| setup.config.model.clone()) {
+        Some(id) => id,
+        None => match first_model(&setup, &mut notices).await {
+            Ok(FirstModel::Chosen(id)) => {
+                println!(
+                    "Saved {} as your default model in {}.",
+                    terminal_safe(&id),
+                    terminal_safe(&setup.paths.global_config_file().display().to_string())
+                );
+                id
+            }
+            Ok(FirstModel::Ended(ending)) => return exit_code(ending),
+            Err(message) => {
+                eprintln!("error: {}", terminal_safe(&message));
+                return 2;
+            }
+        },
     };
     let resolved = registry::resolve(&model_id, &setup.config.providers, setup.keys());
     // Redacted, as `harness ask` prints them; those raised later go to the transcript.
@@ -210,6 +338,7 @@ pub async fn run(
         notifications,
         redactor,
         write_mode_warning,
+        pick_session,
     )
     .await;
     sandbox_session.end();
@@ -275,6 +404,7 @@ fn ignored(signal: nix::libc::c_int) -> bool {
 }
 
 /// Runs the session on this process's terminal, and gives the terminal back as it was.
+#[allow(clippy::too_many_arguments)]
 async fn terminal_session(
     agent: harness_core::agent::Agent,
     host: Box<dyn Host>,
@@ -283,6 +413,7 @@ async fn terminal_session(
     notifications: harness_config::config::Notifications,
     redactor: Arc<harness_core::redact::Redactor>,
     write_mode_warning: Option<String>,
+    pick_session: bool,
 ) -> std::io::Result<Ending> {
     // From here on, a hangup or SIGTERM ends the session rather than harness.
     let shutdown = shutdown_signals()?;
@@ -313,6 +444,7 @@ async fn terminal_session(
     // when the session ends; the terminal is not read for the session meanwhile.
     let modes = Modes::enter(std::io::stdout(), CrosstermRawMode, keyboard)?;
     modes.leave_on_panic(std::io::stdout, CrosstermRawMode);
+    let modes_alt = modes.alt_screen();
     let input = TerminalInput::start()?;
     options.text_editor = Some(Box::new(
         ExternalEditor::from_env(modes).pausing(input.pauser()),
@@ -322,7 +454,8 @@ async fn terminal_session(
         notifications.desktop,
         notifications.bell,
     )));
-    let mut term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)?;
+    let mut term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)?
+        .with_alt_screen(Box::new(modes_alt));
     if cursor.is_none() {
         term = term.without_cursor_reports();
     }
@@ -330,6 +463,10 @@ async fn terminal_session(
         .with_redactor(redactor)
         .with_cursor_query(input.cursor_query());
     ui.app_mut().set_write_mode_warning(write_mode_warning);
+    // `harness --resume` on its own: the session starts with the session picker open.
+    if pick_session {
+        ui.open_session_picker()?;
+    }
     ui.run(input, shutdown).await
 }
 
@@ -337,7 +474,6 @@ async fn terminal_session(
 mod tests {
     use super::*;
 
-    use crate::setup::Setup;
     use harness_config::{config::Config, paths::Paths, trust::TrustStore};
     use harness_core::{
         engine::{EngineConfig, PermissionEngine, RuleSet},
@@ -394,6 +530,98 @@ mod tests {
         let said = [prepared.notes, prepared.warnings].concat().join("\n");
         assert!(said.contains("asks for model openai/[redacted]"), "{said}");
         assert!(!said.contains(&SECRET[8..]), "{said}");
+    }
+
+    use harness_tui::{input::Timed, testing::TestAltScreen};
+    use ratatui::{
+        backend::TestBackend,
+        crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
+    };
+
+    /// Keys as the terminal's reader gives them, read after the picker had been quiet for a pause.
+    fn keys(codes: &[KeyCode]) -> impl futures::Stream<Item = std::io::Result<Timed>> + Unpin {
+        let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        futures::stream::iter(
+            codes
+                .iter()
+                .enumerate()
+                .map(|(i, code)| {
+                    Ok(Timed {
+                        event: Event::Key(KeyEvent::new(*code, KeyModifiers::NONE)),
+                        at: base + std::time::Duration::from_millis(i as u64),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn terminal() -> InlineTerminal<TestBackend> {
+        InlineTerminal::new(TestBackend::new(80, 20), 0)
+            .unwrap()
+            .with_alt_screen(Box::new(TestAltScreen::new().0))
+    }
+
+    // Spec: "First interactive run with Ollama running": the picker lists the models, and the
+    // one chosen is saved to the global configuration file.
+    #[tokio::test]
+    async fn the_first_run_saves_the_chosen_model_as_the_default() {
+        let home = tempfile::tempdir().unwrap();
+        let global = home.path().join("config/config.toml");
+        let found = vec!["ollama/llama3".to_string(), "ollama/qwen3-coder:30b".into()];
+        let mut term = terminal();
+        let chosen = choose_first_model(
+            &global,
+            found,
+            &mut term,
+            keys(&[KeyCode::Down, KeyCode::Enter]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(chosen, "ollama/qwen3-coder:30b");
+        assert_eq!(
+            std::fs::read_to_string(&global).unwrap(),
+            "model = \"ollama/qwen3-coder:30b\"\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_the_first_run_picker_saves_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let global = home.path().join("config.toml");
+        let mut term = terminal();
+        let error = choose_first_model(
+            &global,
+            vec!["ollama/llama3".into()],
+            &mut term,
+            keys(&[KeyCode::Esc]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("no model was chosen"), "{error}");
+        assert!(error.contains("--model"), "{error}");
+        assert!(!global.exists());
+    }
+
+    // Spec: "If no models are available, interactive mode MUST guide the user to sign in or
+    // configure a provider."
+    #[tokio::test]
+    async fn with_no_models_the_first_run_says_how_to_get_one() {
+        let home = tempfile::tempdir().unwrap();
+        let global = home.path().join("config.toml");
+        let mut term = terminal();
+        let error = choose_first_model(&global, Vec::new(), &mut term, keys(&[]))
+            .await
+            .unwrap_err();
+        for hint in [
+            "Ollama",
+            "harness login chatgpt",
+            "harness auth add openai",
+            "config.toml",
+        ] {
+            assert!(error.contains(hint), "{hint}: {error}");
+        }
+        assert!(!term.in_full_screen());
+        assert!(!global.exists());
     }
 
     // Review A's M8: Emacs's shell mode and other terminals that cannot move the cursor set

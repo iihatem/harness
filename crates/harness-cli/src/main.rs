@@ -16,7 +16,7 @@ mod start;
 mod term;
 mod trust;
 
-use std::process::ExitCode;
+use std::{io::IsTerminal, process::ExitCode};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use harness_core::permission::Mode;
@@ -240,7 +240,17 @@ fn main() -> ExitCode {
             eprintln!("{RESUME_NEEDS_AN_ID}");
             return ExitCode::from(2);
         }
-        (Some(None), _) => return ExitCode::from(sessions::print_list()),
+        // On a terminal, the session starts with the session picker open.
+        (Some(None), _)
+            if interactive::needs_terminal(
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+            )
+            .is_some() =>
+        {
+            return ExitCode::from(sessions::print_list());
+        }
+        (Some(None), _) => sessions::Choice::New,
         (Some(Some(id)), _) => sessions::Choice::Resume(id.clone()),
         (None, true) => sessions::Choice::Continue,
         (None, false) => sessions::Choice::New,
@@ -284,7 +294,10 @@ fn main() -> ExitCode {
             Some(Command::Sandbox {
                 command: SandboxCommand::Doctor,
             }) => doctor::run(),
-            None => interactive::run(cli.model, cli.mode, session).await,
+            None => {
+                let pick_session = matches!(cli.resume, Some(None));
+                interactive::run(cli.model, cli.mode, session, pick_session).await
+            }
         }
     });
     // A blocking task given up on (a file read for an approval's diff that never returned) must

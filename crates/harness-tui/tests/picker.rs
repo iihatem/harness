@@ -1,9 +1,12 @@
 //! The picker: a list to choose from, filtered as the user types, drawn in a full-screen view
 //! on the terminal's alternate screen, which gives the inline screen back as it was.
 
+use std::time::{Duration, Instant};
+
 use harness_tui::{
     inline::InlineTerminal,
-    picker::{Item, Picked, Picker},
+    input::Timed,
+    picker::{Item, Picked, Picker, choose},
     style::Theme,
     terminal::{AltScreen, CrosstermAltScreen},
     testing::TestAltScreen,
@@ -11,7 +14,7 @@ use harness_tui::{
 use ratatui::{
     backend::{CrosstermBackend, TestBackend},
     buffer::Buffer,
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
     layout::Rect,
     text::Line,
 };
@@ -248,8 +251,8 @@ impl std::io::Write for Sent {
 fn the_terminal_switches_screens_with_1049() {
     let sent = Sent::default();
     let mut backend = CrosstermBackend::new(sent.clone());
-    CrosstermAltScreen.enter(&mut backend).unwrap();
-    CrosstermAltScreen.leave(&mut backend).unwrap();
+    CrosstermAltScreen::default().enter(&mut backend).unwrap();
+    CrosstermAltScreen::default().leave(&mut backend).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&sent.0.lock().unwrap()),
         "\u{1b}[?1049h\u{1b}[?1049l"
@@ -310,4 +313,102 @@ fn a_picker_on_a_tiny_terminal_still_shows_the_selection() {
         "{screen:#?}"
     );
     assert_eq!(picker.key(key(KeyCode::Enter)), Some(Picked::Chosen(3)));
+}
+
+/// Keys as the terminal's reader gives them, each read `after` the picker was shown (the first
+/// at least a pause after it), so the picker takes them.
+fn keys(
+    codes: &[(KeyCode, KeyModifiers)],
+) -> impl futures::Stream<Item = std::io::Result<Timed>> + Unpin {
+    keys_after(Duration::from_secs(1), codes)
+}
+
+fn keys_after(
+    after: Duration,
+    codes: &[(KeyCode, KeyModifiers)],
+) -> impl futures::Stream<Item = std::io::Result<Timed>> + Unpin {
+    let base = Instant::now() + after;
+    futures::stream::iter(
+        codes
+            .iter()
+            .enumerate()
+            .map(|(i, (code, modifiers))| {
+                Ok(Timed {
+                    event: Event::Key(KeyEvent::new(*code, *modifiers)),
+                    at: base + Duration::from_millis(i as u64),
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+// The first-run model choice: a picker on its own, before the session starts.
+#[tokio::test]
+async fn a_picker_on_its_own_returns_the_choice_and_gives_the_screen_back() {
+    let (alt, log) = TestAltScreen::new();
+    let mut term = InlineTerminal::new(TestBackend::new(60, 12), 0)
+        .unwrap()
+        .with_alt_screen(Box::new(alt));
+    term.insert(&[Line::from("$ harness")]).unwrap();
+    let chosen = choose(
+        &mut term,
+        keys(&[
+            (KeyCode::Char('g'), KeyModifiers::NONE),
+            (KeyCode::Char('p'), KeyModifiers::NONE),
+            (KeyCode::Char('t'), KeyModifiers::NONE),
+            (KeyCode::Down, KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+        ]),
+        models(),
+        &Theme::monochrome(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(chosen, Some(3));
+    assert_eq!(*log.lock().unwrap(), ["enter", "leave"]);
+    assert!(!term.in_full_screen());
+    assert_eq!(rows(term.backend().buffer())[0], "$ harness");
+}
+
+// Keys read before the picker had been quiet for a pause were typed ahead of it: they choose
+// nothing, and the picker waits for a pause after the last of them.
+#[tokio::test]
+async fn keys_typed_ahead_of_a_picker_on_its_own_choose_nothing() {
+    let mut term = InlineTerminal::new(TestBackend::new(60, 12), 0)
+        .unwrap()
+        .with_alt_screen(Box::new(TestAltScreen::new().0));
+    let chosen = choose(
+        &mut term,
+        keys_after(
+            Duration::ZERO,
+            &[
+                (KeyCode::Enter, KeyModifiers::NONE),
+                (KeyCode::Esc, KeyModifiers::NONE),
+            ],
+        ),
+        models(),
+        &Theme::monochrome(),
+    )
+    .await
+    .unwrap();
+    // Nothing chose or closed it: the events ended.
+    assert_eq!(chosen, None);
+}
+
+#[tokio::test]
+async fn esc_ctrl_c_or_the_end_of_input_choose_nothing() {
+    for script in [
+        vec![(KeyCode::Esc, KeyModifiers::NONE)],
+        vec![(KeyCode::Char('c'), KeyModifiers::CONTROL)],
+        vec![(KeyCode::Down, KeyModifiers::NONE)],
+    ] {
+        let mut term = InlineTerminal::new(TestBackend::new(60, 12), 0)
+            .unwrap()
+            .with_alt_screen(Box::new(TestAltScreen::new().0));
+        let chosen = choose(&mut term, keys(&script), models(), &Theme::monochrome())
+            .await
+            .unwrap();
+        assert_eq!(chosen, None);
+        assert!(!term.in_full_screen());
+    }
 }

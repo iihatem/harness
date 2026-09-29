@@ -274,6 +274,12 @@ where
         self
     }
 
+    /// Opens the session picker, as `harness --resume` does when the session starts.
+    pub fn open_session_picker(&mut self) -> io::Result<()> {
+        self.app.open_session_picker();
+        self.draw()
+    }
+
     pub fn app(&self) -> &App {
         &self.app
     }

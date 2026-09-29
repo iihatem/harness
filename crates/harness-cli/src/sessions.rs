@@ -98,8 +98,9 @@ pub fn open(setup: &Setup, choice: &Choice, notices: &mut Notices) -> Result<Ses
     Ok(session)
 }
 
-/// `harness --resume` without an id: prints each session of this project, most recent first,
-/// with its id, start time and first message.
+/// `harness --resume` without an id and without a terminal: prints each session of this
+/// project, most recent first, with its id, start time and first message. On a terminal the
+/// interactive session opens with the session picker instead.
 pub fn print_list() -> u8 {
     let setup = match setup::load() {
         Ok(setup) => setup,
@@ -130,6 +131,6 @@ pub fn print_list() -> u8 {
             terminal_safe(&first)
         );
     }
-    println!("Continue one with: harness --resume <id> ask \"...\"");
+    println!("Continue one with: harness --resume <id>, or harness --resume <id> ask \"...\"");
     0
 }

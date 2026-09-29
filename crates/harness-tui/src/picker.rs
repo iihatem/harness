@@ -1,21 +1,26 @@
 //! A list to choose from, drawn in a full-screen view: the models, the sessions, the messages
-//! to rewind to, the modes. Typing filters it, fuzzily, as `@` completion matches files; the
+//! to rewind to, the modes; on its own, before a session starts, the first-run model choice. Typing filters it, fuzzily, as `@` completion matches files; the
 //! arrow keys, Page Up, Page Down, Home and End move; Enter chooses; Esc closes it.
 
-use std::cell::Cell;
+use std::{cell::Cell, io, time::Instant};
 
+use futures::{Stream, StreamExt};
 use nucleo_matcher::{
     Config, Matcher, Utf32Str,
     pattern::{CaseMatching, Normalization, Pattern},
 };
 use ratatui::{
+    backend::Backend,
     buffer::Buffer,
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Position, Rect},
     text::{Line, Span},
 };
 
 use crate::{
+    approval::Arming,
+    inline::{CursorReport, InlineTerminal},
+    input::Timed,
     style::Theme,
     text::{sanitize, width as text_width, wrap},
 };
@@ -319,4 +324,63 @@ impl Picker {
             })
             .collect()
     }
+}
+
+/// Runs `picker` on its own on `term`, in a full-screen view, with the terminal's `events`, as
+/// the first-run model choice does before the session starts: the index of the item chosen, or
+/// `None` for Esc, Ctrl+C or the end of the events (the terminal hung up). The inline screen is
+/// given back either way.
+///
+/// The picker takes keys as an approval does: once the user has paused for
+/// [`ARMING_DELAY`](crate::approval::ARMING_DELAY), counted from when each key was read, so keys
+/// typed ahead never choose an item (they are dropped: nothing here takes typed input). Ctrl+C
+/// closes it at any time. The terminal is not read from here, nor asked where its cursor is
+/// after a resize: `events` is its reader's.
+pub async fn choose<B, S, E>(
+    term: &mut InlineTerminal<B>,
+    mut events: S,
+    mut picker: Picker,
+    theme: &Theme,
+) -> io::Result<Option<usize>>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+    S: Stream<Item = io::Result<E>> + Unpin,
+    E: Into<Timed>,
+{
+    let mut arming = Arming::default();
+    let chosen = loop {
+        term.draw_full(|area, buf| picker.render(area, buf, theme))?;
+        arming.drawn(Instant::now());
+        let Some(next) = events.next().await else {
+            break None;
+        };
+        let Timed { event, at } = match next {
+            Ok(event) => event.into(),
+            Err(e) => {
+                term.leave_full()?;
+                return Err(e);
+            }
+        };
+        match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    break None;
+                }
+                if !arming.armed(at) {
+                    arming.typed(at);
+                    continue;
+                }
+                match picker.key(key) {
+                    Some(Picked::Chosen(index)) => break Some(index),
+                    Some(Picked::Cancelled) => break None,
+                    None => {}
+                }
+            }
+            Event::Resize(..) => term.resized_to(CursorReport::Unasked)?,
+            _ => {}
+        }
+    };
+    term.leave_full()?;
+    Ok(chosen)
 }

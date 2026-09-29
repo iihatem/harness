@@ -1315,6 +1315,11 @@ impl App {
         Some(Action::SwitchModel(id.to_string()))
     }
 
+    /// Opens the session picker, as `harness --resume` does when the session starts.
+    pub fn open_session_picker(&mut self) {
+        self.resume("");
+    }
+
     /// `/resume`: with an id, continues that session; alone, opens the session picker.
     fn resume(&mut self, id: &str) -> Option<Action> {
         let width = self.width;

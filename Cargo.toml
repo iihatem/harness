@@ -35,6 +35,7 @@ keyring-core = "1.0.0"
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }
 nix = { version = "0.31.3", features = ["signal", "process"] }
+nucleo-matcher = "0.3.1"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 regex = "1"

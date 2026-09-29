@@ -94,6 +94,17 @@ impl Editor {
         self.recall = None;
     }
 
+    /// Replaces the bytes `range` of the text (a word being completed) with `with` and a space,
+    /// dropping spaces that followed the word, and puts the cursor after the space. Collapsed
+    /// pastes elsewhere in the text stay collapsed.
+    pub fn replace_word(&mut self, range: std::ops::Range<usize>, with: &str) {
+        let end = range.end.min(self.text.len());
+        let spaces = self.text[end..].len() - self.text[end..].trim_start_matches(' ').len();
+        let start = range.start.min(end);
+        self.splice(start, end + spaces, &format!("{with} "));
+        self.cursor = start + with.len() + 1;
+    }
+
     /// Empties the editor.
     pub fn clear(&mut self) {
         self.set_text("");

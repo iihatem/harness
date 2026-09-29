@@ -8,9 +8,14 @@ publish.workspace = true
 
 [dependencies]
 harness-core.workspace = true
+ignore.workspace = true
+nucleo-matcher.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
 similar.workspace = true
 syntect.workspace = true
 unicode-width.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -23,8 +23,9 @@ pub const MIN_MAX_TOKENS: u64 = 1_024;
 /// tool results are user content here, so a note or prompt after them joins their message.
 /// What the API rejects, and a conversation held on other providers can hold, is left out or
 /// made to fit: text that is only whitespace, empty assistant messages, and tool-call ids with
-/// characters outside its pattern (`tool_use_id`). The system prompt and the last message
-/// are prompt-cache breakpoints.
+/// characters outside its pattern (`tool_use_id`). The system prompt, the last message and the
+/// previous request's last message are prompt-cache breakpoints; `max_tokens` is fitted to the
+/// room the window has left.
 pub fn request_body(req: &ChatRequest) -> Value {
     let mut messages: Vec<(&str, Vec<Value>)> = Vec::new();
     let mut push = |role: &'static str, blocks: Vec<Value>| {

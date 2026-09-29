@@ -86,6 +86,63 @@ fn text_around_a_call_or_a_quoted_call_is_not_recovered() {
     }
 }
 
+// Review E I1: Qwen3-Coder's own form, as its chat template writes calls and vLLM's
+// `qwen3_coder` parser reads them: one `<function=…>` inside each `<tool_call>` block.
+#[test]
+fn qwen3_coder_calls_are_recovered() {
+    let one = "<tool_call>\n<function=read>\n<parameter=path>\nsrc/lib.rs\n</parameter>\n</function>\n</tool_call>";
+    assert_eq!(
+        recover(one, known),
+        Some(vec![call("read", r#"{"path":"src/lib.rs"}"#)])
+    );
+    // The template puts one newline on each side of a value: only those belong to the format.
+    // A value that parses as JSON is JSON; any other is a string.
+    let typed = "\n<tool_call>\n<function=read>\n<parameter=path>\n two words\n\n</parameter>\n<parameter=offset>\n10\n</parameter>\n<parameter=ranges>\n[1, 2]\n</parameter>\n<parameter=exact>\ntrue\n</parameter>\n</function>\n</tool_call>\n";
+    assert_eq!(
+        recover(typed, known),
+        Some(vec![call(
+            "read",
+            r#"{"exact":true,"offset":10,"path":" two words\n","ranges":[1,2]}"#
+        )])
+    );
+    // Several blocks, a call without parameters, and the JSON form beside it.
+    let several = "<tool_call>\n<function=echo>\n<parameter=text>\na\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read>\n</function>\n</tool_call>\n<tool_call>{\"name\": \"echo\", \"arguments\": {\"text\": \"b\"}}</tool_call>";
+    assert_eq!(
+        recover(several, known),
+        Some(vec![
+            call("echo", r#"{"text":"a"}"#),
+            call("read", "{}"),
+            call("echo", r#"{"text":"b"}"#),
+        ])
+    );
+}
+
+// Spec: "Example code in prose", for Qwen3-Coder's form: only a whole message of well-formed
+// blocks naming known tools is a call.
+#[test]
+fn qwen3_coder_calls_in_prose_or_a_fence_or_malformed_stay_text() {
+    let block = "<tool_call>\n<function=read>\n<parameter=path>\na\n</parameter>\n</function>\n</tool_call>";
+    for text in [
+        format!("I'll read it.\n{block}"),
+        format!("{block}\nDone."),
+        format!("```xml\n{block}\n```"),
+        format!("Call it like this:\n\n```\n{block}\n```\n"),
+        // A tool the agent does not have.
+        "<tool_call>\n<function=deploy>\n</function>\n</tool_call>".into(),
+        // No `</function>`, or no `</parameter>`.
+        "<tool_call>\n<function=read>\n<parameter=path>\na\n</parameter>\n</tool_call>".into(),
+        "<tool_call>\n<function=read>\n<parameter=path>\na\n</function>\n</tool_call>".into(),
+        // Text between parameters, or after the function.
+        "<tool_call>\n<function=read>\nplease\n<parameter=path>\na\n</parameter>\n</function>\n</tool_call>".into(),
+        "<tool_call>\n<function=read>\n</function>\nthen stop\n</tool_call>".into(),
+        // No name.
+        "<tool_call>\n<function=>\n</function>\n</tool_call>".into(),
+        "<tool_call>\n<function=read>\n<parameter=>\na\n</parameter>\n</function>\n</tool_call>".into(),
+    ] {
+        assert_eq!(recover(&text, known), None, "{text:?}");
+    }
+}
+
 fn local_agent(provider: Arc<MockProvider>, dir: &std::path::Path) -> harness_core::agent::Agent {
     let mut agent = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir);
     agent.config_mut().text_tool_calls = true;
@@ -121,6 +178,53 @@ async fn a_tagged_call_in_a_reply_runs_like_a_native_one() {
         provider.requests()[1].messages.last(),
         Some(Message::Tool { .. })
     ));
+}
+
+// Review E I1: Qwen3-Coder served without a tool-call parser writes its calls in its own form;
+// they run like native ones, validated and permission-checked.
+#[tokio::test]
+async fn a_qwen3_coder_call_in_a_reply_runs_like_a_native_one() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("ws");
+    std::fs::create_dir(&dir).unwrap();
+    let provider = MockProvider::new(vec![
+        Script::text(
+            "<tool_call>\n<function=echo>\n<parameter=text>\nran\n</parameter>\n</function>\n</tool_call>",
+        ),
+        Script::text(
+            "<tool_call>\n<function=echo>\n<parameter=txt>\nx\n</parameter>\n</function>\n</tool_call>",
+        ),
+        Script::text(
+            "<tool_call>\n<function=touch>\n<parameter=path>\n../outside.txt\n</parameter>\n</function>\n</tool_call>",
+        ),
+        Script::text("done"),
+    ]);
+    let mut agent = local_agent(provider.clone(), &dir);
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    let outputs = finished_outputs(&events);
+    assert_eq!(outputs[0], ("ran".to_string(), false));
+    // Validated like any call...
+    assert!(
+        outputs[1].1 && outputs[1].0.contains("invalid arguments"),
+        "{outputs:?}"
+    );
+    assert_eq!(agent.invalid_calls_this_turn(), 1);
+    // ...and checked: a write outside the workspace needs approval nobody can give here.
+    assert!(outputs[2].1, "{outputs:?}");
+    assert!(!root.path().join("outside.txt").exists());
+    match &agent.history()[1] {
+        Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
+            assert!(content.is_empty(), "{content}");
+            assert_eq!(tool_calls[0].name, "echo");
+            assert_eq!(tool_calls[0].arguments, r#"{"text":"ran"}"#);
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]

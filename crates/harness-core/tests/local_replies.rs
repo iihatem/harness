@@ -8,11 +8,14 @@ use std::sync::Arc;
 use common::*;
 use harness_core::agent::NonInteractive;
 use harness_core::event::{AgentEvent, TurnEndReason};
+use harness_core::message::ToolSpec;
 use harness_core::message::{Message, ToolCall};
+use harness_core::permission::Action;
 use harness_core::permission::Mode;
 use harness_core::provider::{FinishReason, ProviderEvent};
 use harness_core::testing::{MockProvider, Script};
 use harness_core::textcalls::recover;
+use harness_core::tool::{Tool, ToolContext, ToolOutput, ToolRegistry};
 use serde_json::json;
 
 fn known(name: &str) -> bool {
@@ -117,6 +120,128 @@ fn qwen3_coder_calls_are_recovered() {
     );
 }
 
+/// A tool with `schema` as its parameters, as `recover` reads it; it is never run here.
+struct Schema(&'static str, serde_json::Value);
+
+#[async_trait::async_trait]
+impl Tool for Schema {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.0.into(),
+            description: String::new(),
+            parameters: self.1.clone(),
+        }
+    }
+    fn action(&self, _args: &serde_json::Value, ctx: &ToolContext) -> Action {
+        Action::Read(ctx.workspace.clone())
+    }
+    async fn run(&self, _args: serde_json::Value, _ctx: &ToolContext) -> ToolOutput {
+        ToolOutput::ok("")
+    }
+}
+
+/// Tools with the parameters of harness's `write`, `edit` and `read`.
+fn builtins() -> ToolRegistry {
+    let string = json!({"type": "string"});
+    ToolRegistry::new(vec![
+        Arc::new(Schema(
+            "write",
+            json!({"type": "object", "properties": {"path": string, "content": string}}),
+        )),
+        Arc::new(Schema(
+            "edit",
+            json!({"type": "object", "properties": {"path": string, "old_string": string,
+                "new_string": string, "replace_all": {"type": "boolean"}}}),
+        )),
+        Arc::new(Schema(
+            "read",
+            json!({"type": "object", "properties": {"path": string,
+                "offset": {"type": "integer", "minimum": 1}, "limit": {"type": ["integer", "null"]},
+                "note": {"type": ["string", "null"]}}}),
+        )),
+    ])
+}
+
+/// A Qwen3-Coder call of `tool` with these parameters.
+fn qwen(tool: &str, parameters: &[(&str, &str)]) -> String {
+    let parameters: String = parameters
+        .iter()
+        .map(|(name, value)| format!("<parameter={name}>\n{value}\n</parameter>\n"))
+        .collect();
+    format!("<tool_call>\n<function={tool}>\n{parameters}</function>\n</tool_call>")
+}
+
+/// The arguments of the one call `text` holds, as JSON.
+fn arguments(text: &str) -> serde_json::Value {
+    let calls = recover(text, &builtins()).expect("a call");
+    serde_json::from_str(&calls[0].arguments).unwrap()
+}
+
+// Ruling on review E I1: as vLLM's `qwen3_coder` parser does, a parameter the tool's schema types
+// as a string keeps its text, even when that text parses as JSON; others are JSON when they parse.
+#[test]
+fn qwen3_coder_string_parameters_keep_their_text() {
+    let json_file = "{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\"\n}";
+    assert_eq!(
+        arguments(&qwen(
+            "write",
+            &[("path", "package.json"), ("content", json_file)]
+        )),
+        json!({"path": "package.json", "content": json_file})
+    );
+    for (old, new) in [
+        ("42", "43"),
+        ("true", "false"),
+        ("\"a\"", "\"a\", \"b\""),
+        ("null", "[1]"),
+    ] {
+        assert_eq!(
+            arguments(&qwen(
+                "edit",
+                &[("path", "a.txt"), ("old_string", old), ("new_string", new)]
+            )),
+            json!({"path": "a.txt", "old_string": old, "new_string": new}),
+            "{old} -> {new}"
+        );
+    }
+}
+
+#[test]
+fn qwen3_coder_other_parameters_are_json_when_they_parse() {
+    assert_eq!(
+        arguments(&qwen(
+            "edit",
+            &[
+                ("path", "a"),
+                ("old_string", "x"),
+                ("new_string", "y"),
+                ("replace_all", "true")
+            ]
+        )),
+        json!({"path": "a", "old_string": "x", "new_string": "y", "replace_all": true})
+    );
+    assert_eq!(
+        arguments(&qwen(
+            "read",
+            &[
+                ("path", "10"),
+                ("offset", "10"),
+                ("limit", "20"),
+                ("note", "7")
+            ]
+        )),
+        json!({"path": "10", "offset": 10, "limit": 20, "note": "7"})
+    );
+    // A parameter the schema does not list, or text that is not JSON, as before.
+    assert_eq!(
+        arguments(&qwen(
+            "read",
+            &[("path", "a"), ("extra", "[1, 2]"), ("offset", "ten")]
+        )),
+        json!({"path": "a", "extra": [1, 2], "offset": "ten"})
+    );
+}
+
 // Spec: "Example code in prose", for Qwen3-Coder's form: only a whole message of well-formed
 // blocks naming known tools is a call.
 #[test]
@@ -178,6 +303,35 @@ async fn a_tagged_call_in_a_reply_runs_like_a_native_one() {
         provider.requests()[1].messages.last(),
         Some(Message::Tool { .. })
     ));
+}
+
+// Ruling on review E I1: the agent reads its tools' schemas, so a string parameter whose text is
+// JSON (`42`, `"a"`) reaches the tool as that text.
+#[tokio::test]
+async fn a_qwen3_coder_string_parameter_reaches_the_tool_as_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let echo = |text: &str| {
+        Script::text(&format!(
+            "<tool_call>\n<function=echo>\n<parameter=text>\n{text}\n</parameter>\n</function>\n</tool_call>"
+        ))
+    };
+    let provider = MockProvider::new(vec![
+        echo("42"),
+        echo("\"a\""),
+        echo("{\"k\": true}"),
+        Script::text("done"),
+    ]);
+    let mut agent = local_agent(provider, dir.path());
+    let (_, events) = run(&mut agent, "go").await;
+    assert_eq!(
+        finished_outputs(&events),
+        [
+            ("42".to_string(), false),
+            ("\"a\"".to_string(), false),
+            ("{\"k\": true}".to_string(), false)
+        ]
+    );
+    assert_eq!(agent.invalid_calls_this_turn(), 0);
 }
 
 // Review E I1: Qwen3-Coder served without a tool-call parser writes its calls in its own form;

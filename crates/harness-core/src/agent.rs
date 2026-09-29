@@ -752,15 +752,14 @@ impl Agent {
             let mut reply = reply;
             let cut_off = reply.finish == Some(FinishReason::Length);
             // A cut-off text call lacks its end, so it is not looked for.
-            if reply.tool_calls.is_empty() && !cut_off && self.config.text_tool_calls {
-                let tools = &self.tools;
-                if let Some(mut calls) =
-                    crate::textcalls::recover(&reply.text, |name| tools.get(name).is_some())
-                {
-                    self.dedupe_call_ids(&mut calls);
-                    reply.text.clear();
-                    reply.tool_calls = calls;
-                }
+            if reply.tool_calls.is_empty()
+                && !cut_off
+                && self.config.text_tool_calls
+                && let Some(mut calls) = crate::textcalls::recover(&reply.text, &self.tools)
+            {
+                self.dedupe_call_ids(&mut calls);
+                reply.text.clear();
+                reply.tool_calls = calls;
             }
             // Text held back in case it was calls, and that was not.
             reply.show(events);

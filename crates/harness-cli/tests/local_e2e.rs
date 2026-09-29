@@ -208,3 +208,76 @@ async fn a_local_models_tagged_tool_call_runs() {
     .await
     .unwrap();
 }
+
+// Ruling on review E I1: Qwen3-Coder's calls reach harness's own tools with their string
+// parameters as written, JSON-looking or not (a JSON file's content, `42`, `true`, `"a"`), and
+// their other parameters (`replace_all`) as JSON.
+#[tokio::test(flavor = "multi_thread")]
+async fn qwen3_coder_calls_write_and_edit_text_that_looks_like_json() {
+    let server = MockServer::start().await;
+    let call = |tool: &str, parameters: &[(&str, &str)]| {
+        let parameters: String = parameters
+            .iter()
+            .map(|(name, value)| format!("<parameter={name}>\n{value}\n</parameter>\n"))
+            .collect();
+        answer(&format!(
+            "<tool_call>\n<function={tool}>\n{parameters}</function>\n</tool_call>"
+        ))
+    };
+    let edit = |old: &str, new: &str, all: &str| {
+        call(
+            "edit",
+            &[
+                ("path", "config.json"),
+                ("old_string", old),
+                ("new_string", new),
+                ("replace_all", all),
+            ],
+        )
+    };
+    let steps = [
+        call(
+            "write",
+            &[
+                ("path", "config.json"),
+                ("content", "{\"x\": 42, \"ok\": true, \"name\": \"a\"}"),
+            ],
+        ),
+        edit("42", "\"a\"", "false"),
+        edit("true", "42", "false"),
+        edit("\"a\"", "true", "true"),
+    ];
+    // Each step once, in order; then the answer.
+    for (priority, step) in (1u8..).zip(steps) {
+        Mock::given(method("POST"))
+            .respond_with(step)
+            .up_to_n_times(1)
+            .with_priority(priority)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .respond_with(answer("All done."))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+    let env = Env::new(&format!(
+        "model = \"mock/qwen3-coder\"\nmode = \"full-access\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n",
+        server.uri()
+    ));
+    let env = tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .args(["ask", "write config.json and edit it"])
+            .assert()
+            .success()
+            .stdout(contains("All done."))
+            .stderr(contains("error").not());
+        env
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(env.ws.path().join("config.json")).unwrap(),
+        "{\"x\": true, \"ok\": 42, \"name\": true}"
+    );
+}

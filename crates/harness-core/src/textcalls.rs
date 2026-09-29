@@ -18,7 +18,45 @@
 
 use serde_json::{Map, Value};
 
-use crate::message::ToolCall;
+use crate::{message::ToolCall, tool::ToolRegistry};
+
+/// What [`recover`] needs to know of the agent's tools.
+pub trait Tools {
+    /// Whether the agent has a tool called `name`.
+    fn has(&self, name: &str) -> bool;
+    /// Whether tool `tool`'s schema types its parameter `parameter` as a string.
+    fn is_string(&self, _tool: &str, _parameter: &str) -> bool {
+        false
+    }
+}
+
+/// Knows tool names only: every parameter is JSON when it parses.
+impl<F: Fn(&str) -> bool> Tools for F {
+    fn has(&self, name: &str) -> bool {
+        self(name)
+    }
+}
+
+impl Tools for &ToolRegistry {
+    fn has(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// Typed `"string"`, or a list of types that is `"string"` besides `"null"`.
+    fn is_string(&self, tool: &str, parameter: &str) -> bool {
+        let Some(tool) = self.get(tool) else {
+            return false;
+        };
+        match &tool.spec().parameters["properties"][parameter]["type"] {
+            Value::String(kind) => kind == "string",
+            Value::Array(kinds) => {
+                let kinds: Vec<&Value> = kinds.iter().filter(|k| *k != "null").collect();
+                kinds == ["string"]
+            }
+            _ => false,
+        }
+    }
+}
 
 const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
@@ -27,9 +65,9 @@ const FUNCTION_END: &str = "</function>";
 const PARAMETER: &str = "<parameter=";
 const PARAMETER_END: &str = "</parameter>";
 
-/// The calls `text` consists of, when it is nothing but calls to tools `known` names. Their ids
-/// are empty; the agent gives them fresh ones.
-pub fn recover(text: &str, known: impl Fn(&str) -> bool) -> Option<Vec<ToolCall>> {
+/// The calls `text` consists of, when it is nothing but calls to tools the agent has (`tools`).
+/// Their ids are empty; the agent gives them fresh ones.
+pub fn recover(text: &str, tools: impl Tools) -> Option<Vec<ToolCall>> {
     let text = text.trim();
     let calls = if text.starts_with(OPEN) {
         let mut calls = Vec::new();
@@ -39,7 +77,7 @@ pub fn recover(text: &str, known: impl Fn(&str) -> bool) -> Option<Vec<ToolCall>
             let end = inner.find(CLOSE)?;
             let block = inner[..end].trim();
             calls.push(if block.starts_with(FUNCTION) {
-                function_call(block)?
+                function_call(block, &tools)?
             } else {
                 call(serde_json::from_str(block).ok()?)?
             });
@@ -51,7 +89,7 @@ pub fn recover(text: &str, known: impl Fn(&str) -> bool) -> Option<Vec<ToolCall>
     } else {
         return None;
     };
-    calls.iter().all(|c| known(&c.name)).then_some(calls)
+    calls.iter().all(|c| tools.has(&c.name)).then_some(calls)
 }
 
 /// A call from `{"name": …, "arguments": …}`. Arguments that are an object become JSON text;
@@ -72,7 +110,7 @@ fn call(value: Value) -> Option<ToolCall> {
 
 /// A call in Qwen3-Coder's form: `<function=NAME>`, then `<parameter=ARG>value</parameter>` for
 /// each argument, then `</function>`, with nothing but whitespace between them.
-fn function_call(block: &str) -> Option<ToolCall> {
+fn function_call(block: &str, tools: &impl Tools) -> Option<ToolCall> {
     let rest = block.strip_prefix(FUNCTION)?;
     let close = rest.find('>')?;
     let name = rest[..close].trim();
@@ -91,7 +129,8 @@ fn function_call(block: &str) -> Option<ToolCall> {
         if key.is_empty() {
             return None;
         }
-        arguments.insert(key.to_string(), parameter_value(&after[..end]));
+        let text = tools.is_string(name, key);
+        arguments.insert(key.to_string(), parameter_value(&after[..end], text));
         rest = after[end + PARAMETER_END.len()..].trim_start();
     }
     Some(ToolCall {
@@ -101,12 +140,18 @@ fn function_call(block: &str) -> Option<ToolCall> {
     })
 }
 
-/// A parameter's value: JSON when it parses as JSON, a string otherwise. The chat template writes
-/// a newline on each side of it, which is not part of it.
-fn parameter_value(raw: &str) -> Value {
+/// A parameter's value: its text for a parameter the tool types as a string (`text`), as vLLM's
+/// `qwen3_coder` parser reads it; otherwise JSON when it parses as JSON, and its text when not.
+/// The chat template writes a newline on each side of it, which is not part of it.
+fn parameter_value(raw: &str, text: bool) -> Value {
     let raw = raw.strip_prefix('\n').unwrap_or(raw);
     let raw = raw.strip_suffix('\n').unwrap_or(raw);
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+    let parsed = if text {
+        None
+    } else {
+        serde_json::from_str(raw).ok()
+    };
+    parsed.unwrap_or_else(|| Value::String(raw.to_string()))
 }
 
 /// The keys a call object can start with.

@@ -96,7 +96,7 @@ The system SHALL validate each tool call's arguments against the tool's JSON sch
 - **THEN** no file is read, the model receives an error result, and the turn's invalid-call count increases by one
 
 ### Requirement: Tool calls written as text are recovered
-When text tool-call parsing is enabled for the active model (the default for local providers), the system SHALL treat an assistant message that contains no native tool calls and consists of `<tool_call>` blocks, or solely of a JSON object with `name` and `arguments` (or `parameters`) fields, naming available tools, as tool calls. A block MUST be accepted holding such a JSON object, or one function in Qwen3-Coder's form (`<function=NAME>`, then `<parameter=ARG>value</parameter>` for each argument, then `</function>`), whose values are JSON when they parse as JSON and strings otherwise. Recovered calls MUST go through the same validation and permission checks as native calls. Text that merely contains such structures alongside other prose MUST NOT be treated as a tool call. Text recovered as tool calls MUST NOT also be streamed to the user as the reply's text.
+When text tool-call parsing is enabled for the active model (the default for local providers), the system SHALL treat an assistant message that contains no native tool calls and consists of `<tool_call>` blocks, or solely of a JSON object with `name` and `arguments` (or `parameters`) fields, naming available tools, as tool calls. A block MUST be accepted holding such a JSON object, or one function in Qwen3-Coder's form (`<function=NAME>`, then `<parameter=ARG>value</parameter>` for each argument, then `</function>`), whose values are their text for parameters the tool's schema types as `string`, and otherwise JSON when they parse as JSON and their text when not. Recovered calls MUST go through the same validation and permission checks as native calls. Text that merely contains such structures alongside other prose MUST NOT be treated as a tool call. Text recovered as tool calls MUST NOT also be streamed to the user as the reply's text.
 
 #### Scenario: Local model emits a tagged tool call as text
 - **WHEN** a local model replies only with `<tool_call>{"name":"read","arguments":{"path":"src/lib.rs"}}</tool_call>`
@@ -105,6 +105,10 @@ When text tool-call parsing is enabled for the active model (the default for loc
 #### Scenario: Qwen3-Coder's own form
 - **WHEN** a local model replies only with `<tool_call>` `<function=read>` `<parameter=path>` `src/lib.rs` `</parameter>` `</function>` `</tool_call>`, one tag per line
 - **THEN** the `read` tool runs on `src/lib.rs`
+
+#### Scenario: Qwen3-Coder writes a JSON file
+- **WHEN** a local model writes a `write` call in Qwen3-Coder's form whose `content` parameter is a JSON object
+- **THEN** the file is written with that text, since `content` is a string parameter
 
 #### Scenario: Example code in prose
 - **WHEN** a reply explains the tool format and includes a JSON example inside a longer paragraph

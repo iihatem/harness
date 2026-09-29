@@ -28,6 +28,7 @@ use crate::{
     complete::{self, Completer, Offer},
     editor::{Edit, Editor},
     notify::{self, Notify},
+    picker::{Item, Picked, Picker},
     plan::{Choice, PlanChoice, TextEditor},
     status::{self, Totals},
     style::Theme,
@@ -42,7 +43,7 @@ pub const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TYPED_PAST: &str = "your typing went to your message; the prompt takes keys once you pause";
 
 /// Built-in commands that come with the rest of the terminal UI, and where.
-const LATER: [(&str, &str); 7] = [
+const LATER: [(&str, &str); 5] = [
     (
         "model",
         "with the model picker; for now, start harness with --model <provider>/<model>",
@@ -51,18 +52,44 @@ const LATER: [(&str, &str); 7] = [
         "login",
         "with sign-in inside the session; for now, run `harness login <provider>` or `harness auth add <provider>` in a shell",
     ),
-    (
-        "mode",
-        "with the full terminal UI; press Shift+Tab to cycle plan, ask and auto",
-    ),
     ("new", "with the session picker"),
     (
         "resume",
         "with the session picker; start harness with -c or --resume <id>",
     ),
     ("rewind", "with the rewind picker"),
-    ("compact", "with the full terminal UI"),
 ];
+
+/// The modes `/mode` offers, and what each lets the agent do. `full-access` is chosen only when
+/// harness starts.
+const MODES: [(Mode, &str); 4] = [
+    (
+        Mode::Plan,
+        "read-only; ends with a plan to build, edit, or keep planning",
+    ),
+    (
+        Mode::ReadOnly,
+        "reads, and runs commands that change nothing",
+    ),
+    (Mode::Ask, "asks before edits, and commands no rule allows"),
+    (
+        Mode::Auto,
+        "edits the workspace and runs sandboxed commands",
+    ),
+];
+
+/// What a picker is choosing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    Mode,
+}
+
+/// How work the agent did for a command ended.
+#[derive(Debug)]
+pub enum Done {
+    /// `/compact`: `Err` says why nothing was compacted.
+    Compacted(Result<(), String>),
+}
 
 /// A slash command expanded for a turn.
 pub struct Prepared {
@@ -120,6 +147,8 @@ pub enum Action {
     RunIn(Mode, TurnInput),
     /// Open the plan in the user's editor.
     EditPlan(String),
+    /// Compact the conversation, with what to keep in particular.
+    Compact(Option<String>),
     /// Stop the running turn.
     Interrupt,
     /// Leave harness.
@@ -185,6 +214,10 @@ pub struct App {
     /// Whether the running turn has requested any tool call: files it wrote or created should
     /// be offered by `@` completion once it ends.
     ran_tools: bool,
+    /// A picker the user is choosing in, drawn in a full-screen view, and what for.
+    picker: Option<(Pick, Picker)>,
+    /// What the agent is doing for a command, shown until it is done.
+    working: Option<String>,
 }
 
 impl App {
@@ -222,6 +255,25 @@ impl App {
             redactor: None,
             write_mode_warning: None,
             ran_tools: false,
+            picker: None,
+            working: None,
+        }
+    }
+
+    /// The picker the user is choosing in: the session draws it in a full-screen view.
+    pub fn picker(&self) -> Option<&Picker> {
+        self.picker.as_ref().map(|(_, picker)| picker)
+    }
+
+    /// Work the agent did for a command ended.
+    pub fn on_done(&mut self, done: Done) {
+        self.working = None;
+        let width = self.width;
+        match done {
+            Done::Compacted(Ok(())) => {}
+            Done::Compacted(Err(why)) => self
+                .transcript
+                .push_note(&format!("the conversation was not compacted: {why}"), width),
         }
     }
 
@@ -241,7 +293,7 @@ impl App {
         &*self.host
     }
 
-    fn theme(&self) -> Theme {
+    pub fn theme(&self) -> Theme {
         *self.transcript.theme()
     }
 
@@ -283,7 +335,7 @@ impl App {
     /// time takes keys once the user has paused for
     /// [`ARMING_DELAY`](crate::approval::ARMING_DELAY) since then.
     pub fn drawn(&mut self, now: Instant) {
-        if self.prompt.is_some() || self.plan_choice.is_some() {
+        if self.takes_keys_after_a_pause() {
             self.arming.drawn(now);
         }
     }
@@ -292,7 +344,13 @@ impl App {
     pub fn armed_at(&self) -> Option<Instant> {
         self.arming
             .armed_at()
-            .filter(|_| self.prompt.is_some() || self.plan_choice.is_some())
+            .filter(|_| self.takes_keys_after_a_pause())
+    }
+
+    /// Whether an approval, a plan choice or a picker waits for an answer: it takes keys only
+    /// once the user has paused ([`Arming`]), so keys typed ahead never answer it.
+    fn takes_keys_after_a_pause(&self) -> bool {
+        self.prompt.is_some() || self.plan_choice.is_some() || self.picker.is_some()
     }
 
     /// Denies the approval waiting, if any, as the session ends: the turn stops.
@@ -337,9 +395,9 @@ impl App {
         self.mode
     }
 
-    /// Whether a turn is running, or about to.
+    /// Whether a turn is running, or about to, or the agent works for a command.
     pub fn busy(&self) -> bool {
-        self.running
+        self.running || self.working.is_some()
     }
 
     /// Where send-now input goes: give it to the agent (`Agent::with_steering`).
@@ -518,7 +576,7 @@ impl App {
         {
             return;
         }
-        if (self.prompt.is_some() || self.plan_choice.is_some()) && !self.arming.armed(now) {
+        if self.takes_keys_after_a_pause() && !self.arming.armed(now) {
             self.arming.typed(now);
         }
         if !self.editor.paste(text) {
@@ -550,7 +608,7 @@ impl App {
         }
         self.ctrl_c = None;
         self.hint = None;
-        if self.prompt.is_some() || self.plan_choice.is_some() {
+        if self.takes_keys_after_a_pause() {
             if self.arming.armed(now) {
                 return self.prompt_key(key);
             }
@@ -559,8 +617,8 @@ impl App {
                 self.answer(Answered::Interrupt);
                 return Some(Action::Interrupt);
             }
-            // Until the prompt takes keys, they were typed for the input, and the prompt waits
-            // for the user to pause.
+            // Until the prompt or the picker takes keys, they were typed for the input, and it
+            // waits for the user to pause.
             self.arming.typed(now);
         }
         if ctrl && key.code == KeyCode::Char('d') && self.editor.is_empty() {
@@ -595,6 +653,14 @@ impl App {
                 "choose b, e or k first: nothing is sent while the plan waits".into()
             });
             return None;
+        }
+        if let Some((_, picker)) = &mut self.picker {
+            let picked = picker.key(key)?;
+            let (pick, picker) = self.picker.take()?;
+            return match picked {
+                Picked::Chosen(index) => self.picked(pick, &picker, index),
+                Picked::Cancelled => None,
+            };
         }
         if let Some(prompt) = &mut self.prompt {
             let answered = prompt.key(key)?;
@@ -666,6 +732,9 @@ impl App {
         }
         self.ctrl_c = Some(now);
         self.hint = Some("press Ctrl+C again to exit".into());
+        if self.picker.take().is_some() {
+            return None;
+        }
         if self.prompt.is_some() {
             self.answer(Answered::Interrupt);
         }
@@ -722,7 +791,8 @@ impl App {
             && !self.starts_a_turn(invocation.name)
         {
             let name = invocation.name.to_string();
-            return self.builtin(&name, &full);
+            let args = invocation.args.trim().to_string();
+            return self.builtin(&name, &args, &full);
         }
         let (shown, full) = self.editor.submit();
         // Input typed ahead of a plan choice waits for it, as input typed during a turn does.
@@ -758,11 +828,37 @@ impl App {
         name == "init" || (!is_builtin(name) && self.host.is_command(name))
     }
 
-    /// A built-in command that runs here, without a turn, or an unknown one.
-    fn builtin(&mut self, name: &str, full: &str) -> Option<Action> {
+    /// Whether a command that changes the session can run now: not during a turn, when a hint
+    /// says so and the input stays for later.
+    fn between_turns(&mut self, name: &str) -> bool {
+        if self.busy() {
+            self.hint = Some(format!(
+                "/{name} works between turns: press Esc to stop this one first"
+            ));
+            return false;
+        }
+        true
+    }
+
+    /// A built-in command that runs here, without a turn, or an unknown one. `args` follow its
+    /// name.
+    fn builtin(&mut self, name: &str, args: &str, full: &str) -> Option<Action> {
         let width = self.width;
         match name {
             "quit" => return self.quit(),
+            "mode" | "compact" if !self.between_turns(name) => {}
+            "mode" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return self.mode_command(args);
+            }
+            "compact" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                self.working = Some("compacting the conversation".into());
+                let focus = (!args.is_empty()).then(|| args.to_string());
+                return Some(Action::Compact(focus));
+            }
             "help" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
@@ -803,6 +899,53 @@ impl App {
             }
         }
         None
+    }
+
+    /// `/mode`: with a mode's name, switches to it; alone, opens the mode picker.
+    fn mode_command(&mut self, args: &str) -> Option<Action> {
+        let width = self.width;
+        if args.is_empty() {
+            let items = MODES
+                .iter()
+                .map(|(mode, what)| {
+                    let current = if *mode == self.mode { "(current) " } else { "" };
+                    Item::new(&mode.to_string(), &format!("{current}{what}"))
+                })
+                .collect();
+            let current = MODES.iter().position(|(m, _)| *m == self.mode).unwrap_or(0);
+            let picker = Picker::new("Choose the approval mode", items)
+                .with_selected(current)
+                .with_footer(vec![
+                    "full-access is chosen only when harness starts (--mode full-access).".into(),
+                ]);
+            self.picker = Some((Pick::Mode, picker));
+            return None;
+        }
+        match args.parse::<Mode>() {
+            Ok(Mode::FullAccess) => self.transcript.push_error(
+                "full-access is chosen only when harness starts (--mode full-access)",
+                width,
+            ),
+            Ok(mode) if mode == self.mode => self
+                .transcript
+                .push_note(&format!("already in {mode} mode"), width),
+            Ok(mode) => return self.switch_mode(mode),
+            Err(why) => self.transcript.push_error(&why, width),
+        }
+        None
+    }
+
+    /// The user chose item `index` of `picker`, for `pick`.
+    fn picked(&mut self, pick: Pick, _picker: &Picker, index: usize) -> Option<Action> {
+        match pick {
+            Pick::Mode => {
+                let mode = MODES.get(index)?.0;
+                if mode == self.mode {
+                    return None;
+                }
+                self.switch_mode(mode)
+            }
+        }
     }
 
     /// Sends input typed as `shown`, `full` with pastes expanded: a custom command or `/init`
@@ -922,6 +1065,15 @@ impl App {
         }
         for (shown, _) in &self.queued {
             waiting.push(pending_line("queued: ", shown, &theme));
+        }
+        if let Some(what) = &self.working {
+            waiting.insert(
+                0,
+                Line::from(vec![
+                    Span::styled("● ", theme.accent()),
+                    Span::styled(format!("{what}… (Esc to stop)"), theme.dim()),
+                ]),
+            );
         }
         cursor.y += waiting.len() as u16;
         waiting.append(&mut editor);

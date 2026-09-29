@@ -19,7 +19,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    app::{Action, App, Host, Options},
+    app::{Action, App, Done, Host, Options},
     approval::{Reply, Requests},
     inline::{CursorReport, InlineTerminal},
     input::{CursorQuery, Timed},
@@ -81,6 +81,17 @@ enum Job {
         cancel: CancellationToken,
     },
     SetMode(harness_core::permission::Mode),
+    Compact {
+        focus: Option<String>,
+        cancel: CancellationToken,
+    },
+}
+
+/// What the task that owns the agent says after each job: where the context goes now, and how
+/// the job ended when that has something to tell.
+struct Update {
+    context: ContextUsage,
+    done: Option<Done>,
 }
 
 /// The interactive session on a terminal.
@@ -89,8 +100,8 @@ pub struct Ui<B: Backend> {
     term: InlineTerminal<B>,
     jobs: Option<mpsc::UnboundedSender<Job>>,
     events: mpsc::UnboundedReceiver<AgentEvent>,
-    /// Where the context goes, sent by the runner after each job.
-    contexts: mpsc::UnboundedReceiver<ContextUsage>,
+    /// What the runner says after each job.
+    updates: mpsc::UnboundedReceiver<Update>,
     /// A job was sent whose context update has not come yet.
     awaiting_context: bool,
     approvals: Requests,
@@ -130,7 +141,7 @@ where
         let notifier = options.notifier.take();
         let (jobs, mut queue) = mpsc::unbounded_channel::<Job>();
         let (events_tx, events) = mpsc::unbounded_channel();
-        let (contexts_tx, contexts) = mpsc::unbounded_channel();
+        let (updates_tx, updates) = mpsc::unbounded_channel();
         let width = term.width() as usize;
         let mut app = App::new(options, host, width);
         let agent = agent.with_steering(app.steering());
@@ -138,13 +149,24 @@ where
         let runner = tokio::spawn(async move {
             let mut agent = agent;
             while let Some(job) = queue.recv().await {
-                match job {
+                let done = match job {
                     Job::Turn { input, cancel } => {
                         agent.run_turn(*input, &events_tx, cancel).await;
+                        None
                     }
-                    Job::SetMode(mode) => agent.set_mode(mode),
-                }
-                let _ = contexts_tx.send(agent.context_usage());
+                    Job::SetMode(mode) => {
+                        agent.set_mode(mode);
+                        None
+                    }
+                    Job::Compact { focus, cancel } => {
+                        let result = agent.compact(focus.as_deref(), &events_tx, cancel).await;
+                        Some(Done::Compacted(result))
+                    }
+                };
+                let _ = updates_tx.send(Update {
+                    context: agent.context_usage(),
+                    done,
+                });
             }
         });
         Ui {
@@ -152,7 +174,7 @@ where
             term,
             jobs: Some(jobs),
             events,
-            contexts,
+            updates,
             awaiting_context: false,
             approvals,
             runner: Some(runner),
@@ -208,11 +230,24 @@ where
         }
     }
 
-    /// Writes the finished lines into the scrollback and redraws the live region.
+    /// Writes the finished lines into the scrollback and redraws the live region, or draws the
+    /// picker the user is choosing in, in a full-screen view.
     pub fn draw(&mut self) -> io::Result<()> {
         self.drawn_at = Some(tokio::time::Instant::now());
         self.redraw = false;
         self.notify();
+        if let Some(picker) = self.app.picker() {
+            // Finished lines wait for the inline screen.
+            let theme = self.app.theme();
+            self.term
+                .draw_full(|area, buf| picker.render(area, buf, &theme))?;
+            // The picker takes keys once the user has paused, as an approval does.
+            self.app.drawn(Instant::now());
+            return Ok(());
+        }
+        if self.term.in_full_screen() {
+            self.term.leave_full()?;
+        }
         let finished = self.app.transcript.take_finished();
         self.term.insert(&finished)?;
         let rows = self.term.height() as usize;
@@ -254,6 +289,15 @@ where
             Action::SetMode(mode) => {
                 if let Some(jobs) = &self.jobs {
                     let _ = jobs.send(Job::SetMode(mode));
+                    self.awaiting_context = true;
+                }
+                Flow::Continue
+            }
+            Action::Compact(focus) => {
+                let cancel = CancellationToken::new();
+                self.cancel = Some(cancel.clone());
+                if let Some(jobs) = &self.jobs {
+                    let _ = jobs.send(Job::Compact { focus, cancel });
                     self.awaiting_context = true;
                 }
                 Flow::Continue
@@ -408,14 +452,20 @@ where
             self.take_in(event);
         }
         self.host_warnings();
+        self.next_actions()?;
+        self.draw_soon()?;
+        Ok(Flow::Continue)
+    }
+
+    /// Once nothing runs: switches to the mode chosen during the turn, then sends queued input.
+    fn next_actions(&mut self) -> io::Result<()> {
         if let Some(action) = self.app.take_pending_mode() {
             self.dispatch(action)?;
         }
         if let Some(action) = self.app.next_queued() {
             self.dispatch(action)?;
         }
-        self.draw_soon()?;
-        Ok(Flow::Continue)
+        Ok(())
     }
 
     /// Shows an approval request, after the events that came before it.
@@ -441,11 +491,19 @@ where
         Ok(Flow::Continue)
     }
 
-    /// Takes in where the context goes after a job, and redraws the status line.
-    fn context(&mut self, context: ContextUsage) -> io::Result<Flow> {
+    /// Takes in what the runner says after a job, and redraws; queued input goes next.
+    fn update(&mut self, update: Update) -> io::Result<Flow> {
         self.awaiting_context = false;
-        self.app.set_context(context);
+        // Events the job sent come first.
+        while let Ok(event) = self.events.try_recv() {
+            self.show(event);
+        }
+        self.app.set_context(update.context);
+        if let Some(done) = update.done {
+            self.app.on_done(done);
+        }
         self.host_warnings();
+        self.next_actions()?;
         self.draw()?;
         Ok(Flow::Continue)
     }
@@ -467,7 +525,7 @@ where
                 Some(event) => self.agent_event(event),
                 None => Ok(Flow::Quit),
             },
-            Some(context) = self.contexts.recv() => self.context(context),
+            Some(update) = self.updates.recv() => self.update(update),
             Some((request, reply)) = self.approvals.recv() => self.approval(request, reply).await,
             _ = tokio::time::sleep_until(redraw_at), if redraw => {
                 self.draw().map(|()| Flow::Continue)
@@ -610,7 +668,7 @@ where
                     },
                     None => Flow::Quit,
                 },
-                Some(context) = self.contexts.recv() => self.context(context)?,
+                Some(update) = self.updates.recv() => self.update(update)?,
                 // A request left unshown when the session ends is denied when its reply drops.
                 Some((request, reply)) = self.approvals.recv() => match self.keys(None, input).await? {
                     None => self.approval(request, reply).await?,

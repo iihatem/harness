@@ -27,7 +27,7 @@ The tasks were first built on `e37a8ef`, P3's last commit before its final fix w
 What was not verified:
 
 - **Real providers and servers.** No request reached OpenAI, Anthropic, ChatGPT or a real local server. The Responses and Messages fixtures in `crates/harness-providers/tests/fixtures/` are built from the providers' documented streaming examples, not recorded from live traffic. Overflow wording, quota error bodies (`usage_limit_reached`, `insufficient_quota`) and in-stream error types come from documentation and from Codex's parsing code. Local-server answers (llama.cpp `/props` with `?model=` on a server that is not in router mode, Ollama `/api/ps` `context_length` on older Ollama releases, LM Studio's `/api/v1/models`) come from their documentation.
-- **ChatGPT's servers accepting harness.** Whether OpenAI's authorization server accepts `originator=harness` and the smaller scope set (decision 2), whether the device-code flow works for it, and whether ChatGPT's backend accepts harness's requests (its system prompt as `instructions`, no output limit) are unverified. The flows follow Codex's code exactly otherwise.
+- **ChatGPT's servers accepting harness.** Whether OpenAI's authorization server and ChatGPT's backend accept requests identified with Codex's own `originator` (`codex_cli_rs`) and scope list (decision 2) from a client they did not register, whether the device-code flow works for it, and whether ChatGPT's backend accepts harness's requests otherwise (its system prompt as `instructions`, no output limit) are unverified. The flows follow Codex's code exactly otherwise.
 - **Keychains.** The user's keychain was never touched. `KeychainStore` was tested through `keyring-core`'s mock store; the real macOS Keychain and a Linux Secret Service were not exercised, nor whether macOS asks for a password when a rebuilt binary reads an entry.
 - **Linux.** `harness-providers` pulls in `aws-lc-sys` through `reqwest`, so it cannot be linted for Linux from macOS. `credentials.rs` was type-checked for `x86_64-unknown-linux-gnu` in a throwaway crate with the same dependencies, including the Secret Service store; nothing else of P4 is Linux-specific. Its tests first run on Linux in the pull request's CI.
 - **Terminals and browsers.** Reading a key without echo (`auth add` on a terminal) and opening a browser (`open`, `xdg-open`) have no automated test; the tests pipe keys in and use the device flow.
@@ -49,7 +49,7 @@ The spec settles what P4 does; these settle how, where it is silent. Task 1 writ
    - requests to `https://chatgpt.com/backend-api/codex/responses` (`codex-rs/model-provider-info/src/lib.rs`) with the `ChatGPT-Account-ID` header (`codex-rs/model-provider/src/bearer_auth_provider.rs`), taken from the ID token's `https://api.openai.com/auth` claim `chatgpt_account_id` (`codex-rs/login/src/token_data.rs`), with `store: false` (`codex-rs/core/src/client.rs`).
 
    The Apache licence covers Codex's code, not the use of its OAuth client: the client id and its redirect URIs are registered with OpenAI for Codex, and I found no OpenAI statement that lets other applications use them. What supports doing it is design.md's finding that OpenAI publicly tolerates ChatGPT sign-in in third-party harnesses (pi, OpenCode, Amp). D3 already isolates it: it lives behind the default-on `chatgpt-login` Cargo feature (a `--no-default-features` build has none, and says so), and the login says it rests on OpenAI's current practice. *Alternatives:* ship the feature off by default; or leave ChatGPT sign-in out of M1 and rely on OpenAI API keys and M3's `codex app-server` delegation.
-2. **harness names itself to OpenAI.** It sends `originator=harness` when signing in and `originator: harness` with requests, and asks only for `openid profile email offline_access` (Codex also asks for `api.connectors.read api.connectors.invoke`, which harness does not use). Whether OpenAI's servers accept that is not verified. *Alternative:* send Codex's own `originator` (`codex_cli_rs`) and scopes, which presents harness as Codex.
+2. **harness identifies itself to OpenAI the way Codex does.** The maintainer chose the plan's alternative over the plan's original proposal: harness sends Codex's own `originator` (`codex_cli_rs`) when signing in and with requests to ChatGPT's backend, and asks for Codex's full scope list (`openid profile email offline_access api.connectors.read api.connectors.invoke`), including the two connector scopes harness does not use. The reasoning: harness already signs in with the Codex CLI's OAuth client (decision 1); presenting a distinct `originator=harness` and a smaller scope set is an unverified guess about what OpenAI's servers accept from a client they did not register, where matching Codex exactly is known to work. The wording throughout says harness signs in with the Codex CLI's OAuth client and identifies to OpenAI as it, not that OpenAI endorses harness.
 3. **The Responses adapter is stateless.** Each request carries the whole conversation with `store: false`; reasoning items are not kept between requests (Codex sends them back encrypted with `include: ["reasoning.encrypted_content"]`), and reasoning summaries stream as reasoning deltas. So nothing provider-specific enters the session format, and switching models loses nothing. Requests to ChatGPT's backend carry no output limit, as Codex sends none. *Alternative:* keep encrypted reasoning items per protocol in the message model (a session format change), for better multi-step reasoning on OpenAI's reasoning models.
 4. **The Anthropic adapter** authenticates with an API key only (`x-api-key`), sends `max_tokens` from the profile or 16,384 (the protocol requires one, and input plus `max_tokens` must fit the window), marks the system prompt and the last message as prompt-cache breakpoints, and requests no extended thinking in M1 (thinking blocks would have to go back signed within a tool loop). Overloaded, API and rate-limit errors inside a stream are retried like their HTTP forms.
 5. **Where same-role messages are joined (P3's review F).** The agent already joins consecutive user messages for every provider (P3's `request_messages`), which covers a compaction summary followed by the next prompt. The Anthropic adapter also puts tool results and the user text after them into one user message, since tool results are user content in its protocol, and leaves out empty assistant messages. Harness never adds a note of its own directly after tool results: a cut-off tool call's notice goes in its tool result (decision 13). One case remains: a turn that ends on tool results (the step limit, Ctrl+C) followed by a new prompt reads as two user turns to a Mistral template that drops tool messages; P5 can close it when it adds steering. *Alternative:* each adapter joins messages its own way.
@@ -6133,7 +6133,7 @@ EOF
 **Interfaces:**
 - Consumes: nothing new.
 - Produces, behind the default-on feature `chatgpt-login` of `harness-providers`, in `harness_providers::chatgpt::oauth`:
-  - `ISSUER = "https://auth.openai.com"`, `CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"`, `SCOPES = "openid profile email offline_access"`, `CALLBACK_PORTS = [1455, 1457]`, `ORIGINATOR = "harness"`, `DEVICE_CODE_WAIT` (15 minutes);
+  - `ISSUER = "https://auth.openai.com"`, `CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"`, `SCOPES = "openid profile email offline_access api.connectors.read api.connectors.invoke"`, `CALLBACK_PORTS = [1455, 1457]`, `ORIGINATOR = "codex_cli_rs"` (decision 2: Codex's own originator, not a `harness`-specific one), `DEVICE_CODE_WAIT` (15 minutes);
   - `OAuthError { Network, Rejected { status, body }, Invalid, Denied, TimedOut, Io }`; `Rejected` says to run `harness login chatgpt`;
   - `Pkce { verifier, challenge }` with `Pkce::generate()` and `Pkce::from_verifier(&str)`, and `random_state()`, from `/dev/urandom`;
   - `Tokens { access_token, refresh_token, account_id: Option<String>, email: Option<String> }` with `expires_at() -> Option<u64>` (the access token's `exp`), `to_json()`, `from_json(&str) -> Option<Tokens>`, and a `Debug` without the tokens;
@@ -6285,7 +6285,10 @@ fn the_authorize_url_asks_for_a_code_with_pkce() {
         ("response_type", "code"),
         ("client_id", CLIENT_ID),
         ("redirect_uri", "http://127.0.0.1:1455/auth/callback"),
-        ("scope", "openid profile email offline_access"),
+        (
+            "scope",
+            "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        ),
         (
             "code_challenge",
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
@@ -6294,7 +6297,7 @@ fn the_authorize_url_asks_for_a_code_with_pkce() {
         ("state", "st"),
         ("id_token_add_organizations", "true"),
         ("codex_cli_simplified_flow", "true"),
-        ("originator", "harness"),
+        ("originator", "codex_cli_rs"),
     ] {
         assert_eq!(query.get(key).map(String::as_str), Some(value), "{key}");
     }
@@ -6619,8 +6622,9 @@ Create `crates/harness-providers/src/chatgpt/mod.rs`:
 
 ```rust
 //! ChatGPT sign-in and the `chatgpt` provider (feature `chatgpt-login`). The OAuth flows follow
-//! OpenAI's open-source Codex CLI (github.com/openai/codex, Apache-2.0, `codex-rs/login`) and use
-//! its public client.
+//! OpenAI's open-source Codex CLI (github.com/openai/codex, Apache-2.0, `codex-rs/login`), use
+//! its public client, and identify to OpenAI as it (the Codex CLI's `originator` and scopes, not
+//! a `harness`-specific identity). This is not an OpenAI endorsement of harness.
 
 pub mod oauth;
 ```
@@ -6630,8 +6634,9 @@ Create `crates/harness-providers/src/chatgpt/oauth.rs`:
 ```rust
 //! ChatGPT sign-in: OAuth 2.0 authorization code with PKCE, through the browser and a callback
 //! on `127.0.0.1`, or through a device code; and refreshing the access token. The endpoints,
-//! client id, scopes and callback ports are those of OpenAI's Codex CLI (openai/codex,
-//! `codex-rs/login/src/server.rs`, `device_code_auth.rs` and `auth/manager.rs`).
+//! client id, scopes, originator and callback ports are those of OpenAI's Codex CLI (openai/codex,
+//! `codex-rs/login/src/server.rs`, `device_code_auth.rs` and `auth/manager.rs`): harness signs in
+//! with the Codex CLI's OAuth client and identifies to OpenAI as it, not as a distinct client.
 
 use std::{
     collections::HashMap,
@@ -6652,12 +6657,16 @@ use tokio::{
 pub const ISSUER: &str = "https://auth.openai.com";
 /// The public OAuth client of OpenAI's Codex CLI.
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-/// What harness asks for: who the user is, and a refresh token.
-pub const SCOPES: &str = "openid profile email offline_access";
+/// What harness asks for: who the user is, a refresh token, and the connector scopes the Codex
+/// CLI also asks for (unused by harness, but part of identifying as it).
+pub const SCOPES: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
 /// The callback ports registered for that client: the first, then the fallback.
 pub const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
-/// How harness names itself to the authorization server.
-pub const ORIGINATOR: &str = "harness";
+/// How harness names itself to the authorization server and to ChatGPT's backend: the Codex
+/// CLI's own originator, not harness's. harness signs in with the Codex CLI's OAuth client and
+/// identifies to OpenAI as it, rather than presenting itself as a distinct client.
+pub const ORIGINATOR: &str = "codex_cli_rs";
 /// How long a device code stays valid.
 pub const DEVICE_CODE_WAIT: Duration = Duration::from_secs(15 * 60);
 
@@ -7376,7 +7385,7 @@ async fn requests_carry_the_token_and_the_account() {
         .and(path("/backend-api/codex/responses"))
         .and(header("authorization", format!("Bearer {token}").as_str()))
         .and(header("chatgpt-account-id", "acct-123"))
-        .and(header("originator", "harness"))
+        .and(header("originator", "codex_cli_rs"))
         .respond_with(text_reply())
         .expect(1)
         .mount(&server)
@@ -8167,8 +8176,9 @@ In `crates/harness-providers/src/chatgpt/mod.rs`:
 Replace:
 
 ```rust
-//! OpenAI's open-source Codex CLI (github.com/openai/codex, Apache-2.0, `codex-rs/login`) and use
-//! its public client.
+//! OpenAI's open-source Codex CLI (github.com/openai/codex, Apache-2.0, `codex-rs/login`), use
+//! its public client, and identify to OpenAI as it (the Codex CLI's `originator` and scopes, not
+//! a `harness`-specific identity). This is not an OpenAI endorsement of harness.
 
 pub mod oauth;
 ```
@@ -8176,8 +8186,9 @@ pub mod oauth;
 with:
 
 ```rust
-//! OpenAI's open-source Codex CLI (github.com/openai/codex, Apache-2.0, `codex-rs/login`) and use
-//! its public client.
+//! OpenAI's open-source Codex CLI (github.com/openai/codex, Apache-2.0, `codex-rs/login`), use
+//! its public client, and identify to OpenAI as it (the Codex CLI's `originator` and scopes, not
+//! a `harness`-specific identity). This is not an OpenAI endorsement of harness.
 
 pub mod auth;
 pub mod oauth;
@@ -13974,7 +13985,7 @@ The controller ticks 4.1 to 4.7 in `openspec/changes/add-core-agent/tasks.md` af
 These ship with P4; the README states the ones users meet.
 
 - **No live verification.** Every provider, the authorization server and the local servers were mocks built from documentation and Codex's code (see "What was not verified").
-- **ChatGPT sign-in depends on OpenAI's tolerance** of third-party use of Codex's OAuth client (decision 1), and on its servers accepting `originator=harness` (decision 2). `--no-default-features` builds leave it out.
+- **ChatGPT sign-in depends on OpenAI's tolerance** of third-party use of Codex's OAuth client (decision 1) and of identifying to it as the Codex CLI, with Codex's own `originator` and scope list (decision 2). `--no-default-features` builds leave it out.
 - **Reasoning between steps.** The Responses adapter keeps no reasoning items, so OpenAI's reasoning models start each step's reasoning afresh (decision 3); Anthropic's extended thinking is not requested.
 - **Context windows** are known for the families in the built-in profiles and for what `ollama`, `lmstudio` and `llamacpp` report; any other server's model gets 8,192 tokens until a profile says otherwise, and a server that silently truncates is still not noticed. LM Studio models that are not loaded count as unknown.
 - **Strict chat templates** still see two user turns when a turn that ended on tool results (step limit, Ctrl+C) is followed by a new prompt (decision 5).

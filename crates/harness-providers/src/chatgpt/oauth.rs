@@ -1,7 +1,8 @@
 //! ChatGPT sign-in: OAuth 2.0 authorization code with PKCE, through the browser and a callback
 //! on `127.0.0.1`, or through a device code; and refreshing the access token. The endpoints,
-//! client id, scopes and callback ports are those of OpenAI's Codex CLI (openai/codex,
-//! `codex-rs/login/src/server.rs`, `device_code_auth.rs` and `auth/manager.rs`).
+//! client id, scopes, originator and callback ports are those of OpenAI's Codex CLI (openai/codex,
+//! `codex-rs/login/src/server.rs`, `device_code_auth.rs` and `auth/manager.rs`): harness signs in
+//! with the Codex CLI's OAuth client and identifies to OpenAI as it, not as a distinct client.
 
 use std::{
     collections::HashMap,
@@ -22,12 +23,16 @@ use tokio::{
 pub const ISSUER: &str = "https://auth.openai.com";
 /// The public OAuth client of OpenAI's Codex CLI.
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-/// What harness asks for: who the user is, and a refresh token.
-pub const SCOPES: &str = "openid profile email offline_access";
+/// What harness asks for: who the user is, a refresh token, and the connector scopes the Codex
+/// CLI also asks for (unused by harness, but part of identifying as it).
+pub const SCOPES: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
 /// The callback ports registered for that client: the first, then the fallback.
 pub const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
-/// How harness names itself to the authorization server.
-pub const ORIGINATOR: &str = "harness";
+/// How harness names itself to the authorization server and to ChatGPT's backend: the Codex
+/// CLI's own originator, not harness's. harness signs in with the Codex CLI's OAuth client and
+/// identifies to OpenAI as it, rather than presenting itself as a distinct client.
+pub const ORIGINATOR: &str = "codex_cli_rs";
 /// How long a device code stays valid.
 pub const DEVICE_CODE_WAIT: Duration = Duration::from_secs(15 * 60);
 

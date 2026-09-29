@@ -125,7 +125,7 @@ async fn requests_carry_the_token_and_the_account() {
         .and(path("/backend-api/codex/responses"))
         .and(header("authorization", format!("Bearer {token}").as_str()))
         .and(header("chatgpt-account-id", "acct-123"))
-        .and(header("originator", "harness"))
+        .and(header("originator", "codex_cli_rs"))
         .respond_with(text_reply())
         .expect(1)
         .mount(&server)

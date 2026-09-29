@@ -75,7 +75,10 @@ fn the_authorize_url_asks_for_a_code_with_pkce() {
         ("response_type", "code"),
         ("client_id", CLIENT_ID),
         ("redirect_uri", "http://127.0.0.1:1455/auth/callback"),
-        ("scope", "openid profile email offline_access"),
+        (
+            "scope",
+            "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        ),
         (
             "code_challenge",
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
@@ -84,7 +87,7 @@ fn the_authorize_url_asks_for_a_code_with_pkce() {
         ("state", "st"),
         ("id_token_add_organizations", "true"),
         ("codex_cli_simplified_flow", "true"),
-        ("originator", "harness"),
+        ("originator", "codex_cli_rs"),
     ] {
         assert_eq!(query.get(key).map(String::as_str), Some(value), "{key}");
     }

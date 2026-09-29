@@ -34,6 +34,54 @@ impl SecretStore for Refusing {
     }
 }
 
+/// A keychain that can be read, and can remove what it holds, but refuses to store anything:
+/// a macOS keychain whose access prompt was denied for the write, say.
+#[derive(Clone)]
+struct ReadOnly {
+    entries: Arc<Mutex<Vec<(String, String)>>>,
+    /// Whether it refuses to delete too.
+    keeps: bool,
+}
+
+impl ReadOnly {
+    fn holding(entries: &[(&str, &str)]) -> ReadOnly {
+        ReadOnly {
+            entries: Arc::new(Mutex::new(
+                entries
+                    .iter()
+                    .map(|(a, s)| (a.to_string(), s.to_string()))
+                    .collect(),
+            )),
+            keeps: false,
+        }
+    }
+}
+
+impl SecretStore for ReadOnly {
+    fn get(&self, account: &str) -> Result<Option<String>, CredentialError> {
+        let entries = self.entries.lock().unwrap();
+        Ok(entries
+            .iter()
+            .find(|(a, _)| a == account)
+            .map(|(_, s)| s.clone()))
+    }
+    fn set(&self, _account: &str, _secret: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::Keychain("the write was denied".into()))
+    }
+    fn delete(&self, account: &str) -> Result<bool, CredentialError> {
+        if self.keeps {
+            return Err(CredentialError::Keychain("the delete was denied".into()));
+        }
+        let mut entries = self.entries.lock().unwrap();
+        let before = entries.len();
+        entries.retain(|(a, _)| a != account);
+        Ok(entries.len() != before)
+    }
+    fn describe(&self) -> String {
+        "a read-only keychain".into()
+    }
+}
+
 /// Records what reaches it, to check what goes to the keychain.
 #[derive(Clone, Default)]
 struct Recording(Arc<Mutex<Vec<(String, String)>>>);
@@ -106,7 +154,11 @@ fn keys_go_to_the_keychain_and_never_to_the_file() {
 fn without_a_keychain_keys_go_to_a_private_file_with_a_warning() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
-    for keychain in [None, Some(Box::new(Refusing) as Box<dyn SecretStore>)] {
+    let empty_read_only = ReadOnly::holding(&[]);
+    for keychain in [
+        None,
+        Some(Box::new(empty_read_only) as Box<dyn SecretStore>),
+    ] {
         let creds = Credentials::with_keychain(&data, keychain);
         let stored = creds.set("openrouter", DEFAULT_PROFILE, "sk-or-1").unwrap();
         let file = data.join("credentials.json");
@@ -228,4 +280,105 @@ fn the_file_store_can_be_chosen_with_an_environment_variable() {
     assert!(dir.path().join("credentials.json").exists());
     // Chosen, so no warning.
     assert!(creds.take_warnings().is_empty());
+}
+
+// Review B, I1 (and C, I4): a keychain that refuses the new key must not go on serving the old
+// one, which it would shadow the file copy with.
+#[test]
+fn a_key_the_keychain_refuses_replaces_the_one_it_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let keychain = ReadOnly::holding(&[("openai/default", "sk-OLD-leaked")]);
+    let creds = Credentials::with_keychain(dir.path(), Some(Box::new(keychain.clone())));
+    let place = creds
+        .set("openai", DEFAULT_PROFILE, "sk-NEW-rotated")
+        .unwrap();
+    assert_eq!(
+        place,
+        dir.path().join("credentials.json").display().to_string()
+    );
+    assert_eq!(
+        creds.active("openai").unwrap().as_deref(),
+        Some("sk-NEW-rotated")
+    );
+    let warnings = creds.take_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("credentials.json")),
+        "{warnings:?}"
+    );
+    assert_eq!(keychain.get("openai/default").unwrap(), None);
+}
+
+// When the old key cannot be removed either, storing the new one would change nothing: that is
+// an error, and nothing is written.
+#[test]
+fn a_keychain_that_keeps_an_old_key_it_cannot_replace_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut keychain = ReadOnly::holding(&[("openai/default", "sk-OLD-leaked")]);
+    keychain.keeps = true;
+    let creds = Credentials::with_keychain(dir.path(), Some(Box::new(keychain)));
+    let error = creds
+        .set("openai", DEFAULT_PROFILE, "sk-NEW-rotated")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("older"), "{error}");
+    assert!(error.contains("HARNESS_CREDENTIAL_STORE=file"), "{error}");
+    assert!(!error.contains("sk-"), "{error}");
+    assert!(!dir.path().join("credentials.json").exists());
+}
+
+// Review B, I1: once the key is in the keychain, a copy left in the file that cannot be removed
+// is worth a warning.
+#[test]
+fn an_older_file_copy_that_cannot_be_removed_is_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    Credentials::with_keychain(&data, None)
+        .set("openai", DEFAULT_PROFILE, "sk-in-file")
+        .unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let creds = Credentials::with_keychain(&data, Some(Box::new(Recording::default())));
+    let stored = creds.set("openai", DEFAULT_PROFILE, "sk-in-keychain");
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(stored.unwrap(), "the recording keychain");
+    let warnings = creds.take_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("credentials.json")),
+        "{warnings:?}"
+    );
+}
+
+// Review B, I2: `logout` must not report success while the keychain keeps the key.
+#[test]
+fn a_keychain_that_refuses_to_remove_a_key_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    Credentials::with_keychain(dir.path(), None)
+        .set("openai", DEFAULT_PROFILE, "sk-file")
+        .unwrap();
+    let creds = Credentials::with_keychain(dir.path(), Some(Box::new(Refusing)));
+    let error = creds.remove("openai", DEFAULT_PROFILE).unwrap_err();
+    assert!(error.to_string().contains("locked"), "{error}");
+    // The copy in the file is gone all the same.
+    let file_only = Credentials::with_keychain(dir.path(), None);
+    assert_eq!(file_only.get("openai", DEFAULT_PROFILE).unwrap(), None);
+}
+
+// Review B, M9: a keychain that cannot be read is reported, not taken for an empty one.
+#[test]
+fn a_keychain_that_cannot_be_read_is_an_error_unless_the_file_has_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let creds = Credentials::with_keychain(dir.path(), Some(Box::new(Refusing)));
+    let error = creds.get("openai", DEFAULT_PROFILE).unwrap_err();
+    assert!(error.to_string().contains("locked"), "{error}");
+    Credentials::with_keychain(dir.path(), None)
+        .set("openai", DEFAULT_PROFILE, "sk-file")
+        .unwrap();
+    assert_eq!(
+        creds.get("openai", DEFAULT_PROFILE).unwrap().as_deref(),
+        Some("sk-file")
+    );
+    let warnings = creds.take_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("locked")),
+        "{warnings:?}"
+    );
 }

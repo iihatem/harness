@@ -33,6 +33,15 @@ pub enum CredentialError {
     },
     #[error("{} is damaged: {message}", .path.display())]
     Damaged { path: PathBuf, message: String },
+    #[error(
+        "{keychain} refused to store the new credential for {account} ({refused}) and to remove the older one it may still hold ({kept}), so harness would go on using that one; nothing was stored. Unlock the keychain and try again, or set {STORE_ENV}=file to keep credentials in credentials.json instead"
+    )]
+    Stale {
+        keychain: String,
+        account: String,
+        refused: String,
+        kept: String,
+    },
     #[error("invalid {what} name `{name}`: use letters, digits, `.`, `_` and `-`")]
     BadName { what: &'static str, name: String },
 }
@@ -291,9 +300,15 @@ impl Credentials {
         }
     }
 
-    /// Warnings gathered since the last call: that a credential went to the file.
+    /// Warnings gathered since the last call: that a credential went to the file, say, or that
+    /// the keychain could not be read.
     pub fn take_warnings(&self) -> Vec<String> {
         std::mem::take(&mut *self.warnings.lock().expect("warnings lock"))
+    }
+
+    /// Queues `warning` for [`take_warnings`](Self::take_warnings).
+    pub fn warn(&self, warning: String) {
+        self.warnings.lock().expect("warnings lock").push(warning);
     }
 
     fn read_accounts(&self) -> Result<AccountsFile, CredentialError> {
@@ -359,14 +374,26 @@ impl Credentials {
     }
 
     /// The credential stored for `provider` under `profile`: from the keychain, or else the
-    /// file (where it went when no keychain could be used). A keychain that refuses to answer
-    /// counts as holding nothing.
+    /// file (where it went when no keychain could be used). A keychain that cannot be read is an
+    /// error, unless the file holds the credential, which is then used with a warning.
     pub fn get(&self, provider: &str, profile: &str) -> Result<Option<String>, CredentialError> {
         let account = account(provider, profile)?;
-        if let Some(keychain) = &self.keychain
-            && let Ok(Some(secret)) = keychain.get(&account)
-        {
-            return Ok(Some(secret));
+        if let Some(keychain) = &self.keychain {
+            match keychain.get(&account) {
+                Ok(Some(secret)) => return Ok(Some(secret)),
+                Ok(None) => {}
+                Err(unreadable) => {
+                    let Some(secret) = self.file.get(&account)? else {
+                        return Err(unreadable);
+                    };
+                    self.warn(format!(
+                        "cannot read {} ({unreadable}); using the copy of {account} in {}",
+                        keychain.describe(),
+                        self.file.describe()
+                    ));
+                    return Ok(Some(secret));
+                }
+            }
         }
         self.file.get(&account)
     }
@@ -391,16 +418,33 @@ impl Credentials {
             Some(keychain) => match keychain.set(&account, secret) {
                 Ok(()) => {
                     // An older copy in the file must not outlive this one.
-                    let _ = self.file.delete(&account);
+                    if let Err(e) = self.file.delete(&account) {
+                        self.warn(format!(
+                            "the credential is in {}, but an older copy of it could not be removed from {} ({e}); remove that file's entry for {account} by hand",
+                            keychain.describe(),
+                            self.file.describe()
+                        ));
+                    }
                     return Ok(keychain.describe());
                 }
-                Err(e) => Some(e.to_string()),
+                Err(refused) => {
+                    // An older copy in the keychain would be read before the file's.
+                    if let Err(kept) = keychain.delete(&account) {
+                        return Err(CredentialError::Stale {
+                            keychain: keychain.describe(),
+                            account,
+                            refused: refused.to_string(),
+                            kept: kept.to_string(),
+                        });
+                    }
+                    Some(refused.to_string())
+                }
             },
             None => self.no_keychain.clone(),
         };
         self.file.set(&account, secret)?;
         if let Some(why) = why {
-            self.warnings.lock().expect("warnings lock").push(format!(
+            self.warn(format!(
                 "no keychain could store it ({why}); it is in {}, readable only by you",
                 self.file.describe()
             ));
@@ -409,14 +453,16 @@ impl Credentials {
     }
 
     /// Removes what is stored for `provider` under `profile`, from the keychain and the file.
+    /// A keychain that refuses is an error, once the file's copy is gone: the keychain's would
+    /// still be used.
     pub fn remove(&self, provider: &str, profile: &str) -> Result<bool, CredentialError> {
         let account = account(provider, profile)?;
         let in_keychain = match &self.keychain {
-            Some(keychain) => keychain.delete(&account).unwrap_or(false),
-            None => false,
+            Some(keychain) => keychain.delete(&account),
+            None => Ok(false),
         };
         let in_file = self.file.delete(&account)?;
-        Ok(in_keychain || in_file)
+        Ok(in_keychain? || in_file)
     }
 }
 

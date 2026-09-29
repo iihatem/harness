@@ -133,8 +133,8 @@ async fn model_names(client: &reqwest::Client, endpoint: &Endpoint) -> Option<Ve
 }
 
 /// Whether OpenAI's model `name` can answer a turn: the GPT, o-series, ChatGPT and Codex
-/// families, without their embedding, audio, realtime, speech, image, search, moderation and
-/// completion-only models.
+/// families, without their embedding, audio, realtime, speech, image, search (deep research
+/// included), moderation and completion-only models.
 fn answers_turns(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     let family = ["gpt-", "o1", "o3", "o4", "chatgpt-", "codex-"]
@@ -147,6 +147,8 @@ fn answers_turns(name: &str) -> bool {
         "transcribe",
         "tts",
         "image",
+        // Search models, and the deep-research ones, which need a web-search tool harness does
+        // not send.
         "search",
         "moderation",
         "instruct",

@@ -225,6 +225,9 @@ async fn openais_listing_keeps_models_that_can_answer_turns() {
         "babbage-002",
         "davinci-002",
         "sora-2",
+        // Re-review A, N3: they need a web-search tool harness does not send.
+        "o3-deep-research",
+        "o4-mini-deep-research-2025-06-26",
     ];
     let data: Vec<_> = ids.iter().map(|id| json!({"id": id})).collect();
     Mock::given(method("GET"))

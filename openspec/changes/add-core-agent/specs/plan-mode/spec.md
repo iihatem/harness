@@ -15,9 +15,15 @@ In `plan` mode the system SHALL apply read-only permissions, instruct the model 
 ### Requirement: Approving a plan starts implementation
 Choosing Build SHALL store the plan as the approved plan in the session (with the Build turn's user message), switch to the mode that was active before `plan` mode (or, if there was none, the configured mode unless it is `plan` or `read-only`, else the workspace's default mode), and start a turn instructing the model to implement the approved plan; after an edit, that turn MUST carry the edited plan itself.
 
+The choices MUST be taken with `b`, `e` and `k` (Esc keeps planning), only by keys pressed for them, as for approval prompts; Enter MUST NOT choose Build. A switch away from `plan` during the planning turn MUST leave the plan unbuilt, without the choices, in the mode the user chose.
+
 #### Scenario: Build from plan
 - **WHEN** the user was in `auto` mode, switched to `plan`, and chooses Build
 - **THEN** the mode returns to `auto` and a new turn begins implementing the plan
+
+#### Scenario: Leaving plan mode while planning
+- **WHEN** a session in `plan` mode configured for `auto` plans, and the user switches to `ask` during the planning turn
+- **THEN** the session is in `ask` mode when the turn ends, and no Build is offered
 
 ### Requirement: Plans can be edited before approval
 Choosing Edit SHALL open the plan in the user's `$EDITOR` (falling back to `vi`), and on save the edited text MUST become the plan presented for approval. Choosing Keep planning MUST keep `plan` mode and return to the input prompt.

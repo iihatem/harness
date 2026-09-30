@@ -64,7 +64,11 @@ Except in `full-access`, the system SHALL require approval for `read`, `grep`, a
 - **THEN** the user is asked to approve before the file is read
 
 ### Requirement: Approval prompts offer once, session, or deny with feedback
-When approval is required interactively, the system SHALL offer: approve once; approve for the rest of the session for the same tool and command prefix or path pattern; or deny with an optional message returned to the model. Session approvals MUST NOT apply to destructive commands, and a session approval that cannot apply MUST be reported as applying once. Prompts for `write` and `edit` MUST show the diff. A prompt to run a command outside the sandbox MUST NOT offer approval for the session.
+When approval is required interactively, the system SHALL offer: approve once; approve for the rest of the session for the same tool and command prefix or path pattern; or deny with an optional message returned to the model. Session approvals MUST NOT apply to destructive commands, and a session approval that cannot apply MUST be reported as applying once. Prompts for `write` and `edit` MUST show the diff, or, for a file that cannot be diffed, a note and the new content; building one MUST NOT wait on the target (a FIFO, a terminal) or block the session. A prompt MUST show all of what it asks about, scrolling when it does not fit, and say when part of it is hidden; characters that would draw as nothing MUST be shown as escapes. Only a key pressed for a prompt MUST answer it. A prompt to run a command outside the sandbox MUST NOT offer approval for the session. Once the turn is stopped, nothing more MUST be asked, and an unanswered prompt MUST be denied.
+
+#### Scenario: A command longer than the prompt
+- **WHEN** the model asks to run a one-line command longer than the prompt can show
+- **THEN** the prompt says which rows show, and the user can scroll to the command's end before answering
 
 #### Scenario: Approve for session
 - **WHEN** the user approves `cargo test` for the session and the model later runs `cargo test --all`

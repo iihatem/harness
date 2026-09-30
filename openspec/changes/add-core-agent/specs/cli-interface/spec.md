@@ -27,7 +27,11 @@ Interactive mode SHALL display a status line showing the active model, approval 
 - **THEN** a stats line shows the model, time to first token, tokens per second, and cache hit rate
 
 ### Requirement: Keyboard interaction
-Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on empty input to open `/rewind`; Ctrl+C pressed twice within 2 seconds to exit; Shift+Tab to cycle approval modes; Alt+Enter or Shift+Enter to insert a newline, with Ctrl+J and a backslash before Enter as fallbacks for terminals that do not report Shift+Enter; Up arrow to recall previous inputs; `/` at the start of input for command completion; `@` for fuzzy completion of workspace file paths; Enter while a turn is running to queue input; and Ctrl+S while a turn is running to send input immediately (steering). An approval prompt MUST take y (approve once), a (approve for the session, when offered), n (deny, with an optional reason for the model) and Esc (deny and stop the turn).
+Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on empty input to open `/rewind`; Ctrl+C pressed twice within 2 seconds to exit; Shift+Tab to cycle approval modes; Alt+Enter or Shift+Enter to insert a newline, with Ctrl+J and a backslash before Enter as fallbacks for terminals that do not report Shift+Enter; Up arrow to recall previous inputs; `/` at the start of input for command completion; `@` for fuzzy completion of workspace file paths; Enter while a turn is running to queue input; and Ctrl+S while a turn is running to send input immediately (steering). An approval prompt MUST take y (approve once), a (approve for the session, when offered), n (deny, with an optional reason for the model) and Esc (deny and stop the turn). A prompt MUST be answered only by a key pressed for it: keys typed before it was drawn, or within 300 ms after, MUST go to the input; Enter, and the letters with Ctrl or Alt held, MUST NOT answer it.
+
+#### Scenario: A key typed ahead of a prompt
+- **WHEN** the user is typing a message as an approval prompt appears, and the next key is `y` or Enter
+- **THEN** the key goes to the message, and the prompt still waits for an answer
 
 #### Scenario: File completion
 - **WHEN** the user types `@mainrs`
@@ -36,6 +40,17 @@ Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on 
 #### Scenario: Steering key
 - **WHEN** the user types a message and presses Ctrl+S while a tool is running
 - **THEN** the message is delivered to the model at the next tool-result boundary
+
+### Requirement: Interactive sessions end cleanly
+However an interactive session ends, it SHALL stop the running turn and the command it runs, deny any approval that waits, restore the terminal's modes, and end the sandbox's session. A hangup (SIGHUP) or SIGTERM MUST end it this way, with exit code 129 or 143; a terminal whose input ends or fails MUST end it as a hangup, whether or not harness ignores SIGHUP, and never leave harness reading it. While an external editor has the terminal, SIGINT and SIGQUIT MUST NOT end harness, and their earlier actions MUST be restored afterwards.
+
+#### Scenario: Terminal closed during a command
+- **WHEN** the user closes the terminal window while a command runs
+- **THEN** the command's processes are ended, the sandbox's session ends, and harness exits with code 129
+
+#### Scenario: Ctrl+C in the editor
+- **WHEN** the user presses Ctrl+C while editing a plan in `$EDITOR`
+- **THEN** harness keeps running, and its terminal modes and plan are as they were
 
 ### Requirement: Desktop notifications
 Interactive mode SHALL emit an OSC 9 desktop notification and a terminal bell when a turn that ran 10 seconds or longer finishes, other than by the user's interruption, or when an approval is needed. Both MUST be configurable (`[notifications] desktop` and `bell`, on by default) and MUST be disabled when stdout is not a terminal. Text in a notification MUST have its control characters removed.

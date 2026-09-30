@@ -164,11 +164,6 @@ impl Prompt {
         }
     }
 
-    /// Whether the user is typing why they deny.
-    pub fn typing_reason(&self) -> bool {
-        self.feedback.is_some()
-    }
-
     /// Takes a paste into the reason the user is typing; `false` when they are not typing one.
     pub fn paste(&mut self, text: &str) -> bool {
         match &mut self.feedback {

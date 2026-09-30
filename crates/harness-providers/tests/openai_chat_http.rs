@@ -17,6 +17,7 @@ fn request() -> ChatRequest {
         system: "s".into(),
         messages: vec![],
         tools: vec![],
+        ..ChatRequest::default()
     }
 }
 
@@ -119,4 +120,54 @@ async fn unreachable_servers_are_network_errors() {
     let provider = OpenAiChat::new("http://127.0.0.1:9/v1", None);
     let first = provider.stream(request()).next().await.unwrap();
     assert!(matches!(first, Err(ProviderError::Network(_))));
+}
+
+/// A server that answers one request with its headers, then sends nothing for a minute. It runs
+/// on a thread of its own, on real time.
+fn silent_after_headers() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let _ = socket.read(&mut [0; 8192]);
+        let _ = socket.write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+        );
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    });
+    url
+}
+
+// Ruling on review A M7: a server that sends its headers and then pauses gets 300 s to start its
+// reply when hosted, and 30 minutes when the profile says it is local (it may be reading a long
+// prompt on a CPU). The test's clock is paused, so those waits pass at once.
+#[tokio::test(start_paused = true)]
+async fn a_local_server_gets_longer_than_a_hosted_one_to_start_its_reply() {
+    for (local, wait, shown) in [(false, 300, "300 s"), (true, 1_800, "30 min")] {
+        let provider = OpenAiChat::new(silent_after_headers(), None);
+        let mut request = request();
+        request.options.local = local;
+        let started = tokio::time::Instant::now();
+        let events: Vec<_> = provider.stream(request).collect().await;
+        let waited = started.elapsed().as_secs();
+        match events.last() {
+            // Final review, I-1: the local server's is not retried.
+            Some(Err(
+                error @ ProviderError::NoStart {
+                    message,
+                    local: said,
+                },
+            )) => {
+                assert!(
+                    message.contains(&format!("did not start its reply within {shown}")),
+                    "{message}"
+                );
+                assert_eq!(*said, local);
+                assert_eq!(error.is_retryable(), !local);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!((wait..wait + 5).contains(&waited), "{waited}");
+    }
 }

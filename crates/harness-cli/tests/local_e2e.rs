@@ -1,0 +1,341 @@
+//! Local models in `harness ask`: the window the server really runs the model with, and a
+//! conversation held on local models that is continued on a hosted one (which says nothing).
+
+mod common;
+use common::Isolate;
+
+use assert_cmd::Command;
+use predicates::prelude::*;
+use predicates::str::contains;
+use serde_json::json;
+use tempfile::TempDir;
+use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+const BIN: &str = env!("CARGO_BIN_EXE_harness");
+
+fn answer(text: &str) -> ResponseTemplate {
+    let chunk =
+        json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]});
+    ResponseTemplate::new(200).set_body_raw(
+        format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+        "text/event-stream",
+    )
+}
+
+struct Env {
+    home: TempDir,
+    ws: TempDir,
+}
+
+impl Env {
+    fn new(config: &str) -> Env {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        std::fs::write(home.path().join("config/config.toml"), config).unwrap();
+        std::fs::create_dir(ws.path().join(".git")).unwrap();
+        Env { home, ws }
+    }
+
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::new(BIN);
+        cmd.current_dir(self.ws.path())
+            .env("HARNESS_HOME", self.home.path())
+            .isolate()
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_STATE_HOME");
+        cmd
+    }
+}
+
+// Spec: "Ollama running with a small context".
+#[tokio::test(flavor = "multi_thread")]
+async fn ollamas_small_running_context_is_used_and_explained() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": [
+            {"name": "qwen3-coder:30b", "model": "qwen3-coder:30b", "context_length": 4096}
+        ]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(answer("ok"))
+        .mount(&server)
+        .await;
+    // Ollama moved to the mock server: still Ollama, so it is asked.
+    let env = Env::new(&format!(
+        "model = \"ollama/qwen3-coder:30b\"\n[providers.ollama]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n",
+        server.uri()
+    ));
+    // About 1,250 tokens: more than a quarter of 4,096, but not of the model's 262,144.
+    std::fs::write(env.ws.path().join("AGENTS.md"), "x".repeat(5_000)).unwrap();
+    tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .args(["ask", "hi"])
+            .assert()
+            .success()
+            .stderr(contains("runs with a 4096-token context window"))
+            .stderr(contains("OLLAMA_CONTEXT_LENGTH=32768"))
+            .stderr(contains("the 4096-token context window"));
+    })
+    .await
+    .unwrap();
+}
+
+// Review D M2: a model Ollama does not have gets one clear message, Ollama's own, rather than a
+// warning that its window is unknown first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_ollama_does_not_have_gets_one_message() {
+    let server = MockServer::start().await;
+    let refusal = json!({"error": "model \"nope\" not found, try pulling it first"});
+    Mock::given(method("GET"))
+        .and(path("/api/ps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(refusal.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": {
+            "message": "model \"nope\" not found, try pulling it first",
+            "type": "api_error", "param": null, "code": null}})))
+        .mount(&server)
+        .await;
+    let env = Env::new(&format!(
+        "model = \"ollama/nope\"\n[providers.ollama]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n",
+        server.uri()
+    ));
+    tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .args(["ask", "hi"])
+            .assert()
+            .failure()
+            .stderr(contains("not found, try pulling it first"))
+            .stderr(contains("context window").not());
+    })
+    .await
+    .unwrap();
+}
+
+// Ruling on review A M7: a local server may take 30 minutes to start its reply (a long prompt on
+// a CPU), and Ctrl+C still ends that wait at once. The server sends its headers, then nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_c_ends_the_wait_for_a_slow_local_server() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (asked, request_arrived) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let _ = socket.read(&mut [0; 65_536]);
+        let _ = socket.write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+        );
+        let _ = asked.send(());
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    });
+    let env = Env::new(&format!(
+        "model = \"mock/slow\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n"
+    ));
+    let mut child = std::process::Command::new(BIN)
+        .args(["ask", "hi"])
+        .current_dir(env.ws.path())
+        .env("HARNESS_HOME", env.home.path())
+        .env("HARNESS_CREDENTIAL_STORE", "file")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // The request arrived, so the SIGINT handler, installed first, is live.
+    let arrived = tokio::task::spawn_blocking(move || {
+        request_arrived.recv_timeout(std::time::Duration::from_secs(10))
+    })
+    .await
+    .unwrap();
+    if arrived.is_err() {
+        let _ = child.kill();
+        panic!("the server never got the request");
+    }
+    // Waiting, well within the first 30 minutes.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .unwrap();
+    let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+// Decision 14: continuing a conversation held on local models with a hosted model says nothing
+// about it (the behaviour before P4); harness does not flag it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_conversation_continued_on_a_hosted_model_prints_no_warning() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(answer("ok"))
+        .mount(&server)
+        .await;
+    // `mock` is on the loopback interface, so local; `cloud` is too, but its profile says it is
+    // not.
+    let env = Env::new(&format!(
+        "[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{uri}/v1\"\n[providers.cloud]\nprotocol = \"openai-chat\"\nbase_url = \"{uri}/v1\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n[profiles.\"cloud/*\"]\ncontext_window = 200000\nlocal = false\n",
+        uri = server.uri()
+    ));
+    let flagged = "ran on local models so far; continuing it on";
+    tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .args(["--model", "mock/small", "ask", "one"])
+            .assert()
+            .success()
+            .stderr(contains(flagged).not());
+        env.cmd()
+            .args(["-c", "--model", "mock/small", "ask", "two"])
+            .assert()
+            .success()
+            .stderr(contains(flagged).not());
+        env.cmd()
+            .args(["-c", "--model", "cloud/big", "ask", "three"])
+            .assert()
+            .success()
+            .stderr(contains(flagged).not());
+        env.cmd()
+            .args(["-c", "--model", "cloud/big", "ask", "four"])
+            .assert()
+            .success()
+            .stderr(contains(flagged).not());
+        // A new conversation holds nothing yet.
+        env.cmd()
+            .args(["--model", "cloud/big", "ask", "five"])
+            .assert()
+            .success()
+            .stderr(contains(flagged).not());
+    })
+    .await
+    .unwrap();
+}
+
+// Spec: "Local model emits a tagged tool call as text": a model on a local server gets text tool
+// calls by default.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_models_tagged_tool_call_runs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .and(body_string_contains("pub fn add"))
+        .respond_with(answer("It defines add."))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(answer(
+            r#"<tool_call>{"name": "read", "arguments": {"path": "src/lib.rs"}}</tool_call>"#,
+        ))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let env = Env::new(&format!(
+        "model = \"mock/qwen\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n",
+        server.uri()
+    ));
+    std::fs::create_dir(env.ws.path().join("src")).unwrap();
+    std::fs::write(env.ws.path().join("src/lib.rs"), "pub fn add() {}\n").unwrap();
+    tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .args(["ask", "what is in lib.rs?"])
+            .assert()
+            .success()
+            .stdout(contains("It defines add."));
+    })
+    .await
+    .unwrap();
+}
+
+// Ruling on review E I1: Qwen3-Coder's calls reach harness's own tools with their string
+// parameters as written, JSON-looking or not (a JSON file's content, `42`, `true`, `"a"`), and
+// their other parameters (`replace_all`) as JSON.
+#[tokio::test(flavor = "multi_thread")]
+async fn qwen3_coder_calls_write_and_edit_text_that_looks_like_json() {
+    let server = MockServer::start().await;
+    let call = |tool: &str, parameters: &[(&str, &str)]| {
+        let parameters: String = parameters
+            .iter()
+            .map(|(name, value)| format!("<parameter={name}>\n{value}\n</parameter>\n"))
+            .collect();
+        answer(&format!(
+            "<tool_call>\n<function={tool}>\n{parameters}</function>\n</tool_call>"
+        ))
+    };
+    let edit = |old: &str, new: &str, all: &str| {
+        call(
+            "edit",
+            &[
+                ("path", "config.json"),
+                ("old_string", old),
+                ("new_string", new),
+                ("replace_all", all),
+            ],
+        )
+    };
+    let steps = [
+        call(
+            "write",
+            &[
+                ("path", "config.json"),
+                ("content", "{\"x\": 42, \"ok\": true, \"name\": \"a\"}"),
+            ],
+        ),
+        edit("42", "\"a\"", "false"),
+        edit("true", "42", "false"),
+        edit("\"a\"", "true", "true"),
+    ];
+    // Each step once, in order; then the answer.
+    for (priority, step) in (1u8..).zip(steps) {
+        Mock::given(method("POST"))
+            .respond_with(step)
+            .up_to_n_times(1)
+            .with_priority(priority)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .respond_with(answer("All done."))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+    let env = Env::new(&format!(
+        "model = \"mock/qwen3-coder\"\nmode = \"full-access\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n",
+        server.uri()
+    ));
+    let env = tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .args(["ask", "write config.json and edit it"])
+            .assert()
+            .success()
+            .stdout(contains("All done."))
+            .stderr(contains("error").not());
+        env
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(env.ws.path().join("config.json")).unwrap(),
+        "{\"x\": true, \"ok\": 42, \"name\": true}"
+    );
+}

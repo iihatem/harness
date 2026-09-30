@@ -1,0 +1,810 @@
+//! Secrets stay out of what harness writes (session files, tool-output files), while the model
+//! still sees tool output as it is.
+
+mod common;
+
+use std::sync::Arc;
+
+use common::*;
+use harness_core::agent::NonInteractive;
+use harness_core::message::Message;
+use harness_core::permission::Mode;
+use harness_core::redact::{REDACTED, Redactor};
+use harness_core::session::{EntryKind, Session};
+use harness_core::testing::{MockProvider, Script};
+use serde_json::json;
+
+const KEY: &str = "sk-canary-0123456789abcdef";
+
+#[test]
+fn known_secrets_are_replaced_wherever_they_appear() {
+    let redactor = Redactor::default();
+    redactor.add(KEY);
+    redactor.add("short");
+    assert_eq!(
+        redactor.redact(&format!("a {KEY} b {KEY}")),
+        format!("a {REDACTED} b {REDACTED}")
+    );
+    // Too short to tell apart from ordinary text.
+    assert_eq!(redactor.redact("short text"), "short text");
+    // A secret that contains another is replaced whole.
+    redactor.add("sk-canary-0123");
+    assert_eq!(redactor.redact(KEY), REDACTED);
+    assert!(!format!("{redactor:?}").contains("canary"));
+}
+
+#[test]
+fn a_secret_is_found_in_its_json_escaped_form_too() {
+    let redactor = Redactor::default();
+    let secret = r#"pa"ss\word-2024"#;
+    redactor.add(secret);
+    let line = serde_json::to_string(&json!({"content": format!("x {secret} y")})).unwrap();
+    let redacted = redactor.redact(&line);
+    assert!(!redacted.contains("ss\\\\word"), "{redacted}");
+    assert!(redacted.contains(REDACTED), "{redacted}");
+}
+
+#[test]
+fn secret_looking_environment_variables_are_secrets() {
+    let redactor = Redactor::default();
+    redactor.add_env(
+        [
+            ("OPENAI_API_KEY", "sk-proj-aaaaaaaaaaaa"),
+            ("GITHUB_TOKEN", "ghp_bbbbbbbbbbbbbbbb"),
+            ("AWS_SECRET_ACCESS_KEY", "cccccccccccccccccc"),
+            ("DB_PASSWORD", "dddddddddddd"),
+            ("client_secret", "eeeeeeeeeeee"),
+            ("HOME", "/home/someone"),
+            ("SHORT_TOKEN", "abc"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    let text = "sk-proj-aaaaaaaaaaaa ghp_bbbbbbbbbbbbbbbb cccccccccccccccccc dddddddddddd eeeeeeeeeeee /home/someone abc";
+    assert_eq!(
+        redactor.redact(text),
+        format!("{REDACTED} {REDACTED} {REDACTED} {REDACTED} {REDACTED} /home/someone abc")
+    );
+}
+
+// Review F M7: the common secret names beyond the four endings, and the password in a URL.
+#[test]
+fn common_secret_names_and_the_passwords_in_urls_are_secrets() {
+    let redactor = Redactor::default();
+    redactor.add_env([
+        ("PULUMI_CONFIG_PASSPHRASE", "passphrase-value-1"),
+        ("MYSQL_PWD", "mysql-pwd-value-2"),
+        ("SMTP_PASS", "smtp-pass-value-3"),
+        ("GOOGLE_CREDENTIALS", "credentials-value-4"),
+        ("API_KEYS", "api-keys-value-5"),
+        ("GITHUB_TOKENS", "tokens-value-6"),
+        ("VAULT_SECRETS", "secrets-value-7"),
+        ("ADMIN_PASSWORDS", "passwords-value-8"),
+        (
+            "DATABASE_URL",
+            "postgres://app:url-password-9@db.internal:5432/app",
+        ),
+        ("HTTPS_PROXY", "http://me:p%40ss-word-10@proxy:8080"),
+        // Not secrets: the working directories, names that only end in the same letters, a URL
+        // without a password, and values too short to tell from ordinary text.
+        ("PWD", "/home/someone/project"),
+        ("OLDPWD", "/home/someone/elsewhere"),
+        ("COMPASS", "north-by-northwest"),
+        ("HOMEPAGE_URL", "https://someone@example.com/some/path"),
+        ("MAX_TOKENS", "4096"),
+    ]);
+    let secrets = [
+        "passphrase-value-1",
+        "mysql-pwd-value-2",
+        "smtp-pass-value-3",
+        "credentials-value-4",
+        "api-keys-value-5",
+        "tokens-value-6",
+        "secrets-value-7",
+        "passwords-value-8",
+        "url-password-9",
+        "p%40ss-word-10",
+        "p@ss-word-10",
+    ];
+    for secret in secrets {
+        assert_eq!(redactor.redact(secret), REDACTED, "{secret}");
+    }
+    for plain in [
+        "/home/someone/project",
+        "/home/someone/elsewhere",
+        "north-by-northwest",
+        "https://someone@example.com/some/path",
+        "4096",
+        "postgres://app:",
+    ] {
+        assert_eq!(redactor.redact(plain), plain);
+    }
+}
+
+// Review F I1: a variable that is not UTF-8 is read, not a panic, and its value is a secret in
+// its lossy form, the form the bash tool's output takes.
+#[test]
+fn environment_variables_that_are_not_utf8_are_read_lossily() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    let redactor = Redactor::default();
+    redactor.add_env([
+        (
+            OsString::from("LEGACY_TOKEN"),
+            OsString::from_vec(b"caf\xe9-token-1234".to_vec()),
+        ),
+        (
+            OsString::from_vec(b"CAF\xc9_SECRET".to_vec()),
+            OsString::from("latin1-named-secret"),
+        ),
+        (
+            OsString::from("LEGACY_NAME"),
+            OsString::from_vec(b"caf\xe9-not-a-secret".to_vec()),
+        ),
+    ]);
+    assert_eq!(
+        redactor.redact("caf\u{fffd}-token-1234 latin1-named-secret caf\u{fffd}-not-a-secret"),
+        format!("{REDACTED} {REDACTED} caf\u{fffd}-not-a-secret")
+    );
+}
+
+#[test]
+fn session_files_hold_no_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(KEY);
+    let mut session = Session::create(&dir.path().join("sessions"), dir.path());
+    session.set_redactor(redactor);
+    session.append(EntryKind::Message {
+        message: Message::User {
+            content: format!("my key is {KEY}"),
+        },
+        display: None,
+        note: false,
+    });
+    let saved = std::fs::read_to_string(session.path().unwrap()).unwrap();
+    assert!(!saved.contains(KEY), "{saved}");
+    assert!(saved.contains(&format!("my key is {REDACTED}")), "{saved}");
+    // In memory, the conversation is as it was.
+    assert!(
+        session
+            .messages()
+            .iter()
+            .any(|(_, m)| matches!(m, Message::User { content } if content.contains(KEY)))
+    );
+}
+
+// Spec: "A command prints the environment", in the core: the tool-output file and the session
+// file hold no key, and the model still gets the output as it is.
+#[tokio::test]
+async fn tool_output_files_and_sessions_hold_no_secrets_but_the_model_sees_the_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = format!(
+        "{}\nOPENAI_API_KEY={KEY}\n{}",
+        "a".repeat(8_000),
+        "b".repeat(8_000)
+    );
+    let provider = MockProvider::new(vec![
+        Script::tool_call("c1", "echo", json!({"text": long})),
+        Script::text("done"),
+    ]);
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(KEY);
+    let sessions = dir.path().join("sessions");
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    )
+    .with_session(Session::create(&sessions, dir.path()))
+    .with_redactor(redactor);
+    agent.config_mut().output_limit = 4_000;
+    run(&mut agent, "go").await;
+    let spilled = std::fs::read_to_string(dir.path().join(".spill/c1.txt")).unwrap();
+    assert!(!spilled.contains(KEY));
+    assert!(spilled.contains(&format!("OPENAI_API_KEY={REDACTED}")));
+    for file in std::fs::read_dir(&sessions).unwrap() {
+        let saved = std::fs::read_to_string(file.unwrap().path()).unwrap();
+        assert!(!saved.contains(KEY), "{saved}");
+    }
+    // The call's arguments carried the key to the model's own request, as it wrote them.
+    let requests = provider.requests();
+    assert!(
+        serde_json::to_string(&requests[1].messages)
+            .unwrap()
+            .contains(KEY)
+    );
+}
+
+/// What `stream` shows of `pieces`, streamed one after another, then finished.
+fn streamed(redactor: &Arc<Redactor>, pieces: &[&str]) -> String {
+    let mut stream = redactor.stream();
+    let mut shown = String::new();
+    for piece in pieces {
+        shown.push_str(&stream.push(piece));
+    }
+    shown.push_str(&stream.finish());
+    shown
+}
+
+// Review F C1: a secret the model streams in pieces is replaced whole, wherever the pieces split
+// it: at every byte offset, into two pieces and into three.
+#[test]
+fn a_streamed_secret_is_replaced_however_it_is_split() {
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(KEY);
+    let text = format!("Your key is {KEY}, again:{KEY}{KEY}.");
+    let expected = redactor.redact(&text);
+    assert!(!expected.contains("canary"), "{expected}");
+    let n = text.len();
+    for i in 0..=n {
+        let shown = streamed(&redactor, &[&text[..i], &text[i..]]);
+        assert_eq!(shown, expected, "split at {i}");
+        for j in i..=n {
+            let shown = streamed(&redactor, &[&text[..i], &text[i..j], &text[j..]]);
+            assert_eq!(shown, expected, "split at {i} and {j}");
+        }
+    }
+}
+
+#[test]
+fn a_stream_holds_back_only_what_could_still_become_a_secret() {
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(KEY);
+    let mut stream = redactor.stream();
+    assert_eq!(stream.push("nothing secret "), "nothing secret ");
+    assert_eq!(stream.push("here: sk-can"), "here: ");
+    assert_eq!(stream.push("dle"), "sk-candle");
+    assert_eq!(stream.push(" sk-canary-0123"), " ");
+    assert_eq!(stream.push("456789abcdef!"), format!("{REDACTED}!"));
+    assert_eq!(stream.push("sk-"), "");
+    assert_eq!(stream.finish(), "sk-");
+    // After `finish`, the stream starts afresh.
+    assert_eq!(stream.push("more"), "more");
+}
+
+#[test]
+fn a_stream_replaces_secrets_that_overlap_or_hold_other_characters() {
+    let redactor = Arc::new(Redactor::default());
+    for secret in ["abababab", "pässwörd-ünïcode", r#"pa"ss\word-2024"#] {
+        redactor.add(secret);
+    }
+    for text in [
+        "abababababababab ab abababa",
+        "x pässwörd-ünïcode y pässwörd-ünïcod",
+        r#"cmd 'pa"ss\word-2024' and {"a":"pa\"ss\\word-2024"}"#,
+    ] {
+        let expected = redactor.redact_message(text);
+        let bounds: Vec<usize> = (0..=text.len())
+            .filter(|&i| text.is_char_boundary(i))
+            .collect();
+        for &i in &bounds {
+            for &j in bounds.iter().filter(|&&j| j >= i) {
+                let shown = streamed(&redactor, &[&text[..i], &text[i..j], &text[j..]]);
+                assert_eq!(shown, expected, "{text:?} split at {i} and {j}");
+            }
+        }
+    }
+}
+
+// Review F C1: the deltas of a turn go through one stream each, flushed before any other event,
+// so a secret split across `text_delta` or `reasoning_delta` events is never shown in pieces.
+#[test]
+fn events_show_streamed_secrets_whole_and_flush_before_other_events() {
+    use harness_core::event::{AgentEvent, TurnEndReason};
+    use harness_core::redact::EventRedactor;
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(KEY);
+    let (head, tail) = KEY.split_at(10);
+    let mut events = EventRedactor::new(redactor.clone());
+    let mut shown = Vec::new();
+    for event in [
+        AgentEvent::TurnStarted,
+        AgentEvent::ReasoningDelta {
+            text: format!("the user's key {head}"),
+        },
+        AgentEvent::TextDelta {
+            text: format!("Your key is {head}"),
+        },
+        AgentEvent::ReasoningDelta {
+            text: tail.to_string(),
+        },
+        AgentEvent::TextDelta {
+            text: tail[..3].to_string(),
+        },
+        AgentEvent::TextDelta {
+            text: format!("{}. Done", &tail[3..]),
+        },
+        AgentEvent::TextDelta {
+            text: " sk-".into(),
+        },
+        AgentEvent::AssistantMessage {
+            content: format!("Your key is {KEY}. Done sk-"),
+            model: "mock/m".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "after sk-canary".into(),
+        },
+    ] {
+        shown.extend(events.push(event));
+    }
+    shown.extend(events.finish());
+    let text: String = shown
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let reasoning: String = shown
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ReasoningDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    // The reply that ends the events ends with nine characters of the key: they are redacted too
+    // (see `a_secret_split_across_a_cut_off_reply_and_its_continuation_is_written_nowhere`).
+    assert_eq!(
+        text,
+        format!("Your key is {REDACTED}. Done sk-after {REDACTED}")
+    );
+    assert_eq!(reasoning, format!("the user's key {REDACTED}"));
+    let lines: Vec<String> = shown
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    for line in &lines {
+        assert!(!line.contains(head), "{line}");
+        assert!(!line.contains(tail), "{line}");
+        assert!(!line.contains(r#""text":"""#), "an empty delta: {line}");
+    }
+    // What the deltas held back comes out before the message that ends them.
+    let message = shown
+        .iter()
+        .position(|e| matches!(e, AgentEvent::AssistantMessage { .. }))
+        .unwrap();
+    assert!(matches!(&shown[message - 1], AgentEvent::TextDelta { text } if text == "sk-"));
+    assert_eq!(
+        shown[message],
+        AgentEvent::AssistantMessage {
+            content: format!("Your key is {REDACTED}. Done sk-"),
+            model: "mock/m".into(),
+        }
+    );
+    assert_eq!(shown[0], AgentEvent::TurnStarted);
+    assert!(!shown.contains(&AgentEvent::TurnFinished {
+        reason: TurnEndReason::Completed
+    }));
+}
+
+const PASSWORD: &str = r#"pa"ss\word-2024"#;
+
+/// Whether `text` holds any part of [`PASSWORD`] that would give it away, in any escaping.
+fn holds_the_password(text: &str) -> bool {
+    text.contains("word-2024")
+}
+
+// Review F I3: a tool call's arguments are JSON inside the event, so a password with `"` or `\`
+// was escaped twice there and never matched. Each string is redacted on its own now.
+#[test]
+fn a_password_in_a_tool_calls_arguments_is_redacted() {
+    use harness_core::event::AgentEvent;
+    let redactor = Redactor::default();
+    redactor.add(PASSWORD);
+    let arguments =
+        serde_json::to_string(&json!({"command": format!("mysql -p'{PASSWORD}'")})).unwrap();
+    let event = redactor.redact_event(&AgentEvent::ToolCallRequested {
+        id: "c1".into(),
+        name: "bash".into(),
+        arguments,
+    });
+    let AgentEvent::ToolCallRequested { arguments, .. } = &event else {
+        panic!("{event:?}");
+    };
+    assert!(!holds_the_password(arguments), "{arguments}");
+    let args: serde_json::Value = serde_json::from_str(arguments).unwrap();
+    assert_eq!(args["command"], format!("mysql -p'{REDACTED}'"));
+    assert!(!holds_the_password(&serde_json::to_string(&event).unwrap()));
+}
+
+#[test]
+fn session_files_hold_no_password_from_a_tool_call() {
+    use harness_core::message::ToolCall;
+    let dir = tempfile::tempdir().unwrap();
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(PASSWORD);
+    let mut session = Session::create(&dir.path().join("sessions"), dir.path());
+    session.set_redactor(redactor);
+    session.append(EntryKind::Message {
+        message: Message::Assistant {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: serde_json::to_string(&json!({"command": format!("echo '{PASSWORD}'")}))
+                    .unwrap(),
+            }],
+            model: "mock/m".into(),
+        },
+        display: None,
+        note: false,
+    });
+    let saved = std::fs::read_to_string(session.path().unwrap()).unwrap();
+    assert!(!holds_the_password(&saved), "{saved}");
+    assert!(saved.contains(REDACTED), "{saved}");
+}
+
+// Review F M5: a secret that is also a field name, an event's type or another of harness's own
+// words replaced them, which broke the NDJSON and session formats. Only values are redacted,
+// and the words that name what a record is are left alone.
+#[test]
+fn a_secret_that_is_one_of_harnesss_own_words_breaks_no_record() {
+    use harness_core::event::{AgentEvent, ErrorKind, TurnEndReason};
+    let redactor = Arc::new(Redactor::default());
+    for word in [
+        "text_delta",
+        "arguments",
+        "tool_call_requested",
+        "completed",
+        "provider",
+        "assistant",
+        "tool_calls",
+        "conversation",
+    ] {
+        redactor.add(word);
+    }
+    for event in [
+        AgentEvent::TextDelta {
+            text: "some text".into(),
+        },
+        AgentEvent::ToolCallRequested {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        },
+        AgentEvent::TurnFinished {
+            reason: TurnEndReason::Completed,
+        },
+        AgentEvent::Error {
+            kind: ErrorKind::Provider,
+            message: "it failed".into(),
+        },
+    ] {
+        assert_eq!(redactor.redact_event(&event), event);
+    }
+    // Values are still redacted.
+    assert_eq!(
+        redactor.redact_event(&AgentEvent::TextDelta {
+            text: "a text_delta b".into()
+        }),
+        AgentEvent::TextDelta {
+            text: format!("a {REDACTED} b")
+        }
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::create(&dir.path().join("sessions"), dir.path());
+    session.set_redactor(redactor);
+    session.append(EntryKind::Message {
+        message: Message::Assistant {
+            content: "the assistant speaks".into(),
+            tool_calls: vec![],
+            model: "mock/m".into(),
+        },
+        display: None,
+        note: false,
+    });
+    let path = session.path().unwrap().to_path_buf();
+    drop(session);
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains(&format!("the {REDACTED} speaks")), "{saved}");
+    let (reopened, warnings) = Session::open(&path).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(reopened.messages().iter().any(|(_, m)| matches!(
+        m,
+        Message::Assistant { content, .. } if content == &format!("the {REDACTED} speaks")
+    )));
+}
+
+/// The five-character pieces of `secret`: a piece of it that a cut lets through holds one.
+fn pieces(secret: &str) -> Vec<&str> {
+    (0..=secret.len() - 5).map(|i| &secret[i..i + 5]).collect()
+}
+
+// Review F I2: the tool output the model gets (and the writers then redact whole) is cut 400
+// bytes from each end at this limit. A secret the cut would run through goes wholly to one
+// side, wherever it starts, at either end; the model still gets the text as it is.
+#[test]
+fn the_tool_output_cut_never_splits_a_secret() {
+    use harness_core::output::limit_output;
+    let dir = tempfile::tempdir().unwrap();
+    let redactor = Redactor::default();
+    redactor.add(KEY);
+    let (limit, keep) = (1000, 400);
+    for k in 0..=KEY.len() + 1 {
+        let at_the_head = format!("{}{KEY}{}", "a".repeat(keep - k), "b".repeat(3000));
+        let at_the_tail = format!(
+            "{}{KEY}{}",
+            "b".repeat(3000),
+            "c".repeat(keep + k - KEY.len())
+        );
+        for content in [at_the_head, at_the_tail] {
+            let limited = limit_output(&content, limit, dir.path(), "c1", Some(&redactor));
+            assert!(limited.contains("omitted"), "{limited}");
+            let shown = redactor.redact(&limited);
+            for piece in pieces(KEY) {
+                assert!(!shown.contains(piece), "k = {k}: {shown}");
+            }
+            // What the model gets is the output as it is, the secret whole where it is kept.
+            assert!(!limited.contains(REDACTED), "{limited}");
+            if pieces(KEY).iter().any(|piece| limited.contains(piece)) {
+                assert!(limited.contains(KEY), "k = {k}: {limited}");
+            }
+        }
+    }
+}
+
+// Re-review F, R4: a secret that overlaps itself (`00000000`, a placeholder-like value) in a run of
+// zeros ran the cuts through the whole output, so the model got neither head nor tail, and 16 MB
+// took seconds. A cut moves by at most the longest secret's length, and only the text around it
+// is searched.
+#[test]
+fn a_self_overlapping_secret_moves_the_cut_a_little_and_quickly() {
+    use harness_core::output::limit_output;
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let redactor = Redactor::default();
+    redactor.add("00000000");
+    redactor.add(KEY);
+    let content = "0".repeat(16 * 1024 * 1024);
+    let (limit, keep) = (10 * 1024, 10 * 1024 * 2 / 5);
+    let started = Instant::now();
+    let limited = limit_output(&content, limit, dir.path(), "c1", Some(&redactor));
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(900), "took {took:?}");
+    let (head, rest) = limited.split_once("\n[... ").unwrap();
+    let (_, tail) = rest.split_once(" ...]\n").unwrap();
+    for (end, kept) in [("head", head), ("tail", tail)] {
+        assert!(kept.len() <= keep, "{end}: {}", kept.len());
+        assert!(kept.len() >= keep - KEY.len(), "{end}: {}", kept.len());
+    }
+}
+
+#[test]
+fn occurrences_are_where_secrets_are() {
+    let redactor = Redactor::default();
+    redactor.add(KEY);
+    redactor.add("abababab");
+    let text = format!("x{KEY}y ababababab");
+    let key = 1..1 + KEY.len();
+    let at = text.find("abab").unwrap();
+    assert_eq!(
+        redactor.occurrences(&text),
+        vec![key, at..at + 8, at + 2..at + 10]
+    );
+    assert!(redactor.occurrences("nothing here").is_empty());
+}
+
+// Some servers report usage with every chunk, so a usage event can arrive between the deltas of
+// one reply. It does not end the reply: the streams go on, and the secret is still whole.
+#[test]
+fn a_usage_event_between_deltas_does_not_split_a_secret() {
+    use harness_core::event::AgentEvent;
+    use harness_core::message::Usage;
+    use harness_core::redact::EventRedactor;
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(KEY);
+    let (head, tail) = KEY.split_at(10);
+    let usage = AgentEvent::Usage {
+        model: "mock/m".into(),
+        usage: Usage::default(),
+    };
+    let mut events = EventRedactor::new(redactor);
+    let mut shown = Vec::new();
+    for event in [
+        AgentEvent::TextDelta {
+            text: format!("key {head}"),
+        },
+        usage.clone(),
+        AgentEvent::TextDelta {
+            text: tail.to_string(),
+        },
+    ] {
+        shown.extend(events.push(event));
+    }
+    shown.extend(events.finish());
+    assert_eq!(
+        shown,
+        [
+            AgentEvent::TextDelta {
+                text: "key ".into()
+            },
+            usage,
+            AgentEvent::TextDelta {
+                text: REDACTED.into()
+            },
+        ]
+    );
+}
+
+/// The events [`EventRedactor`] shows for `events`, then for the end of the events.
+fn shown(
+    redactor: &Arc<Redactor>,
+    events: Vec<harness_core::event::AgentEvent>,
+) -> Vec<harness_core::event::AgentEvent> {
+    let mut redacting = harness_core::redact::EventRedactor::new(redactor.clone());
+    let mut shown = Vec::new();
+    for event in events {
+        shown.extend(redacting.push(event));
+    }
+    shown.extend(redacting.finish());
+    shown
+}
+
+// Re-review F, R1 (probe P5): a reply cut off at the output limit in the middle of a key, and the
+// reply that continues it, each hold their part of the key at their edge. Neither part is shown,
+// wherever the replies' deltas are split; the model still sees both as they are.
+#[test]
+fn a_secret_split_across_a_cut_off_reply_and_its_continuation_is_written_nowhere() {
+    use harness_core::event::AgentEvent;
+    let key = "sk-canary-key-0123456789";
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(key);
+    let (head, tail) = key.split_at(14);
+    let cut_off = format!("Your key is {head}");
+    let continued = format!("{tail} is the rest.");
+    for i in 0..=cut_off.len() {
+        for j in 0..=continued.len() {
+            let mut events = Vec::new();
+            for (reply, at) in [(&cut_off, i), (&continued, j)] {
+                for piece in [&reply[..at], &reply[at..]] {
+                    events.push(AgentEvent::TextDelta {
+                        text: piece.to_string(),
+                    });
+                }
+                events.push(AgentEvent::AssistantMessage {
+                    content: reply.clone(),
+                    model: "mock/m".into(),
+                });
+                events.push(AgentEvent::Warning {
+                    message: "the model's reply was cut off at its output limit".into(),
+                });
+            }
+            let shown = shown(&redactor, events);
+            for line in shown.iter().map(|e| serde_json::to_string(e).unwrap()) {
+                assert!(!line.contains(head), "split at {i}, {j}: {line}");
+                assert!(!line.contains(tail), "split at {i}, {j}: {line}");
+            }
+            let messages: Vec<&str> = shown
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::AssistantMessage { content, .. } => Some(content.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                messages,
+                [
+                    format!("Your key is {REDACTED}"),
+                    format!("{REDACTED} is the rest.")
+                ]
+            );
+            let text: String = shown
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                text,
+                format!("Your key is {REDACTED}{REDACTED} is the rest."),
+                "split at {i}, {j}"
+            );
+        }
+    }
+}
+
+// Re-review F, R1: the session file holds neither part either, and the conversation in memory,
+// which the model is sent, is as it was.
+#[test]
+fn a_session_holds_no_part_of_a_secret_split_across_two_replies() {
+    let key = "sk-canary-key-0123456789";
+    let (head, tail) = key.split_at(14);
+    let dir = tempfile::tempdir().unwrap();
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(key);
+    let mut session = Session::create(&dir.path().join("sessions"), dir.path());
+    session.set_redactor(redactor);
+    let reply = |content: String| EntryKind::Message {
+        message: Message::Assistant {
+            content,
+            tool_calls: vec![],
+            model: "mock/m".into(),
+        },
+        display: None,
+        note: false,
+    };
+    session.append(reply(format!("Your key is {head}")));
+    session.append(EntryKind::Message {
+        message: Message::User {
+            content: "[harness] Your last reply was cut off. Continue exactly where it stopped."
+                .into(),
+        },
+        display: None,
+        note: true,
+    });
+    session.append(reply(format!("{tail} is the rest.")));
+    let saved = std::fs::read_to_string(session.path().unwrap()).unwrap();
+    assert!(!saved.contains(head), "{saved}");
+    assert!(!saved.contains(tail), "{saved}");
+    assert!(
+        saved.contains(&format!("Your key is {REDACTED}")),
+        "{saved}"
+    );
+    assert!(
+        saved.contains(&format!("{REDACTED} is the rest.")),
+        "{saved}"
+    );
+    let in_memory: String = session
+        .messages()
+        .iter()
+        .filter_map(|(_, m)| match m {
+            Message::Assistant { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(in_memory, format!("Your key is {head}{tail} is the rest."));
+}
+
+// Re-review F, R1: only an edge of eight characters or more that is part of a secret counts, the
+// same minimum as secrets, and only at the edges of a message.
+#[test]
+fn only_message_edges_of_eight_characters_or_more_are_parts_of_secrets() {
+    let redactor = Redactor::default();
+    redactor.add(KEY);
+    for (message, shown) in [
+        ("Your key is sk-canary", format!("Your key is {REDACTED}")),
+        ("Your key is sk-cana", "Your key is sk-cana".to_string()),
+        (
+            "456789abcdef is the rest",
+            format!("{REDACTED} is the rest"),
+        ),
+        ("abcdef is the rest", "abcdef is the rest".to_string()),
+        // The start of a secret at the start of a message is no edge of one.
+        (
+            "sk-canary-0123 at the start",
+            "sk-canary-0123 at the start".to_string(),
+        ),
+        (
+            "a middle part: canary-0123 of it",
+            "a middle part: canary-0123 of it".to_string(),
+        ),
+        ("0123456789abcdef", REDACTED.to_string()),
+        ("sk-canary-0123456789abcdef", REDACTED.to_string()),
+        (
+            "6789abcdef and sk-canary-0",
+            format!("{REDACTED} and {REDACTED}"),
+        ),
+    ] {
+        assert_eq!(redactor.redact_message(message), shown, "{message}");
+    }
+}
+
+// Re-review F, R1: the start of a streamed reply is held back only while it could still be the
+// end of a secret.
+#[test]
+fn a_stream_holds_back_its_start_only_while_it_could_end_a_secret() {
+    let redactor = Arc::new(Redactor::default());
+    redactor.add(KEY);
+    let mut stream = redactor.stream();
+    assert_eq!(stream.push("456789"), "");
+    assert_eq!(
+        stream.push("abcdef and more"),
+        format!("{REDACTED} and more")
+    );
+    assert_eq!(stream.finish(), "");
+    assert_eq!(stream.push("The answer"), "The answer");
+    assert_eq!(stream.finish(), "");
+    // The end of a secret shorter than eight characters is shown at once.
+    assert_eq!(stream.push("bcdef"), "bcdef");
+}

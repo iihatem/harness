@@ -1,3 +1,6 @@
+mod common;
+use common::Isolate;
+
 use assert_cmd::Command;
 use predicates::str::contains;
 use serde_json::{Value, json};
@@ -49,6 +52,7 @@ fn cmd(home: &TempDir, ws: &TempDir) -> Command {
     let mut cmd = Command::new(BIN);
     cmd.current_dir(ws.path())
         .env("HARNESS_HOME", home.path())
+        .isolate()
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_STATE_HOME");
@@ -160,6 +164,7 @@ async fn a_checkpoint_repository_inside_the_workspace_disables_checkpoints() {
         let output = Command::new(BIN)
             .current_dir(ws.path())
             .env("HARNESS_HOME", &inner)
+            .isolate()
             .env("HARNESS_SANDBOX", "none")
             .env_remove("XDG_DATA_HOME")
             .args(["--mode", "auto", "ask", "--json", "make hello.txt"])

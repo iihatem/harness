@@ -1,3 +1,6 @@
+mod common;
+use common::Isolate;
+
 use assert_cmd::Command;
 use predicates::str::contains;
 use serde_json::{Value, json};
@@ -33,7 +36,8 @@ impl Env {
         std::fs::create_dir_all(home.path().join("config")).unwrap();
         std::fs::write(
             home.path().join("config/config.toml"),
-            format!("model = \"mock/test-model\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{server_uri}/v1\"\n"),
+            // These tests measure against a 32,768-token window.
+            format!("model = \"mock/test-model\"\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{server_uri}/v1\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n"),
         )
         .unwrap();
         std::fs::create_dir(ws.path().join(".git")).unwrap();
@@ -44,6 +48,7 @@ impl Env {
         let mut cmd = Command::new(BIN);
         cmd.current_dir(self.ws.path())
             .env("HARNESS_HOME", self.home.path())
+            .isolate()
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_STATE_HOME");

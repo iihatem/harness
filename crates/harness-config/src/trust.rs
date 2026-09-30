@@ -32,7 +32,7 @@ impl TrustStore {
         let file = match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text).map_err(|e| ConfigError::Parse {
                 path: path.clone(),
-                message: e.to_string(),
+                message: crate::config::toml_error(&text, &e),
             })?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => TrustFile::default(),
             Err(source) => return Err(ConfigError::Io { path, source }),

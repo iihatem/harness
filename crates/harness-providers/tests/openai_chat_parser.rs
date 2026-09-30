@@ -192,6 +192,7 @@ fn request_body_maps_messages_and_tools() {
             description: "Read".into(),
             parameters: json!({"type": "object"}),
         }],
+        ..ChatRequest::default()
     };
     let body = request_body(&req);
     assert_eq!(body["model"], "qwen3:14b");
@@ -225,6 +226,33 @@ fn request_body_omits_empty_tools() {
         system: String::new(),
         messages: vec![],
         tools: vec![],
+        ..ChatRequest::default()
     };
     assert!(request_body(&req).get("tools").is_none());
+}
+
+#[test]
+fn profile_options_reach_the_chat_request() {
+    use harness_core::message::RequestOptions;
+    let plain = ChatRequest {
+        model: "m".into(),
+        ..ChatRequest::default()
+    };
+    let body = request_body(&plain);
+    for absent in ["max_tokens", "temperature", "reasoning_effort"] {
+        assert!(body.get(absent).is_none(), "{absent}");
+    }
+    let tuned = ChatRequest {
+        options: RequestOptions {
+            max_output_tokens: Some(2048),
+            temperature: Some(0.2),
+            reasoning_effort: Some("low".into()),
+            ..RequestOptions::default()
+        },
+        ..plain
+    };
+    let body = request_body(&tuned);
+    assert_eq!(body["max_tokens"], 2048);
+    assert_eq!(body["temperature"], 0.2);
+    assert_eq!(body["reasoning_effort"], "low");
 }

@@ -1,3 +1,6 @@
+mod common;
+use common::Isolate;
+
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -55,6 +58,7 @@ impl Env {
         let mut cmd = Command::new(BIN);
         cmd.current_dir(self.ws.path())
             .env("HARNESS_HOME", self.home.path())
+            .isolate()
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_STATE_HOME");
@@ -189,6 +193,67 @@ async fn piped_stdin_is_appended_to_the_prompt() {
     .unwrap();
 }
 
+// Final review, M-2: a key pasted as `api_key_env` is refused, and never printed, whether the
+// global config or a project's holds it, by `ask` and by `harness trust`.
+#[test]
+fn a_key_pasted_as_api_key_env_is_never_printed() {
+    let pasted = "[providers.x]\nprotocol = \"openai-chat\"\nbase_url = \"https://x.example/v1\"\napi_key_env = \"sk-proj-AbCdEfGhIjKlMnOpQrSt\"\n";
+    let env = Env::new("http://127.0.0.1:9", &format!("model = \"x/m\"\n{pasted}"));
+    env.cmd()
+        .args(["ask", "hi"])
+        .assert()
+        .code(2)
+        .stderr(contains("names an environment variable, not a key"))
+        .stderr(predicates::prelude::PredicateBooleanExt::not(contains(
+            "AbCdEf",
+        )));
+    let env = Env::new("http://127.0.0.1:9", "");
+    std::fs::create_dir_all(env.ws.path().join(".harness")).unwrap();
+    std::fs::write(env.ws.path().join(".harness/config.toml"), pasted).unwrap();
+    for args in [&["ask", "hi"][..], &["trust"]] {
+        env.cmd()
+            .args(args)
+            .write_stdin("n\n")
+            .assert()
+            .code(2)
+            .stderr(contains("names an environment variable, not a key"))
+            .stderr(predicates::prelude::PredicateBooleanExt::not(contains(
+                "AbCdEf",
+            )));
+    }
+}
+
+// Final review, M-3: a refused key is named by where it came from, with what fixes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_key_says_which_key_it_was() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Incorrect API key provided"))
+        .mount(&server)
+        .await;
+    let keyed = format!(
+        "model = \"keyed/m\"\n[providers.keyed]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\napi_key_env = \"KEYED_API_KEY\"\n",
+        server.uri()
+    );
+    let env = Env::new(&server.uri(), &keyed);
+    tokio::task::spawn_blocking(move || {
+        env.cmd()
+            .env("KEYED_API_KEY", "sk-keyed-0123456789")
+            .args(["ask", "hi"])
+            .assert()
+            .code(1)
+            .stderr(contains("HTTP 401: Incorrect API key provided"))
+            .stderr(contains("$KEYED_API_KEY"))
+            .stderr(contains("unset KEYED_API_KEY"))
+            .stderr(contains("`harness auth add keyed`"))
+            .stderr(predicates::prelude::PredicateBooleanExt::not(contains(
+                "sk-keyed",
+            )));
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn provider_errors_exit_1() {
     let server = MockServer::start().await;
@@ -282,6 +347,7 @@ async fn ctrl_c_interrupts_the_run_and_exits_130() {
         .args(["ask", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
+        .isolate()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -330,6 +396,7 @@ async fn a_closed_stdout_pipe_does_not_panic_and_still_exits() {
         .args(["ask", "--json", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
+        .isolate()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -397,6 +464,7 @@ async fn missing_model_exits_2_promptly_even_with_an_open_stdin_pipe() {
         .args(["ask", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
+        .isolate()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -430,6 +498,7 @@ async fn idle_stdin_pipe_does_not_hang() {
         .args(["ask", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
+        .isolate()
         .env("HARNESS_STDIN_WAIT_MS", "300")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -473,6 +542,7 @@ async fn slowly_piped_stdin_is_still_included() {
         .args(["ask", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
+        .isolate()
         .env("HARNESS_STDIN_WAIT_MS", "2000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -555,6 +625,7 @@ async fn interrupt_while_stdin_stays_open(env: &Env, delay: Duration) -> std::pr
         .args(["--model", "mock/test-model", "ask", "hi"])
         .current_dir(env.ws.path())
         .env("HARNESS_HOME", env.home.path())
+        .isolate()
         .env("HARNESS_STDIN_WAIT_MS", "2000")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -643,9 +714,10 @@ async fn control_characters_reach_the_terminal_only_escaped() {
     );
 }
 
-// Review Focus: a config parse error echoes a snippet of the offending source line. If that line
-// contains a raw control byte (e.g. pasted from a terminal capture), it must reach stderr escaped,
-// not raw — the same guarantee `terminal_safe` already gives rule text and model output.
+// Review Focus: a config parse error echoed a snippet of the offending source line. If that line
+// contains a raw control byte (e.g. pasted from a terminal capture), it must not reach stderr raw
+// — the same guarantee `terminal_safe` already gives rule text and model output. Since re-review
+// F, R2, the line is not echoed at all (it can hold a key): only where it is.
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_config_with_an_escape_byte_is_escaped_on_stderr() {
     let server = MockServer::start().await;
@@ -661,7 +733,8 @@ async fn invalid_config_with_an_escape_byte_is_escaped_on_stderr() {
         !stderr.contains('\u{1b}'),
         "raw ESC byte on stderr: {stderr:?}"
     );
-    assert!(stderr.contains("\\u{1b}"), "{stderr}");
+    assert!(stderr.contains("line 1, column 4"), "{stderr}");
+    assert!(!stderr.contains("mdo"), "{stderr}");
 }
 
 // Review Focus: `registry::resolve`'s errors (BadId/UnknownProvider) embed the raw model id or

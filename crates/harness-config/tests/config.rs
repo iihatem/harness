@@ -771,3 +771,277 @@ fn an_ignored_low_threshold_takes_a_keep_share_it_cannot_hold_with_it() {
     assert_eq!(cfg.compaction.threshold(), 0.8);
     assert_eq!(cfg.compaction.keep_recent(), 0.25);
 }
+
+#[test]
+fn providers_may_use_the_responses_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(
+        &file,
+        "[providers.oa]\nprotocol = \"openai-responses\"\nbase_url = \"https://x.example/v1\"\n",
+    )
+    .unwrap();
+    let parsed = config::parse_file(&file).unwrap().unwrap();
+    assert_eq!(
+        parsed.providers["oa"].protocol,
+        config::Protocol::OpenaiResponses
+    );
+}
+
+#[test]
+fn providers_may_use_the_messages_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(
+        &file,
+        "[providers.local-claude]\nprotocol = \"anthropic-messages\"\nbase_url = \"http://127.0.0.1:4000/v1\"\n",
+    )
+    .unwrap();
+    let parsed = config::parse_file(&file).unwrap().unwrap();
+    assert_eq!(
+        parsed.providers["local-claude"].protocol,
+        config::Protocol::AnthropicMessages
+    );
+}
+
+#[test]
+fn model_profiles_are_read_from_the_global_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    std::fs::write(
+        &global,
+        "[profiles.\"ollama/qwen3-coder*\"]\ncontext_window = 65536\ntemperature = 0.2\ntext_tool_calls = false\n\n[profiles.\"openai/*\"]\nreasoning_effort = \"high\"\nmax_output_tokens = 8000\n",
+    )
+    .unwrap();
+    let cfg = config::load(&global, dir.path(), &TrustStore::default()).unwrap();
+    let qwen = &cfg.profiles["ollama/qwen3-coder*"];
+    assert_eq!(qwen.context_window, Some(65_536));
+    assert_eq!(qwen.temperature, Some(0.2));
+    assert_eq!(qwen.text_tool_calls, Some(false));
+    assert_eq!(qwen.local, None);
+    let openai = &cfg.profiles["openai/*"];
+    assert_eq!(openai.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(openai.max_output_tokens, Some(8000));
+}
+
+// A project's profiles choose output limits, reasoning effort and context budgets, which cost
+// paid requests, and whether text runs as tool calls: they need trust.
+#[test]
+fn a_projects_model_profiles_need_trust() {
+    let global = "[profiles.\"ollama/*\"]\ncontext_window = 32768\ntemperature = 0.5\n";
+    let project = "[profiles.\"ollama/*\"]\ntemperature = 0.1\n[profiles.\"openai/*\"]\nreasoning_effort = \"high\"\n";
+    let (cfg, widening) = load_project(Some(global), project, true);
+    assert_eq!(cfg.profiles.len(), 1);
+    assert_eq!(cfg.profiles["ollama/*"].temperature, Some(0.5));
+    let widening = widening.expect("profiles widen");
+    assert_eq!(
+        widening.items,
+        [
+            "profiles.\"ollama/*\": temperature = 0.1",
+            "profiles.\"openai/*\": reasoning_effort = \"high\""
+        ]
+    );
+    assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
+    assert!(cfg.warnings[0].contains("profiles"), "{:?}", cfg.warnings);
+
+    // Trusted, a project's fields go over the global profile's.
+    let dir = tempfile::tempdir().unwrap();
+    let global_file = dir.path().join("global.toml");
+    std::fs::write(&global_file, global).unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    std::fs::write(ws.join(".harness/config.toml"), project).unwrap();
+    let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    trust
+        .trust(&ws, &widening_of(&global_file, &ws).fingerprint)
+        .unwrap();
+    let cfg = config::load(&global_file, &ws, &trust).unwrap();
+    assert_eq!(cfg.profiles["ollama/*"].temperature, Some(0.1));
+    assert_eq!(cfg.profiles["ollama/*"].context_window, Some(32_768));
+    assert_eq!(
+        cfg.profiles["openai/*"].reasoning_effort.as_deref(),
+        Some("high")
+    );
+}
+
+#[test]
+fn invalid_profiles_are_errors_naming_the_file() {
+    for (text, problem) in [
+        (
+            "[profiles.\"ollama/[qwen\"]\ntemperature = 0.2\n",
+            "not a valid glob",
+        ),
+        (
+            "[profiles.\"ollama/*\"]\ncontext_window = 0\n",
+            "context_window",
+        ),
+        (
+            "[profiles.\"ollama/*\"]\ntemperature = 3.0\n",
+            "temperature",
+        ),
+        (
+            "[profiles.\"ollama/*\"]\ncontxt_window = 1\n",
+            "contxt_window",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        std::fs::write(&global, text).unwrap();
+        let error = config::load(&global, dir.path(), &TrustStore::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("global.toml"), "{error}");
+        assert!(error.contains(problem), "{error}");
+    }
+}
+
+// Review C, I1: `chatgpt` is the ChatGPT sign-in; a provider defined under that name would be
+// handed the stored sign-in tokens as its API key. No config may define it, global or project,
+// trusted or not.
+#[test]
+fn the_provider_name_chatgpt_is_reserved_for_chatgpt_sign_in() {
+    let chatgpt = "[providers.chatgpt]\nprotocol = \"openai-responses\"\nbase_url = \"https://proxy.example/v1\"\napi_key_env = \"PROXY_KEY\"\n";
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("config.toml");
+    std::fs::write(&global, chatgpt).unwrap();
+    let err = config::load(&global, dir.path(), &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&global.display().to_string()), "{err}");
+    assert!(err.contains("reserved for ChatGPT sign-in"), "{err}");
+
+    let (dir, ws, none) = project_dir(chatgpt);
+    let project = ws.join(".harness/config.toml");
+    let err = config::load(&none, &ws, &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&project.display().to_string()), "{err}");
+    assert!(err.contains("reserved for ChatGPT sign-in"), "{err}");
+    // Nor can `harness trust` trust it.
+    let err = config::project_widening(&none, &ws)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("reserved for ChatGPT sign-in"), "{err}");
+    drop(dir);
+}
+
+// Re-review F, R2: TOML's error quotes the line it could not read, and `api_key = "sk-…"` (a
+// setting of other tools) is a common mistake. The error keeps the file, the line and the column,
+// and never the line.
+#[test]
+fn a_parse_error_never_quotes_the_line_it_could_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.toml");
+    for (text, at) in [
+        (
+            "model = \"ollama/a\"\n[providers.x]\napi_key = \"sk-proj-SECRETVALUE123\"\n",
+            "line 3, column 1",
+        ),
+        (
+            "model = \"ollama/a\"\napi_key = sk-proj-SECRETVALUE123\n",
+            "line 2, column 11",
+        ),
+    ] {
+        std::fs::write(&file, text).unwrap();
+        let err = config::load(&file, dir.path(), &TrustStore::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config.toml"), "{err}");
+        assert!(err.contains(at), "{err}");
+        assert!(!err.contains("SECRETVALUE"), "{err}");
+        assert!(!err.contains('\n'), "{err}");
+    }
+    // The name of an unknown setting is not the line.
+    std::fs::write(
+        &file,
+        "[providers.x]\napi_key = \"sk-proj-SECRETVALUE123\"\n",
+    )
+    .unwrap();
+    let err = config::load(&file, dir.path(), &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown field `api_key`"), "{err}");
+}
+
+// Final review, M-2: a key pasted as `api_key_env` (other tools take `api_key`) would be
+// printed in full: in "set $<value>", in untrusted-project warnings and by `harness trust`. It is
+// refused when the file is read, without echoing it.
+#[test]
+fn an_api_key_env_that_is_not_a_variable_name_is_refused_without_echoing_it() {
+    let pasted = "sk-proj-AbCdEfGhIjKlMnOpQrSt";
+    let provider = |var: &str| {
+        format!(
+            "[providers.x]\nprotocol = \"openai-chat\"\nbase_url = \"https://x.example/v1\"\napi_key_env = \"{var}\"\n"
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("config.toml");
+    std::fs::write(&global, provider(pasted)).unwrap();
+    let err = config::load(&global, dir.path(), &TrustStore::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&global.display().to_string()), "{err}");
+    assert!(err.contains("[providers.x]"), "{err}");
+    assert!(
+        err.contains("`api_key_env` names an environment variable, not a key"),
+        "{err}"
+    );
+    assert!(!err.contains("AbCdEf"), "{err}");
+
+    // In a project's config, untrusted: neither its warning nor `harness trust` lists it.
+    let (dir, ws, none) = project_dir(&provider(pasted));
+    for err in [
+        config::load(&none, &ws, &TrustStore::default())
+            .unwrap_err()
+            .to_string(),
+        config::project_widening(&none, &ws)
+            .unwrap_err()
+            .to_string(),
+    ] {
+        assert!(err.contains("names an environment variable"), "{err}");
+        assert!(!err.contains("AbCdEf"), "{err}");
+    }
+    drop(dir);
+
+    // A variable's name is fine.
+    for var in ["OPENAI_API_KEY", "_KEY2", "x"] {
+        std::fs::write(&global, provider(var)).unwrap();
+        let cfg = config::load(&global, dir_of(&global), &TrustStore::default()).unwrap();
+        assert_eq!(cfg.providers["x"].api_key_env.as_deref(), Some(var));
+    }
+    for bad in ["", "1KEY", "MY-KEY", "MY KEY", "$OPENAI_API_KEY"] {
+        std::fs::write(&global, provider(bad)).unwrap();
+        assert!(
+            config::load(&global, dir_of(&global), &TrustStore::default()).is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
+fn dir_of(file: &std::path::Path) -> &std::path::Path {
+    file.parent().unwrap()
+}
+
+// Re-review A, N4: a provider remembers the file that defined it, so that what is wrong with it
+// can name that file when it is used.
+#[test]
+fn a_provider_knows_the_file_that_defined_it() {
+    let provider = |name: &str| {
+        format!(
+            "[providers.{name}]\nprotocol = \"openai-chat\"\nbase_url = \"http://127.0.0.1:9/v1\"\n"
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    std::fs::write(&global, provider("g")).unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join(".harness")).unwrap();
+    let project = ws.join(".harness/config.toml");
+    std::fs::write(&project, provider("p")).unwrap();
+    let widening = widening_of(&global, &ws);
+    let mut trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    trust.trust(&ws, &widening.fingerprint).unwrap();
+    let cfg = config::load(&global, &ws, &trust).unwrap();
+    assert_eq!(cfg.providers["g"].file.as_deref(), Some(global.as_path()));
+    assert_eq!(cfg.providers["p"].file.as_deref(), Some(project.as_path()));
+}

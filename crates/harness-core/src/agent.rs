@@ -16,10 +16,11 @@ use crate::{
     checkpoint::{CheckpointError, Checkpoints},
     compaction::{self, CompactionConfig},
     event::{AgentEvent, ErrorKind, TurnEndReason},
-    message::{ChatRequest, Message, ToolCall, Usage},
+    message::{ChatRequest, Message, RequestOptions, ToolCall, Usage},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
     permission::{Action, Decision, FsAccess, Mode, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
+    redact::Redactor,
     retry::RetryPolicy,
     session::{Entry, EntryKind, RewindScope, Session},
     tokens::DEFAULT_CONTEXT_WINDOW,
@@ -29,6 +30,12 @@ use crate::{
 
 /// Model calls allowed per turn unless configured otherwise.
 pub const DEFAULT_MAX_STEPS: u32 = 50;
+
+/// The result of each tool call of a reply the output limit cut off: the call is not run.
+pub const CUT_OFF_CALL: &str = "not run: your reply was cut off at the output-token limit, so this call may be incomplete. Continue in smaller steps: write a large file in parts (write the start, then add the rest with edit), and make one change per call.";
+
+/// The note after a reply without tool calls that the output limit cut off.
+pub const CUT_OFF_REPLY: &str = "[harness] Your last reply was cut off at the output-token limit. Continue exactly where it stopped, in smaller steps.";
 
 /// What the rewind list says about effects a rewind cannot undo.
 pub const REWIND_LIMITS: &str = "Rewinding restores files in the workspace only: network calls, databases, pushed commits, files outside the workspace, and what is inside nested git repositories and submodules stay as they are. Files that checkpoints leave out (git-ignored files, files over 10 MB, node_modules and target) are neither restored nor removed.";
@@ -78,6 +85,10 @@ pub struct AgentConfig {
     /// The model's context window in tokens.
     pub context_window: u64,
     pub compaction: CompactionConfig,
+    /// Output limit, temperature and reasoning effort for every request to the session's model.
+    pub request: RequestOptions,
+    /// Run tool calls the model writes as text (`textcalls`): for local models.
+    pub text_tool_calls: bool,
 }
 
 impl AgentConfig {
@@ -97,6 +108,8 @@ impl AgentConfig {
             retry: RetryPolicy::default(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             compaction: CompactionConfig::default(),
+            request: RequestOptions::default(),
+            text_tool_calls: false,
         }
     }
 }
@@ -141,12 +154,27 @@ impl Approver for NonInteractive {
 struct ModelReply {
     text: String,
     tool_calls: Vec<ToolCall>,
-    #[allow(dead_code)] // read in P4 (truncation)
     finish: Option<FinishReason>,
     /// Whether any output was already shown to the user (then the call must not be retried).
     emitted: bool,
     /// The token counts the provider reported for this call.
     usage: Option<Usage>,
+    /// How much of `text` was sent as text deltas. With text tool calls on, text that may still
+    /// turn out to be calls is held back, and shown once it cannot (see [`Self::show`]).
+    shown: usize,
+    watch: crate::textcalls::CallWatch,
+}
+
+impl ModelReply {
+    /// Sends the text not shown yet.
+    fn show(&mut self, events: &UnboundedSender<AgentEvent>) {
+        if self.shown < self.text.len() {
+            let text = self.text[self.shown..].to_string();
+            self.shown = self.text.len();
+            self.emitted = true;
+            let _ = events.send(AgentEvent::TextDelta { text });
+        }
+    }
 }
 
 /// Why the conversation is being compacted.
@@ -227,6 +255,8 @@ pub struct Agent {
     /// compaction then waits until the estimate drops below it, rather than repeat at every step
     /// without shrinking anything.
     auto_compaction_paused: bool,
+    /// Keeps secrets out of the session file and tool-output files.
+    redactor: Option<Arc<Redactor>>,
 }
 
 impl Agent {
@@ -269,6 +299,7 @@ impl Agent {
             next_call_id: 0,
             turn_model: None,
             auto_compaction_paused: false,
+            redactor: None,
         }
     }
 
@@ -295,7 +326,18 @@ impl Agent {
     /// a stopped run left without results at the end of it get results, saved in the session.
     pub fn with_session(mut self, session: Session) -> Self {
         self.session = session;
+        if let Some(redactor) = &self.redactor {
+            self.session.set_redactor(redactor.clone());
+        }
         self.load_history(true);
+        self
+    }
+
+    /// Keeps the secrets `redactor` knows out of the session file and tool-output files. The
+    /// model is still sent everything as it is.
+    pub fn with_redactor(mut self, redactor: Arc<Redactor>) -> Self {
+        self.session.set_redactor(redactor.clone());
+        self.redactor = Some(redactor);
         self
     }
 
@@ -699,15 +741,37 @@ impl Agent {
                     reply
                 }
                 ModelOutcome::Failed(error, partial) => return self.fail(error, partial, events),
-                ModelOutcome::Interrupted(partial) => {
+                ModelOutcome::Interrupted(mut partial) => {
                     if !partial.text.is_empty() {
+                        partial.show(events);
                         self.push_assistant(partial.text, Vec::new(), events);
                     }
                     return self.finish(TurnEndReason::Interrupted, events);
                 }
             };
+            let mut reply = reply;
+            let cut_off = reply.finish == Some(FinishReason::Length);
+            // A cut-off text call lacks its end, so it is not looked for.
+            if reply.tool_calls.is_empty()
+                && !cut_off
+                && self.config.text_tool_calls
+                && let Some(mut calls) = crate::textcalls::recover(&reply.text, &self.tools)
+            {
+                self.dedupe_call_ids(&mut calls);
+                reply.text.clear();
+                reply.tool_calls = calls;
+            }
+            // Text held back in case it was calls, and that was not.
+            reply.show(events);
             let calls = reply.tool_calls.clone();
-            self.push_assistant(reply.text, calls.clone(), events);
+            // A cut-off reply with nothing in it (all reasoning, say) leaves no empty message.
+            if !(cut_off && reply.text.trim().is_empty() && calls.is_empty()) {
+                self.push_assistant(reply.text, calls.clone(), events);
+            }
+            if cut_off {
+                self.after_cut_off(&calls, events);
+                continue;
+            }
             if calls.is_empty() {
                 return self.finish(TurnEndReason::Completed, events);
             }
@@ -737,6 +801,34 @@ impl Agent {
             }
         }
         self.finish(TurnEndReason::StepLimit, events)
+    }
+
+    /// After a reply the output limit cut off: its tool calls get results saying they were not
+    /// run, or, without calls, a note asks the model to go on. The turn goes on either way.
+    fn after_cut_off(&mut self, calls: &[ToolCall], events: &UnboundedSender<AgentEvent>) {
+        let message = if calls.is_empty() {
+            self.record(
+                Message::User {
+                    content: CUT_OFF_REPLY.into(),
+                },
+                None,
+                true,
+            );
+            "the model's reply was cut off at its output limit; asking it to continue"
+        } else {
+            for call in calls {
+                let result = Message::Tool {
+                    call_id: call.id.clone(),
+                    content: CUT_OFF_CALL.into(),
+                    is_error: true,
+                };
+                self.record(result, None, false);
+            }
+            "the model's reply was cut off at its output limit, so its tool calls were not run"
+        };
+        let _ = events.send(AgentEvent::Warning {
+            message: message.into(),
+        });
     }
 
     /// The turn's user message: text parts as they are, and each shell part replaced by the output
@@ -925,8 +1017,23 @@ impl Agent {
         // model: then it is tried once more with half as much.
         let mut max_tokens = window / 2;
         let summary = loop {
-            let request =
+            let mut request =
                 compaction::summary_request(&model, &self.history[..cut], focus, max_tokens);
+            // The session's model writes it under its profile's options, as it answers turns; a
+            // slash command's model gets the provider's defaults, but for whether it is local, as
+            // for its turn.
+            match &self.turn_model {
+                None => {
+                    request.options = self.config.request.clone();
+                    let input = compaction::request_tokens(
+                        &request.system,
+                        &request.tools,
+                        &request.messages,
+                    );
+                    request.output_room = Some(window.saturating_sub(input));
+                }
+                Some(turn) => request.options = turn.options(),
+            }
             match self.summarize(request, events, cancel).await {
                 Err(CompactError::Overflow(_)) if max_tokens == window / 2 => max_tokens /= 2,
                 result => break result?,
@@ -991,7 +1098,7 @@ impl Agent {
                     ));
                 }
                 Ok((text, _)) => return Ok(text.trim().to_string()),
-                Err(error) if error.is_retryable() && attempt < self.config.retry.max_attempts => {
+                Err(error) if self.config.retry.retries(&error, attempt) => {
                     let delay = self.config.retry.delay(attempt, error.retry_after());
                     let _ = events.send(AgentEvent::Retrying {
                         attempt,
@@ -1065,9 +1172,8 @@ impl Agent {
                 None => return ModelOutcome::Interrupted(reply),
                 Some(Ok(())) => return ModelOutcome::Reply(reply),
                 Some(Err(error))
-                    if error.is_retryable()
+                    if self.config.retry.retries(&error, attempt)
                         && !reply.emitted
-                        && attempt < self.config.retry.max_attempts
                         && !error
                             .retry_after()
                             .is_some_and(|d| d > crate::retry::MAX_AUTOMATIC_RETRY_AFTER) =>
@@ -1126,10 +1232,11 @@ impl Agent {
     fn fail(
         &mut self,
         error: ProviderError,
-        partial: ModelReply,
+        mut partial: ModelReply,
         events: &UnboundedSender<AgentEvent>,
     ) -> TurnEndReason {
         if !partial.text.is_empty() {
+            partial.show(events);
             self.push_assistant(partial.text, Vec::new(), events);
         }
         let _ = events.send(AgentEvent::Error {
@@ -1145,23 +1252,42 @@ impl Agent {
         reply: &mut ModelReply,
         events: &UnboundedSender<AgentEvent>,
     ) -> Result<(), ProviderError> {
-        let (provider, model) = match &self.turn_model {
-            Some(turn) => (&turn.provider, turn.name.clone()),
-            None => (&self.provider, self.config.model_name.clone()),
+        // A slash command's model gets the provider's defaults, but for whether it is local: the
+        // options, and the window, are the session model's.
+        let (provider, model, options, output_room) = match &self.turn_model {
+            Some(turn) => (&turn.provider, turn.name.clone(), turn.options(), None),
+            None => (
+                &self.provider,
+                self.config.model_name.clone(),
+                self.config.request.clone(),
+                Some(
+                    self.config
+                        .context_window
+                        .saturating_sub(self.estimated_tokens()),
+                ),
+            ),
         };
         let request = ChatRequest {
             model,
             system: self.config.system_prompt.clone(),
             messages: request_messages(&self.history),
             tools: self.tools.specs(),
+            options,
+            output_room,
         };
         let mut stream = provider.stream(request);
         while let Some(item) = stream.next().await {
             match item? {
                 ProviderEvent::TextDelta(text) => {
-                    reply.emitted = true;
                     reply.text.push_str(&text);
-                    let _ = events.send(AgentEvent::TextDelta { text });
+                    // Tool calls written as text are not shown as text: what may still become
+                    // them waits for the reply's end, or until it cannot.
+                    let held = self.config.text_tool_calls
+                        && reply.shown == 0
+                        && reply.watch.may_be_calls(&reply.text);
+                    if !held {
+                        reply.show(events);
+                    }
                 }
                 ProviderEvent::ReasoningDelta(text) => {
                     reply.emitted = true;
@@ -1197,6 +1323,7 @@ impl Agent {
             self.config.output_limit,
             &self.config.output_dir,
             &call.id,
+            self.redactor.as_deref(),
         );
         let output = ToolOutput { content, ..raw };
         let _ = events.send(AgentEvent::ToolCallFinished {
@@ -1445,6 +1572,24 @@ fn request_messages(history: &[Message]) -> Vec<Message> {
 
 /// A human-readable error message for the user.
 fn describe(error: &ProviderError) -> String {
+    // An exhausted quota says when it resets, whatever `Retry-After` asks.
+    let quoted = |body: &str| -> String { body.chars().take(500).collect() };
+    if error.is_quota_exhausted() {
+        let resets = error
+            .resets_at()
+            .map(|at| format!("; it resets at {}", crate::time::timestamp(at)))
+            .unwrap_or_default();
+        let said = match error {
+            ProviderError::Http { status, body, .. } => format!("HTTP {status}: {}", quoted(body)),
+            ProviderError::Reported { body, .. } => {
+                format!("the provider reported: {}", quoted(body))
+            }
+            _ => String::new(),
+        };
+        return format!(
+            "the provider's usage limit is reached{resets}. Switch models with --model (or /model in the terminal UI). {said}"
+        );
+    }
     if let Some(wait) = error.retry_after()
         && wait > crate::retry::MAX_AUTOMATIC_RETRY_AFTER
     {
@@ -1454,15 +1599,32 @@ fn describe(error: &ProviderError) -> String {
         );
     }
     match error {
-        ProviderError::Http { status: 429, .. } => {
+        ProviderError::NoStart {
+            message,
+            local: true,
+        } => format!(
+            "{message}: the local server may still be loading the model, or reading a long prompt on a CPU. harness does not retry, since a retry would start that work over; check the server (its log, and whether the model fits in memory and runs on the GPU), or use a smaller context or model"
+        ),
+        ProviderError::Http { status: 429, .. } | ProviderError::Reported { status: 429, .. } => {
             format!(
                 "{error}. The provider is rate limiting; try again later or switch models with --model."
             )
         }
-        ProviderError::Http { status, body, .. } => {
-            let body: String = body.chars().take(500).collect();
-            format!("HTTP {status}: {body}")
+        ProviderError::Http { status, body, .. } => format!("HTTP {status}: {}", quoted(body)),
+        // What fixes it is kept, however long the body.
+        ProviderError::KeyRefused { status, body, hint } => {
+            format!("HTTP {status}: {}; {hint}", quoted(body))
         }
+        ProviderError::Reported {
+            status,
+            body,
+            retry_after,
+        } => ProviderError::Reported {
+            status: *status,
+            body: quoted(body),
+            retry_after: *retry_after,
+        }
+        .to_string(),
         other => other.to_string(),
     }
 }

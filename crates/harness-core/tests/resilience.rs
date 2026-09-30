@@ -243,3 +243,269 @@ async fn tool_calls_still_run_normally_without_interrupts() {
     assert_eq!(reason, TurnEndReason::Completed);
     assert_eq!(finished_outputs(&events), vec![("fine".to_string(), false)]);
 }
+
+fn quota(body: &str) -> ProviderError {
+    ProviderError::Http {
+        status: 429,
+        body: body.to_string(),
+        retry_after: None,
+    }
+}
+
+const USAGE_LIMIT: &str = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":1790208000}}"#;
+
+#[test]
+fn exhausted_quotas_are_not_worth_retrying() {
+    for body in [
+        USAGE_LIMIT,
+        r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+        r#"{"error":{"type":"usage_not_included","message":"Upgrade to use this model"}}"#,
+    ] {
+        let error = quota(body);
+        assert!(error.is_quota_exhausted(), "{body}");
+        assert!(!error.is_retryable(), "{body}");
+    }
+    let busy = quota(r#"{"error":{"type":"rate_limit_exceeded","message":"Slow down"}}"#);
+    assert!(!busy.is_quota_exhausted());
+    assert!(busy.is_retryable());
+    assert_eq!(quota(USAGE_LIMIT).resets_at(), Some(1_790_208_000));
+    let relative = quota(r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":60}}"#);
+    let resets = relative.resets_at().unwrap();
+    let now = harness_core::time::now_unix();
+    assert!((now + 55..=now + 65).contains(&resets), "{resets} vs {now}");
+}
+
+// Review C, M7: a reset time far out does not overflow.
+#[test]
+fn a_reset_time_far_out_does_not_overflow() {
+    let far = quota(
+        r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":18446744073709551615}}"#,
+    );
+    assert_eq!(far.resets_at(), Some(u64::MAX));
+}
+
+// Review C, M7: a quota 429 that also asks to wait longer than harness waits still tells when the
+// limit resets.
+#[tokio::test(start_paused = true)]
+async fn a_usage_limit_with_a_long_retry_after_keeps_its_reset_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let limited = ProviderError::Http {
+        status: 429,
+        body: USAGE_LIMIT.to_string(),
+        retry_after: Some(std::time::Duration::from_secs(3 * 3600)),
+    };
+    let provider = MockProvider::new(vec![Script::error(limited)]);
+    let mut agent = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    let message = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(message.contains("2026-09-24T00:00:00Z"), "{message}");
+    assert!(message.contains("usage limit"), "{message}");
+}
+
+// Spec: "Subscription limit reached".
+#[tokio::test(start_paused = true)]
+async fn a_usage_limit_ends_the_turn_with_its_reset_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::error(quota(USAGE_LIMIT)),
+        Script::text("later"),
+    ]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert!(retries(&events).is_empty());
+    assert_eq!(provider.requests().len(), 1);
+    let message = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(message.contains("2026-09-24T00:00:00Z"), "{message}");
+    assert!(message.contains("--model"), "{message}");
+    // The session stays usable.
+    let (reason, _) = run(&mut agent, "again").await;
+    assert_eq!(reason, TurnEndReason::Completed);
+}
+
+/// The error a server that sent nothing within the wait for the reply's first data ends the
+/// stream with.
+fn no_start(local: bool) -> ProviderError {
+    ProviderError::NoStart {
+        message: format!(
+            "the server did not start its reply within {}",
+            if local { "30 min" } else { "300 s" }
+        ),
+        local,
+    }
+}
+
+fn error_message(events: &[AgentEvent]) -> String {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .unwrap()
+}
+
+// Ruling on the final review's I-1: a local server that did not start its reply within 30
+// minutes is not asked again, since a retry would start what it was doing (loading the model,
+// reading the prompt) over, and a headless run would wait hours. The message says what to check.
+#[tokio::test(start_paused = true)]
+async fn a_local_server_that_never_starts_its_reply_is_not_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::error(no_start(true)), Script::text("late")]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert!(retries(&events).is_empty(), "{events:?}");
+    assert_eq!(provider.requests().len(), 1);
+    let message = error_message(&events);
+    for part in ["local server", "30 min", "not retr", "model", "smaller"] {
+        assert!(message.contains(part), "{part}: {message}");
+    }
+}
+
+// The final review's I-1, optional part: a hosted provider that did not start its reply within
+// 300 s is asked once more, not four times, so a headless run waits 10 minutes at most.
+#[tokio::test(start_paused = true)]
+async fn a_hosted_first_data_timeout_is_retried_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::error(no_start(false)),
+        Script::error(no_start(false)),
+        Script::text("late"),
+    ]);
+    let mut hosted = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let (reason, events) = run(&mut hosted, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert_eq!(retries(&events).len(), 1, "{events:?}");
+    assert_eq!(provider.requests().len(), 2);
+    assert!(
+        error_message(&events).contains("did not start its reply within 300 s"),
+        "{events:?}"
+    );
+    // Once is enough when the retry answers.
+    let provider = MockProvider::new(vec![Script::error(no_start(false)), Script::text("ok")]);
+    let mut hosted = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let (reason, _) = run(&mut hosted, "go").await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    // Other network errors keep their five attempts.
+    let mut script: Vec<Script> = (0..4)
+        .map(|_| Script::error(ProviderError::Network("reset".into())))
+        .collect();
+    script.push(Script::text("ok"));
+    let provider = MockProvider::new(script);
+    let mut hosted = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
+    let (reason, events) = run(&mut hosted, "go").await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert_eq!(retries(&events).len(), 4);
+}
+
+// Re-review A, N2: an error the provider reports inside the stream is described as what it is,
+// not as an HTTP status that was never received; it is retried, or not, as that status would be.
+#[tokio::test(start_paused = true)]
+async fn an_error_reported_in_the_stream_is_described_as_such() {
+    let dir = tempfile::tempdir().unwrap();
+    let overloaded = || {
+        Script::error(ProviderError::Reported {
+            status: 529,
+            body: "overloaded_error: Overloaded".into(),
+            retry_after: None,
+        })
+    };
+    let provider = MockProvider::new((0..5).map(|_| overloaded()).collect());
+    let mut overloads = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
+    let (reason, events) = run(&mut overloads, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert_eq!(retries(&events).len(), 4);
+    let message = error_message(&events);
+    assert!(
+        message.contains("the provider reported an overload"),
+        "{message}"
+    );
+    assert!(!message.contains("HTTP"), "{message}");
+
+    let quota = ProviderError::Reported {
+        status: 429,
+        body: USAGE_LIMIT.to_string(),
+        retry_after: None,
+    };
+    assert!(quota.is_quota_exhausted());
+    assert!(!quota.is_retryable());
+    assert_eq!(quota.resets_at(), Some(1_790_208_000));
+    let provider = MockProvider::new(vec![Script::error(quota)]);
+    let mut limited = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
+    let (_, events) = run(&mut limited, "go").await;
+    let message = error_message(&events);
+    assert!(message.contains("usage limit"), "{message}");
+    assert!(message.contains("2026-09-24T00:00:00Z"), "{message}");
+    assert!(!message.contains("HTTP"), "{message}");
+
+    let slow_down = ProviderError::Reported {
+        status: 429,
+        body: "slow_down: wait".into(),
+        retry_after: Some(Duration::from_secs(3)),
+    };
+    assert!(slow_down.is_retryable());
+    assert_eq!(slow_down.retry_after(), Some(Duration::from_secs(3)));
+}
+
+// Final review, M-3: a refused key's message keeps what fixes it, however long the body.
+#[tokio::test(start_paused = true)]
+async fn a_refused_keys_message_keeps_its_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let refused = ProviderError::KeyRefused {
+        status: 401,
+        body: "<html>".repeat(200),
+        hint: "harness sent the key in $OPENAI_API_KEY".into(),
+    };
+    assert!(!refused.is_retryable());
+    let provider = MockProvider::new(vec![Script::error(refused)]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert_eq!(provider.requests().len(), 1);
+    let message = error_message(&events);
+    assert!(message.starts_with("HTTP 401: <html>"), "{message}");
+    assert!(message.len() < 700, "{message}");
+    assert!(
+        message.ends_with("harness sent the key in $OPENAI_API_KEY"),
+        "{message}"
+    );
+}

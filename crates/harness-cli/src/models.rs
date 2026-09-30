@@ -11,7 +11,7 @@ use crate::{
 /// Models from local servers and configured providers, local first.
 pub async fn available(setup: &Setup) -> Vec<DiscoveredModel> {
     let local = registry::local_endpoints(&setup.config.providers);
-    let configured = registry::configured_endpoints(&setup.config.providers, setup::env);
+    let configured = registry::configured_endpoints(&setup.config.providers, setup.keys());
     let (mut found, remote) = tokio::join!(
         discovery::list_models(&local, LOCAL_PROBE_TIMEOUT),
         discovery::list_models(&configured, REMOTE_PROBE_TIMEOUT)
@@ -29,6 +29,7 @@ pub async fn run() -> u8 {
         }
     };
     let found = available(&setup).await;
+    setup.print_credential_warnings();
     if found.is_empty() {
         eprintln!(
             "No models found. Start Ollama, LM Studio, or llama.cpp, or configure a provider in {}.",

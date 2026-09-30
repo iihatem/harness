@@ -28,6 +28,11 @@ pub enum ProviderEvent {
 pub enum ProviderError {
     #[error("network error: {0}")]
     Network(String),
+    /// No data came within the wait for a reply's first data: 300 s for a hosted provider, 30
+    /// minutes for a local server (`local`), which may load the model and read a long prompt on a
+    /// CPU first.
+    #[error("{message}")]
+    NoStart { message: String, local: bool },
     #[error("HTTP {status}: {body}")]
     Http {
         status: u16,
@@ -36,19 +41,76 @@ pub enum ProviderError {
     },
     #[error("invalid provider response: {0}")]
     Protocol(String),
+    /// An error the provider reported inside a response stream that stands for an HTTP error:
+    /// it is treated as `status`, retried or not as that status would be, though no such status
+    /// was received.
+    #[error("the provider reported {}: {body}", reported(*.status, .body))]
+    Reported {
+        status: u16,
+        body: String,
+        retry_after: Option<Duration>,
+    },
+    /// An API key the provider refused (HTTP 401 or 403), with which key that was (the
+    /// variable, or the stored profile) and how to replace it.
+    #[error("HTTP {status}: {body}; {hint}")]
+    KeyRefused {
+        status: u16,
+        body: String,
+        hint: String,
+    },
     /// An error the provider reported inside a response stream.
     #[error("provider error: {0}")]
     InStream(String),
 }
 
 impl ProviderError {
-    /// Network errors, HTTP 429, and HTTP 5xx are worth retrying.
+    /// Network errors, HTTP 429, and HTTP 5xx are worth retrying; a 429 that reports an
+    /// exhausted quota or plan limit is not, since waiting seconds does not end it. Nor is a local
+    /// server that did not start its reply within its wait: a retry would start over what it was
+    /// doing (loading the model, reading the prompt), and wait as long again.
     pub fn is_retryable(&self) -> bool {
         match self {
             ProviderError::Network(_) => true,
-            ProviderError::Http { status, .. } => *status == 429 || (500..600).contains(status),
-            ProviderError::Protocol(_) | ProviderError::InStream(_) => false,
+            ProviderError::NoStart { local, .. } => !local,
+            ProviderError::Http { status: 429, .. }
+            | ProviderError::Reported { status: 429, .. } => !self.is_quota_exhausted(),
+            ProviderError::Http { status, .. } | ProviderError::Reported { status, .. } => {
+                (500..600).contains(status)
+            }
+            ProviderError::Protocol(_)
+            | ProviderError::InStream(_)
+            | ProviderError::KeyRefused { .. } => false,
         }
+    }
+
+    /// Whether this is a 429 that reports an exhausted quota or plan limit: ChatGPT's
+    /// `usage_limit_reached` and `usage_not_included`, or OpenAI's `insufficient_quota`, and the
+    /// credit and spend limits Codex counts as quotas too.
+    pub fn is_quota_exhausted(&self) -> bool {
+        match self {
+            ProviderError::Http {
+                status: 429, body, ..
+            }
+            | ProviderError::Reported {
+                status: 429, body, ..
+            } => reports_quota(body),
+            _ => false,
+        }
+    }
+
+    /// When an exhausted limit resets, in seconds since the Unix epoch, if the provider said:
+    /// `resets_at`, or `resets_in_seconds` from now.
+    pub fn resets_at(&self) -> Option<u64> {
+        let (ProviderError::Http { body, .. } | ProviderError::Reported { body, .. }) = self else {
+            return None;
+        };
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        let error = &value["error"];
+        error["resets_at"].as_u64().or_else(|| {
+            error["resets_in_seconds"]
+                .as_u64()
+                .map(|secs| crate::time::now_unix().saturating_add(secs))
+        })
     }
 
     /// Whether the provider rejected the request as longer than the model's context window.
@@ -92,9 +154,41 @@ impl ProviderError {
 
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
-            ProviderError::Http { retry_after, .. } => *retry_after,
+            ProviderError::Http { retry_after, .. }
+            | ProviderError::Reported { retry_after, .. } => *retry_after,
             _ => None,
         }
+    }
+}
+
+/// Whether an error response's `body` reports an exhausted quota or plan limit.
+fn reports_quota(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let error = &value["error"];
+    [&error["type"], &error["code"]].iter().any(|v| {
+        matches!(
+            v.as_str(),
+            Some(
+                "usage_limit_reached"
+                    | "usage_not_included"
+                    | "insufficient_quota"
+                    | "credit_balance_exhausted"
+                    | "organization_spend_limit_exceeded"
+                    | "project_spend_limit_exceeded"
+            )
+        )
+    })
+}
+
+/// What an error reported in a stream and treated as HTTP `status`, with `body`, stands for.
+fn reported(status: u16, body: &str) -> &'static str {
+    match status {
+        429 if reports_quota(body) => "a usage limit",
+        429 => "a rate limit",
+        503 | 529 => "an overload",
+        _ => "a server error",
     }
 }
 

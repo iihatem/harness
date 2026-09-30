@@ -1,3 +1,6 @@
+mod common;
+use common::Isolate;
+
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
@@ -95,7 +98,8 @@ impl Env {
         std::fs::create_dir_all(env.home.path().join("config")).unwrap();
         std::fs::write(
             env.home.path().join("config/config.toml"),
-            format!("model = \"mock/m\"\n{extra_config}\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{server_uri}/v1\"\n"),
+            // A known window, so that the only warnings are the sandbox's.
+            format!("model = \"mock/m\"\n{extra_config}\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{server_uri}/v1\"\n[profiles.\"mock/*\"]\ncontext_window = 32768\n"),
         )
         .unwrap();
         let git = StdCommand::new("git")
@@ -111,6 +115,7 @@ impl Env {
         let mut cmd = Command::new(BIN);
         cmd.current_dir(self.ws.path())
             .env("HARNESS_HOME", self.home.path())
+            .isolate()
             .env_remove("HARNESS_SANDBOX")
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
@@ -390,6 +395,7 @@ fn sandbox_doctor_reports_the_mechanism_and_tier() {
         .args(["sandbox", "doctor"])
         .current_dir(ws.path())
         .env("HARNESS_HOME", home.path())
+        .isolate()
         .env_remove("HARNESS_SANDBOX")
         .output()
         .unwrap();

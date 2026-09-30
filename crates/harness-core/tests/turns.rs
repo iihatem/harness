@@ -160,6 +160,7 @@ async fn a_turn_model_answers_only_its_turn() {
             provider: command_model.clone(),
             id: "mock/m2".into(),
             name: "m2".into(),
+            local: false,
         }),
         ..TurnInput::from("one")
     };

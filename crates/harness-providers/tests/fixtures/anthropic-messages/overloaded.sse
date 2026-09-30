@@ -1,0 +1,6 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_04","type":"message","role":"assistant","model":"claude-sonnet-4-5","stop_sequence":null,"usage":{"input_tokens":30,"output_tokens":1},"content":[],"stop_reason":null}}
+
+event: error
+data: {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+

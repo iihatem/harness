@@ -1,5 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::provider::ProviderError;
+
 /// A server-requested `Retry-After` beyond this is not worth waiting for automatically; the turn
 /// fails instead of blocking the session for that long.
 pub const MAX_AUTOMATIC_RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -24,6 +26,18 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// Whether a call whose attempt number `attempt` (1-based) failed with `error` is tried
+    /// again: an error worth retrying, while attempts remain. A reply that did not start within
+    /// its wait (300 s from a hosted provider) is tried once more at most, since each try waits
+    /// that long.
+    pub fn retries(&self, error: &ProviderError, attempt: u32) -> bool {
+        let attempts = match error {
+            ProviderError::NoStart { .. } => self.max_attempts.min(2),
+            _ => self.max_attempts,
+        };
+        error.is_retryable() && attempt < attempts
+    }
+
     /// Delay before retry number `attempt` (1-based). A server-provided `Retry-After` wins; otherwise
     /// exponential backoff capped at `max_delay`, plus up to `base_delay` of jitter.
     pub fn delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {

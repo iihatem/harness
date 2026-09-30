@@ -14,11 +14,12 @@ brush-parser = "=0.4.0"
 harness-config = { path = "crates/harness-config" }
 harness-context = { path = "crates/harness-context" }
 harness-core = { path = "crates/harness-core" }
-harness-providers = { path = "crates/harness-providers" }
+harness-providers = { path = "crates/harness-providers", default-features = false }
 harness-sandbox = { path = "crates/harness-sandbox" }
 harness-shell = { path = "crates/harness-shell" }
 harness-tools = { path = "crates/harness-tools" }
 async-stream = "0.3"
+base64 = "0.23.1"
 async-trait = "0.1.92"
 clap = { version = "4.6.7", features = ["derive"] }
 eventsource-stream = "0.2.3"
@@ -29,6 +30,9 @@ ignore = "0.4.33"
 landlock = "0.4.7"
 libc = "0.2"
 jsonschema = "0.57.0"
+keyring-core = "1.0.0"
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }
 nix = { version = "0.31.3", features = ["signal", "process"] }
 regex = "1"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls"] }

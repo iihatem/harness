@@ -125,6 +125,7 @@ pub fn summary_request(
         system: SUMMARY_SYSTEM.to_string(),
         messages: vec![Message::User { content }],
         tools: Vec::new(),
+        ..ChatRequest::default()
     }
 }
 

@@ -43,12 +43,29 @@ pub struct Usage {
     pub cached_tokens: u64,
 }
 
+/// Settings a model profile gives each request. `None` leaves the provider's default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestOptions {
+    pub max_output_tokens: Option<u64>,
+    pub temperature: Option<f64>,
+    /// For models that reason: `minimal`, `low`, `medium` or `high`, as the provider names it.
+    pub reasoning_effort: Option<String>,
+    /// Whether the model runs on a server of the user's own (its profile's `local`), which may
+    /// take long to start a reply: it may load the model and read a long prompt on a CPU first.
+    pub local: bool,
+}
+
 /// Everything a provider needs for one model call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatRequest {
     /// Model name as the provider knows it (without the `<provider>/` prefix).
     pub model: String,
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
+    pub options: RequestOptions,
+    /// Tokens the model's context window has left after this request's input, as the agent
+    /// estimates them; `None` when it does not know the window. An adapter that must send an
+    /// output limit keeps it within this, since input and output share the window.
+    pub output_room: Option<u64>,
 }

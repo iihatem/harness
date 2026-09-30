@@ -1,7 +1,10 @@
 mod ask;
+mod auth;
 mod context;
 mod doctor;
+mod login;
 mod models;
+mod notices;
 mod prompt;
 mod sandbox;
 mod sessions;
@@ -31,6 +34,10 @@ struct Cli {
     /// Continue the most recent session in this project
     #[arg(short = 'c', long = "continue", global = true)]
     continue_session: bool,
+    /// With `ask`: also write the run's events and warnings, secrets redacted, to a log file in
+    /// the state directory
+    #[arg(long, global = true)]
+    debug: bool,
     /// Resume the session with this id; without an id, list this project's sessions
     #[arg(
         long,
@@ -57,6 +64,30 @@ enum Command {
     },
     /// List models from local servers and configured providers
     Models,
+    /// Store API keys and choose account profiles
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    /// Sign in to ChatGPT, in the browser or with a device code
+    Login {
+        /// The provider to sign in to: chatgpt
+        provider: String,
+        /// The account profile to sign in under
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Sign in with a device code instead of the browser (for SSH sessions)
+        #[arg(long)]
+        device: bool,
+    },
+    /// Remove a provider's stored credentials
+    Logout {
+        /// The provider, e.g. openai
+        provider: String,
+        /// The account profile (default: the one the provider uses)
+        #[arg(long)]
+        profile: Option<String>,
+    },
     /// Review the workspace's project settings that widen what the agent may do, and trust them
     Trust {
         /// Trust without asking (for scripts)
@@ -70,6 +101,25 @@ enum Command {
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Store an API key for a provider, read from standard input (typed without echo, or piped)
+    Add {
+        /// The provider, e.g. openai
+        provider: String,
+        /// The account profile to store it under
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
+    /// Make a stored account profile the one a provider uses
+    Use {
+        /// The provider, e.g. openai
+        provider: String,
+        /// The account profile
+        profile: String,
     },
 }
 
@@ -118,6 +168,14 @@ fn command_line(command: &Command) -> &'static str {
     match command {
         Command::Ask { .. } => "harness ask",
         Command::Models => "harness models",
+        Command::Auth {
+            command: AuthCommand::Add { .. },
+        } => "harness auth add",
+        Command::Auth {
+            command: AuthCommand::Use { .. },
+        } => "harness auth use",
+        Command::Login { .. } => "harness login",
+        Command::Logout { .. } => "harness logout",
         Command::Trust { .. } => "harness trust",
         Command::Sandbox { .. } => "harness sandbox doctor",
     }
@@ -140,7 +198,8 @@ fn main() -> ExitCode {
         }
         Err(e) => e.exit(),
     };
-    // Only `ask` continues a session: with another subcommand the flag would do nothing.
+    // Only `ask` continues a session and has a run to log: with another subcommand `-c`,
+    // `--resume` and `--debug` would do nothing.
     if let Some(command) = cli
         .command
         .as_ref()
@@ -154,6 +213,13 @@ fn main() -> ExitCode {
         if let Some(flag) = flag {
             eprintln!(
                 "error: {flag} continues a session, which only `harness ask` does; run `{}` without it",
+                command_line(command)
+            );
+            return ExitCode::from(2);
+        }
+        if cli.debug {
+            eprintln!(
+                "error: --debug logs a run of `harness ask`; run `{}` without it",
                 command_line(command)
             );
             return ExitCode::from(2);
@@ -174,9 +240,31 @@ fn main() -> ExitCode {
     let code = runtime.block_on(async move {
         match cli.command {
             Some(Command::Ask { json, prompt }) => {
-                ask::run(cli.model, cli.mode, session, prompt.join(" "), json).await
+                ask::run(
+                    cli.model,
+                    cli.mode,
+                    session,
+                    prompt.join(" "),
+                    json,
+                    cli.debug,
+                )
+                .await
             }
             Some(Command::Models) => models::run().await,
+            Some(Command::Auth {
+                command: AuthCommand::Add { provider, profile },
+            }) => auth::add(&provider, &profile),
+            Some(Command::Auth {
+                command: AuthCommand::Use { provider, profile },
+            }) => auth::use_profile(&provider, &profile),
+            Some(Command::Login {
+                provider,
+                profile,
+                device,
+            }) => login::run(&provider, &profile, device).await,
+            Some(Command::Logout { provider, profile }) => {
+                auth::logout(&provider, profile.as_deref()).await
+            }
             Some(Command::Trust { yes, revoke }) => trust::run(yes, revoke),
             Some(Command::Sandbox {
                 command: SandboxCommand::Doctor,

@@ -1,7 +1,9 @@
 //! Slash commands in `harness ask`: custom commands and `/init` run as the turn's input; the other
 //! built-ins need the interactive terminal.
 
-use harness_config::config;
+use std::collections::BTreeMap;
+
+use harness_config::config::{self, ProfileSettings};
 use harness_context::{
     commands::{
         self, Commands,
@@ -15,13 +17,16 @@ use harness_core::{
     permission::PermissionPolicy,
     turn::{InputPart, TurnInput, TurnModel},
 };
-use harness_providers::registry;
+use harness_providers::{
+    profiles,
+    registry::{self, Resolved},
+};
 
-use crate::{context::home, setup, setup::Setup, term::terminal_safe};
+use crate::{context::home, notices::Notices, setup::Setup, term::terminal_safe};
 
 /// The project's custom commands when `prompt` is a slash command, printing a warning for each
 /// command file that was ignored. `None` for ordinary prompts.
-pub fn discover(setup: &Setup, prompt: &str) -> Option<Commands> {
+pub fn discover(setup: &Setup, prompt: &str, notices: &mut Notices) -> Option<Commands> {
     parse_invocation(prompt)?;
     let found = commands::discover(
         &project_root(&setup.workspace),
@@ -29,7 +34,7 @@ pub fn discover(setup: &Setup, prompt: &str) -> Option<Commands> {
         home().as_deref(),
     );
     for warning in &found.warnings {
-        eprintln!("warning: {}", terminal_safe(warning));
+        notices.warn(warning);
     }
     Some(found)
 }
@@ -66,6 +71,7 @@ pub fn turn_input(
     commands: Option<&Commands>,
     setup: &Setup,
     policy: &dyn PermissionPolicy,
+    notices: &mut Notices,
 ) -> TurnInput {
     let whole = || TurnInput::from(format!("{prompt}{piped}"));
     let (Some(invocation), Some(commands)) = (parse_invocation(prompt), commands) else {
@@ -90,35 +96,42 @@ pub fn turn_input(
     };
     let expansion = expand(command, invocation.args, &setup.workspace, policy, trust);
     for warning in &expansion.warnings {
-        eprintln!("warning: {}", terminal_safe(warning));
+        notices.warn(warning);
     }
     for note in &expansion.notes {
-        eprintln!("note: {}", terminal_safe(note));
+        notices.note(note);
     }
     let mut input = expansion.input;
     if !piped.is_empty() {
         input.parts.push(InputPart::Text(piped.to_string()));
     }
     if let Some(model) = expansion.model {
-        match registry::resolve(&model, &setup.config.providers, setup::env) {
+        match registry::resolve(&model, &setup.config.providers, setup.keys()) {
             Ok(resolved) => {
-                eprintln!("{}", runs_on(&command.name, &resolved.id));
-                input.model = Some(TurnModel {
-                    provider: resolved.provider,
-                    id: resolved.id,
-                    name: resolved.model,
-                });
+                notices.note(&runs_on(&command.name, &resolved.id));
+                input.model = Some(turn_model(resolved, &setup.config.profiles));
             }
-            Err(e) => eprintln!("{}", cannot_use(&command.name, &model, &e.to_string())),
+            Err(e) => notices.warn(&cannot_use(&command.name, &model, &e.to_string())),
         }
     }
     input
 }
 
+/// The model a command asks for, as `resolved`: local when its profile (from `profiles`) says so.
+fn turn_model(resolved: Resolved, user: &BTreeMap<String, ProfileSettings>) -> TurnModel {
+    let local = profiles::is_local(&resolved.id, &resolved.base_url);
+    TurnModel {
+        local: profiles::resolve(&resolved.id, local, user).local,
+        provider: resolved.provider,
+        id: resolved.id,
+        name: resolved.model,
+    }
+}
+
 /// The note that command `name` runs on `model`.
 fn runs_on(name: &str, model: &str) -> String {
     format!(
-        "note: /{} runs on {}, as its command file asks",
+        "/{} runs on {}, as its command file asks",
         terminal_safe(name),
         terminal_safe(model)
     )
@@ -127,7 +140,7 @@ fn runs_on(name: &str, model: &str) -> String {
 /// The warning that command `name` asks for `model`, which `error` keeps from being used.
 fn cannot_use(name: &str, model: &str, error: &str) -> String {
     format!(
-        "warning: /{} asks for model {}, which cannot be used ({}); using the session's model",
+        "/{} asks for model {}, which cannot be used ({}); using the session's model",
         terminal_safe(name),
         terminal_safe(model),
         terminal_safe(error)
@@ -137,6 +150,36 @@ fn cannot_use(name: &str, model: &str, error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Final review, I-1: a command's model on a local server gets a local server's wait, and its
+    // rule that a reply that never starts is not asked for again; a profile may say otherwise.
+    #[test]
+    fn a_commands_model_is_local_as_its_profile_says() {
+        use std::collections::BTreeMap;
+
+        use harness_config::config::ProfileSettings;
+
+        let providers = BTreeMap::new();
+        let resolved = |id: &str| {
+            registry::resolve(id, &providers, |_: &str| Some("sk-test-key".to_string())).unwrap()
+        };
+        let none = BTreeMap::new();
+        assert!(turn_model(resolved("ollama/qwen3"), &none).local);
+        assert!(!turn_model(resolved("openrouter/qwen3"), &none).local);
+        let hosted = BTreeMap::from([(
+            "ollama/*".to_string(),
+            ProfileSettings {
+                local: Some(false),
+                ..ProfileSettings::default()
+            },
+        )]);
+        let model = turn_model(resolved("ollama/qwen3"), &hosted);
+        assert!(!model.local);
+        assert_eq!(
+            (model.id.as_str(), model.name.as_str()),
+            ("ollama/qwen3", "qwen3")
+        );
+    }
 
     // Review C, minor 7: a command's name is printed like any other text from a file.
     #[test]

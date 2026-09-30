@@ -6,11 +6,12 @@ use common::*;
 use harness_core::agent::{Agent, NonInteractive};
 use harness_core::compaction::{SUMMARY_PREFIX, SUMMARY_SYSTEM, request_tokens};
 use harness_core::event::{AgentEvent, TurnEndReason};
-use harness_core::message::{Message, Usage};
+use harness_core::message::{Message, RequestOptions, Usage};
 use harness_core::permission::Mode;
 use harness_core::provider::{FinishReason, ProviderError, ProviderEvent};
 use harness_core::session::{RewindScope, Session};
 use harness_core::testing::{MockProvider, Script};
+use harness_core::turn::{TurnInput, TurnModel};
 use tokio_util::sync::CancellationToken;
 
 fn overflow() -> Script {
@@ -493,6 +494,66 @@ async fn compacting_again_keeps_the_end_of_the_earlier_summary() {
     assert!(first_user(&summaries[1].messages).contains("TAIL-REMAINING-WORK"));
 }
 
+// Review A I3: the session's model writes the summary under its profile's request options, so a
+// model whose output the profile limits can still be compacted.
+#[tokio::test]
+async fn the_summary_request_carries_the_configured_request_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, provider) =
+        after_three_turns(dir.path(), vec![Script::text("the summary")]).await;
+    let options = RequestOptions {
+        max_output_tokens: Some(1000),
+        temperature: Some(0.3),
+        reasoning_effort: Some("low".into()),
+        ..RequestOptions::default()
+    };
+    agent.config_mut().request = options.clone();
+    let (result, _) = compact_now(&mut agent).await;
+    result.unwrap();
+    let request = provider.requests().pop().unwrap();
+    assert!(is_summary_request(&request));
+    assert_eq!(request.options, options);
+    // Review A M5: and within the room the window leaves.
+    let input = request_tokens(&request.system, &request.tools, &request.messages);
+    assert_eq!(request.output_room, Some(2_000 - input));
+}
+
+// A slash command's model keeps the provider's defaults when it writes the summary, as it does
+// for its turn: the options are the session model's.
+#[tokio::test]
+async fn a_turn_models_summary_request_keeps_the_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, session_model) = after_three_turns(dir.path(), vec![]).await;
+    agent.config_mut().request = RequestOptions {
+        max_output_tokens: Some(1000),
+        ..RequestOptions::default()
+    };
+    let command_model = MockProvider::new(vec![Script::text("summary"), Script::text("answer")]);
+    let input = TurnInput {
+        model: Some(TurnModel {
+            provider: command_model.clone(),
+            id: "mock/m2".into(),
+            name: "m2".into(),
+            local: false,
+        }),
+        ..TurnInput::from("d".repeat(1_500))
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let reason = agent.run_turn(input, &tx, CancellationToken::new()).await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert_eq!(compacted(&events).len(), 1, "{events:?}");
+    let requests = command_model.requests();
+    assert!(is_summary_request(&requests[0]));
+    assert_eq!(requests[0].options, RequestOptions::default());
+    assert_eq!(requests[0].output_room, None);
+    assert_eq!(session_model.requests().len(), 3);
+}
+
 // Review F I3: output tokens, reasoning included, are not sent back to the model, so only the
 // reported input counts; the reply itself is estimated like any other message.
 #[tokio::test]
@@ -593,4 +654,82 @@ fn a_parse_error_quoting_model_text_is_not_an_overflow() {
         !ProviderError::Protocol(format!("EOF while parsing an object in chunk: {chunk}"))
             .is_context_overflow()
     );
+}
+
+// Final review, I-1: the summary loop retries as a turn does: a local server's first-data
+// timeout not at all, a hosted provider's once.
+#[tokio::test(start_paused = true)]
+async fn a_summary_request_retries_first_data_timeouts_as_a_turn_does() {
+    let no_start = |local| {
+        Script::error(ProviderError::NoStart {
+            message: "the server did not start its reply".into(),
+            local,
+        })
+    };
+    let summaries = |provider: &MockProvider| {
+        provider
+            .requests()
+            .iter()
+            .filter(|r| is_summary_request(r))
+            .count()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, provider) =
+        after_three_turns(dir.path(), vec![no_start(true), Script::text("summary")]).await;
+    let (result, events) = compact_now(&mut agent).await;
+    let error = result.unwrap_err();
+    assert!(error.contains("local server"), "{error}");
+    assert!(compacted(&events).is_empty());
+    assert_eq!(summaries(&provider), 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, provider) = after_three_turns(
+        dir.path(),
+        vec![no_start(false), no_start(false), Script::text("summary")],
+    )
+    .await;
+    let (result, _) = compact_now(&mut agent).await;
+    assert!(result.is_err());
+    assert_eq!(summaries(&provider), 2);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, provider) =
+        after_three_turns(dir.path(), vec![no_start(false), Script::text("summary")]).await;
+    let (result, events) = compact_now(&mut agent).await;
+    result.unwrap();
+    assert_eq!(compacted(&events).len(), 1);
+    assert_eq!(summaries(&provider), 2);
+}
+
+// Final review, I-1: a slash command's model on a local server gets a local server's wait, for
+// its turn and for a summary it writes.
+#[tokio::test]
+async fn a_local_turn_models_requests_say_it_is_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, _) = after_three_turns(dir.path(), vec![]).await;
+    let command_model = MockProvider::new(vec![Script::text("summary"), Script::text("answer")]);
+    let input = TurnInput {
+        model: Some(TurnModel {
+            provider: command_model.clone(),
+            id: "ollama/m2".into(),
+            name: "m2".into(),
+            local: true,
+        }),
+        ..TurnInput::from("d".repeat(1_500))
+    };
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let reason = agent.run_turn(input, &tx, CancellationToken::new()).await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    let requests = command_model.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(is_summary_request(&requests[0]));
+    for request in &requests {
+        assert_eq!(
+            request.options,
+            RequestOptions {
+                local: true,
+                ..RequestOptions::default()
+            }
+        );
+    }
 }

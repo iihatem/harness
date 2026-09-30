@@ -9,7 +9,7 @@ use harness_core::{
     session::{self, Session},
 };
 
-use crate::{setup, setup::Setup, term::terminal_safe};
+use crate::{notices::Notices, setup, setup::Setup, term::terminal_safe};
 
 /// The session a run starts from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +37,7 @@ pub fn checkpoints(
     setup: &Setup,
     session: &Session,
     writable: &[PathBuf],
+    notices: &mut Notices,
 ) -> Option<Arc<Checkpoints>> {
     let key = project_key(&project_root(&setup.workspace));
     let gitdir = setup
@@ -59,10 +60,9 @@ pub fn checkpoints(
             Some(Arc::new(checkpoints))
         }
         Err(e) => {
-            eprintln!(
-                "warning: checkpoints are disabled: {}; turns run normally but cannot be rewound",
-                terminal_safe(&e.to_string())
-            );
+            notices.warn(&format!(
+                "checkpoints are disabled: {e}; turns run normally but cannot be rewound"
+            ));
             None
         }
     }
@@ -70,7 +70,7 @@ pub fn checkpoints(
 
 /// Opens the session to run in, printing any warnings about its file. Errors are user-facing
 /// messages (exit code 2).
-pub fn open(setup: &Setup, choice: &Choice) -> Result<Session, String> {
+pub fn open(setup: &Setup, choice: &Choice, notices: &mut Notices) -> Result<Session, String> {
     let dir = dir(setup);
     let path = match choice {
         Choice::New => return Ok(Session::create(&dir, &setup.workspace)),
@@ -93,7 +93,7 @@ pub fn open(setup: &Setup, choice: &Choice) -> Result<Session, String> {
     };
     let (session, warnings) = Session::open(&path).map_err(|e| e.to_string())?;
     for warning in warnings {
-        eprintln!("warning: {}", terminal_safe(&warning));
+        notices.warn(&warning);
     }
     Ok(session)
 }

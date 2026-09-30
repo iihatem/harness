@@ -13,11 +13,16 @@ use sha2::{Digest, Sha256};
 
 use crate::trust::TrustStore;
 
-/// Wire protocol spoken by a configured provider. P4 adds `openai-responses` and `anthropic-messages`.
+/// Wire protocol spoken by a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Protocol {
+    /// `POST /chat/completions`: Ollama, LM Studio, llama.cpp, OpenRouter and most others.
     OpenaiChat,
+    /// `POST /responses`: OpenAI API keys and ChatGPT sign-in.
+    OpenaiResponses,
+    /// `POST /messages`: Anthropic API keys and Anthropic-compatible servers.
+    AnthropicMessages,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -25,7 +30,12 @@ pub enum Protocol {
 pub struct ProviderConfig {
     pub protocol: Protocol,
     pub base_url: String,
+    /// The environment variable holding its key: a name (`[A-Za-z_][A-Za-z0-9_]*`), which
+    /// [`parse_file`] checks.
     pub api_key_env: Option<String>,
+    /// The file that defined it, for messages; [`parse_file`] sets it.
+    #[serde(skip)]
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -127,8 +137,99 @@ impl CompactionSettings {
     }
 }
 
+/// `[profiles."<glob>"]`: settings for the models whose ids match the glob (resolved in
+/// `harness_providers::profiles`).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileSettings {
+    /// The model's context window, in tokens.
+    pub context_window: Option<u64>,
+    /// The smallest window worth running agentic turns in; below it harness warns.
+    pub min_context: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub temperature: Option<f64>,
+    pub reasoning_effort: Option<String>,
+    /// Whether tool calls the model writes as text are run.
+    pub text_tool_calls: Option<bool>,
+    /// Whether the model runs on a server of the user's own.
+    pub local: Option<bool>,
+}
+
+impl ProfileSettings {
+    /// These settings with `other`'s over them.
+    pub fn overlaid(&self, other: &ProfileSettings) -> ProfileSettings {
+        ProfileSettings {
+            context_window: other.context_window.or(self.context_window),
+            min_context: other.min_context.or(self.min_context),
+            max_output_tokens: other.max_output_tokens.or(self.max_output_tokens),
+            temperature: other.temperature.or(self.temperature),
+            reasoning_effort: other
+                .reasoning_effort
+                .clone()
+                .or_else(|| self.reasoning_effort.clone()),
+            text_tool_calls: other.text_tool_calls.or(self.text_tool_calls),
+            local: other.local.or(self.local),
+        }
+    }
+
+    /// The settings that are set, as `key = value`, for listings and fingerprints.
+    fn describe(&self) -> String {
+        let mut set = Vec::new();
+        let mut number = |key: &str, value: Option<u64>| {
+            if let Some(value) = value {
+                set.push(format!("{key} = {value}"));
+            }
+        };
+        number("context_window", self.context_window);
+        number("min_context", self.min_context);
+        number("max_output_tokens", self.max_output_tokens);
+        if let Some(t) = self.temperature {
+            set.push(format!("temperature = {t}"));
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            set.push(format!("reasoning_effort = {effort:?}"));
+        }
+        if let Some(on) = self.text_tool_calls {
+            set.push(format!("text_tool_calls = {on}"));
+        }
+        if let Some(local) = self.local {
+            set.push(format!("local = {local}"));
+        }
+        set.join(", ")
+    }
+
+    /// What is wrong with the profile under `key`, if anything.
+    fn problem(&self, key: &str) -> Option<String> {
+        if let Err(e) = globset::Glob::new(key) {
+            return Some(format!("profiles.{key:?} is not a valid glob: {e}"));
+        }
+        for (name, value) in [
+            ("context_window", self.context_window),
+            ("min_context", self.min_context),
+            ("max_output_tokens", self.max_output_tokens),
+        ] {
+            if value == Some(0) {
+                return Some(format!("profiles.{key:?}: {name} must be at least 1"));
+            }
+        }
+        if self.temperature.is_some_and(|t| !(0.0..=2.0).contains(&t)) {
+            return Some(format!(
+                "profiles.{key:?}: temperature must be between 0 and 2"
+            ));
+        }
+        None
+    }
+}
+
+/// The first problem with any of `profiles`.
+fn profiles_problem(profiles: &BTreeMap<String, ProfileSettings>) -> Option<String> {
+    profiles
+        .iter()
+        .find_map(|(key, profile)| profile.problem(key))
+}
+
 /// One `config.toml` file as written by the user.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     pub model: Option<String>,
@@ -142,6 +243,8 @@ pub struct ConfigFile {
     pub sandbox: SandboxConfig,
     #[serde(default)]
     pub compaction: CompactionSettings,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ProfileSettings>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -156,7 +259,7 @@ pub enum ConfigError {
 }
 
 /// The merged, effective configuration plus warnings about settings that were ignored.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Config {
     pub model: Option<String>,
     pub mode: Option<Mode>,
@@ -170,6 +273,8 @@ pub struct Config {
     pub writable_roots: Vec<PathBuf>,
     pub allow_localhost: bool,
     pub linux_git_protection: LinuxGitProtection,
+    /// Model profiles by model-id glob: the global config's, with a trusted project's over them.
+    pub profiles: BTreeMap<String, ProfileSettings>,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -189,13 +294,79 @@ pub fn parse_file(path: &Path) -> Result<Option<ConfigFile>, ConfigError> {
             });
         }
     };
-    toml::from_str(&text)
-        .map(Some)
-        .map_err(|e| ConfigError::Parse {
+    let mut file: ConfigFile = toml::from_str(&text).map_err(|e| ConfigError::Parse {
+        path: path.to_path_buf(),
+        message: toml_error(&text, &e),
+    })?;
+    for provider in file.providers.values_mut() {
+        provider.file = Some(path.to_path_buf());
+    }
+    if let Some(name) = file
+        .providers
+        .keys()
+        .find(|name| RESERVED_PROVIDERS.contains(&name.as_str()))
+    {
+        return Err(ConfigError::Parse {
             path: path.to_path_buf(),
-            message: e.to_string(),
-        })
+            message: format!(
+                "[providers.{name}]: the name `{name}` is reserved for ChatGPT sign-in (`harness login {name}`); give this provider another name"
+            ),
+        });
+    }
+    // A key pasted here would be printed wherever the variable is named; the error never echoes it.
+    if let Some(name) = file.providers.iter().find_map(|(name, provider)| {
+        provider
+            .api_key_env
+            .as_deref()
+            .is_some_and(|var| !is_variable_name(var))
+            .then_some(name)
+    }) {
+        return Err(ConfigError::Parse {
+            path: path.to_path_buf(),
+            message: format!(
+                "[providers.{name}]: `api_key_env` names an environment variable, not a key: give the variable's name (letters, digits and `_`), and keep the key in that variable, or store it with `harness auth add {name}`"
+            ),
+        });
+    }
+    Ok(Some(file))
 }
+
+/// Whether `name` can name an environment variable: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_variable_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// What is wrong with `text`, which TOML could not read: where (line and column) and why, never
+/// the line itself, which TOML's own message quotes and which can hold a key (`api_key = "sk-…"`
+/// is a setting of other tools).
+pub fn toml_error(text: &str, error: &toml::de::Error) -> String {
+    let why = error.message().trim_end();
+    match error.span() {
+        Some(span) => {
+            let before = &text[..floor_char_boundary(text, span.start)];
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            format!("line {line}, column {column}: {}", why.replace('\n', "; "))
+        }
+        None => why.replace('\n', "; "),
+    }
+}
+
+/// The char boundary at or before `i` in `s`, or its end.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Provider names no config may define: `chatgpt` is the account signed in with `harness login
+/// chatgpt`, whose stored tokens a provider defined under that name would be handed as its key.
+pub const RESERVED_PROVIDERS: [&str; 1] = ["chatgpt"];
 
 /// Project settings that widen what the agent may do, and a fingerprint of them. Trust is granted to a
 /// fingerprint, that of the empty set included, so any change to these settings needs trust again.
@@ -270,6 +441,11 @@ fn widening(project: &ConfigFile, baseline: Baseline) -> Widening {
     if let Some(true) = project.sandbox.allow_localhost {
         items.push("sandbox.allow_localhost = true".to_string());
     }
+    // They choose output limits, reasoning effort and context budgets (paid requests), and
+    // whether text is run as tool calls.
+    for (key, profile) in &project.profiles {
+        items.push(format!("profiles.{key:?}: {}", profile.describe()));
+    }
     if project.sandbox.linux_git_protection == Some(LinuxGitProtection::BestEffort)
         && baseline.linux_git_protection == LinuxGitProtection::Required
     {
@@ -313,6 +489,7 @@ pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening
         .compaction
         .out_of_range()
         .or_else(|| global_compaction.overlaid(&project.compaction).problem())
+        .or_else(|| profiles_problem(&project.profiles))
     {
         return Err(ConfigError::Parse { path, message });
     }
@@ -338,7 +515,11 @@ pub fn load(
     let mut cfg = Config::default();
     let global = parse_file(global_file)?;
     let baseline = Baseline::new(global.as_ref(), workspace);
-    if let Some(message) = global.as_ref().and_then(|g| g.compaction.problem()) {
+    if let Some(message) = global.as_ref().and_then(|g| {
+        g.compaction
+            .problem()
+            .or_else(|| profiles_problem(&g.profiles))
+    }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
             message,
@@ -358,13 +539,18 @@ pub fn load(
         cfg.writable_roots = expand_all(&global.sandbox.writable_roots, base, home);
         cfg.allow_localhost = global.sandbox.allow_localhost.unwrap_or(false);
         cfg.linux_git_protection = global.sandbox.linux_git_protection.unwrap_or_default();
+        cfg.profiles = global.profiles;
     }
     let path = project_file(workspace);
     let project = parse_file(&path)?;
     let widening = widening(project.as_ref().unwrap_or(&ConfigFile::default()), baseline);
     cfg.trusted = trust.is_trusted(workspace, &widening.fingerprint);
     if let Some(project) = project {
-        if let Some(message) = project.compaction.out_of_range() {
+        if let Some(message) = project
+            .compaction
+            .out_of_range()
+            .or_else(|| profiles_problem(&project.profiles))
+        {
             return Err(ConfigError::Parse { path, message });
         }
         cfg.deny.extend(project.permissions.deny.iter().cloned());
@@ -445,6 +631,10 @@ pub fn load(
                 }
                 if let Some(protection) = project.sandbox.linux_git_protection {
                     cfg.linux_git_protection = protection;
+                }
+                for (key, profile) in &project.profiles {
+                    let merged = cfg.profiles.entry(key.clone()).or_default();
+                    *merged = merged.overlaid(profile);
                 }
             } else {
                 let items: Vec<&str> = widening_items.iter().map(|item| item.as_str()).collect();

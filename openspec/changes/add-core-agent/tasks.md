@@ -60,14 +60,14 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 
 ## 5. P5 Terminal UI (first half, P5a: `docs/superpowers/plans/2026-09-28-m1-p5a-terminal-ui.md`, written before P4 by the human's choice: 5.1 to 5.6 and 5.8, with the first-use trust prompt and the 2.13 final review's M1 and M4; the rest, 5.7 and what needs P4, is planned after P4)
 
-- [ ] 5.1 Inline renderer with native scrollback, Markdown and diff rendering, `NO_COLOR`; verify with ratatui `TestBackend` snapshots
-- [ ] 5.2 Input editor: history, multi-line, collapsed pastes, `/` and `@` completion; verify with snapshot and unit tests
-- [ ] 5.3 Status line, per-turn stats, `/context`, and `/usage`; verify with snapshot tests
-- [ ] 5.4 Interactive approvals with diffs, re-run-unsandboxed offer, and Shift+Tab mode cycling; verify with scripted-input tests
-- [ ] 5.5 Steering (queued vs send-now input) in the runtime and UI; verify the agent-runtime steering scenarios as tests
-- [ ] 5.6 Plan mode flow (Build / Edit in `$EDITOR` / Keep planning); verify the plan-mode scenarios as tests
+- [x] 5.1 Inline renderer with native scrollback, Markdown and diff rendering, `NO_COLOR`; verify with ratatui `TestBackend` snapshots
+- [x] 5.2 Input editor: history, multi-line, collapsed pastes, `/` and `@` completion; verify with snapshot and unit tests
+- [x] 5.3 Status line, per-turn stats, `/context`, and `/usage`; verify with snapshot tests
+- [x] 5.4 Interactive approvals with diffs, re-run-unsandboxed offer, and Shift+Tab mode cycling; verify with scripted-input tests
+- [x] 5.5 Steering (queued vs send-now input) in the runtime and UI; verify the agent-runtime steering scenarios as tests
+- [x] 5.6 Plan mode flow (Build / Edit in `$EDITOR` / Keep planning); verify the plan-mode scenarios as tests
 - [ ] 5.7 `/rewind` picker, `/compact`, `/resume` and `/mode`, model and session pickers, first-run model choice; verify with scripted-input tests
-- [ ] 5.8 Desktop notifications (OSC 9 + bell); verify emitted escape sequences in a test
+- [x] 5.8 Desktop notifications (OSC 9 + bell); verify emitted escape sequences in a test
 
 ## 6. M1 acceptance
 

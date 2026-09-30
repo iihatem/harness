@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     app::{Action, App, Host, Options},
     approval::{Reply, Requests},
-    inline::InlineTerminal,
+    inline::{CursorReport, InlineTerminal},
     input::{CursorQuery, Timed},
     notify::Notify,
     plan::TextEditor,
@@ -360,7 +360,7 @@ where
             let cursor = if self.term.reports_cursor() {
                 query.position(CURSOR_WAIT).await
             } else {
-                None
+                CursorReport::Unasked
             };
             self.term.resized_to(cursor)?;
             self.app.set_width(self.term.width() as usize);

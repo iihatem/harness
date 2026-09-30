@@ -8,6 +8,14 @@
 //! ends when it hangs up: a wakeup that finds nothing to read is not its end. While an editor has
 //! the terminal, the reader stops reading, so the keys go to the editor.
 //!
+//! On Linux, crossterm is told of the terminal's bytes only as more arrive (its readiness is
+//! edge-triggered), and reads 1 KiB of them at a time: the rest of a longer burst of keys (a
+//! paste without bracketed paste, `tmux send-keys`) stalls in the terminal until the next key.
+//! The reader does not spin meanwhile, and what comes after a stall counts as read when the stall
+//! began: it was typed then, before any prompt that appeared meanwhile, so it never answers one.
+//! Nor is the terminal asked where its cursor is during a stall, as its answer would come behind
+//! the keys waiting.
+//!
 //! A resize is taken from SIGWINCH as the session next looks at its input, rather than from the
 //! reader, so that the next draw already uses the new size.
 
@@ -34,6 +42,8 @@ use ratatui::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+use crate::inline::CursorReport;
+
 /// How long the reader waits for the terminal before it looks for a pause or the end of the
 /// session again, should nothing wake it.
 const WAIT: Duration = Duration::from_millis(100);
@@ -58,7 +68,7 @@ const STARTUP_LIMIT: Duration = Duration::from_secs(6);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timed {
     pub event: Event,
-    /// When the reader read it.
+    /// When the reader read it; after a stall (see the module's docs), when the stall began.
     pub at: Instant,
 }
 
@@ -113,7 +123,7 @@ struct State {
     /// Resizes come from the signal: crossterm's are dropped.
     resizes_elsewhere: bool,
     /// Where to send where the cursor is, once the reader has asked the terminal.
-    cursor: Option<oneshot::Sender<io::Result<(u16, u16)>>>,
+    cursor: Option<oneshot::Sender<CursorReport>>,
 }
 
 impl Control {
@@ -229,22 +239,51 @@ impl Drop for Paused {
 }
 
 impl CursorQuery {
-    /// Where the terminal's cursor is, as its answer says, within `limit`: `None` when it did
-    /// not answer by then, or its input ended. An answer to an earlier question that came too
-    /// late is not taken for this one.
-    pub async fn position(&self, limit: Duration) -> Option<Position> {
+    /// Where the terminal's cursor is, as its answer says, within `limit`: missed when it did not
+    /// answer by then, or its input ended; not asked while keys it has not handed over wait ahead
+    /// of where its answer would come. An answer to an earlier question that came too late is not
+    /// taken for this one: once crossterm gave up waiting for one, which may still come, the
+    /// terminal is not asked again.
+    pub async fn position(&self, limit: Duration) -> CursorReport {
         let (answer, answered) = oneshot::channel();
         lock(&self.0).cursor = Some(answer);
         self.0.wake();
         match tokio::time::timeout(limit, answered).await {
-            Ok(Ok(Ok((column, row)))) => Some(Position::new(column, row)),
-            _ => None,
+            Ok(Ok(report)) => report,
+            _ => CursorReport::Missed,
         }
     }
 }
 
 fn lock(control: &Control) -> std::sync::MutexGuard<'_, State> {
     control.state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Where the reader's events come from: crossterm, which reads and parses the terminal.
+trait Source {
+    /// The next event, parsed already or read from the terminal now, without waiting for one:
+    /// `None` when there is none now.
+    fn next(&mut self) -> io::Result<Option<Event>>;
+    /// Asks the terminal where its cursor is, (column, row), and waits for its answer. The
+    /// events read meanwhile are kept for [`next`](Self::next).
+    fn position(&mut self) -> io::Result<(u16, u16)>;
+}
+
+/// crossterm's reader of the process's terminal.
+struct Crossterm;
+
+impl Source for Crossterm {
+    fn next(&mut self) -> io::Result<Option<Event>> {
+        if event::poll(Duration::ZERO)? {
+            event::read().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn position(&mut self) -> io::Result<(u16, u16)> {
+        cursor::position()
+    }
 }
 
 /// What the terminal on `fd` has for the reader.
@@ -300,15 +339,25 @@ fn terminal(fd: RawFd, woken: Option<RawFd>, wait: Duration) -> (Terminal, bool)
         };
     }
     let woke = polls[1].revents & libc::POLLIN != 0;
-    let mut waiting: libc::c_int = 0;
     let waiting = if polls[0].revents & libc::POLLIN != 0 {
-        // SAFETY: `FIONREAD` writes one `c_int` through the pointer given.
-        let asked = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut waiting) };
-        (asked >= 0).then_some(waiting)
+        waiting(fd)
     } else {
         None
     };
     (classify(polls[0].revents, waiting), woke)
+}
+
+/// How many bytes wait to be read from the terminal on `fd`: `None` when that cannot be asked.
+fn waiting(fd: RawFd) -> Option<libc::c_int> {
+    let mut waiting: libc::c_int = 0;
+    // SAFETY: `FIONREAD` writes one `c_int` through the pointer given.
+    let asked = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut waiting) };
+    (asked >= 0).then_some(waiting)
+}
+
+/// Whether bytes wait to be read from the terminal on `fd`.
+fn has_waiting(fd: RawFd) -> bool {
+    waiting(fd).is_some_and(|waiting| waiting > 0)
 }
 
 /// Whether the terminal on `fd` hung up (its other side closed) or cannot be polled. Unlike
@@ -328,18 +377,30 @@ fn hung_up(fd: RawFd) -> bool {
 /// The reader's thread: reads until done, then says so, so that a pause does not wait for it.
 /// The stream of events ends as `events` drops.
 fn reader_thread(fd: RawFd, control: &Control, events: mpsc::UnboundedSender<io::Result<Timed>>) {
-    read(fd, control, &events);
+    read(fd, control, &events, &mut Crossterm);
     let mut state = lock(control);
     state.reading = false;
     control.changed.notify_all();
 }
 
-/// The reader's loop: sends the terminal's events until the terminal closes, its input fails,
-/// or the session stops reading them; asks where the cursor is when the session wants to know.
-fn read(fd: RawFd, control: &Control, events: &mpsc::UnboundedSender<io::Result<Timed>>) {
+/// The reader's loop: sends the terminal's events, from `source`, until the terminal on `fd`
+/// closes, its input fails, or the session stops reading them; asks where the cursor is when the
+/// session wants to know.
+fn read(
+    fd: RawFd,
+    control: &Control,
+    events: &mpsc::UnboundedSender<io::Result<Timed>>,
+    source: &mut impl Source,
+) {
     let woken = control.woken.as_raw_fd();
-    // The terminal said it had bytes to read at the last wait.
-    let mut ready = false;
+    // When the terminal said it had bytes to read, at the last wait.
+    let mut ready_at: Option<Instant> = None;
+    // Since when bytes crossterm did not take have waited in the terminal (see the module's
+    // docs): until none wait, what comes counts from then.
+    let mut stalled: Option<Instant> = None;
+    // crossterm gave up waiting for the terminal to say where its cursor is: its answer may still
+    // come, and would be taken for a later question's.
+    let mut gave_up = false;
     loop {
         let (asked, resizes_elsewhere) = {
             let mut state = lock(control);
@@ -361,61 +422,86 @@ fn read(fd: RawFd, control: &Control, events: &mpsc::UnboundedSender<io::Result<
         if hung_up(fd) {
             return;
         }
-        // Events crossterm set aside while it waited for the answer were read meanwhile: they
-        // are timed from when it started to wait, never later than they were read.
-        let mut read_from = None;
-        if let Some(answer) = asked {
-            read_from = Some(Instant::now());
-            let _ = answer.send(cursor::position());
-        }
-        // What crossterm has now: what it parsed already (keys typed while harness started, or
-        // while it waited for an answer), and what the terminal has.
-        let Some(got) = forward(fd, events, read_from, resizes_elsewhere) else {
+        // What crossterm has now: what it parsed already (keys typed while harness started),
+        // and what the terminal has; after a stall, counted from when it began.
+        let Some(got) = forward(fd, source, events, stalled, resizes_elsewhere) else {
             return;
         };
-        // Bytes waited, and crossterm, which is told of new input only as it comes, took none:
-        // it reads them once more comes. Not spinning meanwhile.
-        if ready && got == 0 {
+        let left = has_waiting(fd);
+        if !left {
+            stalled = None;
+        } else if let Some(at) = ready_at.filter(|_| got == 0) {
+            // Bytes waited, and crossterm, which is told of new input only as it comes, took
+            // none: it reads them once more comes.
+            stalled.get_or_insert(at);
+        }
+        if let Some(answer) = asked {
+            if gave_up {
+                let _ = answer.send(CursorReport::Missed);
+            } else if stalled.is_some() {
+                let _ = answer.send(CursorReport::Unasked);
+            } else if left {
+                // Asked once what waits has been read, or has stalled: the next wait ends at once.
+                lock(control).cursor.get_or_insert(answer);
+            } else {
+                // Events crossterm sets aside while it waits for the answer are read meanwhile:
+                // they count from when it began to wait, never later than they were read.
+                let asked_at = Instant::now();
+                let report = match source.position() {
+                    Ok((column, row)) => CursorReport::At(Position::new(column, row)),
+                    Err(_) => {
+                        gave_up = true;
+                        CursorReport::Missed
+                    }
+                };
+                let _ = answer.send(report);
+                if forward(fd, source, events, Some(asked_at), resizes_elsewhere).is_none() {
+                    return;
+                }
+                // What arrived meanwhile and was left may have stalled since.
+                if has_waiting(fd) {
+                    stalled.get_or_insert(asked_at);
+                }
+            }
+        }
+        // Not spinning while crossterm leaves bytes waiting.
+        if ready_at.is_some() && got == 0 {
             std::thread::sleep(BACK_OFF);
         }
         let (terminal, woke) = terminal(fd, Some(woken), WAIT);
         if woke {
             control.drain_wakes();
         }
-        ready = false;
+        ready_at = None;
         match terminal {
             Terminal::Closed => return,
-            Terminal::Ready => ready = true,
+            Terminal::Ready => ready_at = Some(Instant::now()),
             Terminal::Empty => std::thread::sleep(BACK_OFF),
             Terminal::Quiet => {}
         }
     }
 }
 
-/// Sends every event crossterm has, timed as read now or from `read_from`, and crossterm's
-/// resizes unless they come from elsewhere; how many, or `None` when the session is done.
+/// Sends every event crossterm has, timed from `read_from` (a stall's start, or when the terminal
+/// was asked where its cursor is) or else as read now, and crossterm's resizes unless they come
+/// from elsewhere; how many, or `None` when the session is done.
 fn forward(
     fd: RawFd,
+    source: &mut impl Source,
     events: &mpsc::UnboundedSender<io::Result<Timed>>,
     read_from: Option<Instant>,
     resizes_elsewhere: bool,
 ) -> Option<usize> {
     let mut got = 0;
     loop {
-        match event::poll(Duration::ZERO) {
-            Ok(true) => match event::read() {
-                Ok(Event::Resize(..)) if resizes_elsewhere => {}
-                Ok(event) => {
-                    let at = read_from.unwrap_or_else(Instant::now);
-                    events.send(Ok(Timed { event, at })).ok()?;
-                    got += 1;
-                }
-                Err(e) => {
-                    let _ = events.send(Err(e));
-                    return None;
-                }
-            },
-            Ok(false) => return Some(got),
+        match source.next() {
+            Ok(Some(Event::Resize(..))) if resizes_elsewhere => {}
+            Ok(Some(event)) => {
+                let at = read_from.unwrap_or_else(Instant::now);
+                events.send(Ok(Timed { event, at })).ok()?;
+                got += 1;
+            }
+            Ok(None) => return Some(got),
             Err(e) => {
                 let _ = events.send(Err(e));
                 return None;
@@ -634,6 +720,156 @@ mod tests {
         assert_eq!(lock(&control).paused, 1);
         drop(paused);
         assert_eq!(lock(&control).paused, 0);
+    }
+
+    /// The terminal as crossterm reads it on Linux: told of bytes only as more arrive (its
+    /// readiness is edge-triggered), and reading at most [`Stalling::CHUNK`] of them each time, so
+    /// the rest of a burst waits in the terminal, here a pipe, until the next key.
+    struct Stalling {
+        pipe: std::io::PipeReader,
+        /// Arrivals crossterm was told of and has not read after yet.
+        arrivals: Arc<std::sync::atomic::AtomicUsize>,
+        parsed: std::collections::VecDeque<Event>,
+        /// How many times the terminal was asked where its cursor is.
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Stalling {
+        const CHUNK: usize = 5;
+    }
+
+    impl Source for Stalling {
+        fn next(&mut self) -> io::Result<Option<Event>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.parsed.is_empty()
+                && self
+                    .arrivals
+                    .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                let mut buf = [0; Self::CHUNK];
+                let n = self.pipe.read(&mut buf)?;
+                self.parsed.extend(buf[..n].iter().map(|&b| {
+                    Event::Key(ratatui::crossterm::event::KeyEvent::from(
+                        ratatui::crossterm::event::KeyCode::Char(b.into()),
+                    ))
+                }));
+            }
+            Ok(self.parsed.pop_front())
+        }
+
+        fn position(&mut self) -> io::Result<(u16, u16)> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((0, 7))
+        }
+    }
+
+    fn char_of(timed: &Timed) -> char {
+        match &timed.event {
+            Event::Key(key) => match key.code {
+                ratatui::crossterm::event::KeyCode::Char(c) => c,
+                _ => panic!("{key:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // Final review I1 (Linux): the rest of a burst of more than 1 KiB waits in the terminal until
+    // the next key, which could come after a prompt appeared and armed. What comes after such a
+    // stall counts from when it began, so it goes to the input as typed before the prompt, never
+    // to the prompt; and the terminal is not asked where its cursor is meanwhile, since its
+    // answer would come behind the keys waiting.
+    #[tokio::test]
+    async fn keys_released_after_a_stall_count_from_when_it_began() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let mut source = Stalling {
+            pipe: reader.try_clone().unwrap(),
+            arrivals: arrivals.clone(),
+            parsed: Default::default(),
+            asked: asked.clone(),
+        };
+        let fd = reader.as_raw_fd();
+        let control = Arc::new(Control::new().unwrap());
+        let (sender, mut events) = mpsc::unbounded_channel();
+        let reading = control.clone();
+        let thread = std::thread::spawn(move || {
+            let _reader = reader;
+            read(fd, &reading, &sender, &mut source);
+        });
+        let next = async |events: &mut mpsc::UnboundedReceiver<io::Result<Timed>>| {
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("an event")
+                .expect("the reader runs")
+                .unwrap()
+        };
+
+        // A burst: crossterm reads its start, and the rest waits.
+        let burst = Instant::now();
+        arrivals.fetch_add(1, SeqCst);
+        writer.write_all(b"abcdefgh").unwrap();
+        let mut head = Vec::new();
+        for _ in 0..Stalling::CHUNK {
+            head.push(next(&mut events).await);
+        }
+        assert_eq!(head.iter().map(char_of).collect::<String>(), "abcde");
+        assert!(head.iter().all(|timed| timed.at >= burst));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(events.try_recv().is_err(), "the rest came without a key");
+
+        // A prompt shows and arms meanwhile.
+        let mut prompt = crate::approval::Arming::default();
+        prompt.drawn(Instant::now());
+        // Asked where the cursor is during the stall, the terminal is not asked.
+        let cursor = CursorQuery(control.clone())
+            .position(Duration::from_secs(1))
+            .await;
+        assert_eq!(cursor, CursorReport::Unasked);
+        assert_eq!(asked.load(SeqCst), 0, "asked during the stall");
+        tokio::time::sleep(crate::approval::ARMING_DELAY).await;
+
+        // The user presses `y` for the prompt, which lets the rest through, and itself.
+        let released = Instant::now();
+        writer.write_all(b"y").unwrap();
+        arrivals.fetch_add(1, SeqCst);
+        let mut rest = Vec::new();
+        for _ in 0..4 {
+            rest.push(next(&mut events).await);
+        }
+        assert_eq!(rest.iter().map(char_of).collect::<String>(), "fghy");
+        for timed in &rest {
+            assert!(
+                timed.at < released,
+                "{:?} after the stall",
+                timed.at - burst
+            );
+            assert!(!prompt.armed(timed.at), "{:?} answers", char_of(timed));
+        }
+
+        // Once nothing waits, a key counts from when it was read, and the cursor is asked. (A key
+        // read along with the rest, before the reader found nothing waiting, counts from the
+        // stall's start too.)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let typed = Instant::now();
+        arrivals.fetch_add(1, SeqCst);
+        writer.write_all(b"n").unwrap();
+        let after = next(&mut events).await;
+        assert_eq!(char_of(&after), 'n');
+        assert!(after.at >= typed);
+        assert!(prompt.armed(after.at));
+        let cursor = CursorQuery(control.clone())
+            .position(Duration::from_secs(1))
+            .await;
+        assert_eq!(cursor, CursorReport::At(Position::new(0, 7)));
+        assert_eq!(asked.load(SeqCst), 1);
+
+        lock(&control).stopped = true;
+        control.wake();
+        drop(events);
+        thread.join().unwrap();
     }
 
     // Review A N2: a resize the terminal signals reaches the session at once, ahead of what the

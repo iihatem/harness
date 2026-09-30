@@ -739,7 +739,13 @@ fn keys_typed_while_harness_starts_are_drawn_at_once() {
 }
 
 // Review D N6: 3,000 plain keys at once (`tmux send-keys`, or a paste into a terminal without
-// bracketed paste) all arrive within a second, and harness does not spin after them.
+// bracketed paste) all arrive, whole, and harness does not spin after them.
+//
+// On macOS they arrive within a second. On Linux (final review I1), crossterm is told of the
+// terminal's bytes only as more arrive (epoll, edge-triggered) and reads 1 KiB at a time, so the
+// rest of the burst can stall in the terminal until more keys come, each letting up to 1 KiB
+// more through: a limitation M1 keeps, and documents. There harness must not spin while the rest
+// waits, and nothing may be lost once more keys are sent (a harmless Enter, on an empty input).
 #[test]
 fn a_burst_of_keys_arrives_whole_and_nothing_spins() {
     let provider = Provider::start(Vec::new());
@@ -750,6 +756,27 @@ fn a_burst_of_keys_arrives_whole_and_nothing_spins() {
     let typed = "x".repeat(3000);
     let sent = Instant::now();
     session.type_keys(format!("{typed}\r").as_bytes());
+    if cfg!(target_os = "linux") {
+        std::thread::sleep(Duration::from_millis(300));
+        let before = session.cpu();
+        std::thread::sleep(Duration::from_secs(2));
+        let spent = session.cpu().saturating_sub(before);
+        assert!(
+            spent < Duration::from_millis(500),
+            "{spent:?} of CPU in 2 s while the rest of the burst waited"
+        );
+        let mut more = 0;
+        while provider.requests().is_empty() {
+            assert!(
+                more < 10,
+                "the keys were not all taken in after {more} more:\n{}",
+                session.shown()
+            );
+            session.type_keys(b"\r");
+            more += 1;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
     while provider.requests().is_empty() {
         assert!(
             sent.elapsed() < Duration::from_secs(1),

@@ -9,7 +9,8 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 use crate::{
-    diff, markdown,
+    diff,
+    markdown::{self, Stream},
     style::Theme,
     text::{lines, sanitize, wrap},
 };
@@ -31,8 +32,9 @@ pub struct Transcript {
     theme: Theme,
     /// Finished lines not yet written to the terminal.
     pending: Vec<Line<'static>>,
-    /// The assistant's reply as it streams.
-    streaming: String,
+    /// The assistant's reply as it streams: its complete blocks go into the finished lines as
+    /// they complete, the rest is shown in the live region.
+    reply: Stream,
     /// The model is reasoning (its reasoning is not shown).
     thinking: bool,
     calls: HashMap<String, Call>,
@@ -49,7 +51,7 @@ impl Transcript {
         Transcript {
             theme,
             pending: Vec::new(),
-            streaming: String::new(),
+            reply: Stream::default(),
             thinking: false,
             calls: HashMap::new(),
             running: None,
@@ -135,21 +137,22 @@ impl Transcript {
         match event {
             AgentEvent::TurnStarted => {
                 self.busy = true;
-                self.streaming.clear();
+                self.reply = Stream::default();
             }
             AgentEvent::TextDelta { text } => {
                 self.thinking = false;
-                self.streaming.push_str(text);
+                self.reply.push(text);
+                if let Some(blocks) = self.reply.take_complete() {
+                    let lines = markdown::render(blocks, width, &self.theme);
+                    self.push_reply(lines);
+                }
             }
             AgentEvent::ReasoningDelta { .. } => self.thinking = true,
             AgentEvent::AssistantMessage { content, .. } => {
                 self.thinking = false;
-                self.streaming.clear();
-                if !content.trim().is_empty() {
-                    self.gap();
-                    let rendered = markdown::render(content, width, &self.theme);
-                    self.emit(rendered);
-                }
+                let rest = self.reply.finish(Some(content));
+                let lines = markdown::render(&rest, width, &self.theme);
+                self.push_reply(lines);
             }
             AgentEvent::ToolCallRequested {
                 id,
@@ -217,14 +220,10 @@ impl Transcript {
                 self.busy = false;
                 self.thinking = false;
                 self.running = None;
-                if !self.streaming.trim().is_empty() {
-                    // Output that never became a message: keep what arrived.
-                    let text = std::mem::take(&mut self.streaming);
-                    self.gap();
-                    let rendered = markdown::render(&text, width, &self.theme);
-                    self.emit(rendered);
-                }
-                self.streaming.clear();
+                // Output that never became a message: keep what arrived.
+                let rest = self.reply.finish(None);
+                let lines = markdown::render(&rest, width, &self.theme);
+                self.push_reply(lines);
                 match reason {
                     TurnEndReason::Interrupted => self.push_note("interrupted", width),
                     TurnEndReason::StepLimit => {
@@ -256,6 +255,14 @@ impl Transcript {
             AgentEvent::ApprovalNeeded { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::CheckpointCreated { .. } => {}
+        }
+    }
+
+    /// Rendered blocks of the reply, after a blank line.
+    fn push_reply(&mut self, lines: Vec<Line<'static>>) {
+        if !lines.is_empty() {
+            self.gap();
+            self.emit(lines);
         }
     }
 
@@ -293,12 +300,12 @@ impl Transcript {
         }
     }
 
-    /// What the live region shows of the turn in progress, at most `rows` lines: the tail of the
-    /// reply streaming in, and what is running.
+    /// What the live region shows of the turn in progress, at most `rows` lines: the block of
+    /// the reply still streaming in (code not highlighted yet), and what is running.
     pub fn live(&self, width: usize, rows: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
-        if !self.streaming.is_empty() {
-            out = markdown::render(&self.streaming, width, &self.theme);
+        if !self.reply.rest().is_empty() {
+            out = markdown::render_plain(&self.reply.live(rows), width, &self.theme);
         }
         if let Some(call) = self.running.as_ref().and_then(|id| self.calls.get(id)) {
             let summary = call_summary(&call.name, &call.arguments);

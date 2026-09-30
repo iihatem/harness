@@ -1,6 +1,10 @@
 //! Markdown, as the model writes it, rendered as styled lines of a given width: paragraphs,
 //! headings, emphasis, inline code, fenced code blocks with syntax highlighting, lists, block
-//! quotes, links, tables and rules. Everything drawn is sanitized first.
+//! quotes, links, tables and rules. Everything drawn is sanitized first. A reply that is still
+//! streaming is split into the blocks that are complete, rendered once, and the block still
+//! growing ([`Stream`]).
+
+use std::borrow::Cow;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
@@ -16,10 +20,21 @@ use crate::{
 
 /// `markdown` as lines at most `width` columns wide.
 pub fn render(markdown: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    render_with(markdown, width, theme, true)
+}
+
+/// `markdown` as lines at most `width` columns wide, with code blocks not highlighted: for text
+/// that is drawn again and again as it grows.
+pub fn render_plain(markdown: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    render_with(markdown, width, theme, false)
+}
+
+fn render_with(markdown: &str, width: usize, theme: &Theme, highlight: bool) -> Vec<Line<'static>> {
     let options =
         Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let mut renderer = Renderer {
         theme,
+        highlight,
         width: width.max(8),
         out: Vec::new(),
         line: Vec::new(),
@@ -58,6 +73,8 @@ struct Table {
 
 struct Renderer<'t> {
     theme: &'t Theme,
+    /// Code blocks are highlighted.
+    highlight: bool,
     width: usize,
     out: Vec<Line<'static>>,
     /// The line being built.
@@ -360,7 +377,12 @@ impl Renderer<'_> {
             return;
         };
         let text = code.text.strip_suffix('\n').unwrap_or(&code.text);
-        let lines = highlight(text, &code.language, self.theme).unwrap_or_else(|| {
+        let highlighted = if self.highlight {
+            highlight(text, &code.language, self.theme)
+        } else {
+            None
+        };
+        let lines = highlighted.unwrap_or_else(|| {
             text.split('\n')
                 .map(|l| Line::from(Span::styled(sanitize(l), self.theme.plain())))
                 .collect()
@@ -424,4 +446,163 @@ impl Renderer<'_> {
         }
         self.items_started();
     }
+}
+
+/// A reply as it streams in, split into the Markdown blocks that are complete, which can be
+/// rendered once and go into the scrollback, and the block still growing, which the live region
+/// shows.
+///
+/// A block is complete once the next one starts: at a line that is not indented after a blank
+/// line (an indented one may continue a list item), at a fenced code block's closing fence, or at
+/// a fence that opens without indentation (a code block ends the paragraph, list or quote before
+/// it). Blank lines inside a fenced code block end nothing.
+#[derive(Debug, Default)]
+pub struct Stream {
+    text: String,
+    /// Where the blocks not yet taken start.
+    taken: usize,
+    /// Where the complete blocks end.
+    complete: usize,
+    /// Where the next line to look at starts: lines are looked at once they end.
+    scanned: usize,
+    /// The last line looked at was blank.
+    after_blank: bool,
+    /// The fenced code block open at `scanned`.
+    fence: Option<OpenFence>,
+}
+
+#[derive(Debug)]
+struct OpenFence {
+    /// Where its first line of code starts.
+    content: usize,
+    marker: char,
+    len: usize,
+    /// It opened without indentation, so its closing fence ends a block.
+    top: bool,
+}
+
+impl Stream {
+    /// Adds `delta` to the reply.
+    pub fn push(&mut self, delta: &str) {
+        self.text.push_str(delta);
+        while let Some(end) = self.text[self.scanned..].find('\n') {
+            let start = self.scanned;
+            let end = start + end;
+            self.line(start, end);
+            self.scanned = end + 1;
+        }
+        // A line that has begun without indentation after a blank one starts a block, whatever
+        // follows on it.
+        let begun = self.text[self.scanned..].chars().next();
+        if self.fence.is_none() && self.after_blank && begun.is_some_and(|c| !c.is_whitespace()) {
+            self.complete = self.scanned;
+        }
+    }
+
+    /// Looks at the line `start..end`, which has ended.
+    fn line(&mut self, start: usize, end: usize) {
+        let line = &self.text[start..end];
+        if let Some(open) = &self.fence {
+            if closes(line, open) {
+                if open.top {
+                    self.complete = end + 1;
+                }
+                self.fence = None;
+            }
+            self.after_blank = false;
+            return;
+        }
+        if line.trim().is_empty() {
+            self.after_blank = true;
+            return;
+        }
+        let opened = opens_fence(line);
+        let indented = line.starts_with(char::is_whitespace);
+        if !indented && (self.after_blank || opened.is_some()) {
+            self.complete = start;
+        }
+        if let Some((marker, len, indent)) = opened {
+            self.fence = Some(OpenFence {
+                content: end + 1,
+                marker,
+                len,
+                top: indent == 0,
+            });
+        }
+        self.after_blank = false;
+    }
+
+    /// The blocks that became complete since they were last taken, which are then taken.
+    pub fn take_complete(&mut self) -> Option<&str> {
+        if self.complete <= self.taken {
+            return None;
+        }
+        let taken = self.taken;
+        self.taken = self.complete;
+        Some(&self.text[taken..self.complete])
+    }
+
+    /// What has not been taken: the block still growing.
+    pub fn rest(&self) -> &str {
+        &self.text[self.taken..]
+    }
+
+    /// The Markdown the live region draws for the rest, cut short in an open code block to its
+    /// last `lines` lines, so the cost of drawing it does not grow with the block.
+    pub fn live(&self, lines: usize) -> Cow<'_, str> {
+        let Some(open) = &self.fence else {
+            return Cow::Borrowed(self.rest());
+        };
+        let code = &self.text[open.content..];
+        match code.rmatch_indices('\n').nth(lines) {
+            Some((cut, _)) => Cow::Owned(format!(
+                "{}{}",
+                &self.text[self.taken..open.content],
+                &code[cut + 1..]
+            )),
+            None => Cow::Borrowed(self.rest()),
+        }
+    }
+
+    /// The reply ended: what of it has not been taken, and the stream starts again. `message` is
+    /// the reply as a whole, when it came: its end after what was taken, as long as it starts with
+    /// that, and all of it otherwise.
+    pub fn finish(&mut self, message: Option<&str>) -> String {
+        let taken = &self.text[..self.taken];
+        let rest = match message {
+            Some(message) => message.strip_prefix(taken).unwrap_or(message),
+            None => &self.text[self.taken..],
+        }
+        .to_string();
+        *self = Stream::default();
+        rest
+    }
+}
+
+/// A fence of three or more backticks or tildes, indented by at most three spaces: its
+/// character, length and indentation.
+fn fence(line: &str) -> Option<(char, usize, usize)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let marker = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let len = rest.len() - rest.trim_start_matches(marker).len();
+    (len >= 3).then_some((marker, len, indent))
+}
+
+/// The fence `line` opens a code block with. A backtick fence's info string has no backticks
+/// (`` ``` `` followed by more backticks on the line is inline code).
+fn opens_fence(line: &str) -> Option<(char, usize, usize)> {
+    let (marker, len, indent) = fence(line)?;
+    let info = &line[indent + len..];
+    (marker == '~' || !info.contains('`')).then_some((marker, len, indent))
+}
+
+/// Whether `line` closes the code block `open` began.
+fn closes(line: &str, open: &OpenFence) -> bool {
+    fence(line).is_some_and(|(marker, len, indent)| {
+        marker == open.marker && len >= open.len && line[indent + len..].trim().is_empty()
+    })
 }

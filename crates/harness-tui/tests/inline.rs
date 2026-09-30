@@ -6,11 +6,12 @@ mod support;
 use std::sync::{Arc, Mutex};
 
 use harness_core::event::{AgentEvent, TurnEndReason};
-use harness_tui::{inline::InlineTerminal, style::Theme, transcript::Transcript};
+use harness_tui::{inline::InlineTerminal, markdown, style::Theme, transcript::Transcript};
 use ratatui::{
     backend::{Backend, ClearType, TestBackend, WindowSize},
     buffer::{Buffer, Cell},
     layout::{Position, Size},
+    style::Color,
     text::Line,
     widgets::{Paragraph, Widget},
 };
@@ -380,15 +381,30 @@ fn an_edit_shows_what_it_replaced_and_long_output_is_cut_short() {
 }
 
 #[test]
-fn the_live_region_shows_the_tail_of_a_long_reply_and_the_running_tool() {
+fn the_live_region_shows_the_block_still_streaming_and_the_running_tool() {
     let mut transcript = Transcript::new(Theme::monochrome());
     transcript.on_event(
         &AgentEvent::TextDelta {
-            text: "one\n\ntwo\n\nthree\n\nfour".into(),
+            text: "one\n\ntwo\n\nthree\n\nfour and".into(),
         },
         20,
     );
-    assert_eq!(text_rows(&transcript.live(20, 3)), ["three", "", "four"]);
+    // The paragraphs that are complete are finished lines already.
+    assert_eq!(
+        text_rows(&transcript.take_finished()),
+        ["one", "", "two", "", "three"]
+    );
+    transcript.on_event(
+        &AgentEvent::TextDelta {
+            text: " more\nwords to wrap".into(),
+        },
+        20,
+    );
+    assert_eq!(
+        text_rows(&transcript.live(20, 2)),
+        ["four and more words", "to wrap"]
+    );
+    assert_eq!(text_rows(&transcript.live(20, 1)), ["to wrap"]);
     transcript.on_event(
         &AgentEvent::ToolCallRequested {
             id: "c".into(),
@@ -399,7 +415,7 @@ fn the_live_region_shows_the_tail_of_a_long_reply_and_the_running_tool() {
     );
     assert_eq!(
         text_rows(&transcript.live(20, 2)),
-        ["four", "● read README.md"]
+        ["to wrap", "● read README.md"]
     );
 }
 
@@ -437,4 +453,99 @@ fn interrupted_and_failed_turns_say_so_and_keep_partial_output() {
             "error: stopped after reaching the step limit",
         ]
     );
+}
+
+const REPLY: &str = "# Title
+
+First paragraph with **bold** text.
+
+- one
+- two
+
+  still two
+
+Second paragraph.
+```rust
+fn main() {}
+
+let x = 1;
+```
+After the code.
+
+| a | b |
+|---|---|
+| 1 | 2 |
+
+> quote
+
+Last line.";
+
+fn coloured(lines: &[Line<'_>]) -> bool {
+    lines
+        .iter()
+        .flat_map(|l| &l.spans)
+        .any(|s| matches!(s.style.fg, Some(Color::Rgb(..) | Color::Indexed(_))))
+}
+
+// Review A's I1: every redraw rendered and highlighted the whole reply so far, so each chunk of a
+// long reply cost more than the last. Blocks now go into the scrollback as they complete,
+// rendered once, and the live region shows only the block still growing.
+#[test]
+fn a_streaming_reply_goes_into_the_scrollback_block_by_block() {
+    let theme = Theme::colored();
+    let mut transcript = Transcript::new(theme);
+    transcript.on_event(&AgentEvent::TurnStarted, 40);
+    let mut streamed = Vec::new();
+    for chunk in REPLY.as_bytes().chunks(5) {
+        let text = std::str::from_utf8(chunk).unwrap().to_string();
+        transcript.on_event(&AgentEvent::TextDelta { text }, 40);
+        streamed.extend(transcript.take_finished());
+    }
+    let before_the_end = streamed.len();
+    transcript.on_event(
+        &AgentEvent::AssistantMessage {
+            content: REPLY.into(),
+            model: "mock/m".into(),
+        },
+        40,
+    );
+    streamed.extend(transcript.take_finished());
+    // All but the last paragraph was in the scrollback before the reply ended...
+    assert_eq!(text_rows(&streamed[before_the_end..]), ["", "Last line."]);
+    // ...and it is the reply rendered whole, code highlighted.
+    assert_eq!(streamed, markdown::render(REPLY, 40, &theme));
+    assert!(coloured(&streamed));
+}
+
+#[test]
+fn an_open_code_block_streams_plain_and_is_highlighted_once_it_closes() {
+    let mut transcript = Transcript::new(Theme::colored());
+    transcript.on_event(
+        &AgentEvent::TextDelta {
+            text: "```rust\nlet x = 1;\nlet y = 2;\n".into(),
+        },
+        40,
+    );
+    let live = transcript.live(40, 10);
+    assert_eq!(text_rows(&live), ["  let x = 1;", "  let y = 2;"]);
+    assert!(!coloured(&live));
+    assert!(transcript.take_finished().is_empty());
+    // A long block shows its last lines only.
+    let more: String = (1..=3_000).map(|i| format!("let v{i} = {i};\n")).collect();
+    transcript.on_event(&AgentEvent::TextDelta { text: more }, 40);
+    assert_eq!(
+        text_rows(&transcript.live(40, 2)),
+        ["  let v2999 = 2999;", "  let v3000 = 3000;"]
+    );
+    transcript.on_event(
+        &AgentEvent::TextDelta {
+            text: "```\nafter".into(),
+        },
+        40,
+    );
+    let finished = transcript.take_finished();
+    assert_eq!(finished.len(), 3_002);
+    assert_eq!(text_rows(&finished[..2]), ["  let x = 1;", "  let y = 2;"]);
+    assert!(coloured(&finished));
+    assert_eq!(text_rows(&transcript.live(40, 10)), ["after"]);
 }

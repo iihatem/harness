@@ -5,15 +5,38 @@ The command-line interface presents the agent to users, both as an interactive i
 ## ADDED Requirements
 
 ### Requirement: Interactive sessions render inline
-Interactive mode SHALL render into the terminal's normal screen: completed messages MUST be written into the terminal scrollback, and only the active region (input, streaming output, prompts) MUST be redrawn. Full-screen views MAY be used for pickers, `/rewind`, and long diffs and MUST return to inline mode when closed. Interactive mode MUST need a terminal on standard input and standard output; without one, `harness` MUST exit with code 2 and name `harness ask`.
+Interactive mode SHALL render into the terminal's normal screen: completed messages MUST be written into the terminal scrollback, and only the active region (input, streaming output, prompts) MUST be redrawn. A streaming reply's Markdown blocks (a paragraph, a list, a closed code block) MUST go into the scrollback as each completes, so that redrawing costs no more as the reply grows; the active region shows the block still growing. Each line MUST reach the scrollback once, with its text whole, wide characters included, and the end of the last message MUST stay on screen above the active region; a resize of the terminal MUST NOT erase or repeat a line of it. Full-screen views MAY be used for pickers, `/rewind`, and long diffs and MUST return to inline mode when closed. Interactive mode MUST need a terminal on standard input and standard output that can move its cursor and reports its size; without one (a pipe, `TERM=dumb`), `harness` MUST exit with code 2 and name `harness ask`.
 
 #### Scenario: Scrollback preserved
 - **WHEN** a session produces more output than fits on screen
 - **THEN** earlier messages remain reachable with the terminal's own scrollback
 
+#### Scenario: A long reply streams
+- **WHEN** the model streams a reply of many paragraphs and code blocks
+- **THEN** each paragraph and code block enters the scrollback as it completes, highlighted once, and when the reply ends its last lines are on screen above the input
+
+#### Scenario: Resizing the window
+- **WHEN** the user makes the terminal shorter, then wider, at the prompt or while a reply streams
+- **THEN** every line of the conversation is still in the scrollback or on screen exactly once, with the input below the last of them
+
 #### Scenario: No terminal
 - **WHEN** the user runs `harness` with standard input from a pipe
 - **THEN** harness exits with code 2 and says to use `harness ask`
+
+#### Scenario: A terminal that cannot move its cursor
+- **WHEN** the user runs `harness` in Emacs's shell mode, where `TERM=dumb`
+- **THEN** harness exits with code 2, writes no escape sequence, and says to use `harness ask`
+
+### Requirement: Text is measured and edited by grapheme cluster
+Interactive mode SHALL measure, wrap and edit text by extended grapheme cluster, as the screen draws it: an emoji with a variation selector, a ZWJ sequence and a flag are each one character two columns wide, and a letter with combining marks is one character. Wrapping MUST NOT cut text off the end of a row or split a cluster, and the input's cursor keys, Backspace and Delete MUST move over and delete a whole cluster. Control, bidirectional and invisible format characters in what is drawn MUST be shown as escapes, except joiners that an emoji or a script needs.
+
+#### Scenario: Deleting an emoji
+- **WHEN** the user types a family emoji (a ZWJ sequence) or a flag and presses Backspace once
+- **THEN** the whole emoji is deleted
+
+#### Scenario: Emoji in a reply
+- **WHEN** a reply contains `⚠️` several times in a line longer than the screen
+- **THEN** the line wraps with none of its text cut off
 
 ### Requirement: Status line and per-turn stats
 Interactive mode SHALL display a status line showing the active model, approval mode, context usage as a percentage of the effective context window, and session token totals. After each turn it MUST show the model that answered, time to first token, output tokens per second, and prompt-cache hit rate when the provider reports cached tokens. Time to first token MUST be measured from the reply's first streamed event of any kind, including a tool call's own first fragment, not from whichever event happens to carry the reply's content; output tokens per second MUST be computed over the generation window that follows from there. The runtime MUST report these per-turn statistics as an event before the turn finishes, so `harness ask --json` prints them too.
@@ -61,7 +84,7 @@ However an interactive session ends, it SHALL stop the running turn and the comm
 - **THEN** harness keeps running, and its terminal modes and plan are as they were
 
 ### Requirement: Desktop notifications
-Interactive mode SHALL emit an OSC 9 desktop notification and a terminal bell when a turn that ran 10 seconds or longer finishes, other than by the user's interruption, or when an approval is needed. Both MUST be configurable (`[notifications] desktop` and `bell`, on by default) and MUST be disabled when stdout is not a terminal. Text in a notification MUST have its control characters removed.
+Interactive mode SHALL emit an OSC 9 desktop notification and a terminal bell when a turn that ran 10 seconds or longer finishes, other than by the user's interruption, or when an approval is needed. Both MUST be configurable (`[notifications] desktop` and `bell`, on by default) and MUST be disabled when stdout is not a terminal. Text in a notification MUST have its control, bidirectional and invisible format characters removed.
 
 #### Scenario: Long task completes
 - **WHEN** a turn runs for 3 minutes and finishes
@@ -72,7 +95,7 @@ Interactive mode SHALL emit an OSC 9 desktop notification and a terminal bell wh
 - **THEN** a long turn ends with a bell and no OSC 9 notification
 
 ### Requirement: Large pastes are collapsed
-Interactive mode SHALL display pasted text longer than 10 lines or 1,000 characters as a numbered placeholder showing its line count, let the user expand the placeholder to edit the text (Ctrl+O), and send the full text with the message.
+Interactive mode SHALL display pasted text longer than 10 lines or 1,000 characters as a numbered placeholder showing its line count, let the user expand the placeholder to edit the text (Ctrl+O), and send the full text with the message. A paste larger than 4 MiB MUST be refused with a message, leaving the input as it was.
 
 #### Scenario: Pasting a stack trace
 - **WHEN** the user pastes a 200-line stack trace

@@ -256,6 +256,20 @@ fn a_second_ctrl_c_after_two_seconds_does_not_exit() {
     ));
 }
 
+#[test]
+fn a_paste_too_large_to_send_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new(options(dir.path()), Box::new(TestHost), 80);
+    app.on_paste(&"x".repeat(harness_tui::editor::PASTE_MAX_BYTES + 1));
+    assert!(app.editor().is_empty());
+    let (lines, _) = app.live(10);
+    let shown: Vec<String> = lines.iter().map(harness_tui::text::plain).collect();
+    assert!(
+        shown.iter().any(|l| l.contains("the paste is too large")),
+        "{shown:#?}"
+    );
+}
+
 #[tokio::test]
 async fn help_lists_the_commands_and_the_keys() {
     let dir = tempfile::tempdir().unwrap();

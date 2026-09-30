@@ -1,7 +1,7 @@
 //! The input editor, driven by scripted keys and pastes.
 
 use harness_tui::{
-    editor::{Edit, Editor},
+    editor::{Edit, Editor, HISTORY_MAX, PASTE_MAX_BYTES},
     style::Theme,
     text::plain,
 };
@@ -260,4 +260,50 @@ fn keys_move_and_delete_whole_grapheme_clusters() {
     type_text(&mut editor, "abcd");
     editor.key(key(KeyCode::Up));
     assert_eq!(editor.cursor(), "日本".len());
+}
+
+// Review B's M1: a paste was copied twice and counted twice on the UI's thread, however large. One
+// larger than 4 MiB, about a million tokens and past any model's window, is refused, and the
+// input is left as it was.
+#[test]
+fn a_paste_too_large_to_send_is_refused() {
+    let mut editor = Editor::new(Vec::new());
+    type_text(&mut editor, "see ");
+    assert!(!editor.paste(&"x".repeat(PASTE_MAX_BYTES + 1)));
+    assert_eq!(editor.text(), "see ");
+    assert!(editor.paste(&"y\r\n".repeat(PASTE_MAX_BYTES / 3)));
+    assert_eq!(
+        editor.text(),
+        format!("see [Pasted text #1, {} lines]", PASTE_MAX_BYTES / 3)
+    );
+    assert_eq!(editor.expanded().len(), 4 + 2 * (PASTE_MAX_BYTES / 3));
+}
+
+// Review B's M2: a placeholder wider than the row was placed whole, and ran past the edge.
+#[test]
+fn a_placeholder_wider_than_the_row_is_cut_short() {
+    let mut editor = Editor::new(Vec::new());
+    editor.paste(&"line\n".repeat(500));
+    let (lines, cursor) = editor.render("› ", 16, &Theme::monochrome());
+    assert_eq!(lines.len(), 2);
+    assert_eq!(plain(&lines[0]), "› [Pasted text …");
+    assert!(lines.iter().all(|l| l.width() <= 16));
+    assert_eq!(cursor, Position::new(2, 1));
+}
+
+// Review B's M3: every input of a resumed session was kept for Up, however many and however
+// large. The latest are kept.
+#[test]
+fn up_recalls_the_latest_inputs_only() {
+    let mut history: Vec<String> = (0..HISTORY_MAX + 500)
+        .map(|i| format!("input {i}"))
+        .collect();
+    history.push("z".repeat(PASTE_MAX_BYTES + 1));
+    let mut editor = Editor::new(history);
+    editor.key(key(KeyCode::Up));
+    assert_eq!(editor.text(), format!("input {}", HISTORY_MAX + 499));
+    for _ in 0..HISTORY_MAX + 500 {
+        editor.key(key(KeyCode::Up));
+    }
+    assert_eq!(editor.text(), "input 500");
 }

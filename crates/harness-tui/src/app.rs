@@ -512,7 +512,14 @@ impl App {
         {
             return;
         }
-        self.editor.paste(text);
+        if !self.editor.paste(text) {
+            let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+            self.hint = Some(format!(
+                "the paste is too large ({:.1} MiB; at most {:.0} MiB): save it to a file in the workspace and mention it with @",
+                mib(text.len()),
+                mib(crate::editor::PASTE_MAX_BYTES),
+            ));
+        }
         self.update_completion();
     }
 

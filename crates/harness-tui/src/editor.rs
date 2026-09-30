@@ -17,6 +17,12 @@ use crate::{
 pub const PASTE_MAX_LINES: usize = 10;
 /// A paste with more characters than this is collapsed.
 pub const PASTE_MAX_CHARS: usize = 1_000;
+/// A paste larger than this (about a million tokens, past any model's window) is refused.
+pub const PASTE_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Earlier inputs kept for Up, at most: the latest.
+pub const HISTORY_MAX: usize = 1_000;
+/// Bytes of earlier inputs kept for Up, at most.
+const HISTORY_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// A collapsed paste.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,10 +61,24 @@ pub struct Editor {
 }
 
 impl Editor {
-    /// An empty editor that recalls `history` (oldest first) with the Up key.
+    /// An empty editor that recalls `history` (oldest first) with the Up key: its latest
+    /// [`HISTORY_MAX`] entries, as far as they fit in 16 MiB, leaving out any too large to paste.
     pub fn new(history: Vec<String>) -> Editor {
+        let mut kept = Vec::new();
+        let mut bytes = 0;
+        for entry in history.into_iter().rev() {
+            if entry.len() > PASTE_MAX_BYTES {
+                continue;
+            }
+            bytes += entry.len();
+            if kept.len() == HISTORY_MAX || bytes > HISTORY_MAX_BYTES {
+                break;
+            }
+            kept.push(entry);
+        }
+        kept.reverse();
         Editor {
-            history,
+            history: kept,
             ..Editor::default()
         }
     }
@@ -118,16 +138,18 @@ impl Editor {
     pub fn submit(&mut self) -> (String, String) {
         let shown = self.text.clone();
         let full = self.expanded();
-        if !full.trim().is_empty() && self.history.last() != Some(&full) {
-            self.history.push(full.clone());
-        }
+        self.remember(&full);
         self.clear();
         (shown, full)
     }
 
-    /// Adds `text` to the history without sending it (input sent some other way).
+    /// Adds `text` to the history without sending it (input sent some other way). The oldest
+    /// entry goes when there are [`HISTORY_MAX`].
     pub fn remember(&mut self, text: &str) {
         if !text.trim().is_empty() && self.history.last().map(String::as_str) != Some(text) {
+            if self.history.len() == HISTORY_MAX {
+                self.history.remove(0);
+            }
             self.history.push(text.to_string());
         }
     }
@@ -169,10 +191,26 @@ impl Editor {
 
     /// Pastes `text`: collapsed to `[Pasted text #n, N lines]` when it has more than
     /// [`PASTE_MAX_LINES`] lines or [`PASTE_MAX_CHARS`] characters, typed in as it is otherwise.
-    pub fn paste(&mut self, text: &str) {
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    /// A paste larger than [`PASTE_MAX_BYTES`] is refused (`false`), and the input left as it was.
+    pub fn paste(&mut self, text: &str) -> bool {
+        if text.len() > PASTE_MAX_BYTES {
+            return false;
+        }
+        self.put(text);
+        true
+    }
+
+    /// Puts `text` in as a paste, whatever its size (an earlier input recalled). It is copied
+    /// once, and counted in as few passes as can tell.
+    fn put(&mut self, text: &str) {
+        let text = if text.contains('\r') {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text.to_string()
+        };
         let lines = text.lines().count();
-        if lines <= PASTE_MAX_LINES && text.chars().count() <= PASTE_MAX_CHARS {
+        let short = text.len() <= PASTE_MAX_CHARS || text.chars().nth(PASTE_MAX_CHARS).is_none();
+        if lines <= PASTE_MAX_LINES && short {
             self.insert(&text);
             return;
         }
@@ -349,7 +387,7 @@ impl Editor {
             self.history[next].clone()
         };
         self.set_text("");
-        self.paste(&text);
+        self.put(&text);
         if next < self.history.len() {
             self.recall = Some((next, draft));
         }
@@ -483,7 +521,7 @@ impl Editor {
                 break;
             };
             rows.cursor_before(paste.start, self.cursor);
-            let label = self.text[paste.start..paste.end].to_string();
+            let label = fit(&self.text[paste.start..paste.end], width - prompt_width);
             let w = text_width(&label);
             if rows.column + w > width && rows.column > prompt_width {
                 rows.new_row();
@@ -503,6 +541,24 @@ impl Editor {
             .collect();
         (lines, cursor)
     }
+}
+
+/// `label`, cut to fit in `width` columns, with an ellipsis when it is cut.
+fn fit(label: &str, width: usize) -> String {
+    if text_width(label) <= width {
+        return label.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in label.graphemes(true) {
+        used += grapheme_width(grapheme);
+        if used + 1 > width {
+            break;
+        }
+        out.push_str(grapheme);
+    }
+    out.push('…');
+    out
 }
 
 /// The editor's rows as they are laid out: each row's prefix, then its text.

@@ -9,6 +9,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     text::{Line, Span},
@@ -88,6 +89,9 @@ impl<W: Write + Send, R: RawMode + Send> TextEditor for ExternalEditor<W, R> {
             file.write_all(text.as_bytes())?;
             drop(file);
             let _paused = self.input.as_ref().map(InputPause::pause);
+            // Ctrl+C and Ctrl+\ at the editor signal its process group, which is harness's: they
+            // are the editor's, until raw mode is back.
+            let held = HeldInterrupts::hold();
             self.modes.suspend()?;
             let status = Command::new("/bin/sh")
                 .arg("-c")
@@ -95,7 +99,9 @@ impl<W: Write + Send, R: RawMode + Send> TextEditor for ExternalEditor<W, R> {
                 .arg("harness")
                 .arg(&path)
                 .status();
-            self.modes.resume()?;
+            let resumed = self.modes.resume();
+            drop(held);
+            resumed?;
             let status = status?;
             if !status.success() {
                 return Err(io::Error::other(format!(
@@ -107,6 +113,40 @@ impl<W: Write + Send, R: RawMode + Send> TextEditor for ExternalEditor<W, R> {
         })();
         let _ = std::fs::remove_file(&path);
         result
+    }
+}
+
+/// SIGINT and SIGQUIT caught and dropped while held, and given back their earlier actions
+/// after. A caught signal, unlike an ignored one, is not passed on to the programs harness runs:
+/// they get the default action.
+struct HeldInterrupts(Vec<(Signal, SigAction)>);
+
+extern "C" fn drop_signal(_: libc::c_int) {}
+
+impl HeldInterrupts {
+    fn hold() -> HeldInterrupts {
+        let caught = SigAction::new(
+            SigHandler::Handler(drop_signal),
+            SaFlags::SA_RESTART,
+            SigSet::empty(),
+        );
+        let mut earlier = Vec::new();
+        for signal in [Signal::SIGINT, Signal::SIGQUIT] {
+            // SAFETY: the handler does nothing, so it is async-signal-safe.
+            if let Ok(action) = unsafe { sigaction(signal, &caught) } {
+                earlier.push((signal, action));
+            }
+        }
+        HeldInterrupts(earlier)
+    }
+}
+
+impl Drop for HeldInterrupts {
+    fn drop(&mut self) {
+        for (signal, action) in &self.0 {
+            // SAFETY: puts back the action that was there before.
+            let _ = unsafe { sigaction(*signal, action) };
+        }
     }
 }
 

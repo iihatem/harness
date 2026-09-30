@@ -582,6 +582,14 @@ impl App {
         self.mode = mode;
         self.transcript
             .push_note(&format!("switched to {mode} mode"), self.width);
+        // Leaving plan mode, as the user chose during the planning turn or before the plan took
+        // keys, leaves its plan: Build would switch to a mode other than the one they chose.
+        if mode != Mode::Plan && self.plan_choice.take().is_some() {
+            self.transcript.push_note(
+                "the plan is left unbuilt: you left plan mode; say what to do next",
+                self.width,
+            );
+        }
         Some(Action::SetMode(mode))
     }
 

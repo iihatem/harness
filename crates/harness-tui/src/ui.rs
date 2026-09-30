@@ -72,6 +72,8 @@ pub struct Ui<B: Backend> {
     /// Cancels the running turn.
     cancel: Option<CancellationToken>,
     text_editor: Option<Box<dyn TextEditor>>,
+    /// The plan the user asked to edit, for [`edit_plan`](Self::edit_plan).
+    editing: Option<String>,
     notifier: Option<Box<dyn Notify>>,
     /// Keeps the secrets harness knows out of what the agent's events show.
     redactor: Option<EventRedactor>,
@@ -123,6 +125,7 @@ where
             runner: Some(runner),
             cancel: None,
             text_editor,
+            editing: None,
             notifier,
             redactor: None,
         }
@@ -185,16 +188,9 @@ where
                 self.dispatch(Action::SetMode(mode))?;
                 self.dispatch(Action::Run(input))?
             }
+            // Opened by `edit_plan`, off the session's task.
             Action::EditPlan(plan) => {
-                let edited = match &mut self.text_editor {
-                    Some(editor) => {
-                        // The editor gets the terminal; the live region is drawn again after.
-                        self.term.clear()?;
-                        editor.edit(&plan)
-                    }
-                    None => Err(io::Error::other("no editor is set up")),
-                };
-                self.app.plan_edited(edited);
+                self.editing = Some(plan);
                 Flow::Continue
             }
             Action::Run(input) => {
@@ -224,6 +220,39 @@ where
             }
             Action::Quit => Flow::Quit,
         })
+    }
+
+    /// Opens the plan in the user's editor, when they asked to edit it, and takes in the edited
+    /// plan. The editor runs on a thread of its own, off the session's task, with the terminal
+    /// given to it meanwhile.
+    pub async fn edit_plan(&mut self) -> io::Result<()> {
+        let Some(plan) = self.editing.take() else {
+            return Ok(());
+        };
+        let edited = match self.text_editor.take() {
+            Some(mut editor) => {
+                // The editor gets the terminal; the live region is drawn again after.
+                if let Err(e) = self.term.clear() {
+                    self.text_editor = Some(editor);
+                    return Err(e);
+                }
+                let ran = tokio::task::spawn_blocking(move || {
+                    let edited = editor.edit(&plan);
+                    (editor, edited)
+                })
+                .await;
+                match ran {
+                    Ok((editor, edited)) => {
+                        self.text_editor = Some(editor);
+                        edited
+                    }
+                    Err(e) => Err(io::Error::other(format!("the editor failed: {e}"))),
+                }
+            }
+            None => Err(io::Error::other("no editor is set up")),
+        };
+        self.app.plan_edited(edited);
+        self.draw()
     }
 
     /// Takes in one terminal event: a key, a paste, or a resize.
@@ -430,6 +459,7 @@ where
         tokio::pin!(shutdown);
         self.draw()?;
         loop {
+            self.edit_plan().await?;
             let flow = tokio::select! {
                 biased;
                 ending = &mut shutdown => return Ok(ending),

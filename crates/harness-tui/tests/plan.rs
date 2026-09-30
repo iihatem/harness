@@ -3,6 +3,7 @@
 //! planning stays.
 
 use std::{
+    os::unix::process::CommandExt,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -65,6 +66,17 @@ fn start(
     mode: Mode,
     default_mode: Mode,
 ) -> Ui<TestBackend> {
+    start_with(provider, dir, mode, default_mode, Box::new(DeleteStepThree)).0
+}
+
+/// Like [`start`], with `editor` for plans; the session's permission engine too.
+fn start_with(
+    provider: Arc<MockProvider>,
+    dir: &Path,
+    mode: Mode,
+    default_mode: Mode,
+    editor: Box<dyn TextEditor>,
+) -> (Ui<TestBackend>, Arc<PermissionEngine>) {
     let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode,
         workspace: dir.to_path_buf(),
@@ -81,7 +93,7 @@ fn start(
     let agent = Agent::new(
         provider,
         ToolRegistry::new(tools),
-        policy,
+        policy.clone(),
         approver,
         AgentConfig::new("mock/m", "m", "system", dir.join("out")),
         ToolContext::new(dir).with_sandbox(None, mode.fs_access()),
@@ -97,13 +109,13 @@ fn start(
         instruction_files: Vec::new(),
         window_note: None,
         default_mode,
-        text_editor: Some(Box::new(DeleteStepThree)),
+        text_editor: Some(editor),
         notifier: None,
     };
     let term = InlineTerminal::new(TestBackend::new(100, 30), 0).unwrap();
     let mut ui = Ui::start(agent, Box::new(NoCommands), term, options, approvals);
     ui.draw().unwrap();
-    ui
+    (ui, policy)
 }
 
 fn rows(buffer: &Buffer) -> Vec<String> {
@@ -270,6 +282,7 @@ async fn an_edited_plan_is_shown_again_and_built_as_edited() {
     let mut ui = start(provider.clone(), dir.path(), Mode::Plan, Mode::Auto);
     plan(&mut ui).await;
     choose(&mut ui, 'e').await;
+    ui.edit_plan().await.unwrap();
     let screen = everything(&ui);
     let edited = screen
         .iter()
@@ -363,6 +376,146 @@ async fn enter_and_keys_typed_ahead_do_not_choose() {
     assert_eq!(last_user(&provider), "b");
     assert!(status(&ui).starts_with("mock/m · plan ·"));
     ui.finish().await.unwrap();
+}
+
+// Review D I3 and E I1, probe 6: a session in plan mode whose default is auto; during the
+// planning turn the user picks ask. Leaving plan mode leaves its plan: nothing builds, and the
+// mode is the one they chose.
+#[tokio::test]
+async fn leaving_plan_mode_while_planning_leaves_the_plan() {
+    for (mode, shift_tabs) in [(Mode::Plan, 1), (Mode::Auto, 2)] {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = planning_script(vec![Script::text("Implemented.")]);
+        let (mut ui, policy) = start_with(
+            provider.clone(),
+            dir.path(),
+            mode,
+            Mode::Auto,
+            Box::new(DeleteStepThree),
+        );
+        let shift_tab = || Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        if mode == Mode::Auto {
+            // From auto to plan now, then to ask after the planning turn.
+            ui.handle(shift_tab()).unwrap();
+        }
+        send(&mut ui, "add a login rate limiter");
+        ui.handle(shift_tab()).unwrap();
+        assert!(
+            status(&ui).contains("ask mode after this turn"),
+            "{}",
+            status(&ui)
+        );
+        settle(&mut ui).await;
+        assert!(ui.app().plan_choice().is_none(), "{shift_tabs}");
+        assert!(status(&ui).starts_with("mock/m · ask ·"), "{}", status(&ui));
+        assert!(
+            everything(&ui)
+                .iter()
+                .any(|r| r.contains("the plan is left unbuilt")),
+            "{:#?}",
+            everything(&ui)
+        );
+        choose(&mut ui, 'b').await;
+        assert_eq!(policy.mode(), Mode::Ask);
+        assert_eq!(provider.requests().len(), 2);
+        assert_eq!(ui.app().editor().text(), "b");
+        ui.finish().await.unwrap();
+    }
+}
+
+/// Records the thread it edits on.
+struct Where(Arc<Mutex<Option<std::thread::ThreadId>>>);
+
+impl TextEditor for Where {
+    fn edit(&mut self, text: &str) -> std::io::Result<String> {
+        *self.0.lock().unwrap() = Some(std::thread::current().id());
+        Ok(text.to_string())
+    }
+}
+
+// Review E M2: the editor runs off the session's task, which is not held up meanwhile.
+#[tokio::test]
+async fn the_editor_runs_off_the_sessions_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = planning_script(vec![]);
+    let edited_on = Arc::new(Mutex::new(None));
+    let (mut ui, _) = start_with(
+        provider,
+        dir.path(),
+        Mode::Plan,
+        Mode::Auto,
+        Box::new(Where(edited_on.clone())),
+    );
+    plan(&mut ui).await;
+    choose(&mut ui, 'e').await;
+    ui.edit_plan().await.unwrap();
+    let edited_on = edited_on.lock().unwrap().expect("the editor ran");
+    assert_ne!(edited_on, std::thread::current().id());
+    assert!(everything(&ui).iter().any(|r| r == "the edited plan:"));
+    ui.finish().await.unwrap();
+}
+
+/// Whether `signal` has its default action.
+fn default_action(signal: libc::c_int) -> bool {
+    // SAFETY: with no new action, `sigaction` only reads the current one into `current`.
+    let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+    let read = unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) };
+    read == 0 && current.sa_sigaction == libc::SIG_DFL
+}
+
+const SIGNAL_CHILD: &str = "HARNESS_TUI_TEST_EDITOR_SIGNALS";
+
+// Review E I2: Ctrl+C or Ctrl+\ while the editor runs signals its whole process group, harness
+// included. harness ignores both meanwhile, then takes them back. Run in a process of its own,
+// in a group of its own, which the editor signals.
+#[test]
+fn a_signal_at_the_editor_does_not_end_harness() {
+    if std::env::var_os(SIGNAL_CHILD).is_some() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut editor = ExternalEditor::new(
+            r#"f() { trap '' INT QUIT; kill -INT 0; kill -QUIT 0; grep -v '^3\.' "$1" > "$1.new"; mv "$1.new" "$1"; }; f"#
+                .into(),
+            Modes::enter(Vec::new(), FakeRaw(log.clone()), false).unwrap(),
+        );
+        let edited = editor
+            .edit(
+                "1. a
+2. b
+3. c
+",
+            )
+            .unwrap();
+        assert_eq!(
+            edited,
+            "1. a
+2. b
+"
+        );
+        assert_eq!(*log.lock().unwrap(), ["raw on", "raw off", "raw on"]);
+        assert!(default_action(libc::SIGINT) && default_action(libc::SIGQUIT));
+        println!("harness is still here");
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_signal_at_the_editor_does_not_end_harness",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(SIGNAL_CHILD, "1")
+        .process_group(0)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("harness is still here"),
+        "{:?}
+{stdout}
+{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Records whether raw mode is on.

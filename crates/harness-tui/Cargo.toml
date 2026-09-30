@@ -13,6 +13,7 @@ harness-context.workspace = true
 harness-core.workspace = true
 ignore.workspace = true
 libc.workspace = true
+nix.workspace = true
 nucleo-matcher.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true

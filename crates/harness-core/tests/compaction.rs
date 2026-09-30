@@ -230,6 +230,59 @@ async fn reported_usage_counts_toward_the_threshold() {
     assert_eq!(compacted(&events).len(), 1, "{events:?}");
 }
 
+// Review C, minor 3: `Agent::summarize` dropped the summary call's `Usage` event entirely
+// (`_ => {}`), so compaction, often the largest request in a long session, never counted towards
+// `/usage` or the status line's totals.
+#[tokio::test]
+async fn compaction_reports_the_summary_calls_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::text("hi"),
+        Script::Reply(vec![
+            Ok(ProviderEvent::TextDelta("the summary".into())),
+            Ok(ProviderEvent::Usage(Usage {
+                input_tokens: 5_000,
+                output_tokens: 40,
+                cached_tokens: 0,
+            })),
+            Ok(ProviderEvent::Finished(FinishReason::Stop)),
+        ]),
+    ]);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    );
+    run(&mut agent, "hello").await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .compact(None, &tx, CancellationToken::new())
+        .await
+        .unwrap();
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let usage = events.iter().find_map(|e| match e {
+        AgentEvent::Usage { model, usage } => Some((model.clone(), *usage)),
+        _ => None,
+    });
+    assert_eq!(
+        usage,
+        Some((
+            "mock/m1".into(),
+            Usage {
+                input_tokens: 5_000,
+                output_tokens: 40,
+                cached_tokens: 0,
+            }
+        )),
+        "{events:#?}"
+    );
+}
+
 fn echo(id: &str, text: &str) -> Script {
     Script::tool_call(id, "echo", serde_json::json!({ "text": text }))
 }

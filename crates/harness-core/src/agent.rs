@@ -872,7 +872,7 @@ impl Agent {
             match &outcome {
                 ModelOutcome::Reply(reply)
                 | ModelOutcome::Failed(_, reply)
-                | ModelOutcome::Interrupted(reply) => self.tally(reply),
+                | ModelOutcome::Interrupted(reply) => self.tally(reply, events),
             }
             let reply = match outcome {
                 ModelOutcome::Reply(mut reply) => {
@@ -1233,33 +1233,49 @@ impl Agent {
             let collect = async {
                 let mut text = String::new();
                 let mut finish = None;
+                let mut usage = None;
                 let mut stream = provider.stream(request.clone());
                 while let Some(item) = stream.next().await {
                     match item? {
                         ProviderEvent::TextDelta(delta) => text.push_str(&delta),
                         ProviderEvent::Finished(reason) => finish = Some(reason),
+                        // Last one wins, as for any other reply: some servers report it
+                        // cumulatively, in every chunk.
+                        ProviderEvent::Usage(reported) => usage = Some(reported),
                         _ => {}
                     }
                 }
-                Ok::<(String, Option<FinishReason>), ProviderError>((text, finish))
+                Ok::<(String, Option<FinishReason>, Option<Usage>), ProviderError>((
+                    text, finish, usage,
+                ))
             };
             let result = tokio::select! {
                 result = collect => result,
                 _ = cancel.cancelled() => return Err(CompactError::Interrupted),
             };
             match result {
-                Ok((text, _)) if text.trim().is_empty() => {
+                Ok((text, _, _)) if text.trim().is_empty() => {
                     return Err(CompactError::Failed(
                         "the model returned an empty summary".into(),
                     ));
                 }
                 // The end of a summary says what remains to be done: a cut-off one is no use.
-                Ok((_, Some(FinishReason::Length))) => {
+                Ok((_, Some(FinishReason::Length), _)) => {
                     return Err(CompactError::Failed(
                         "the summary was cut off at the model's output limit".into(),
                     ));
                 }
-                Ok((text, _)) => return Ok(text.trim().to_string()),
+                Ok((text, _, usage)) => {
+                    // A compaction request is a paid call like any other, and often the turn's
+                    // largest, so it must count towards `/usage` and the status line's totals.
+                    if let Some(usage) = usage {
+                        let _ = events.send(AgentEvent::Usage {
+                            model: self.model_id().to_string(),
+                            usage,
+                        });
+                    }
+                    return Ok(text.trim().to_string());
+                }
                 Err(error) if self.config.retry.retries(&error, attempt) => {
                     let delay = self.config.retry.delay(attempt, error.retry_after());
                     let _ = events.send(AgentEvent::Retrying {
@@ -1379,8 +1395,10 @@ impl Agent {
         self.record(message, None, false);
     }
 
-    /// Adds what a model call took to the turn's stats.
-    fn tally(&mut self, reply: &ModelReply) {
+    /// Adds what a model call took to the turn's stats, and reports its usage once: a server
+    /// that reports usage cumulatively, in every chunk (redact.rs knows such servers exist), must
+    /// not be counted once per chunk, only once per reply, with the last chunk's number.
+    fn tally(&mut self, reply: &ModelReply, events: &UnboundedSender<AgentEvent>) {
         self.stats.model = Some(self.model_id().to_string());
         if let (Some(started), Some(first)) = (reply.started, reply.first_output) {
             if self.stats.time_to_first_token.is_none() {
@@ -1393,6 +1411,10 @@ impl Agent {
             self.stats.usage.input_tokens += usage.input_tokens;
             self.stats.usage.output_tokens += usage.output_tokens;
             self.stats.usage.cached_tokens += usage.cached_tokens;
+            let _ = events.send(AgentEvent::Usage {
+                model: self.model_id().to_string(),
+                usage,
+            });
         }
     }
 
@@ -1500,13 +1522,10 @@ impl Agent {
                 }
                 ProviderEvent::ToolCall(call) => reply.tool_calls.push(call),
                 ProviderEvent::OutputStarted => {}
-                ProviderEvent::Usage(usage) => {
-                    reply.usage = Some(usage);
-                    let _ = events.send(AgentEvent::Usage {
-                        model: self.model_id().to_string(),
-                        usage,
-                    });
-                }
+                // Kept, last one wins, for `tally` to report once the reply is whole: some
+                // servers send it cumulatively, in every chunk, and counting each would
+                // over-count both `/usage` and the status line's session totals.
+                ProviderEvent::Usage(usage) => reply.usage = Some(usage),
                 ProviderEvent::Finished(reason) => reply.finish = Some(reason),
             }
         }

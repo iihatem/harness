@@ -237,6 +237,46 @@ async fn stats_add_up_the_turns_model_calls() {
     assert!(time_to_first_token_ms.is_some());
 }
 
+// Review C, minor 2: a server that reports usage cumulatively, in every chunk, must not be
+// counted once per chunk: `/usage` and the status line's session totals summed every `Usage`
+// event, and this reply's real 20 output tokens would have shown as 25 (5 + 20).
+#[tokio::test]
+async fn a_reply_with_usage_in_every_chunk_is_counted_once_with_the_last_chunks_numbers() {
+    let dir = tempfile::tempdir().unwrap();
+    let usage = |input, output| {
+        Ok(ProviderEvent::Usage(Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: 0,
+        }))
+    };
+    let provider = MockProvider::new(vec![Script::Reply(vec![
+        Ok(ProviderEvent::TextDelta("Hel".into())),
+        usage(300, 5),
+        Ok(ProviderEvent::TextDelta("lo".into())),
+        usage(1_000, 20),
+        Ok(ProviderEvent::Finished(FinishReason::Stop)),
+    ])]);
+    let mut agent = agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path());
+    let (_, events) = run(&mut agent, "go").await;
+    let usages: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Usage { usage, .. } => Some(*usage),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usages,
+        [Usage {
+            input_tokens: 1_000,
+            output_tokens: 20,
+            cached_tokens: 0,
+        }],
+        "{events:#?}"
+    );
+}
+
 #[tokio::test]
 async fn a_turn_that_never_called_the_model_has_no_stats() {
     let dir = tempfile::tempdir().unwrap();

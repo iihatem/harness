@@ -5,11 +5,15 @@ The command-line interface presents the agent to users, both as an interactive i
 ## ADDED Requirements
 
 ### Requirement: Interactive sessions render inline
-Interactive mode SHALL render into the terminal's normal screen: completed messages MUST be written into the terminal scrollback, and only the active region (input, streaming output, prompts) MUST be redrawn. A streaming reply's Markdown blocks (a paragraph, a list, a closed code block) MUST go into the scrollback as each completes, so that redrawing costs no more as the reply grows; the active region shows the block still growing. Each line MUST reach the scrollback once, with its text whole, wide characters included, and the end of the last message MUST stay on screen above the active region; a resize of the terminal MUST NOT erase or repeat a line of it. Full-screen views MAY be used for pickers, `/rewind`, and long diffs and MUST return to inline mode when closed. Interactive mode MUST need a terminal on standard input and standard output that can move its cursor and reports its size; without one (a pipe, `TERM=dumb`), `harness` MUST exit with code 2 and name `harness ask`.
+Interactive mode SHALL render into the terminal's normal screen: completed messages MUST be written into the terminal scrollback, and only the active region (input, streaming output, prompts) MUST be redrawn. A streaming reply's Markdown blocks (a paragraph, a list, a closed code block) MUST go into the scrollback as each completes, so that redrawing costs no more as the reply grows; the active region shows the block still growing. Each line MUST reach the scrollback once, with its text whole, wide characters included, and the end of the last message MUST stay on screen above the active region; a resize of the terminal MUST NOT erase or repeat a line of it, nor end the session, and the next draw MUST be for the new size. Full-screen views MAY be used for pickers, `/rewind`, and long diffs and MUST return to inline mode when closed. Interactive mode MUST need a terminal on standard input and standard output that can move its cursor and reports its size; without one (a pipe, `TERM=dumb`), `harness` MUST exit with code 2 and name `harness ask`.
 
 #### Scenario: Scrollback preserved
 - **WHEN** a session produces more output than fits on screen
 - **THEN** earlier messages remain reachable with the terminal's own scrollback
+
+#### Scenario: Resizing while a reply streams
+- **WHEN** the user drags the window's corner, changing its size many times, while a reply streams
+- **THEN** every line of the reply is in the terminal once, in order, and the session goes on
 
 #### Scenario: A long reply streams
 - **WHEN** the model streams a reply of many paragraphs and code blocks
@@ -54,11 +58,16 @@ Interactive mode SHALL display a status line showing the active model, approval 
 - **THEN** time to first token and tokens per second are measured from the call's first fragment, not from when the whole call arrived
 
 ### Requirement: Keyboard interaction
-Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on empty input to open `/rewind`; Ctrl+C pressed twice within 2 seconds to exit; Shift+Tab to cycle approval modes; Alt+Enter or Shift+Enter to insert a newline, with Ctrl+J and a backslash before Enter as fallbacks for terminals that do not report Shift+Enter; Up arrow to recall previous inputs; `/` at the start of input for command completion; `@` for fuzzy completion of workspace file paths; Enter while a turn is running to queue input; and Ctrl+S while a turn is running to send input immediately (steering). An approval prompt MUST take y (approve once), a (approve for the session, when offered), n (deny, with an optional reason for the model) and Esc (deny and stop the turn). A prompt MUST be answered only by a key pressed for it: keys typed before it was drawn, or within 300 ms after, MUST go to the input; Enter, and the letters with Ctrl or Alt held, MUST NOT answer it.
+Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on empty input to open `/rewind`; Ctrl+C pressed twice within 2 seconds to exit; Shift+Tab to cycle approval modes; Alt+Enter or Shift+Enter to insert a newline, with Ctrl+J and a backslash before Enter as fallbacks for terminals that do not report Shift+Enter; Up arrow to recall previous inputs; `/` at the start of input for command completion; `@` for fuzzy completion of workspace file paths; Enter while a turn is running to queue input; and Ctrl+S while a turn is running to send input immediately (steering). An approval prompt MUST take y (approve once), a (approve for the session, when offered), n (deny, with an optional reason for the model) and Esc (deny and stop the turn). A prompt MUST be answered only by a key pressed for it, once the user has paused: keys typed before it was drawn, and keys typed before 500 ms have passed with no key since it was drawn, MUST go to the input, and the prompt MUST say so; keys MUST be timed by when they were read from the terminal. Enter, and the letters with Ctrl or Alt held, MUST NOT answer it.
 
 #### Scenario: A key typed ahead of a prompt
 - **WHEN** the user is typing a message as an approval prompt appears, and the next key is `y` or Enter
 - **THEN** the key goes to the message, and the prompt still waits for an answer
+
+#### Scenario: Typing through a prompt
+- **WHEN** the user keeps typing a message at 12 keys a second from before an approval prompt appears until a second after it
+- **THEN** every key goes to the message, `a`, `n` and `y` included, and the prompt still waits and says where the keys went
+- **AND** a key pressed after a 500 ms pause answers it
 
 #### Scenario: File completion
 - **WHEN** the user types `@mainrs`
@@ -73,7 +82,7 @@ Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on 
 - **THEN** the message is delivered to the model at the next tool-result boundary
 
 ### Requirement: Interactive sessions end cleanly
-However an interactive session ends, it SHALL stop the running turn and the command it runs, deny any approval that waits, restore the terminal's modes, and end the sandbox's session. A hangup (SIGHUP) or SIGTERM MUST end it this way, with exit code 129 or 143; a terminal whose input ends or fails MUST end it as a hangup, whether or not harness ignores SIGHUP, and never leave harness reading it. While an external editor has the terminal, SIGINT and SIGQUIT MUST NOT end harness, and their earlier actions MUST be restored afterwards.
+However an interactive session ends, it SHALL stop the running turn and the command it runs, deny any approval that waits, restore the terminal's modes, and end the sandbox's session. A hangup (SIGHUP) or SIGTERM MUST end it this way, with exit code 129 or 143; a terminal whose input ends or fails MUST end it as a hangup, whether or not harness ignores SIGHUP, and never leave harness reading it, as the session starts too; a wakeup that finds nothing to read MUST NOT count as the terminal's end. While an external editor has the terminal, SIGINT and SIGQUIT MUST NOT end harness, and their earlier actions MUST be restored afterwards.
 
 #### Scenario: Terminal closed during a command
 - **WHEN** the user closes the terminal window while a command runs

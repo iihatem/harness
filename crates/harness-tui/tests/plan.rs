@@ -431,6 +431,41 @@ async fn typing_through_the_plan_choice_chooses_nothing_until_a_pause() {
     ui.finish().await.unwrap();
 }
 
+// Review D N4: input sent while the plan choice waits is queued behind it. Leaving plan mode
+// drops the choice, and the queued input is sent then, in the mode chosen, not left waiting for
+// the next input.
+#[tokio::test]
+async fn input_queued_behind_the_plan_choice_is_sent_when_leaving_plan_mode_drops_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = planning_script(vec![Script::text("Hello back.")]);
+    let (mut ui, policy) = start_with(
+        provider.clone(),
+        dir.path(),
+        Mode::Plan,
+        Mode::Auto,
+        Box::new(DeleteStepThree),
+    );
+    plan(&mut ui).await;
+    send(&mut ui, "hello");
+    assert!(ui.app().plan_choice().is_some());
+    assert_eq!(provider.requests().len(), 2);
+    ui.handle(Event::Key(KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )))
+    .unwrap();
+    settle(&mut ui).await;
+    assert!(ui.app().plan_choice().is_none());
+    assert_eq!(provider.requests().len(), 3);
+    // Sent in ask mode, which the model is told of.
+    let sent = last_user(&provider);
+    assert!(sent.ends_with("\n\nhello"), "{sent}");
+    assert!(sent.contains("The approval mode is now ask"), "{sent}");
+    assert_eq!(policy.mode(), Mode::Ask);
+    assert!(status(&ui).starts_with("mock/m · ask ·"), "{}", status(&ui));
+    ui.finish().await.unwrap();
+}
+
 // Review D I3 and E I1, probe 6: a session in plan mode whose default is auto; during the
 // planning turn the user picks ask. Leaving plan mode leaves its plan: nothing builds, and the
 // mode is the one they chose.

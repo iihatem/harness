@@ -642,6 +642,10 @@ impl App {
                 "the plan is left unbuilt: you left plan mode; say what to do next",
                 self.width,
             );
+            // Input sent while the choice waited was queued behind it: it goes now, in this mode.
+            if let Some(Action::Run(input)) = self.next_queued() {
+                return Some(Action::RunIn(mode, input));
+            }
         }
         Some(Action::SetMode(mode))
     }

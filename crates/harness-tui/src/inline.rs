@@ -40,17 +40,19 @@ where
     B::Error: Send + Sync + 'static,
 {
     /// Starts drawing at row `top`, where the cursor was when harness started: the rows above it
-    /// are the user's.
+    /// are the user's. A row past the bottom of the screen (the row after a cursor left mid-line
+    /// on the bottom row, or `u16::MAX` when the cursor's place is not known) starts below the
+    /// bottom row: the first draw scrolls the user's rows up rather than drawing over them.
     pub fn new(backend: B, top: u16) -> io::Result<Self> {
         let screen = backend.size().map_err(io_error)?;
-        let top = top.min(screen.height.saturating_sub(1));
+        let top = top.min(screen.height);
         Ok(InlineTerminal {
             backend,
             screen,
             top,
             height: 0,
             shown: Buffer::empty(Rect::new(0, top, screen.width, 0)),
-            cursor_row: top,
+            cursor_row: top.min(screen.height.saturating_sub(1)),
             reports_cursor: true,
         })
     }

@@ -299,8 +299,13 @@ async fn terminal_session(
     let shutdown = shutdown_signals()?;
     // Asked before any events are read: both queries read the terminal's answer from stdin.
     let keyboard = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-    let (column, row) = crossterm::cursor::position().unwrap_or((0, 0));
-    let top = if column == 0 { row } else { row + 1 };
+    // The row after the cursor when the shell left it mid-line. A terminal that does not say
+    // where its cursor is gets harness below its bottom row, drawing over nothing of the user's.
+    let cursor = crossterm::cursor::position().ok();
+    let top = cursor.map_or(
+        u16::MAX,
+        |(column, row)| if column == 0 { row } else { row + 1 },
+    );
     // The editor for plans owns the terminal's modes, so they are undone while it runs, and
     // when the session ends; the terminal is not read for the session meanwhile.
     let modes = Modes::enter(std::io::stdout(), CrosstermRawMode, keyboard)?;
@@ -313,7 +318,10 @@ async fn terminal_session(
         notifications.desktop,
         notifications.bell,
     )));
-    let term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)?;
+    let mut term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)?;
+    if cursor.is_none() {
+        term = term.without_cursor_reports();
+    }
     let mut ui = Ui::start(agent, host, term, options, approvals).with_redactor(redactor);
     ui.app_mut().set_write_mode_warning(write_mode_warning);
     ui.run(input, shutdown).await

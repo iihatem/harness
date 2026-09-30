@@ -256,6 +256,34 @@ fn after_a_resize_the_live_region_is_found_where_the_terminal_moved_it() {
     in_place(&term, 10);
 }
 
+// Review A's M3: harness starts on the row after the cursor. When the shell had left the cursor
+// mid-line on the bottom row, that row was clamped back onto the cursor's, and its text was
+// cleared; when the terminal did not say where its cursor was, harness started at the top of the
+// screen and cleared all of it.
+#[test]
+fn starting_never_draws_over_the_users_rows() {
+    let mut vt = Vt::new(20, 4);
+    vt.print("a\nb\nc\n$ partial");
+    let row = vt.cursor().y;
+    let mut term = InlineTerminal::new(VtBackend::new(vt), row + 1).unwrap();
+    draw_live(&mut term, "> ", 2);
+    assert_eq!(
+        term.backend().vt().everything(),
+        ["a", "b", "c", "$ partial", ">", ""]
+    );
+    // Where the cursor is is not known: harness starts below the bottom row.
+    let mut vt = Vt::new(20, 4);
+    vt.print("a\nb\nc\nd");
+    let mut term = InlineTerminal::new(VtBackend::new(vt), u16::MAX)
+        .unwrap()
+        .without_cursor_reports();
+    draw_live(&mut term, "> ", 2);
+    assert_eq!(
+        term.backend().vt().everything(),
+        ["a", "b", "c", "d", ">", ""]
+    );
+}
+
 /// A `TestBackend` that records the rows of every cell it is asked to draw.
 struct Recording {
     inner: TestBackend,

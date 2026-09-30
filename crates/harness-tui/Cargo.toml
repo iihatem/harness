@@ -28,3 +28,4 @@ unicode-width.workspace = true
 [dev-dependencies]
 harness-tools.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

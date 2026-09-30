@@ -30,6 +30,10 @@ use crate::{
 /// a renewal waiting for another process says so while it waits.
 pub const HOST_WARNINGS_EVERY: Duration = Duration::from_millis(250);
 
+/// While the agent's events stream, the screen is redrawn at most this often; keys redraw at
+/// once.
+pub const REDRAW_EVERY: Duration = Duration::from_millis(30);
+
 /// Whether the session goes on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
@@ -77,6 +81,10 @@ pub struct Ui<B: Backend> {
     notifier: Option<Box<dyn Notify>>,
     /// Keeps the secrets harness knows out of what the agent's events show.
     redactor: Option<EventRedactor>,
+    /// When the screen was last drawn.
+    drawn_at: Option<tokio::time::Instant>,
+    /// Events came in since then that are not drawn yet.
+    redraw: bool,
 }
 
 impl<B> Ui<B>
@@ -128,6 +136,8 @@ where
             editing: None,
             notifier,
             redactor: None,
+            drawn_at: None,
+            redraw: false,
         }
     }
 
@@ -166,6 +176,8 @@ where
 
     /// Writes the finished lines into the scrollback and redraws the live region.
     pub fn draw(&mut self) -> io::Result<()> {
+        self.drawn_at = Some(tokio::time::Instant::now());
+        self.redraw = false;
         self.notify();
         let finished = self.app.transcript.take_finished();
         self.term.insert(&finished)?;
@@ -255,6 +267,23 @@ where
         self.draw()
     }
 
+    /// When the screen may be drawn again after the agent's events.
+    fn redraw_at(&self) -> tokio::time::Instant {
+        self.drawn_at
+            .map_or_else(tokio::time::Instant::now, |at| at + REDRAW_EVERY)
+    }
+
+    /// Draws after the agent's events, or, within [`REDRAW_EVERY`] of the last draw, once that
+    /// has passed.
+    fn draw_soon(&mut self) -> io::Result<()> {
+        if tokio::time::Instant::now() >= self.redraw_at() {
+            self.draw()
+        } else {
+            self.redraw = true;
+            Ok(())
+        }
+    }
+
     /// Takes in one terminal event: a key, a paste, or a resize.
     pub fn handle(&mut self, event: Event) -> io::Result<Flow> {
         self.handle_at(event, Instant::now())
@@ -328,7 +357,7 @@ where
         if let Some(action) = self.app.next_queued() {
             self.dispatch(action)?;
         }
-        self.draw()?;
+        self.draw_soon()?;
         Ok(Flow::Continue)
     }
 
@@ -375,6 +404,7 @@ where
     /// Waits for the agent's next event, the runner's next message, or
     /// [`HOST_WARNINGS_EVERY`], and takes it in.
     pub async fn next(&mut self) -> io::Result<Flow> {
+        let (redraw, redraw_at) = (self.redraw, self.redraw_at());
         tokio::select! {
             event = self.events.recv() => match event {
                 Some(event) => self.agent_event(event),
@@ -382,6 +412,9 @@ where
             },
             Some(context) = self.contexts.recv() => self.context(context),
             Some((request, reply)) = self.approvals.recv() => self.approval(request, reply).await,
+            _ = tokio::time::sleep_until(redraw_at), if redraw => {
+                self.draw().map(|()| Flow::Continue)
+            }
             _ = tokio::time::sleep(HOST_WARNINGS_EVERY) => self.idle(),
         }
     }
@@ -393,7 +426,12 @@ where
                 break;
             }
         }
-        Ok(())
+        self.drawn()
+    }
+
+    /// Draws what is not drawn yet.
+    fn drawn(&mut self) -> io::Result<()> {
+        if self.redraw { self.draw() } else { Ok(()) }
     }
 
     /// Takes in the agent's events until no turn is running and the runner has said where the
@@ -406,7 +444,7 @@ where
                 break;
             }
         }
-        Ok(())
+        self.drawn()
     }
 
     /// Takes in the terminal events already waiting. Done before an agent's event or approval is
@@ -460,6 +498,7 @@ where
         self.draw()?;
         loop {
             self.edit_plan().await?;
+            let (redraw, redraw_at) = (self.redraw, self.redraw_at());
             let flow = tokio::select! {
                 biased;
                 ending = &mut shutdown => return Ok(ending),
@@ -483,6 +522,10 @@ where
                     None => self.approval(request, reply).await?,
                     Some(ending) => return Ok(ending),
                 },
+                _ = tokio::time::sleep_until(redraw_at), if redraw => {
+                    self.draw()?;
+                    Flow::Continue
+                }
                 _ = tokio::time::sleep(HOST_WARNINGS_EVERY) => self.idle()?,
             };
             if flow == Flow::Quit {

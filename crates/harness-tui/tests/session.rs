@@ -2,6 +2,8 @@
 //! the mock provider, and what reaches the screen and the scrollback is checked on ratatui's
 //! `TestBackend`.
 
+mod support;
+
 use std::{
     cell::RefCell,
     path::Path,
@@ -13,8 +15,9 @@ use std::{
 use harness_core::{
     agent::{Agent, AgentConfig, NonInteractive},
     engine::{EngineConfig, PermissionEngine, RuleSet},
-    message::Message,
+    message::{ChatRequest, Message},
     permission::Mode,
+    provider::{FinishReason, Provider, ProviderEvent, ProviderStream},
     testing::{MockProvider, Script},
     tool::{ToolContext, ToolRegistry},
     turn::{InputPart, TurnInput},
@@ -55,7 +58,7 @@ impl Host for TestHost {
     }
 }
 
-fn agent(provider: Arc<MockProvider>, dir: &Path) -> Agent {
+fn agent(provider: Arc<dyn Provider>, dir: &Path) -> Agent {
     let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode: Mode::Auto,
         workspace: dir.to_path_buf(),
@@ -395,4 +398,71 @@ async fn quitting_while_a_turn_runs_stops_it_and_ends_the_session() {
     // What streamed is kept, and the live region is gone.
     assert!(shows(&ui, "still going"));
     assert!(!shows(&ui, "mock/m · auto"));
+}
+
+/// Streams `count` words, one every `every`.
+struct Trickle {
+    count: usize,
+    every: Duration,
+}
+
+impl Provider for Trickle {
+    fn stream(&self, _request: ChatRequest) -> ProviderStream {
+        use futures::StreamExt;
+        let every = self.every;
+        let words = futures::stream::iter(0..self.count).then(move |i| async move {
+            tokio::time::sleep(every).await;
+            Ok(ProviderEvent::TextDelta(format!("w{i} ")))
+        });
+        let end = futures::stream::iter([Ok(ProviderEvent::Finished(FinishReason::Stop))]);
+        Box::pin(words.chain(end))
+    }
+}
+
+// Review A's I1: the session redrew after every batch of the agent's events, so a reply streamed
+// in small chunks cost a redraw per chunk. While events stream, it redraws at most once every
+// 30 ms.
+#[tokio::test(start_paused = true)]
+async fn while_a_reply_streams_the_screen_is_redrawn_at_most_every_30_ms() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, draws) = support::count::Counted::new(TestBackend::new(60, 16));
+    let provider = Arc::new(Trickle {
+        count: 200,
+        every: Duration::from_millis(3),
+    });
+    let mut ui = Ui::start(
+        agent(provider, dir.path()),
+        Box::new(TestHost),
+        InlineTerminal::new(backend, 0).unwrap(),
+        options(dir.path()),
+        ChannelApprover::new().1,
+    );
+    for c in "go".chars() {
+        ui.handle(Event::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    }
+    ui.handle(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .unwrap();
+    let before = draws.load(std::sync::atomic::Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(60), ui.settle())
+        .await
+        .expect("the turn ends")
+        .unwrap();
+    let took = started.elapsed().as_millis() as usize;
+    let drawn = draws.load(std::sync::atomic::Ordering::SeqCst) - before;
+    assert!(took >= 600, "the reply took {took} ms");
+    assert!(
+        drawn <= took / 30 + 3,
+        "{drawn} draws in {took} ms of streaming"
+    );
+    let screen = rows(ui.terminal().backend().inner.buffer());
+    assert!(screen.iter().any(|r| r.contains("w199")), "{screen:#?}");
+    ui.finish().await.unwrap();
 }

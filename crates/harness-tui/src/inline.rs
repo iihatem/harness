@@ -85,25 +85,29 @@ where
     }
 
     /// Clears from the live region's top to the bottom of the screen, and forgets what it showed.
+    /// A live region below the bottom row (just after lines that reached it) has nothing on
+    /// screen to clear.
     fn clear_live(&mut self) -> io::Result<()> {
-        self.backend
-            .set_cursor_position(Position::new(0, self.top))
-            .map_err(io_error)?;
-        self.backend
-            .clear_region(ClearType::AfterCursor)
-            .map_err(io_error)?;
+        if self.top < self.screen.height {
+            self.backend
+                .set_cursor_position(Position::new(0, self.top))
+                .map_err(io_error)?;
+            self.backend
+                .clear_region(ClearType::AfterCursor)
+                .map_err(io_error)?;
+        }
         self.shown = Buffer::empty(Rect::new(0, self.top, self.screen.width, self.height));
         Ok(())
     }
 
     /// Writes `lines`, each at most the screen's width, above the live region, which moves down
     /// (and, at the bottom of the screen, pushes the rows above into scrollback). The live region
-    /// is cleared: draw it again afterwards.
+    /// is cleared and left empty, just below the lines: the next draw makes the room it needs,
+    /// so the end of the lines stays on screen even after a live region as tall as the screen.
     pub fn insert(&mut self, lines: &[Line<'_>]) -> io::Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
-        let height = self.height;
         self.height = 0;
         self.clear_live()?;
         let width = self.screen.width;
@@ -125,10 +129,10 @@ where
                 .map_err(io_error)?;
             y += 1;
         }
+        // The row after the last line, which is past the bottom of the screen when the lines
+        // reached it.
         self.top = y.min(self.screen.height);
-        self.make_room(height)?;
-        self.height = height.min(self.screen.height);
-        self.shown = Buffer::empty(Rect::new(0, self.top, width, self.height));
+        self.shown = Buffer::empty(Rect::new(0, self.top, width, 0));
         self.backend.flush().map_err(io_error)
     }
 
@@ -173,9 +177,10 @@ where
     }
 
     /// Clears the live region and leaves the cursor at its top, as harness exits or hands the
-    /// terminal to another program.
+    /// terminal to another program. The cursor gets a row of its own below the last line.
     pub fn clear(&mut self) -> io::Result<()> {
         self.height = 0;
+        self.make_room(1)?;
         self.clear_live()?;
         self.backend.show_cursor().map_err(io_error)?;
         self.backend.flush().map_err(io_error)

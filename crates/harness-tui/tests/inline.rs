@@ -136,6 +136,66 @@ fn wide_characters_keep_their_text_and_width_in_the_scrollback() {
     assert_eq!(vt.widths(), [20, 19, 15, 17, 1]);
 }
 
+/// Draws a live region as tall as the screen, as a long reply streams, then inserts the reply's
+/// `lines`.
+fn a_screen_tall_reply_finishes(lines: usize) -> InlineTerminal<VtBackend> {
+    let mut term = InlineTerminal::new(VtBackend::new(Vt::new(20, 8)), 0).unwrap();
+    term.draw(8, |area, buf| {
+        let tail: Vec<String> = (1..=8).map(|i| format!("tail {i}")).collect();
+        Paragraph::new(tail.join("\n")).render(area, buf);
+        None
+    })
+    .unwrap();
+    let reply: Vec<Line> = (1..=lines)
+        .map(|i| Line::from(format!("reply {i}")))
+        .collect();
+    term.insert(&reply).unwrap();
+    term
+}
+
+// Review A's C2: inserting reserved the old live region's height, so after a reply that filled
+// the screen, the whole reply scrolled off and the screen was left blank.
+#[test]
+fn after_a_screen_tall_live_region_the_end_of_the_reply_stays_on_screen() {
+    let mut term = a_screen_tall_reply_finishes(12);
+    draw_live(&mut term, "> ", 2);
+    {
+        let vt = term.backend().vt();
+        let replies = |range: std::ops::RangeInclusive<usize>| -> Vec<String> {
+            range.map(|i| format!("reply {i}")).collect()
+        };
+        assert_eq!(vt.scrollback(), replies(1..=6));
+        assert_eq!(
+            vt.screen(),
+            [replies(7..=12), vec![">".into(), "".into()]].concat()
+        );
+    }
+    // Leaving keeps the end of the reply too, with the cursor on the row under it.
+    term.clear().unwrap();
+    let vt = term.backend().vt();
+    assert_eq!(vt.screen()[5], "reply 12");
+    assert_eq!(vt.screen()[6], "");
+    assert_eq!(vt.cursor(), Position::new(0, 6));
+    // And so does leaving right after the reply, before the input is drawn again, with more
+    // lines inserted first.
+    drop(vt);
+    let mut term = a_screen_tall_reply_finishes(12);
+    term.insert(&[Line::from("after")]).unwrap();
+    term.clear().unwrap();
+    let vt = term.backend().vt();
+    let everything = vt.everything();
+    assert_eq!(
+        everything.iter().filter(|r| r.starts_with("reply")).count(),
+        12
+    );
+    assert!(
+        !everything.iter().any(|r| r.starts_with("tail")),
+        "{everything:#?}"
+    );
+    assert_eq!(vt.screen()[5..], ["reply 12", "after", ""]);
+    assert_eq!(vt.cursor(), Position::new(0, 7));
+}
+
 /// A `TestBackend` that records the rows of every cell it is asked to draw.
 struct Recording {
     inner: TestBackend,

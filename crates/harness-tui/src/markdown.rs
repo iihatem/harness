@@ -161,14 +161,19 @@ impl Renderer<'_> {
     fn block(&mut self) {
         self.flush();
         if self.needs_blank && !self.out.is_empty() {
-            let (_, rest) = self.prefixes();
-            let quotes: Vec<Span<'static>> = rest
-                .into_iter()
-                .filter(|s| s.content.trim() == "│")
-                .collect();
-            self.out.push(Line::from(quotes));
+            self.blank_line();
         }
         self.needs_blank = false;
+    }
+
+    /// A blank line, with the bars of the quotes it is in.
+    fn blank_line(&mut self) {
+        let (_, rest) = self.prefixes();
+        let quotes: Vec<Span<'static>> = rest
+            .into_iter()
+            .filter(|s| s.content.trim() == "│")
+            .collect();
+        self.out.push(Line::from(quotes));
     }
 
     fn in_item(&self) -> bool {
@@ -198,13 +203,19 @@ impl Renderer<'_> {
                     self.push(&format!("`{code}`"), style);
                 }
             }
-            // An HTML block comes a line at a time, each with its line break.
+            // An HTML block comes a line at a time, each with its line break; its blank lines
+            // are kept.
             Event::Html(html) => {
-                for (i, line) in html.split('\n').enumerate() {
-                    if i > 0 {
-                        self.flush();
+                for part in html.split_inclusive('\n') {
+                    let line = part.trim_end_matches('\n');
+                    if line.is_empty() && self.line.is_empty() && part.ends_with('\n') {
+                        self.blank_line();
+                        continue;
                     }
                     self.push(line, self.theme.dim());
+                    if part.ends_with('\n') {
+                        self.flush();
+                    }
                 }
             }
             Event::InlineHtml(html) => self.push(&html, self.theme.dim()),
@@ -467,8 +478,9 @@ impl Renderer<'_> {
 /// A block is complete once the next one starts: at a line that is not indented after a blank
 /// line (an indented one may continue a list item), at a fenced code block's closing fence, or at
 /// a fence that opens without indentation (a code block ends the paragraph, list or quote before
-/// it). Blank lines inside a fenced code block end nothing, and a list item after a blank line
-/// goes on the list before it, so a loose list is numbered as a whole.
+/// it). Blank lines inside a fenced code block, or inside an HTML block that ends at a marker
+/// (a comment, `<pre>`), end nothing, and a list item after a blank line goes on the list before
+/// it, so a loose list is numbered as a whole.
 #[derive(Debug, Default)]
 pub struct Stream {
     text: String,
@@ -484,6 +496,8 @@ pub struct Stream {
     in_list: bool,
     /// The fenced code block open at `scanned`.
     fence: Option<OpenFence>,
+    /// What ends the HTML block open at `scanned`, of those that a blank line does not end.
+    html_end: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -492,7 +506,7 @@ struct OpenFence {
     content: usize,
     marker: char,
     len: usize,
-    /// It opened without indentation, so its closing fence ends a block.
+    /// It is not in a list item, so its closing fence ends a block.
     top: bool,
 }
 
@@ -521,12 +535,25 @@ impl Stream {
     /// Looks at the line `start..end`, which has ended.
     fn line(&mut self, start: usize, end: usize) {
         let line = &self.text[start..end];
+        let indented = line.starts_with(char::is_whitespace);
         if let Some(open) = &self.fence {
-            if closes(line, open) {
-                if open.top {
-                    self.complete = end + 1;
+            // A line without indentation ends the list item a code block is in, and the block.
+            let leaves_item = !open.top && !indented && !line.trim().is_empty();
+            if !leaves_item {
+                if closes(line, open) {
+                    if open.top {
+                        self.complete = end + 1;
+                    }
+                    self.fence = None;
                 }
-                self.fence = None;
+                self.after_blank = false;
+                return;
+            }
+            self.fence = None;
+        }
+        if let Some(marker) = self.html_end {
+            if line.to_ascii_lowercase().contains(marker) {
+                self.html_end = None;
             }
             self.after_blank = false;
             return;
@@ -536,7 +563,6 @@ impl Stream {
             return;
         }
         let opened = opens_fence(line);
-        let indented = line.starts_with(char::is_whitespace);
         let item = list_item(line);
         let list_goes_on = item && self.in_list && opened.is_none();
         if !indented && (self.after_blank || opened.is_some()) && !list_goes_on {
@@ -550,9 +576,10 @@ impl Stream {
                 content: end + 1,
                 marker,
                 len,
-                top: indent == 0,
+                top: indent == 0 || !self.in_list,
             });
         }
+        self.html_end = html_block_end(line);
         self.after_blank = false;
     }
 
@@ -622,6 +649,40 @@ fn opens_fence(line: &str) -> Option<(char, usize, usize)> {
     let (marker, len, indent) = fence(line)?;
     let info = &line[indent + len..];
     (marker == '~' || !info.contains('`')).then_some((marker, len, indent))
+}
+
+/// What ends the HTML block `line` starts, if it is of a kind a blank line does not end (a
+/// comment, a processing instruction, a declaration, CDATA, or a `pre`, `script`, `style` or
+/// `textarea` element) and does not end on the same line.
+fn html_block_end(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 || !trimmed.starts_with('<') {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let (start, end) = if lower.starts_with("<!--") {
+        (4, "-->")
+    } else if lower.starts_with("<![cdata[") {
+        (9, "]]>")
+    } else if lower.starts_with("<?") {
+        (2, "?>")
+    } else if lower.starts_with("<!") && lower[2..].starts_with(|c: char| c.is_ascii_alphabetic()) {
+        (2, ">")
+    } else {
+        [
+            ("pre", "</pre>"),
+            ("script", "</script>"),
+            ("style", "</style>"),
+            ("textarea", "</textarea>"),
+        ]
+        .into_iter()
+        .find_map(|(tag, end)| {
+            let after = lower.strip_prefix('<')?.strip_prefix(tag)?;
+            let whole = after.is_empty() || after.starts_with([' ', '\t', '>']);
+            whole.then_some((1 + tag.len(), end))
+        })?
+    };
+    (!lower[start..].contains(end)).then_some(end)
 }
 
 /// Whether `line` starts a list item: `-`, `*` or `+`, or a number and `.` or `)`, then a space

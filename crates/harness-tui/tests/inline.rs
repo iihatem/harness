@@ -604,6 +604,18 @@ Steps:
 
 - list
 
+<!-- a comment
+
+that goes on -->
+
+- step
+  ```sh
+  make
+```
+
+after the fence
+```
+
 Last line.";
 
 fn coloured(lines: &[Line<'_>]) -> bool {

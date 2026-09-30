@@ -315,7 +315,7 @@ fn a_very_long_code_block_is_shown_plain() {
 #[test]
 fn html_blocks_keep_their_lines_and_the_space_around_them() {
     let lines = markdown::render(
-        "before\n\n<details>\n<summary>x</summary>\n</details>\n\nafter para\n\n<br>\nmore",
+        "before\n\n<details>\n<summary>x</summary>\n</details>\n\nafter para\n\n<br>\nmore\n\n<!-- a\n\nb -->",
         40,
         &Theme::monochrome(),
     );
@@ -332,6 +332,10 @@ fn html_blocks_keep_their_lines_and_the_space_around_them() {
             "",
             "<br>",
             "more",
+            "",
+            "<!-- a",
+            "",
+            "b -->",
         ]
     );
 }

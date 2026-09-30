@@ -467,6 +467,35 @@ fn an_edit_shows_what_it_replaced_and_long_output_is_cut_short() {
     );
 }
 
+// Review A's M1: output was cut to six lines before it was wrapped, so one long line (minified
+// code, a JSON blob) filled hundreds of rows of the scrollback. It is cut to six rows.
+#[test]
+fn a_long_line_of_tool_output_is_cut_to_six_rows() {
+    let (_, lines) = event_lines(
+        &[
+            AgentEvent::ToolCallRequested {
+                id: "b".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"cat min.js"}"#.into(),
+            },
+            AgentEvent::ToolCallFinished {
+                id: "b".into(),
+                output: format!("{}\nsecond line", "x".repeat(3_000)),
+                is_error: false,
+            },
+        ],
+        40,
+    );
+    assert_eq!(lines.len(), 8, "{lines:#?}");
+    assert_eq!(lines[0], "● $ cat min.js");
+    assert!(
+        lines[1..7]
+            .iter()
+            .all(|l| l == &format!("  {}", "x".repeat(38)))
+    );
+    assert_eq!(lines[7], "  … 74 more lines");
+}
+
 #[test]
 fn the_live_region_shows_the_block_still_streaming_and_the_running_tool() {
     let mut transcript = Transcript::new(Theme::monochrome());

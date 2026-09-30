@@ -279,23 +279,30 @@ impl Transcript {
         let line = Line::from(Span::styled(sanitize(&header).replace('\n', " "), style));
         self.emit(wrap(&line, width, &[marker], &[Span::raw("  ")]));
         let indent = [Span::raw("  ")];
-        let body: Vec<Line<'static>> = match call.name.as_str() {
+        let (body, max): (Vec<Line<'static>>, usize) = match call.name.as_str() {
             "edit" if !is_error => {
                 let old = call.arguments["old_string"].as_str().unwrap_or_default();
                 let new = call.arguments["new_string"].as_str().unwrap_or_default();
                 let mut diff = diff::unified(old, new, 3, &self.theme);
                 // The hunk header's line numbers are the snippet's, not the file's.
                 diff.retain(|l| !l.spans.iter().any(|s| s.content.starts_with("@@")));
-                clip(diff, DIFF_LINES, &self.theme)
+                (diff, DIFF_LINES)
             }
-            "read" | "write" if !is_error => Vec::new(),
-            _ => clip(
-                lines(output.trim_end(), self.theme.dim()),
-                OUTPUT_LINES,
-                &self.theme,
-            ),
+            "read" | "write" if !is_error => (Vec::new(), 0),
+            _ => (lines(output.trim_end(), self.theme.dim()), OUTPUT_LINES),
         };
-        for line in body {
+        // Cut by rows on screen, so one long line (minified code, a JSON blob) is cut short too.
+        let rows: Vec<Line<'static>> = body
+            .iter()
+            .flat_map(|line| wrap(line, width, &indent, &indent))
+            .collect();
+        let more = rows.len().saturating_sub(max);
+        self.emit(rows.into_iter().take(max));
+        if more > 0 {
+            let line = Line::from(Span::styled(
+                format!("… {more} more line{}", if more == 1 { "" } else { "s" }),
+                self.theme.dim(),
+            ));
             self.emit(wrap(&line, width, &indent, &indent));
         }
     }
@@ -320,19 +327,6 @@ impl Transcript {
         let skip = out.len().saturating_sub(rows);
         out.split_off(skip)
     }
-}
-
-/// At most `max` of `lines`, then a line saying how many more there are.
-fn clip(mut lines: Vec<Line<'static>>, max: usize, theme: &Theme) -> Vec<Line<'static>> {
-    if lines.len() > max {
-        let more = lines.len() - max;
-        lines.truncate(max);
-        lines.push(Line::from(Span::styled(
-            format!("… {more} more line{}", if more == 1 { "" } else { "s" }),
-            theme.dim(),
-        )));
-    }
-    lines
 }
 
 /// One line saying what a tool call does, from its arguments.

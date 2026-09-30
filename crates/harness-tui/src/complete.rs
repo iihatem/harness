@@ -24,6 +24,9 @@ pub const MAX_ITEMS: usize = 8;
 /// Workspace files indexed at most, and how long indexing may take.
 const MAX_FILES: usize = 20_000;
 const INDEX_TIME: Duration = Duration::from_secs(1);
+/// How long a built index is trusted before an `@` query rebuilds it anyway, so files changed
+/// outside a tracked tool call (a shell command, another program) still turn up before long.
+const STALE_AFTER: Duration = Duration::from_secs(5);
 
 /// One thing completion can insert.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,8 +50,11 @@ pub struct Completer {
     /// Command names (without `/`) and descriptions.
     commands: Vec<(String, String)>,
     workspace: PathBuf,
-    /// The workspace's files, relative to it, read the first time `@` is typed.
+    /// The workspace's files, relative to it, read the first time `@` is typed, and rebuilt
+    /// whenever it is invalidated or has gone stale.
     files: Option<Vec<String>>,
+    /// When `files` was last built.
+    built_at: Option<Instant>,
     matcher: Matcher,
 }
 
@@ -58,8 +64,15 @@ impl Completer {
             commands,
             workspace: workspace.to_path_buf(),
             files: None,
+            built_at: None,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
         }
+    }
+
+    /// Forgets the built file index, so the next `@` query rebuilds it. Call after a turn that
+    /// ran tools: it may have written or created files nothing has offered yet.
+    pub fn invalidate_files(&mut self) {
+        self.files = None;
     }
 
     /// The commands and their descriptions, as given.
@@ -118,8 +131,12 @@ impl Completer {
     }
 
     fn file_items(&mut self, query: &str) -> Vec<Item> {
-        let workspace = self.workspace.clone();
-        let files = self.files.get_or_insert_with(|| index(&workspace));
+        let stale = self.built_at.is_none_or(|at| at.elapsed() > STALE_AFTER);
+        if self.files.is_none() || stale {
+            self.files = Some(index(&self.workspace));
+            self.built_at = Some(Instant::now());
+        }
+        let files = self.files.as_ref().expect("just built, if it was missing");
         let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
         let mut matched = pattern.match_list(files.iter(), &mut self.matcher);
         matched.sort_by(|(a, x), (b, y)| y.cmp(x).then(a.len().cmp(&b.len())).then(a.cmp(b)));

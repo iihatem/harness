@@ -173,6 +173,9 @@ pub struct App {
     redactor: Option<Arc<Redactor>>,
     /// Said when the session first switches to a mode that writes.
     write_mode_warning: Option<String>,
+    /// Whether the running turn has requested any tool call: files it wrote or created should
+    /// be offered by `@` completion once it ends.
+    ran_tools: bool,
 }
 
 impl App {
@@ -209,6 +212,7 @@ impl App {
             width,
             redactor: None,
             write_mode_warning: None,
+            ran_tools: false,
         }
     }
 
@@ -348,10 +352,12 @@ impl App {
             AgentEvent::TurnStarted => {
                 self.last_reply.clear();
                 self.turn_started = Some(now);
+                self.ran_tools = false;
             }
             AgentEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
                 self.last_reply = content.clone();
             }
+            AgentEvent::ToolCallRequested { .. } => self.ran_tools = true,
             AgentEvent::TurnFinished { reason } => self.turn_ended(*reason, now),
             AgentEvent::Usage { model, usage } => self.totals.add(model, usage),
             AgentEvent::Steered { text } => {
@@ -368,6 +374,11 @@ impl App {
     /// interruption, both go back into the editor instead, for the user to look at again.
     fn turn_ended(&mut self, reason: TurnEndReason, now: Instant) {
         self.running = false;
+        // Files a tool wrote or created should be offered by `@` completion from here on: the
+        // index built before, or during, this turn may already be stale.
+        if std::mem::take(&mut self.ran_tools) {
+            self.completer.invalidate_files();
+        }
         if let Some(started) = self.turn_started.take() {
             let took = now.saturating_duration_since(started);
             let how = match reason {

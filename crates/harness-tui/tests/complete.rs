@@ -86,6 +86,42 @@ fn an_at_offers_workspace_files_matched_fuzzily() {
     assert!(completer.offer("@mainrs x", 3).is_none());
 }
 
+// Review B, Important 2: files the agent writes or creates during the session are the ordinary
+// shape of a coding turn, and must show up in `@` completion without restarting harness.
+#[test]
+fn a_file_written_after_the_first_query_is_offered_once_the_index_is_invalidated() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::write(ws.join("old.rs"), "x").unwrap();
+    let mut completer = Completer::new(commands(), ws);
+    // Builds and caches the index.
+    assert_eq!(inserts(&completer.offer("@old", 4)), ["@old.rs"]);
+    // A tool call writes a new file mid-turn; nothing has told the completer about it yet.
+    std::fs::write(ws.join("new_file.rs"), "x").unwrap();
+    assert!(completer.offer("@new_file", 9).is_none());
+    // The app invalidates the index once the turn that ran the tool ends.
+    completer.invalidate_files();
+    assert_eq!(inserts(&completer.offer("@new_file", 9)), ["@new_file.rs"]);
+    // The old file is still offered too: nothing was dropped by rebuilding.
+    assert_eq!(inserts(&completer.offer("@old", 4)), ["@old.rs"]);
+}
+
+// Review B, Important 2 (fix note): even without a tracked tool call, an index older than five
+// seconds rebuilds on its own at the next `@` query, so a file changed some other way (a shell
+// command, another program) is not stuck out for the rest of the session.
+#[test]
+fn an_index_older_than_five_seconds_rebuilds_without_being_invalidated() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::write(ws.join("old.rs"), "x").unwrap();
+    let mut completer = Completer::new(commands(), ws);
+    assert_eq!(inserts(&completer.offer("@old", 4)), ["@old.rs"]);
+    std::fs::write(ws.join("new_file.rs"), "x").unwrap();
+    assert!(completer.offer("@new_file", 9).is_none());
+    std::thread::sleep(std::time::Duration::from_millis(5_100));
+    assert_eq!(inserts(&completer.offer("@new_file", 9)), ["@new_file.rs"]);
+}
+
 #[test]
 fn the_list_shows_names_and_descriptions_and_highlights_the_selection() {
     let dir = tempfile::tempdir().unwrap();

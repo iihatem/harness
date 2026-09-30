@@ -358,7 +358,10 @@ async fn enter_and_keys_typed_ahead_do_not_choose() {
     }
     assert!(ui.app().plan_choice().is_some());
     assert!(status(&ui).starts_with("mock/m · plan ·"));
-    tokio::time::sleep(ARMING_DELAY).await;
+    // The choice waits for a pause after the keys typed ahead.
+    let armed = ui.app().armed_at().unwrap();
+    assert_eq!(armed, early + ARMING_DELAY);
+    tokio::time::sleep_until(tokio::time::Instant::from_std(armed)).await;
     for (code, modifiers) in [
         (KeyCode::Enter, KeyModifiers::NONE),
         (KeyCode::Char('b'), KeyModifiers::ALT),
@@ -374,6 +377,56 @@ async fn enter_and_keys_typed_ahead_do_not_choose() {
     press(&mut ui, KeyCode::Char('k'));
     settle(&mut ui).await;
     assert_eq!(last_user(&provider), "b");
+    assert!(status(&ui).starts_with("mock/m · plan ·"));
+    ui.finish().await.unwrap();
+}
+
+// Review D C1 residual, for the plan choice (E C1): typing through it at 12 keys a second, `b`,
+// `e` and `k` included, chooses nothing; only a key pressed after a 500 ms pause chooses.
+#[tokio::test]
+async fn typing_through_the_plan_choice_chooses_nothing_until_a_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = planning_script(vec![Script::text("A better plan.")]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Plan, Mode::Auto);
+    plan(&mut ui).await;
+    let shown = ui.app().armed_at().expect("the choice was drawn") - ARMING_DELAY;
+    let pace = Duration::from_millis(83);
+    let mut at = shown;
+    let mut typed = String::new();
+    for c in "keep the backend quick, and be exact about the edge cases; "
+        .repeat(3)
+        .chars()
+    {
+        if at > shown + Duration::from_secs(1) {
+            break;
+        }
+        ui.handle_at(
+            Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            at,
+        )
+        .unwrap();
+        typed.push(c);
+        assert!(ui.app().plan_choice().is_some(), "{c:?} chose");
+        at += pace;
+    }
+    let last = at - pace;
+    assert_eq!(ui.app().editor().text(), typed);
+    assert!(status(&ui).starts_with("mock/m · plan ·"));
+    let shown_rows = rows(ui.terminal().backend().buffer());
+    assert!(
+        shown_rows
+            .iter()
+            .any(|r| r == "your typing went to your message; the prompt takes keys once you pause"),
+        "{shown_rows:#?}"
+    );
+    assert_eq!(ui.app().armed_at(), Some(last + ARMING_DELAY));
+    ui.handle_at(
+        Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+        last + ARMING_DELAY,
+    )
+    .unwrap();
+    assert!(ui.app().plan_choice().is_none());
+    assert_eq!(provider.requests().len(), 2);
     assert!(status(&ui).starts_with("mock/m · plan ·"));
     ui.finish().await.unwrap();
 }

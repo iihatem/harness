@@ -16,6 +16,7 @@ use harness_tui::{
     app::{Host, Options, Prepared},
     approval::{ARMING_DELAY, ChannelApprover, Requests},
     inline::InlineTerminal,
+    input::Timed,
     style::Theme,
     ui::Ui,
 };
@@ -155,6 +156,12 @@ fn send(ui: &mut Ui<TestBackend>, text: &str) {
 async fn until_asked(ui: &mut Ui<TestBackend>) {
     until_shown(ui).await;
     tokio::time::sleep(ARMING_DELAY).await;
+}
+
+/// Waits until the approval shown takes keys.
+async fn until_armed(ui: &Ui<TestBackend>) {
+    let armed = ui.app().armed_at().expect("the prompt was drawn");
+    tokio::time::sleep_until(tokio::time::Instant::from_std(armed)).await;
 }
 
 /// Waits until an approval is shown.
@@ -527,6 +534,47 @@ async fn a_key_queued_before_the_request_leaves_the_prompt_pending() {
     }
 }
 
+// Review D C1 residual: a key is timed by when the terminal's reader read it, not by when the
+// session got to it. A key read before the prompt took keys goes to the input, even when the
+// session takes it in only after (while it built a prompt's diff, say).
+#[tokio::test]
+async fn a_key_is_timed_by_when_it_was_read_not_when_it_is_handled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, approvals) = mpsc::unbounded_channel();
+    let mut ui = start_with(
+        MockProvider::new(vec![]),
+        dir.path(),
+        Mode::Ask,
+        Some(approvals),
+    );
+    let (keys, mut input) = futures::channel::mpsc::unbounded::<std::io::Result<Timed>>();
+    let (reply, mut answer) = oneshot::channel();
+    requests.send((request("cargo test"), reply)).unwrap();
+    let _ = tokio::time::timeout(
+        Duration::from_millis(100),
+        ui.run(&mut input, std::future::pending()),
+    )
+    .await;
+    let armed = ui.app().armed_at().expect("the prompt was drawn");
+    // Read just before the prompt took keys; taken in well after.
+    keys.unbounded_send(Ok(Timed {
+        event: key(KeyCode::Char('y'), KeyModifiers::NONE),
+        at: armed - Duration::from_millis(1),
+    }))
+    .unwrap();
+    tokio::time::sleep_until(tokio::time::Instant::from_std(armed + ARMING_DELAY)).await;
+    let _ = tokio::time::timeout(
+        Duration::from_millis(100),
+        ui.run(&mut input, std::future::pending()),
+    )
+    .await;
+    assert!(!is_approval(answer.try_recv()), "a key read early approved");
+    assert!(ui.app().prompt().is_some());
+    assert_eq!(ui.app().editor().text(), "y");
+    drop(keys);
+    ui.finish().await.unwrap();
+}
+
 // Review D C1, probe 2: only y, a, n and Esc answer, and not with Ctrl or Alt held; Enter, the
 // new-line keys and readline's Ctrl+A were typed for the input.
 #[tokio::test]
@@ -573,7 +621,7 @@ async fn enter_and_modified_keys_do_not_answer() {
 }
 
 // Review D C1: a prompt takes keys only a moment after it is drawn; a key before that was typed
-// for the input, which it goes to.
+// for the input, which it goes to, and the prompt then waits for a pause after it.
 #[tokio::test]
 async fn a_key_within_the_grace_period_does_not_answer() {
     let dir = tempfile::tempdir().unwrap();
@@ -590,12 +638,89 @@ async fn a_key_within_the_grace_period_does_not_answer() {
         .unwrap();
     assert!(ui.app().prompt().is_some());
     assert_eq!(ui.app().editor().text(), "y");
+    let armed = ui.app().armed_at().unwrap();
+    assert_eq!(armed, early + ARMING_DELAY);
     ui.handle_at(key(KeyCode::Char('y'), KeyModifiers::NONE), armed)
         .unwrap();
     assert!(ui.app().prompt().is_none());
     settle(&mut ui).await;
     assert!(tool_result(&provider, "b1").contains("hi"));
     assert_eq!(ui.app().editor().text(), "y");
+    ui.finish().await.unwrap();
+}
+
+/// The line a prompt shows once typing went to the input instead of it.
+const TYPED_PAST: &str = "your typing went to your message; the prompt takes keys once you pause";
+
+// Review D C1 residual (its `typing.py`): a user types a follow-up at 12 keys a second, from
+// before an approval appears until a second after it. Every key goes to the input, `a`, `n` and
+// `y` included, and the prompt says so; it takes only a key pressed after a 500 ms pause.
+#[tokio::test]
+async fn typing_through_a_prompt_leaves_it_waiting_until_a_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("b1", "bash", json!({"command": "echo hi"})),
+        Script::text("Done."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "go");
+    until_shown(&mut ui).await;
+    let shown = ui.app().armed_at().expect("the prompt was drawn") - ARMING_DELAY;
+    let pace = Duration::from_millis(83);
+    let mut at = shown - Duration::from_millis(500);
+    let mut typed = String::new();
+    for c in "then also add a test for the empty case and say what you ran; "
+        .repeat(3)
+        .chars()
+    {
+        if at > shown + Duration::from_secs(1) {
+            break;
+        }
+        ui.handle_at(key(KeyCode::Char(c), KeyModifiers::NONE), at)
+            .unwrap();
+        typed.push(c);
+        assert!(
+            ui.app().prompt().is_some(),
+            "{c:?}, {:?} after the prompt showed, answered it",
+            at.saturating_duration_since(shown)
+        );
+        at += pace;
+    }
+    let last = at - pace;
+    assert_eq!(ui.app().editor().text(), typed);
+    let shown_rows = screen(&ui);
+    assert!(
+        !shown_rows
+            .iter()
+            .any(|r| r.starts_with("tell the model why")),
+        "{shown_rows:#?}"
+    );
+    assert!(
+        shown_rows.iter().any(|r| r == TYPED_PAST),
+        "{shown_rows:#?}"
+    );
+    // Not quite a pause: the key is the input's, and the prompt waits for a pause after it.
+    let almost = last + ARMING_DELAY - Duration::from_millis(1);
+    ui.handle_at(key(KeyCode::Char('y'), KeyModifiers::NONE), almost)
+        .unwrap();
+    assert!(ui.app().prompt().is_some());
+    assert_eq!(ui.app().armed_at(), Some(almost + ARMING_DELAY));
+    ui.handle_at(
+        key(KeyCode::Char('y'), KeyModifiers::NONE),
+        almost + ARMING_DELAY,
+    )
+    .unwrap();
+    assert!(ui.app().prompt().is_none());
+    settle(&mut ui).await;
+    assert!(tool_result(&provider, "b1").contains("hi"));
+    assert!(
+        everything(&ui)
+            .iter()
+            .any(|r| r.starts_with("✓ approved: ")),
+        "{:#?}",
+        everything(&ui)
+    );
+    assert_eq!(ui.app().editor().text(), format!("{typed}y"));
     ui.finish().await.unwrap();
 }
 
@@ -627,7 +752,7 @@ async fn n_typed_ahead_does_not_turn_the_draft_into_a_denial_reason() {
             .iter()
             .any(|r| r.starts_with("tell the model why"))
     );
-    tokio::time::sleep(ARMING_DELAY).await;
+    until_armed(&ui).await;
     press(&mut ui, KeyCode::Char('y'));
     settle(&mut ui).await;
     // Typed ahead with Enter: queued, and sent once the turn ended.

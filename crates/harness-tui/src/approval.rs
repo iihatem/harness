@@ -37,14 +37,19 @@ const MAX_DIFF_FILE: u64 = 1024 * 1024;
 /// diff after that.
 pub const BODY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long after a prompt is first drawn its keys start to answer it. A key pressed before then
-/// was typed for the input, before the user could have read the prompt.
-pub const ARMING_DELAY: Duration = Duration::from_millis(300);
+/// How long the user must pause before a prompt takes keys: it takes none until this long after
+/// it was first drawn, and each key before then moves that to this long after the key. A user
+/// typing a message as a prompt appears keeps typing until they notice it; their keys go to the
+/// input, however long they type.
+pub const ARMING_DELAY: Duration = Duration::from_millis(500);
 
-/// When a prompt starts to take keys: [`ARMING_DELAY`] after it was first drawn.
+/// When a prompt starts to take keys: once [`ARMING_DELAY`] has passed since it was first drawn
+/// and since the last key typed for the input meanwhile.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Arming {
     drawn: Option<Instant>,
+    /// The last key read before the prompt took keys, which went to the input.
+    typed: Option<Instant>,
 }
 
 impl Arming {
@@ -53,9 +58,22 @@ impl Arming {
         self.drawn.get_or_insert(now);
     }
 
+    /// A key read at `now`, before the prompt took keys, went to the input: the prompt waits for
+    /// a pause after it.
+    pub fn typed(&mut self, now: Instant) {
+        self.typed = Some(self.typed.map_or(now, |typed| typed.max(now)));
+    }
+
+    /// Whether typing went to the input while the prompt waited.
+    pub fn typed_past(&self) -> bool {
+        self.typed.is_some()
+    }
+
     /// When keys start to answer the prompt: `None` until it is drawn.
     pub fn armed_at(&self) -> Option<Instant> {
-        self.drawn.map(|at| at + ARMING_DELAY)
+        let drawn = self.drawn?;
+        let quiet_from = self.typed.map_or(drawn, |typed| typed.max(drawn));
+        Some(quiet_from + ARMING_DELAY)
     }
 
     /// Whether a key read at `now` answers the prompt.

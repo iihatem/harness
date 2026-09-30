@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::Stream;
@@ -26,9 +26,28 @@ const WAIT: Duration = Duration::from_millis(100);
 /// (a long paste) finishes first.
 const PAUSE_WAIT: Duration = Duration::from_secs(1);
 
+/// A terminal event, with when it was read: a key counts from when the user typed it, not from
+/// when the session got to it, which can be later (while it built a prompt, say).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Timed {
+    pub event: Event,
+    /// When the reader read it.
+    pub at: Instant,
+}
+
+impl From<Event> for Timed {
+    /// `event`, read now.
+    fn from(event: Event) -> Timed {
+        Timed {
+            event,
+            at: Instant::now(),
+        }
+    }
+}
+
 /// The terminal's events, as a stream; it ends when the terminal closes or its input fails.
 pub struct TerminalInput {
-    events: mpsc::UnboundedReceiver<io::Result<Event>>,
+    events: mpsc::UnboundedReceiver<io::Result<Timed>>,
     control: Arc<Control>,
     /// The terminal read.
     fd: RawFd,
@@ -82,7 +101,7 @@ impl TerminalInput {
 }
 
 impl Stream for TerminalInput {
-    type Item = io::Result<Event>;
+    type Item = io::Result<Timed>;
 
     /// The next event; the end once the terminal hung up, even should crossterm be reading its
     /// end on the reader's thread (it closed in the middle of an escape sequence, which crossterm
@@ -189,7 +208,7 @@ fn hung_up(fd: RawFd) -> bool {
 
 /// The reader's thread: reads until done, then says so, so that a pause does not wait for it.
 /// The stream of events ends as `events` drops.
-fn reader_thread(fd: RawFd, control: &Control, events: mpsc::UnboundedSender<io::Result<Event>>) {
+fn reader_thread(fd: RawFd, control: &Control, events: mpsc::UnboundedSender<io::Result<Timed>>) {
     read(fd, control, &events);
     let mut state = lock(control);
     state.reading = false;
@@ -198,7 +217,7 @@ fn reader_thread(fd: RawFd, control: &Control, events: mpsc::UnboundedSender<io:
 
 /// The reader's loop: sends the terminal's events until the terminal closes, its input fails,
 /// or the session stops reading them.
-fn read(fd: RawFd, control: &Control, events: &mpsc::UnboundedSender<io::Result<Event>>) {
+fn read(fd: RawFd, control: &Control, events: &mpsc::UnboundedSender<io::Result<Timed>>) {
     loop {
         {
             let mut state = lock(control);
@@ -224,7 +243,7 @@ fn read(fd: RawFd, control: &Control, events: &mpsc::UnboundedSender<io::Result<
             match event::poll(Duration::ZERO) {
                 Ok(true) => match event::read() {
                     Ok(event) => {
-                        if events.send(Ok(event)).is_err() {
+                        if events.send(Ok(event.into())).is_err() {
                             return;
                         }
                     }
@@ -284,10 +303,16 @@ mod tests {
             control: Arc::new(Control::default()),
             fd: reader.as_raw_fd(),
         };
-        sender.send(Ok(Event::FocusGained)).unwrap();
+        sender.send(Ok(Event::FocusGained.into())).unwrap();
         drop(writer);
         use futures::{FutureExt, StreamExt};
-        assert!(matches!(input.next().await, Some(Ok(Event::FocusGained))));
+        assert!(matches!(
+            input.next().await,
+            Some(Ok(Timed {
+                event: Event::FocusGained,
+                ..
+            }))
+        ));
         // As the session does, looking again every so often: on macOS, a process another test
         // starts meanwhile can hold a copy of the pipe's end for a moment.
         let mut end = None;

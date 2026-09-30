@@ -22,6 +22,7 @@ use crate::{
     app::{Action, App, Host, Options},
     approval::{Reply, Requests},
     inline::InlineTerminal,
+    input::Timed,
     notify::Notify,
     plan::TextEditor,
 };
@@ -40,9 +41,9 @@ const GONE_WAIT: Duration = Duration::from_secs(1);
 /// After a write to the terminal failed with `error`: the terminal went away, when its input ends
 /// within [`GONE_WAIT`] (its reader tells a moment after it goes), or the write failed for some
 /// other reason.
-async fn gone_or<S>(input: &mut S, error: io::Error) -> io::Result<Ending>
+async fn gone_or<S, E>(input: &mut S, error: io::Error) -> io::Result<Ending>
 where
-    S: Stream<Item = io::Result<Event>> + Unpin,
+    S: Stream<Item = io::Result<E>> + Unpin,
 {
     match tokio::time::timeout(GONE_WAIT, input.next()).await {
         Ok(None | Some(Err(_))) => Ok(Ending::Hangup),
@@ -305,6 +306,11 @@ where
         self.handle_at(event, Instant::now())
     }
 
+    /// Takes in one terminal event, as of when it was read.
+    fn handle_timed(&mut self, Timed { event, at }: Timed) -> io::Result<Flow> {
+        self.handle_at(event, at)
+    }
+
     /// Takes in one terminal event read at `now`.
     pub fn handle_at(&mut self, event: Event, now: Instant) -> io::Result<Flow> {
         let flow = match event {
@@ -313,7 +319,7 @@ where
                 None => Flow::Continue,
             },
             Event::Paste(text) => {
-                self.app.on_paste(&text);
+                self.app.on_paste_at(&text, now);
                 Flow::Continue
             }
             Event::Resize(..) => {
@@ -466,14 +472,15 @@ where
     /// Takes in the terminal events already waiting. Done before an agent's event or approval is
     /// shown, so that a key typed before a prompt appeared goes where it was typed for, never to
     /// the prompt. `Some` when the session ends.
-    fn drain<S>(&mut self, input: &mut S) -> io::Result<Option<Ending>>
+    fn drain<S, E>(&mut self, input: &mut S) -> io::Result<Option<Ending>>
     where
-        S: Stream<Item = io::Result<Event>> + Unpin,
+        S: Stream<Item = io::Result<E>> + Unpin,
+        E: Into<Timed>,
     {
         while let Some(next) = input.next().now_or_never() {
             match next {
                 Some(Ok(event)) => {
-                    if self.handle(event)? == Flow::Quit {
+                    if self.handle_timed(event.into())? == Flow::Quit {
                         return Ok(Some(Ending::Quit));
                     }
                 }
@@ -483,17 +490,19 @@ where
         Ok(None)
     }
 
-    /// Runs the session on `input`, the terminal's events, until the user leaves, the terminal
-    /// goes away (its input ends or fails), or `shutdown` says to stop (a signal). Keys come
-    /// first: what the user typed is taken in before what the agent sent meanwhile.
+    /// Runs the session on `input`, the terminal's events (each timed by when it was read, or
+    /// else taken as read when the session takes it in), until the user leaves, the terminal goes
+    /// away (its input ends or fails), or `shutdown` says to stop (a signal). Keys come first:
+    /// what the user typed is taken in before what the agent sent meanwhile.
     ///
     /// However it ends, the session [finishes](Self::finish): the turn stops, whatever waits
     /// for an approval is denied, and the agent is dropped. Only after the user left does a
     /// failure to write the terminal fail the run: once it went away, or harness was asked to
     /// stop, there may be no terminal to write to.
-    pub async fn run<S, D>(&mut self, mut input: S, shutdown: D) -> io::Result<Ending>
+    pub async fn run<S, E, D>(&mut self, mut input: S, shutdown: D) -> io::Result<Ending>
     where
-        S: Stream<Item = io::Result<Event>> + Unpin,
+        S: Stream<Item = io::Result<E>> + Unpin,
+        E: Into<Timed>,
         D: std::future::Future<Output = Ending>,
     {
         let ending = self.serve(&mut input, shutdown).await;
@@ -505,9 +514,10 @@ where
     }
 
     /// The session's loop, for [`run`](Self::run): how it ended.
-    async fn serve<S, D>(&mut self, input: &mut S, shutdown: D) -> io::Result<Ending>
+    async fn serve<S, E, D>(&mut self, input: &mut S, shutdown: D) -> io::Result<Ending>
     where
-        S: Stream<Item = io::Result<Event>> + Unpin,
+        S: Stream<Item = io::Result<E>> + Unpin,
+        E: Into<Timed>,
         D: std::future::Future<Output = Ending>,
     {
         tokio::pin!(shutdown);
@@ -519,7 +529,7 @@ where
                 biased;
                 ending = &mut shutdown => return Ok(ending),
                 event = input.next() => match event {
-                    Some(Ok(event)) => self.handle(event)?,
+                    Some(Ok(event)) => self.handle_timed(event.into())?,
                     Some(Err(_)) | None => return Ok(Ending::Hangup),
                 },
                 event = self.events.recv() => match event {

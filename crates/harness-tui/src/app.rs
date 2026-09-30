@@ -38,6 +38,9 @@ use crate::{
 /// Ctrl+C twice within this long exits.
 pub const QUIT_WINDOW: Duration = Duration::from_secs(2);
 
+/// Said under a prompt once keys typed while it waited went to the input instead.
+const TYPED_PAST: &str = "your typing went to your message; the prompt takes keys once you pause";
+
 /// Built-in commands that come with the rest of the terminal UI, and where.
 const LATER: [(&str, &str); 7] = [
     (
@@ -281,7 +284,8 @@ impl App {
     }
 
     /// The live region was drawn at `now`: an approval or a plan choice it showed for the first
-    /// time takes keys from [`ARMING_DELAY`](crate::approval::ARMING_DELAY) later.
+    /// time takes keys once the user has paused for
+    /// [`ARMING_DELAY`](crate::approval::ARMING_DELAY) since then.
     pub fn drawn(&mut self, now: Instant) {
         if self.prompt.is_some() || self.plan_choice.is_some() {
             self.arming.drawn(now);
@@ -507,10 +511,19 @@ impl App {
 
     /// Takes in a paste: into the reason for a denial being typed, else into the input.
     pub fn on_paste(&mut self, text: &str) {
+        self.on_paste_at(text, Instant::now());
+    }
+
+    /// Takes in a paste read at `now`. One that goes to the input while a prompt waits counts as
+    /// typing: the prompt waits for a pause after it.
+    pub fn on_paste_at(&mut self, text: &str, now: Instant) {
         if let Some(prompt) = &mut self.prompt
             && prompt.paste(text)
         {
             return;
+        }
+        if (self.prompt.is_some() || self.plan_choice.is_some()) && !self.arming.armed(now) {
+            self.arming.typed(now);
         }
         if !self.editor.paste(text) {
             let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
@@ -550,7 +563,9 @@ impl App {
                 self.answer(Answered::Interrupt);
                 return Some(Action::Interrupt);
             }
-            // Until the prompt takes keys, they were typed for the input.
+            // Until the prompt takes keys, they were typed for the input, and the prompt waits
+            // for the user to pause.
+            self.arming.typed(now);
         }
         if ctrl && key.code == KeyCode::Char('d') && self.editor.is_empty() {
             return self.quit();
@@ -866,6 +881,14 @@ impl App {
         let theme = self.theme();
         let width = self.width;
         let mut below: Vec<Line<'static>> = Vec::new();
+        if (self.prompt.is_some() || self.plan_choice.is_some()) && self.arming.typed_past() {
+            below.extend(wrap(
+                &Line::from(Span::styled(TYPED_PAST, theme.dim())),
+                width,
+                &[],
+                &[],
+            ));
+        }
         below.extend(wrap(&self.status(), width, &[], &[]));
         if let Some(hint) = self
             .hint

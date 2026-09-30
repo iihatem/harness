@@ -35,13 +35,16 @@ pub enum FirstUse {
 
 /// On interactive use of `workspace` while its project settings that widen what the agent may do
 /// are not trusted, shows them on `out` and asks whether to trust the workspace, reading the
-/// answer from `answer`. Trusting records it as `harness trust` does; declining is asked again
-/// next time. Settings that cannot be read are left for loading the configuration to report.
+/// answer from `answer`. What was typed before the question showed is thrown away first
+/// (`discard_typed`): only an answer typed for it counts. Trusting records it as `harness trust`
+/// does; declining is asked again next time. Settings that cannot be read are left for loading
+/// the configuration to report.
 pub fn first_use(
     workspace: &Path,
     paths: &Paths,
     answer: &mut dyn BufRead,
     out: &mut dyn Write,
+    discard_typed: &mut dyn FnMut(),
 ) -> std::io::Result<FirstUse> {
     let Ok(widening) = config::project_widening(&paths.global_config_file(), workspace) else {
         return Ok(FirstUse::NothingToAsk);
@@ -57,6 +60,7 @@ pub fn first_use(
     }
     write!(out, "Trust this workspace, so these settings apply? [y/N] ")?;
     out.flush()?;
+    discard_typed();
     let mut reply = String::new();
     answer.read_line(&mut reply)?;
     if !matches!(reply.trim(), "y" | "Y" | "yes") {
@@ -219,8 +223,38 @@ mod tests {
 
     fn ask(w: &Workspace, reply: &str) -> (FirstUse, String) {
         let mut out = Vec::new();
-        let result = first_use(&w.ws, &w.paths, &mut reply.as_bytes(), &mut out).unwrap();
+        let result =
+            first_use(&w.ws, &w.paths, &mut reply.as_bytes(), &mut out, &mut || {}).unwrap();
         (result, String::from_utf8(out).unwrap())
+    }
+
+    /// A terminal's input, which `discard` empties as `tcflush` does.
+    struct Typed(std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<u8>>>);
+
+    impl std::io::Read for Typed {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut typed = self.0.borrow_mut();
+            let n = buf.len().min(typed.len());
+            for (slot, byte) in buf.iter_mut().zip(typed.drain(..n)) {
+                *slot = byte;
+            }
+            Ok(n)
+        }
+    }
+
+    // Review D M1: what was typed before the question showed does not answer it, as sudo does.
+    #[test]
+    fn what_was_typed_before_the_question_does_not_answer_it() {
+        let w = workspace(ALLOW);
+        let typed = std::rc::Rc::new(std::cell::RefCell::new(b"y\n".iter().copied().collect()));
+        let mut answer = std::io::BufReader::new(Typed(typed.clone()));
+        let mut out = Vec::new();
+        let result = first_use(&w.ws, &w.paths, &mut answer, &mut out, &mut || {
+            typed.borrow_mut().clear()
+        })
+        .unwrap();
+        assert_eq!(result, FirstUse::Declined);
+        assert!(allowed(&w).is_empty());
     }
 
     fn allowed(w: &Workspace) -> Vec<String> {

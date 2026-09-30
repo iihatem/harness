@@ -100,6 +100,13 @@ pub async fn run(
             &paths,
             &mut std::io::stdin().lock(),
             &mut std::io::stdout(),
+            // What was typed before the question showed.
+            &mut || {
+                let _ = nix::sys::termios::tcflush(
+                    std::io::stdin(),
+                    nix::sys::termios::FlushArg::TCIFLUSH,
+                );
+            },
         );
         if let Err(e) = asked {
             eprintln!("error: {}", terminal_safe(&e.to_string()));

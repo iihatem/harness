@@ -467,7 +467,8 @@ impl Renderer<'_> {
 /// A block is complete once the next one starts: at a line that is not indented after a blank
 /// line (an indented one may continue a list item), at a fenced code block's closing fence, or at
 /// a fence that opens without indentation (a code block ends the paragraph, list or quote before
-/// it). Blank lines inside a fenced code block end nothing.
+/// it). Blank lines inside a fenced code block end nothing, and a list item after a blank line
+/// goes on the list before it, so a loose list is numbered as a whole.
 #[derive(Debug, Default)]
 pub struct Stream {
     text: String,
@@ -479,6 +480,8 @@ pub struct Stream {
     scanned: usize,
     /// The last line looked at was blank.
     after_blank: bool,
+    /// The last line looked at without indentation was a list item.
+    in_list: bool,
     /// The fenced code block open at `scanned`.
     fence: Option<OpenFence>,
 }
@@ -504,9 +507,13 @@ impl Stream {
             self.scanned = end + 1;
         }
         // A line that has begun without indentation after a blank one starts a block, whatever
-        // follows on it.
+        // follows on it, unless it may be an item of the list before it.
         let begun = self.text[self.scanned..].chars().next();
-        if self.fence.is_none() && self.after_blank && begun.is_some_and(|c| !c.is_whitespace()) {
+        let may_be_item = |c: char| matches!(c, '-' | '*' | '+') || c.is_ascii_digit();
+        if self.fence.is_none()
+            && self.after_blank
+            && begun.is_some_and(|c| !c.is_whitespace() && !(self.in_list && may_be_item(c)))
+        {
             self.complete = self.scanned;
         }
     }
@@ -530,8 +537,13 @@ impl Stream {
         }
         let opened = opens_fence(line);
         let indented = line.starts_with(char::is_whitespace);
-        if !indented && (self.after_blank || opened.is_some()) {
+        let item = list_item(line);
+        let list_goes_on = item && self.in_list && opened.is_none();
+        if !indented && (self.after_blank || opened.is_some()) && !list_goes_on {
             self.complete = start;
+        }
+        if !indented {
+            self.in_list = item;
         }
         if let Some((marker, len, indent)) = opened {
             self.fence = Some(OpenFence {
@@ -610,6 +622,18 @@ fn opens_fence(line: &str) -> Option<(char, usize, usize)> {
     let (marker, len, indent) = fence(line)?;
     let info = &line[indent + len..];
     (marker == '~' || !info.contains('`')).then_some((marker, len, indent))
+}
+
+/// Whether `line` starts a list item: `-`, `*` or `+`, or a number and `.` or `)`, then a space
+/// or the end of the line.
+fn list_item(line: &str) -> bool {
+    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let marker = match digits {
+        0 => line.strip_prefix(['-', '*', '+']),
+        1..=9 => line[digits..].strip_prefix(['.', ')']),
+        _ => None,
+    };
+    marker.is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
 }
 
 /// Whether `line` closes the code block `open` began.

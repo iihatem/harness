@@ -594,6 +594,16 @@ After the code.
 
 > quote
 
+Steps:
+1. first
+
+1. second
+1. third
+
+- loose
+
+- list
+
 Last line.";
 
 fn coloured(lines: &[Line<'_>]) -> bool {

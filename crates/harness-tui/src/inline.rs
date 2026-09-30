@@ -135,7 +135,7 @@ where
         for line in lines {
             if y >= self.screen.height {
                 self.scroll_up(1)?;
-                y = self.screen.height - 1;
+                y = self.screen.height.saturating_sub(1);
             }
             let area = Rect::new(0, y, width, 1);
             let mut row = Buffer::empty(area);
@@ -153,7 +153,10 @@ where
         // reached it.
         self.top = y.min(self.screen.height);
         self.shown = Buffer::empty(Rect::new(0, self.top, width, 0));
-        self.move_cursor(Position::new(0, self.top.min(self.screen.height - 1)))?;
+        self.move_cursor(Position::new(
+            0,
+            self.top.min(self.screen.height.saturating_sub(1)),
+        ))?;
         self.backend.flush().map_err(io_error)
     }
 

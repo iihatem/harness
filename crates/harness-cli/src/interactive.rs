@@ -41,6 +41,22 @@ pub fn needs_terminal(stdin: bool, stdout: bool) -> Option<&'static str> {
     )
 }
 
+/// Why the inline UI cannot run on this terminal: one that says it cannot move its cursor
+/// (`TERM=dumb`, as Emacs's shell mode sets), or one whose size is not known.
+pub fn unfit_terminal(term: Option<&str>, size: Option<(u16, u16)>) -> Option<&'static str> {
+    if term.is_some_and(|term| term.trim().eq_ignore_ascii_case("dumb")) {
+        return Some(
+            "interactive mode needs a terminal that can move its cursor, and TERM=dumb says this one cannot; use `harness ask \"<prompt>\"` to run a prompt without one",
+        );
+    }
+    if !size.is_some_and(|(columns, rows)| columns > 0 && rows > 0) {
+        return Some(
+            "interactive mode needs to know the terminal's size, and this terminal does not say; use `harness ask \"<prompt>\"` to run a prompt without one",
+        );
+    }
+    None
+}
+
 /// Expands the project's custom commands and `/init` for the session.
 struct CliHost {
     setup: Arc<Setup>,
@@ -83,10 +99,16 @@ pub async fn run(
     mode_flag: Option<Mode>,
     choice: sessions::Choice,
 ) -> u8 {
+    let unfit = || {
+        let term = std::env::var("TERM").ok();
+        unfit_terminal(term.as_deref(), crossterm::terminal::size().ok())
+    };
     if let Some(message) = needs_terminal(
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
-    ) {
+    )
+    .or_else(unfit)
+    {
         eprintln!("error: {message}");
         return 2;
     }
@@ -386,6 +408,22 @@ mod tests {
         let said = [prepared.notes, prepared.warnings].concat().join("\n");
         assert!(said.contains("asks for model openai/[redacted]"), "{said}");
         assert!(!said.contains(&SECRET[8..]), "{said}");
+    }
+
+    // Review A's M8: Emacs's shell mode and other terminals that cannot move the cursor set
+    // TERM=dumb, and got escape sequences they show as text.
+    #[test]
+    fn a_dumb_terminal_or_one_of_unknown_size_is_refused_naming_harness_ask() {
+        assert!(unfit_terminal(Some("xterm-256color"), Some((80, 24))).is_none());
+        assert!(unfit_terminal(None, Some((16, 5))).is_none());
+        for (term, size) in [
+            (Some("dumb"), Some((80, 24))),
+            (Some("xterm"), None),
+            (Some("xterm"), Some((0, 0))),
+        ] {
+            let message = unfit_terminal(term, size).unwrap();
+            assert!(message.contains("harness ask"), "{message}");
+        }
     }
 
     #[test]

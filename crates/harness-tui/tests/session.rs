@@ -256,18 +256,20 @@ fn a_second_ctrl_c_after_two_seconds_does_not_exit() {
     ));
 }
 
+// Review A's re-review of wave 2, nit: the hint is wrapped, not cut at the row's end, so its
+// advice to mention a file with @ is there on a narrow terminal too.
 #[test]
 fn a_paste_too_large_to_send_says_so() {
     let dir = tempfile::tempdir().unwrap();
-    let mut app = App::new(options(dir.path()), Box::new(TestHost), 80);
+    let mut app = App::new(options(dir.path()), Box::new(TestHost), 60);
     app.on_paste(&"x".repeat(harness_tui::editor::PASTE_MAX_BYTES + 1));
     assert!(app.editor().is_empty());
     let (lines, _) = app.live(10);
     let shown: Vec<String> = lines.iter().map(harness_tui::text::plain).collect();
-    assert!(
-        shown.iter().any(|l| l.contains("the paste is too large")),
-        "{shown:#?}"
-    );
+    assert!(lines.iter().all(|l| l.width() <= 60), "{shown:#?}");
+    let joined = shown.join(" ");
+    assert!(joined.contains("the paste is too large"), "{shown:#?}");
+    assert!(joined.contains("mention it with @"), "{shown:#?}");
 }
 
 #[tokio::test]

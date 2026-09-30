@@ -143,15 +143,25 @@ impl Editor {
         (shown, full)
     }
 
-    /// Adds `text` to the history without sending it (input sent some other way). The oldest
-    /// entry goes when there are [`HISTORY_MAX`].
+    /// Adds `text` to the history without sending it (input sent some other way). As for the
+    /// history the editor starts with, the latest [`HISTORY_MAX`] entries are kept, as far as
+    /// they fit in 16 MiB, and one too large to paste is left out.
     pub fn remember(&mut self, text: &str) {
-        if !text.trim().is_empty() && self.history.last().map(String::as_str) != Some(text) {
-            if self.history.len() == HISTORY_MAX {
-                self.history.remove(0);
-            }
-            self.history.push(text.to_string());
+        if text.trim().is_empty()
+            || text.len() > PASTE_MAX_BYTES
+            || self.history.last().map(String::as_str) == Some(text)
+        {
+            return;
         }
+        self.history.push(text.to_string());
+        let mut dropped = self.history.len().saturating_sub(HISTORY_MAX);
+        let mut bytes: usize = self.history[dropped..].iter().map(String::len).sum();
+        // The latest entry fits on its own.
+        while bytes > HISTORY_MAX_BYTES {
+            bytes -= self.history[dropped].len();
+            dropped += 1;
+        }
+        self.history.drain(..dropped);
     }
 
     /// The paste whose placeholder contains `offset` strictly inside, or ends at it.

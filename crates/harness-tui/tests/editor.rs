@@ -307,3 +307,28 @@ fn up_recalls_the_latest_inputs_only() {
     }
     assert_eq!(editor.text(), "input 500");
 }
+
+// Review A's re-review of wave 2, nit: inputs remembered as the session goes are bounded in
+// bytes too, as those of a resumed session are: the latest are kept.
+#[test]
+fn inputs_remembered_as_the_session_goes_are_bounded_in_bytes() {
+    let mut editor = Editor::new(Vec::new());
+    let large = |i: usize| format!("{i:04} {}", "x".repeat(PASTE_MAX_BYTES - 5));
+    for i in 0..8 {
+        editor.remember(&large(i));
+    }
+    let mut kept = Vec::new();
+    loop {
+        editor.key(key(KeyCode::Up));
+        let text = editor.expanded();
+        if kept.last() == Some(&text) {
+            break;
+        }
+        kept.push(text);
+    }
+    let bytes: usize = kept.iter().map(String::len).sum();
+    assert!(bytes <= 16 * 1024 * 1024, "{bytes} bytes kept");
+    assert_eq!(kept.len(), 4);
+    assert!(kept[0].starts_with("0007 "));
+    assert!(kept[3].starts_with("0004 "));
+}

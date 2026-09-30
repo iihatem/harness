@@ -899,7 +899,7 @@ impl App {
             .as_ref()
             .filter(|_| self.prompt.is_some() || self.plan_choice.is_some())
         {
-            below.push(Line::from(Span::styled(sanitize(hint), theme.dim())));
+            below.extend(hint_rows(hint, width, &theme));
         }
         if let Some(prompt) = &self.prompt {
             let mut lines = prompt.render(width, rows.saturating_sub(below.len()), &theme);
@@ -940,7 +940,7 @@ impl App {
         }
         below.extend(wrap(&self.status(), width, &[], &[]));
         if let Some(hint) = &self.hint {
-            below.push(Line::from(Span::styled(sanitize(hint), theme.dim())));
+            below.extend(hint_rows(hint, width, &theme));
         }
         let fixed = editor.len() + below.len();
         let mut lines = self.transcript.live(width, rows.saturating_sub(fixed + 1));
@@ -967,6 +967,16 @@ pub fn next_mode(mode: Mode) -> Mode {
         Mode::Ask => Mode::Auto,
         Mode::Auto | Mode::FullAccess => Mode::Plan,
     }
+}
+
+/// A hint under the status line, dim, wrapped to `width`.
+fn hint_rows(hint: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    wrap(
+        &Line::from(Span::styled(sanitize(hint), theme.dim())),
+        width,
+        &[],
+        &[],
+    )
 }
 
 /// One line for input waiting to be sent: `label` and the input's first line.

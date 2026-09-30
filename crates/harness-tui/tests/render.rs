@@ -335,3 +335,24 @@ fn html_blocks_keep_their_lines_and_the_space_around_them() {
         ]
     );
 }
+
+// Review A's M5: when the prefixes of nested quotes and lists took the whole width, every row still
+// got one character after them and ran past the screen's edge, where it was cut. A prefix is cut
+// to half the width.
+#[test]
+fn deep_nesting_never_makes_rows_wider_than_the_screen() {
+    let lines = markdown::render("> > > > > > hello world again", 10, &Theme::monochrome());
+    for line in &lines {
+        assert!(line.width() <= 10, "{:?}", text::plain(line));
+    }
+    let text: String = lines
+        .iter()
+        .map(|l| text::plain(l).replace('│', ""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        text.split_whitespace().collect::<Vec<_>>(),
+        ["hello", "world", "again"]
+    );
+    assert!(text::plain(&lines[0]).starts_with("│ │ │"));
+}

@@ -192,13 +192,16 @@ pub fn lines(text: &str, style: Style) -> Vec<Line<'static>> {
 
 /// `line` broken into lines at most `width` columns wide: between words where it can, inside a
 /// word (between grapheme clusters) where it must. The first line starts with `first`, the others
-/// with `rest`, which count towards the width. Spaces where a line breaks are dropped.
+/// with `rest`, which count towards the width; a prefix wider than half the width (quotes and
+/// lists nested deep) is cut to half. Spaces where a line breaks are dropped.
 pub fn wrap(
     line: &Line<'_>,
     width: usize,
     first: &[Span<'static>],
     rest: &[Span<'static>],
 ) -> Vec<Line<'static>> {
+    let first = &fit(first, width / 2);
+    let rest = &fit(rest, width / 2);
     let prefix_width = |p: &[Span<'static>]| p.iter().map(|s| self::width(&s.content)).sum();
     let cells: Vec<(&str, Style)> = line
         .spans
@@ -260,6 +263,31 @@ pub fn wrap(
         }
     }
     finish(&mut current, &mut out);
+    out
+}
+
+/// `prefix`, cut to at most `width` columns.
+fn fit(prefix: &[Span<'static>], width: usize) -> Vec<Span<'static>> {
+    let mut left = width;
+    let mut out = Vec::new();
+    for span in prefix {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let w = grapheme_width(grapheme);
+            if w > left {
+                left = 0;
+                break;
+            }
+            left -= w;
+            content.push_str(grapheme);
+        }
+        if !content.is_empty() {
+            out.push(Span::styled(content, span.style));
+        }
+        if left == 0 {
+            break;
+        }
+    }
     out
 }
 

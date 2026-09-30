@@ -63,6 +63,8 @@ pub struct PermissionEngine {
     /// Whether shell commands run in an OS sandbox in the current mode; `Agent::set_mode` may
     /// change it with the mode.
     sandbox_available: AtomicBool,
+    /// Why shell commands have no sandbox, said when asking about one.
+    unsandboxed: String,
     writes_need_approval: bool,
     /// Where `<workspace>/.git` sends git when it is a symlink or a `gitdir:` file, resolved.
     /// Writes under it are guarded like writes under `.git`.
@@ -298,11 +300,19 @@ impl PermissionEngine {
             deny_paths,
             confirm_paths,
             sandbox_available: AtomicBool::new(config.sandbox_available),
+            unsandboxed: "no sandbox is available on this system".into(),
             writes_need_approval: config.writes_need_approval,
             session_bash: Mutex::new(Vec::new()),
             session_paths: Mutex::new(HashSet::new()),
             turn: Mutex::new(TurnRules::default()),
         }
+    }
+
+    /// Says why shell commands have no sandbox, in the reason for asking about each one, when
+    /// it is not that the system has none: the workspace is too broad, say.
+    pub fn with_unsandboxed_reason(mut self, why: impl Into<String>) -> Self {
+        self.unsandboxed = format!("no sandbox: {}", why.into());
+        self
     }
 
     pub fn mode(&self) -> Mode {
@@ -565,10 +575,9 @@ impl PermissionEngine {
                     "shell commands need the OS sandbox in plan and read-only mode".into(),
                 )
             }
-            _ if !self.sandboxed() => Decision::Ask(format!(
-                "run `{}` (no sandbox is available on this system)",
-                short(command)
-            )),
+            _ if !self.sandboxed() => {
+                Decision::Ask(format!("run `{}` ({})", short(command), self.unsandboxed))
+            }
             Verdict::Ask { reason, .. } => Decision::Ask(reason),
             Verdict::Allow => Decision::Allow,
             Verdict::Unlisted if mode == Mode::Ask => {
@@ -587,25 +596,31 @@ impl PermissionEngine {
     /// `glob_match` has no escape syntax, so storing it as a glob would turn the literal
     /// character into a wildcard.
     fn remember_bash(&self, command: &str) -> bool {
-        if !self.sandboxed() {
-            return false;
-        }
-        let Some(prefixes) = harness_shell::session_prefixes(command) else {
+        let Some(rules) = self.session_bash_rules(command) else {
             return false;
         };
-        if prefixes.is_empty() || prefixes.iter().any(|p| p.contains('*')) {
-            return false;
-        }
-        match harness_shell::evaluate(command, &self.bash_rules(), &self.workspace) {
-            Verdict::Deny { .. } | Verdict::Ask { .. } => return false,
-            Verdict::Allow | Verdict::Unlisted => {}
-        }
-        let rules: Vec<String> = prefixes.iter().map(|p| format!("bash:{p} *")).collect();
         self.session_bash
             .lock()
             .expect("session bash lock")
             .extend(rules);
         true
+    }
+
+    /// The allow rules approving `command` for the session adds, as `remember_bash` says:
+    /// `None` when it would add none.
+    fn session_bash_rules(&self, command: &str) -> Option<Vec<String>> {
+        if !self.sandboxed() {
+            return None;
+        }
+        let prefixes = harness_shell::session_prefixes(command)?;
+        if prefixes.is_empty() || prefixes.iter().any(|p| p.contains('*')) {
+            return None;
+        }
+        match harness_shell::evaluate(command, &self.bash_rules(), &self.workspace) {
+            Verdict::Deny { .. } | Verdict::Ask { .. } => return None,
+            Verdict::Allow | Verdict::Unlisted => {}
+        }
+        Some(prefixes.iter().map(|p| format!("bash:{p} *")).collect())
     }
 
     /// Remembers a write's resolved path as an exact session approval. Returns `false` in plan
@@ -614,15 +629,28 @@ impl PermissionEngine {
     /// deny/confirm rule — none of those decisions can be changed by an approval, since they're
     /// checked before the session approvals in `check_write`.
     fn remember_write(&self, path: &Path, mode: Mode) -> bool {
-        if matches!(mode, Mode::Plan | Mode::ReadOnly) {
+        let Some(target) = self.session_write(path, mode) else {
             return false;
+        };
+        self.session_paths
+            .lock()
+            .expect("session paths lock")
+            .insert(("write", target));
+        true
+    }
+
+    /// The path approving a write to `path` for the session remembers, as `remember_write`
+    /// says: `None` when it would remember none.
+    fn session_write(&self, path: &Path, mode: Mode) -> Option<PathBuf> {
+        if matches!(mode, Mode::Plan | Mode::ReadOnly) {
+            return None;
         }
         let target = resolve_path(&self.workspace, path);
         let lexical = lexical_path(&self.workspace, path);
         if target.strip_prefix(&self.workspace).is_err()
             || self.protected_write(&target, &lexical).is_some()
         {
-            return false;
+            return None;
         }
         if self
             .deny_confirm_rule(&self.deny_paths_now(), "write", &target, &lexical)
@@ -631,18 +659,27 @@ impl PermissionEngine {
                 .deny_confirm_rule(&self.confirm_paths_now(), "write", &target, &lexical)
                 .is_some()
         {
-            return false;
+            return None;
         }
-        self.session_paths
-            .lock()
-            .expect("session paths lock")
-            .insert(("write", target));
-        true
+        Some(target)
     }
 
     /// Remembers a read's resolved path as an exact session approval. Returns `false` when it
     /// matches a deny/confirm rule, since remembering it couldn't change that decision.
     fn remember_read(&self, path: &Path) -> bool {
+        let Some(target) = self.session_read(path) else {
+            return false;
+        };
+        self.session_paths
+            .lock()
+            .expect("session paths lock")
+            .insert(("read", target));
+        true
+    }
+
+    /// The path approving a read of `path` for the session remembers, as `remember_read`
+    /// says: `None` when it would remember none.
+    fn session_read(&self, path: &Path) -> Option<PathBuf> {
         let target = resolve_path(&self.workspace, path);
         let lexical = lexical_path(&self.workspace, path);
         if self
@@ -652,13 +689,9 @@ impl PermissionEngine {
                 .deny_confirm_rule(&self.confirm_paths_now(), "read", &target, &lexical)
                 .is_some()
         {
-            return false;
+            return None;
         }
-        self.session_paths
-            .lock()
-            .expect("session paths lock")
-            .insert(("read", target));
-        true
+        Some(target)
     }
 }
 
@@ -680,6 +713,15 @@ impl PermissionPolicy for PermissionEngine {
             Action::Bash(command) => self.remember_bash(command),
             Action::Write(path) => self.remember_write(path, mode),
             Action::Read(path) => self.remember_read(path),
+        }
+    }
+
+    fn can_remember(&self, action: &Action) -> bool {
+        let mode = self.mode();
+        match action {
+            Action::Bash(command) => self.session_bash_rules(command).is_some(),
+            Action::Write(path) => self.session_write(path, mode).is_some(),
+            Action::Read(path) => self.session_read(path).is_some(),
         }
     }
 

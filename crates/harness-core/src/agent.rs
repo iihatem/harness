@@ -153,6 +153,9 @@ pub struct ApprovalRequest {
     pub action: Action,
     pub reason: String,
     pub kind: ApprovalKind,
+    /// Whether approving it for the session would be kept. When it would not (destructive
+    /// commands, and others the policy always asks about), such an approval applies once.
+    pub kept_for_session: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -922,7 +925,7 @@ impl Agent {
                     for skipped in &calls[index..] {
                         let message = Message::Tool {
                             call_id: skipped.id.clone(),
-                            content: "interrupted by the user before this tool ran".into(),
+                            content: STOPPED_BEFORE_RUNNING.into(),
                             is_error: true,
                         };
                         self.record(message, None, false);
@@ -1590,26 +1593,39 @@ impl Agent {
                 .and_then(|sandbox| sandbox.cannot_run(self.ctx.access))
         {
             let command = command.clone();
+            let asked_anyway = match &decision {
+                Decision::Ask(reason) => Some(reason.clone()),
+                _ => None,
+            };
             return self
-                .run_outside_sandbox(call, &tool, args, &command, &why, mutating, events)
+                .run_outside_sandbox(
+                    call,
+                    &tool,
+                    args,
+                    &command,
+                    &why,
+                    asked_anyway.as_deref(),
+                    mutating,
+                    events,
+                )
                 .await;
         }
         match decision {
             Decision::Allow => {}
             Decision::Deny(reason) => return ToolOutput::error(format!("denied: {reason}")),
             Decision::Ask(reason) => {
-                let _ = events.send(AgentEvent::ApprovalNeeded {
-                    id: call.id.clone(),
-                    reason: reason.clone(),
-                });
                 let request = ApprovalRequest {
                     call_id: call.id.clone(),
                     tool: call.name.clone(),
+                    kept_for_session: self.policy.can_remember(&action),
                     action,
                     reason: reason.clone(),
                     kind: ApprovalKind::Action,
                 };
-                match self.approver.decide(&request).await {
+                let Some(decision) = self.ask(&request, events).await else {
+                    return ToolOutput::error(STOPPED_BEFORE_RUNNING);
+                };
+                match decision {
                     ApprovalDecision::Approve => {}
                     ApprovalDecision::ApproveForSession => {
                         if !self.policy.remember(&request.action) {
@@ -1669,6 +1685,29 @@ impl Agent {
         output
     }
 
+    /// Asks the user about `request`, unless the turn was stopped: then nothing is asked, and a
+    /// turn stopped while the user has not answered stops waiting for the answer. `None` when
+    /// stopped, and the action must not run.
+    async fn ask(
+        &self,
+        request: &ApprovalRequest,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> Option<ApprovalDecision> {
+        let cancel = self.ctx.cancel.clone();
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let _ = events.send(AgentEvent::ApprovalNeeded {
+            id: request.call_id.clone(),
+            reason: request.reason.clone(),
+        });
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            decision = self.approver.decide(request) => Some(decision),
+        }
+    }
+
     /// The sandbox cannot run `command` now, for the reason `why`: asks whether to run it outside
     /// the sandbox, once. Nobody to ask blocks it.
     #[allow(
@@ -1682,23 +1721,34 @@ impl Agent {
         args: Value,
         command: &str,
         why: &str,
+        asked_anyway: Option<&str>,
         mutating: bool,
         events: &UnboundedSender<AgentEvent>,
     ) -> ToolOutput {
-        let shown: String = command.chars().take(80).collect();
-        let reason = format!("{why}; run `{shown}` without the sandbox?");
-        let _ = events.send(AgentEvent::ApprovalNeeded {
-            id: call.id.clone(),
-            reason: reason.clone(),
-        });
+        // What the policy would have asked about anyway (a destructive command, a `confirm`
+        // rule) stays in the question.
+        let reason = match asked_anyway {
+            Some(reason) => format!("{reason}, and {why}: run it without the sandbox?"),
+            None => {
+                let mut shown: String = command.chars().take(80).collect();
+                if shown.len() < command.len() {
+                    shown.push('…');
+                }
+                format!("{why}; run `{shown}` without the sandbox?")
+            }
+        };
         let request = ApprovalRequest {
             call_id: call.id.clone(),
             tool: call.name.clone(),
             action: Action::Bash(command.to_string()),
             reason,
             kind: ApprovalKind::RunUnsandboxed,
+            kept_for_session: false,
         };
-        match self.approver.decide(&request).await {
+        let Some(decision) = self.ask(&request, events).await else {
+            return ToolOutput::error(STOPPED_BEFORE_RUNNING);
+        };
+        match decision {
             ApprovalDecision::Approve | ApprovalDecision::ApproveForSession => {
                 if mutating {
                     self.checkpoint(events).await;
@@ -1740,18 +1790,24 @@ impl Agent {
     ) -> ToolOutput {
         let reason = "the sandbox may have blocked this command; run it again without the sandbox?"
             .to_string();
-        let _ = events.send(AgentEvent::ApprovalNeeded {
-            id: call.id.clone(),
-            reason: reason.clone(),
-        });
         let request = ApprovalRequest {
             call_id: call.id.clone(),
             tool: call.name.clone(),
             action: tool.action(&args, &self.ctx),
             reason,
             kind: ApprovalKind::RunUnsandboxed,
+            kept_for_session: false,
         };
-        let note = match self.approver.decide(&request).await {
+        let Some(decision) = self.ask(&request, events).await else {
+            return ToolOutput {
+                content: format!(
+                    "{}\n[not run again without the sandbox: the user stopped the turn]",
+                    first.content
+                ),
+                ..first
+            };
+        };
+        let note = match decision {
             ApprovalDecision::Approve | ApprovalDecision::ApproveForSession => {
                 let mut ctx = self.ctx.clone();
                 ctx.unsandboxed = true;
@@ -1792,6 +1848,10 @@ fn shell_part_text(command: &str, output: &ToolOutput) -> String {
         ),
     }
 }
+
+/// The result of a tool call the user stopped the turn before, while harness waited to ask or
+/// for the answer.
+const STOPPED_BEFORE_RUNNING: &str = "interrupted by the user before this tool ran";
 
 /// The result given to a tool call that a stopped run left without one.
 fn stopped_result(call_id: String) -> Message {

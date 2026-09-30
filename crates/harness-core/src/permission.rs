@@ -176,6 +176,11 @@ pub trait PermissionPolicy: Send + Sync {
         false
     }
 
+    /// Whether [`remember`](Self::remember) would remember `action` now, without remembering it.
+    fn can_remember(&self, _action: &Action) -> bool {
+        false
+    }
+
     /// Switches the approval mode for later checks. Policies without modes ignore it.
     ///
     /// Internal to the agent: frontends call `Agent::set_mode`, which also gives shell commands

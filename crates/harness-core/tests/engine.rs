@@ -909,3 +909,23 @@ fn a_check_answers_for_one_mode_while_the_mode_changes() {
         &mixed[..mixed.len().min(3)]
     );
 }
+
+// Review D M2: without a sandbox, the reason to ask says why there is none.
+#[test]
+fn the_reason_to_ask_without_a_sandbox_says_why_there_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let default = engine(Mode::Auto, dir.path(), false, RuleSet::default());
+    let Decision::Ask(reason) = default.check(&bash("ls")) else {
+        panic!("asks");
+    };
+    assert_eq!(reason, "run `ls` (no sandbox is available on this system)");
+    let too_broad = engine(Mode::Auto, dir.path(), false, RuleSet::default())
+        .with_unsandboxed_reason("the workspace is your home directory or above");
+    let Decision::Ask(reason) = too_broad.check(&bash("ls")) else {
+        panic!("asks");
+    };
+    assert_eq!(
+        reason,
+        "run `ls` (no sandbox: the workspace is your home directory or above)"
+    );
+}

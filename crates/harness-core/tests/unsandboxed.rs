@@ -82,16 +82,29 @@ impl Approver for Answer {
 }
 
 fn agent(mode: Mode, approver: Arc<dyn Approver>, deny: &[&str], dir: &Path) -> Agent {
+    agent_for("ls", mode, approver, deny, &[], dir)
+}
+
+fn agent_for(
+    command: &str,
+    mode: Mode,
+    approver: Arc<dyn Approver>,
+    deny: &[&str],
+    confirm: &[&str],
+    dir: &Path,
+) -> Agent {
     let provider = MockProvider::new(vec![
-        Script::tool_call("c1", "bash", json!({"command": "ls"})),
+        Script::tool_call("c1", "bash", json!({ "command": command })),
         Script::text("done"),
     ]);
+    let own = |rules: &[&str]| rules.iter().map(|r| r.to_string()).collect();
     let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode,
         workspace: dir.to_path_buf(),
         read_dirs: vec![],
         rules: RuleSet {
-            deny: deny.iter().map(|r| r.to_string()).collect(),
+            deny: own(deny),
+            confirm: own(confirm),
             ..RuleSet::default()
         },
         sandbox_available: true,
@@ -153,7 +166,43 @@ async fn approved_it_runs_outside_the_sandbox_once_asked_once() {
     assert_eq!(asked[0].kind, ApprovalKind::RunUnsandboxed);
     assert_eq!(
         asked[0].reason,
-        "the sandbox dropped to the basic tier; run `ls` without the sandbox?"
+        "run `ls`, and the sandbox dropped to the basic tier: run it without the sandbox?"
+    );
+}
+
+// Review D M7: the question keeps why the command needed approval anyway, and a command cut
+// short says so.
+#[tokio::test]
+async fn the_question_keeps_the_reason_to_ask_and_marks_a_cut_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let answer = Arc::new(Answer(ApprovalDecision::Approve, Mutex::default()));
+    let mut confirmed = agent_for(
+        "make deploy",
+        Mode::Auto,
+        answer.clone(),
+        &[],
+        &["bash:make deploy*"],
+        dir.path(),
+    );
+    run(&mut confirmed, "go").await;
+    let long = format!("echo {}", "x".repeat(200));
+    let mut cut = agent_for(&long, Mode::Auto, answer.clone(), &[], &[], dir.path());
+    run(&mut cut, "go").await;
+    let asked = answer.1.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2, "{asked:#?}");
+    assert!(
+        asked[0].reason.contains("make deploy")
+            && asked[0].reason.contains("confirm")
+            && asked[0]
+                .reason
+                .ends_with("the sandbox dropped to the basic tier: run it without the sandbox?"),
+        "{}",
+        asked[0].reason
+    );
+    assert!(
+        asked[1].reason.contains("xxx…` without the sandbox?"),
+        "{}",
+        asked[1].reason
     );
 }
 

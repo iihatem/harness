@@ -17,6 +17,11 @@ pub enum FinishReason {
 /// One item of a provider's streamed reply. Tool calls arrive complete, never as fragments.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderEvent {
+    /// The reply's first byte of any kind arrived: text, reasoning, or a tool call's name or
+    /// arguments starting to stream. Emitted at most once per reply, before whatever caused it.
+    /// A tool call itself is buffered and arrives whole only once the stream ends, so this is the
+    /// only signal of when a tool-call reply actually started generating.
+    OutputStarted,
     TextDelta(String),
     ReasoningDelta(String),
     ToolCall(ToolCall),

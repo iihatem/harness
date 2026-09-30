@@ -1469,9 +1469,13 @@ impl Agent {
         let mut stream = provider.stream(request);
         while let Some(item) = stream.next().await {
             let item = item?;
+            // `OutputStarted` is a tool-call reply's only early signal: the call itself is
+            // buffered by the wire parser and arrives whole only once the stream ends. The other
+            // three are kept as a fallback for a provider that has none to emit.
             if matches!(
                 item,
-                ProviderEvent::TextDelta(_)
+                ProviderEvent::OutputStarted
+                    | ProviderEvent::TextDelta(_)
                     | ProviderEvent::ReasoningDelta(_)
                     | ProviderEvent::ToolCall(_)
             ) && reply.first_output.is_none()
@@ -1495,6 +1499,7 @@ impl Agent {
                     let _ = events.send(AgentEvent::ReasoningDelta { text });
                 }
                 ProviderEvent::ToolCall(call) => reply.tool_calls.push(call),
+                ProviderEvent::OutputStarted => {}
                 ProviderEvent::Usage(usage) => {
                     reply.usage = Some(usage);
                     let _ = events.send(AgentEvent::Usage {

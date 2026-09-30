@@ -41,6 +41,7 @@ fn text_arrives_as_deltas_with_usage_and_a_stop() {
     assert_eq!(
         parse("text.sse").unwrap(),
         vec![
+            ProviderEvent::OutputStarted,
             ProviderEvent::TextDelta("Hello".into()),
             ProviderEvent::TextDelta(", world".into()),
             ProviderEvent::Usage(Usage {
@@ -56,8 +57,9 @@ fn text_arrives_as_deltas_with_usage_and_a_stop() {
 #[test]
 fn function_calls_are_emitted_whole_in_output_order() {
     let events = parse("tool_call.sse").unwrap();
+    assert_eq!(events[0], ProviderEvent::OutputStarted);
     assert_eq!(
-        events[1..],
+        events[2..],
         [
             ProviderEvent::ToolCall(ToolCall {
                 id: "call_abc".into(),
@@ -72,14 +74,31 @@ fn function_calls_are_emitted_whole_in_output_order() {
             ProviderEvent::Finished(FinishReason::ToolCalls),
         ]
     );
-    assert!(matches!(events[0], ProviderEvent::Usage(_)));
+    assert!(matches!(events[1], ProviderEvent::Usage(_)));
+}
+
+// Review C, Important 2: a function call's own event only arrives whole once its output item is
+// done, so `OutputStarted` is the only early signal such a reply gives — here, at the call's
+// start, well before either call is assembled.
+#[test]
+fn a_function_calls_start_reports_output_started_before_it_is_assembled() {
+    let mut parser = ResponsesStreamParser::default();
+    let added = json!({"type": "response.output_item.added", "output_index": 0,
+        "item": {"id": "fc_1", "type": "function_call", "call_id": "call_abc", "name": "read", "arguments": ""}});
+    let first = parser.push(&added.to_string()).unwrap();
+    assert_eq!(first, vec![ProviderEvent::OutputStarted]);
+    let delta = json!({"type": "response.function_call_arguments.delta", "output_index": 0,
+        "delta": "{}"});
+    let second = parser.push(&delta.to_string()).unwrap();
+    assert!(second.is_empty(), "{second:?}");
 }
 
 #[test]
 fn reasoning_summaries_are_reasoning_deltas() {
     let events = parse("reasoning.sse").unwrap();
+    assert_eq!(events[0], ProviderEvent::OutputStarted);
     assert_eq!(
-        events[..2],
+        events[1..3],
         [
             ProviderEvent::ReasoningDelta("**Checking the tests**".into()),
             ProviderEvent::TextDelta("All green.".into()),
@@ -120,6 +139,7 @@ fn summary_parts_are_separated() {
             delta(1, "**Second**")
         ]),
         [
+            ProviderEvent::OutputStarted,
             ProviderEvent::ReasoningDelta("**First**".into()),
             ProviderEvent::ReasoningDelta("\n\n".into()),
             ProviderEvent::ReasoningDelta("**Second**".into()),
@@ -142,6 +162,7 @@ fn a_refusal_arrives_as_text() {
     assert_eq!(
         events,
         [
+            ProviderEvent::OutputStarted,
             ProviderEvent::TextDelta("I can't help".into()),
             ProviderEvent::TextDelta(" with that.".into()),
             ProviderEvent::Finished(FinishReason::Stop),

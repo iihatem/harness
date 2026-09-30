@@ -204,9 +204,22 @@ pub struct MessagesStreamParser {
     counts: Counts,
     finish: Option<FinishReason>,
     done: bool,
+    /// Whether `OutputStarted` has already been emitted for this reply.
+    started: bool,
 }
 
 impl MessagesStreamParser {
+    /// Emits `OutputStarted` the first time this reply produces any content: a text or thinking
+    /// delta, or a tool call's start or its first argument fragment. A tool call itself is
+    /// buffered and arrives whole only once the message stops, so this is the only early signal
+    /// such a reply gives.
+    fn mark_started(&mut self, out: &mut Vec<ProviderEvent>) {
+        if !self.started {
+            self.started = true;
+            out.push(ProviderEvent::OutputStarted);
+        }
+    }
+
     pub fn push(&mut self, data: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
         let event: Value = serde_json::from_str(data)
             .map_err(|e| ProviderError::Protocol(format!("{e} in event: {data}")))?;
@@ -216,6 +229,7 @@ impl MessagesStreamParser {
             "content_block_start" => {
                 let block = &event["content_block"];
                 if block["type"] == "tool_use" {
+                    self.mark_started(&mut out);
                     let index = event["index"].as_u64().unwrap_or(0);
                     let call = self.calls.entry(index).or_default();
                     call.id = block["id"].as_str().unwrap_or_default().to_string();
@@ -231,17 +245,22 @@ impl MessagesStreamParser {
                 match delta["type"].as_str().unwrap_or_default() {
                     "text_delta" => {
                         if let Some(text) = delta["text"].as_str().filter(|t| !t.is_empty()) {
+                            self.mark_started(&mut out);
                             out.push(ProviderEvent::TextDelta(text.to_string()));
                         }
                     }
                     "thinking_delta" => {
                         if let Some(text) = delta["thinking"].as_str().filter(|t| !t.is_empty()) {
+                            self.mark_started(&mut out);
                             out.push(ProviderEvent::ReasoningDelta(text.to_string()));
                         }
                     }
                     "input_json_delta" => {
                         let index = event["index"].as_u64().unwrap_or(0);
                         if let Some(fragment) = delta["partial_json"].as_str() {
+                            if !fragment.is_empty() {
+                                self.mark_started(&mut out);
+                            }
                             self.calls
                                 .entry(index)
                                 .or_default()

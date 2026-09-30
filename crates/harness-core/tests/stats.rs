@@ -52,6 +52,98 @@ fn async_stream()
     })
 }
 
+/// A provider whose first reply is a tool call: its arguments stream for two seconds (as a wire
+/// parser buffers them, only surfacing `OutputStarted` early and the whole `ToolCall` once the
+/// stream ends), then a second reply answers in text once the tool result comes back.
+struct SlowToolCall(std::sync::atomic::AtomicUsize);
+
+impl Provider for SlowToolCall {
+    fn stream(&self, _request: ChatRequest) -> ProviderStream {
+        if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Box::pin(futures::stream::unfold(0, |step| async move {
+                let event = match step {
+                    0 => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        ProviderEvent::OutputStarted
+                    }
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(2_000)).await;
+                        ProviderEvent::ToolCall(harness_core::message::ToolCall {
+                            id: "c1".into(),
+                            name: "echo".into(),
+                            arguments: json!({"text": "x"}).to_string(),
+                        })
+                    }
+                    2 => ProviderEvent::Usage(Usage {
+                        input_tokens: 10,
+                        output_tokens: 88,
+                        cached_tokens: 0,
+                    }),
+                    3 => ProviderEvent::Finished(FinishReason::ToolCalls),
+                    _ => return None,
+                };
+                Some((Ok(event), step + 1))
+            }))
+        } else {
+            Box::pin(futures::stream::iter(vec![
+                Ok(ProviderEvent::TextDelta("done".into())),
+                Ok(ProviderEvent::Usage(Usage {
+                    input_tokens: 5,
+                    output_tokens: 5,
+                    cached_tokens: 0,
+                })),
+                Ok(ProviderEvent::Finished(FinishReason::Stop)),
+            ]))
+        }
+    }
+}
+
+// Review C, Important 2: a tool call's arguments stream for a while before the call arrives
+// whole, but the reply's actual first byte is `OutputStarted`, well before that. Time to first
+// token, and the generation window used for tokens/second, must count from there, not from
+// whichever event happens to carry the tool call.
+#[tokio::test(start_paused = true)]
+async fn turn_stats_count_a_tool_calls_first_byte_not_its_whole_arrival() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = Arc::new(PermissionEngine::new(EngineConfig {
+        mode: Mode::Auto,
+        workspace: dir.path().to_path_buf(),
+        read_dirs: vec![],
+        rules: Default::default(),
+        sandbox_available: false,
+        writes_need_approval: false,
+    }));
+    let mut agent = Agent::new(
+        Arc::new(SlowToolCall(std::sync::atomic::AtomicUsize::new(0))),
+        ToolRegistry::new(vec![Arc::new(Echo)]),
+        policy,
+        Arc::new(NonInteractive),
+        AgentConfig::new("mock/m1", "m1", "system prompt", dir.path().join("out")),
+        ToolContext::new(dir.path()),
+    );
+    let (reason, events) = run(&mut agent, "hi").await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    let [stat] = &stats(&events)[..] else {
+        panic!("one TurnStats: {events:#?}");
+    };
+    let AgentEvent::TurnStats {
+        time_to_first_token_ms,
+        generation_ms,
+        output_tokens,
+        ..
+    } = stat
+    else {
+        unreachable!()
+    };
+    // The real first byte was at 200ms (`OutputStarted`), not at 2.2s when the whole tool call
+    // arrived.
+    assert_eq!(*time_to_first_token_ms, Some(200));
+    // Generation ran from 200ms to 2.2s (2.0s): the buggy version measured only from 2.2s to
+    // 2.2s, near enough zero, which inflated tokens/second.
+    assert_eq!(*generation_ms, 2_000);
+    assert_eq!(*output_tokens, 93);
+}
+
 fn stats(events: &[AgentEvent]) -> Vec<AgentEvent> {
     events
         .iter()

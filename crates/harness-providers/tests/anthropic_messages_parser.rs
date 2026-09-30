@@ -38,6 +38,7 @@ fn text_arrives_as_deltas_and_usage_counts_cached_input() {
     assert_eq!(
         parse("text.sse").unwrap(),
         vec![
+            ProviderEvent::OutputStarted,
             ProviderEvent::TextDelta("Hello".into()),
             ProviderEvent::TextDelta("!".into()),
             // Input is what was sent: uncached, written to the cache, and read from it.
@@ -54,12 +55,13 @@ fn text_arrives_as_deltas_and_usage_counts_cached_input() {
 #[test]
 fn tool_use_is_emitted_whole_after_the_text() {
     let events = parse("tool_use.sse").unwrap();
+    assert_eq!(events[0], ProviderEvent::OutputStarted);
     assert_eq!(
-        events[0],
+        events[1],
         ProviderEvent::TextDelta("Let me read it.".into())
     );
     assert_eq!(
-        events[2..],
+        events[3..],
         [
             ProviderEvent::ToolCall(ToolCall {
                 id: "toolu_01T1x1fJ34qAmk2tNTrN7Up6".into(),
@@ -69,14 +71,37 @@ fn tool_use_is_emitted_whole_after_the_text() {
             ProviderEvent::Finished(FinishReason::ToolCalls),
         ]
     );
-    assert!(matches!(events[1], ProviderEvent::Usage(_)));
+    assert!(matches!(events[2], ProviderEvent::Usage(_)));
+}
+
+// Review C, Important 2: a tool call's own event only arrives whole once the message stops, so
+// `OutputStarted` is the only early signal such a reply gives. It fires once, at the block's
+// start, not again on every argument fragment that follows.
+#[test]
+fn a_tool_use_blocks_start_reports_output_started_before_it_is_assembled() {
+    let mut parser = MessagesStreamParser::default();
+    let block_start = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {}}
+    });
+    let first = parser.push(&block_start.to_string()).unwrap();
+    assert_eq!(first, vec![ProviderEvent::OutputStarted]);
+    let delta = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": "{}"}
+    });
+    let second = parser.push(&delta.to_string()).unwrap();
+    assert!(second.is_empty(), "{second:?}");
 }
 
 #[test]
 fn a_reply_stopped_by_max_tokens_finishes_with_length() {
     let events = parse("max_tokens.sse").unwrap();
+    assert_eq!(events[0], ProviderEvent::OutputStarted);
     assert_eq!(
-        events[0],
+        events[1],
         ProviderEvent::ReasoningDelta("The file is large.".into())
     );
     assert!(events.contains(&ProviderEvent::ToolCall(ToolCall {

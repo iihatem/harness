@@ -70,9 +70,21 @@ pub struct ChatStreamParser {
     calls: BTreeMap<u64, PartialCall>,
     finish: Option<FinishReason>,
     done: bool,
+    /// Whether `OutputStarted` has already been emitted for this reply.
+    started: bool,
 }
 
 impl ChatStreamParser {
+    /// Emits `OutputStarted` the first time this reply produces any content: a text or reasoning
+    /// delta, or a tool call's first fragment. A tool call itself is buffered and arrives whole
+    /// only once the stream ends, so this is the only early signal such a reply gives.
+    fn mark_started(&mut self, out: &mut Vec<ProviderEvent>) {
+        if !self.started {
+            self.started = true;
+            out.push(ProviderEvent::OutputStarted);
+        }
+    }
+
     pub fn push(&mut self, data: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
         if data.trim() == "[DONE]" {
             return Ok(self.finish());
@@ -86,14 +98,19 @@ impl ChatStreamParser {
         if let Some(choice) = chunk["choices"].get(0) {
             let delta = &choice["delta"];
             if let Some(text) = delta["content"].as_str().filter(|t| !t.is_empty()) {
+                self.mark_started(&mut out);
                 out.push(ProviderEvent::TextDelta(text.to_string()));
             }
             for key in ["reasoning_content", "reasoning"] {
                 if let Some(text) = delta[key].as_str().filter(|t| !t.is_empty()) {
+                    self.mark_started(&mut out);
                     out.push(ProviderEvent::ReasoningDelta(text.to_string()));
                 }
             }
             if let Some(calls) = delta["tool_calls"].as_array() {
+                if !calls.is_empty() {
+                    self.mark_started(&mut out);
+                }
                 for call in calls {
                     // An empty-string id or function name is not a real value; treat it as absent
                     // like a provider that omitted the field entirely.

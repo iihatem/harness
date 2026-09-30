@@ -293,3 +293,19 @@ fn invisible_format_characters_are_shown_escaped() {
         assert_eq!(text::sanitize(text), text);
     }
 }
+
+// Review A's M6: highlighting costs about 0.15 ms a line and only a line's length was bounded,
+// so a block of thousands of lines held the UI for a second when it was rendered. A block of more
+// than 2,000 lines is shown plain.
+#[test]
+fn a_very_long_code_block_is_shown_plain() {
+    let block = |lines: usize| {
+        let code: String = (0..lines).map(|i| format!("let x{i} = {i};\n")).collect();
+        markdown::render(&format!("```rust\n{code}```\n"), 40, &Theme::colored())
+    };
+    let long = block(2_001);
+    assert_eq!(long.len(), 2_001);
+    assert!(colours(&draw(long[..5].to_vec(), 40)).is_empty());
+    let short = block(2_000);
+    assert!(!colours(&draw(short[..5].to_vec(), 40)).is_empty());
+}

@@ -531,11 +531,11 @@ fn an_open_code_block_streams_plain_and_is_highlighted_once_it_closes() {
     assert!(!coloured(&live));
     assert!(transcript.take_finished().is_empty());
     // A long block shows its last lines only.
-    let more: String = (1..=3_000).map(|i| format!("let v{i} = {i};\n")).collect();
+    let more: String = (1..=1_000).map(|i| format!("let v{i} = {i};\n")).collect();
     transcript.on_event(&AgentEvent::TextDelta { text: more }, 40);
     assert_eq!(
         text_rows(&transcript.live(40, 2)),
-        ["  let v2999 = 2999;", "  let v3000 = 3000;"]
+        ["  let v999 = 999;", "  let v1000 = 1000;"]
     );
     transcript.on_event(
         &AgentEvent::TextDelta {
@@ -544,7 +544,7 @@ fn an_open_code_block_streams_plain_and_is_highlighted_once_it_closes() {
         40,
     );
     let finished = transcript.take_finished();
-    assert_eq!(finished.len(), 3_002);
+    assert_eq!(finished.len(), 1_002);
     assert_eq!(text_rows(&finished[..2]), ["  let x = 1;", "  let y = 2;"]);
     assert!(coloured(&finished));
     assert_eq!(text_rows(&transcript.live(40, 10)), ["after"]);

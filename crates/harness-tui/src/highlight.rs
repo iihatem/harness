@@ -19,6 +19,9 @@ use crate::{style::Theme, text::sanitize};
 /// Lines longer than this are not highlighted: syntect's regular expressions can take a long
 /// time on them.
 const MAX_LINE: usize = 2_000;
+/// Code blocks with more lines than this are not highlighted: at about 0.15 ms a line, it would
+/// hold the UI for longer than a third of a second.
+const MAX_LINES: usize = 2_000;
 
 struct Assets {
     syntaxes: SyntaxSet,
@@ -41,9 +44,13 @@ fn assets() -> &'static Assets {
 
 /// `code` highlighted as `language`, the word after a code fence's backticks (`rust`, `py`,
 /// `sh`, ...), one line per line of code. `None` when the theme has no colour, the language is
-/// unknown, or a line is too long to highlight.
+/// unknown, or the code has too many lines, or one too long, to highlight.
 pub fn highlight(code: &str, language: &str, theme: &Theme) -> Option<Vec<Line<'static>>> {
-    if !theme.color || language.is_empty() || code.lines().any(|l| l.len() > MAX_LINE) {
+    if !theme.color
+        || language.is_empty()
+        || code.lines().nth(MAX_LINES).is_some()
+        || code.lines().any(|l| l.len() > MAX_LINE)
+    {
         return None;
     }
     let assets = assets();

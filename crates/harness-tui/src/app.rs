@@ -40,8 +40,14 @@ pub const QUIT_WINDOW: Duration = Duration::from_secs(2);
 
 /// Built-in commands that come with the rest of the terminal UI, and where.
 const LATER: [(&str, &str); 7] = [
-    ("model", "with model profiles (P4) and the model picker"),
-    ("login", "with provider sign-in (P4)"),
+    (
+        "model",
+        "with the model picker; for now, start harness with --model <provider>/<model>",
+    ),
+    (
+        "login",
+        "with sign-in inside the session; for now, run `harness login <provider>` or `harness auth add <provider>` in a shell",
+    ),
     (
         "mode",
         "with the full terminal UI; press Shift+Tab to cycle plan, ask and auto",

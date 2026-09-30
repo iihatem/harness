@@ -116,13 +116,12 @@ where
             let area = Rect::new(0, y, width, 1);
             let mut row = Buffer::empty(area);
             line.render(area, &mut row);
+            // The row is blank on screen: write only what differs from blank, which also skips
+            // the columns hidden under wide characters (writing those would push the rest of the
+            // row right, past its end).
+            let blank = Buffer::empty(area);
             self.backend
-                .draw(
-                    row.content
-                        .iter()
-                        .enumerate()
-                        .map(|(x, cell)| (x as u16, y, cell)),
-                )
+                .draw(blank.diff(&row).into_iter())
                 .map_err(io_error)?;
             y += 1;
         }

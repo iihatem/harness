@@ -1,6 +1,8 @@
 //! The inline terminal and the transcript, on ratatui's `TestBackend`: finished lines go into the
 //! terminal's scrollback, and only the live region is redrawn.
 
+mod support;
+
 use std::sync::{Arc, Mutex};
 
 use harness_core::event::{AgentEvent, TurnEndReason};
@@ -12,6 +14,7 @@ use ratatui::{
     text::Line,
     widgets::{Paragraph, Widget},
 };
+use support::vt::{Vt, VtBackend};
 
 /// Each row of `buffer` as text, without trailing spaces.
 fn rows(buffer: &Buffer) -> Vec<String> {
@@ -110,6 +113,27 @@ fn after_a_resize_the_live_region_stays_on_screen() {
     draw_live(&mut term, "> ", 2);
     assert_eq!(term.top(), 3);
     assert_eq!(term.backend().cursor_position(), Position::new(2, 3));
+}
+
+// Review A's C1: the column hidden under a wide character was written too, which pushed the rest
+// of the row one column right per wide character, off its end, and out of the scrollback.
+#[test]
+fn wide_characters_keep_their_text_and_width_in_the_scrollback() {
+    let lines = [
+        "日本語のテキストです",
+        "ok 🙂 fine 中文 end",
+        "return '日本語'",
+        "a line after them",
+    ];
+    let mut term = InlineTerminal::new(VtBackend::new(Vt::new(20, 4)), 0).unwrap();
+    for line in lines {
+        term.insert(&[Line::from(line)]).unwrap();
+        draw_live(&mut term, "> ", 1);
+    }
+    let vt = term.backend().vt();
+    assert_eq!(vt.scrollback(), &lines[..1]);
+    assert_eq!(vt.screen(), [&lines[1..], &[">"]].concat());
+    assert_eq!(vt.widths(), [20, 19, 15, 17, 1]);
 }
 
 /// A `TestBackend` that records the rows of every cell it is asked to draw.

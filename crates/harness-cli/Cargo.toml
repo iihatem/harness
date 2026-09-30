@@ -40,4 +40,5 @@ predicates.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+unicode-width.workspace = true
 wiremock.workspace = true

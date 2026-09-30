@@ -22,7 +22,7 @@ use crate::{
     app::{Action, App, Host, Options},
     approval::{Reply, Requests},
     inline::InlineTerminal,
-    input::Timed,
+    input::{CursorQuery, Timed},
     notify::Notify,
     plan::TextEditor,
 };
@@ -37,6 +37,10 @@ pub const REDRAW_EVERY: Duration = Duration::from_millis(30);
 
 /// How long the terminal's input is given to end after a write to the terminal failed.
 const GONE_WAIT: Duration = Duration::from_secs(1);
+
+/// How long the terminal has to say where its cursor is after a resize; one that does not
+/// answer by then is taken to have done what xterm does, and is not asked again.
+pub const CURSOR_WAIT: Duration = Duration::from_millis(500);
 
 /// After a write to the terminal failed with `error`: the terminal went away, when its input ends
 /// within [`GONE_WAIT`] (its reader tells a moment after it goes), or the write failed for some
@@ -102,6 +106,9 @@ pub struct Ui<B: Backend> {
     drawn_at: Option<tokio::time::Instant>,
     /// Events came in since then that are not drawn yet.
     redraw: bool,
+    /// Asks the terminal where its cursor is after a resize, through the thread that reads it;
+    /// without it, the backend is asked.
+    cursor_query: Option<CursorQuery>,
 }
 
 impl<B> Ui<B>
@@ -155,7 +162,16 @@ where
             redactor: None,
             drawn_at: None,
             redraw: false,
+            cursor_query: None,
         }
+    }
+
+    /// After a resize, asks the terminal where its cursor is with `query`, through the thread
+    /// that reads the terminal, rather than asking the backend, which would read the terminal
+    /// itself.
+    pub fn with_cursor_query(mut self, query: CursorQuery) -> Self {
+        self.cursor_query = Some(query);
+        self
     }
 
     /// Shows the agent's events, approvals and the host's warnings with the secrets `redactor`
@@ -301,19 +317,24 @@ where
         }
     }
 
-    /// Takes in one terminal event: a key, a paste, or a resize.
+    /// Takes in one terminal event: a key, a paste, or a resize (the backend is asked where the
+    /// cursor is), and draws.
     pub fn handle(&mut self, event: Event) -> io::Result<Flow> {
         self.handle_at(event, Instant::now())
     }
 
-    /// Takes in one terminal event, as of when it was read.
-    fn handle_timed(&mut self, Timed { event, at }: Timed) -> io::Result<Flow> {
-        self.handle_at(event, at)
+    /// Takes in one terminal event read at `now`, and draws.
+    pub fn handle_at(&mut self, event: Event, now: Instant) -> io::Result<Flow> {
+        let flow = self.take_in_at(event, now)?;
+        if flow == Flow::Continue {
+            self.draw()?;
+        }
+        Ok(flow)
     }
 
-    /// Takes in one terminal event read at `now`.
-    pub fn handle_at(&mut self, event: Event, now: Instant) -> io::Result<Flow> {
-        let flow = match event {
+    /// Takes in one terminal event read at `now`, without drawing.
+    fn take_in_at(&mut self, event: Event, now: Instant) -> io::Result<Flow> {
+        Ok(match event {
             Event::Key(key) => match self.app.on_key(key, now) {
                 Some(action) => self.dispatch(action)?,
                 None => Flow::Continue,
@@ -328,11 +349,24 @@ where
                 Flow::Continue
             }
             _ => Flow::Continue,
-        };
-        if flow == Flow::Continue {
-            self.draw()?;
+        })
+    }
+
+    /// Takes in one terminal event, as of when it was read, without drawing. After a resize,
+    /// the terminal is asked where its cursor is through the thread that reads it, when there is
+    /// one, waiting at most [`CURSOR_WAIT`] for the answer.
+    async fn take_in_key(&mut self, Timed { event, at }: Timed) -> io::Result<Flow> {
+        if let (Event::Resize(..), Some(query)) = (&event, self.cursor_query.clone()) {
+            let cursor = if self.term.reports_cursor() {
+                query.position(CURSOR_WAIT).await
+            } else {
+                None
+            };
+            self.term.resized_to(cursor)?;
+            self.app.set_width(self.term.width() as usize);
+            return Ok(Flow::Continue);
         }
-        Ok(flow)
+        self.take_in_at(event, at)
     }
 
     /// Takes in `event`, redacted: none, one or more events, since the redactor holds back the
@@ -469,23 +503,37 @@ where
         self.drawn()
     }
 
-    /// Takes in the terminal events already waiting. Done before an agent's event or approval is
-    /// shown, so that a key typed before a prompt appeared goes where it was typed for, never to
-    /// the prompt. `Some` when the session ends.
-    fn drain<S, E>(&mut self, input: &mut S) -> io::Result<Option<Ending>>
+    /// Takes in `first`, if any, and the terminal events already waiting after it, and draws
+    /// once after them all: a burst of keys costs one draw. Done before an agent's event or
+    /// approval is shown, so that a key typed before a prompt appeared goes where it was typed
+    /// for, never to the prompt. `Some` when the session ends.
+    async fn keys<S, E>(
+        &mut self,
+        first: Option<Timed>,
+        input: &mut S,
+    ) -> io::Result<Option<Ending>>
     where
         S: Stream<Item = io::Result<E>> + Unpin,
         E: Into<Timed>,
     {
-        while let Some(next) = input.next().now_or_never() {
-            match next {
-                Some(Ok(event)) => {
-                    if self.handle_timed(event.into())? == Flow::Quit {
-                        return Ok(Some(Ending::Quit));
-                    }
-                }
-                Some(Err(_)) | None => return Ok(Some(Ending::Hangup)),
+        let mut next = first;
+        let mut taken = false;
+        loop {
+            let timed = match next.take() {
+                Some(timed) => timed,
+                None => match input.next().now_or_never() {
+                    None => break,
+                    Some(Some(Ok(event))) => event.into(),
+                    Some(Some(Err(_)) | None) => return Ok(Some(Ending::Hangup)),
+                },
+            };
+            taken = true;
+            if self.take_in_key(timed).await? == Flow::Quit {
+                return Ok(Some(Ending::Quit));
             }
+        }
+        if taken {
+            self.draw()?;
         }
         Ok(None)
     }
@@ -529,11 +577,14 @@ where
                 biased;
                 ending = &mut shutdown => return Ok(ending),
                 event = input.next() => match event {
-                    Some(Ok(event)) => self.handle_timed(event.into())?,
+                    Some(Ok(event)) => match self.keys(Some(event.into()), input).await? {
+                        None => Flow::Continue,
+                        Some(ending) => return Ok(ending),
+                    },
                     Some(Err(_)) | None => return Ok(Ending::Hangup),
                 },
                 event = self.events.recv() => match event {
-                    Some(event) => match self.drain(input)? {
+                    Some(event) => match self.keys(None, input).await? {
                         None => self.agent_event(event)?,
                         Some(ending) => {
                             self.take_in(event);
@@ -544,13 +595,13 @@ where
                 },
                 Some(context) = self.contexts.recv() => self.context(context)?,
                 // A request left unshown when the session ends is denied when its reply drops.
-                Some((request, reply)) = self.approvals.recv() => match self.drain(input)? {
+                Some((request, reply)) = self.approvals.recv() => match self.keys(None, input).await? {
                     None => self.approval(request, reply).await?,
                     Some(ending) => return Ok(ending),
                 },
                 // Drawn after the keys waiting, and not once the terminal has gone, which it may
                 // have just before its reader can tell.
-                _ = tokio::time::sleep_until(redraw_at), if redraw => match self.drain(input)? {
+                _ = tokio::time::sleep_until(redraw_at), if redraw => match self.keys(None, input).await? {
                     None => match self.draw() {
                         Ok(()) => Flow::Continue,
                         Err(e) => return gone_or(input, e).await,

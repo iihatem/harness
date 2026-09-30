@@ -14,7 +14,7 @@ use harness_tui::{
     app::{Host, Options, Prepared},
     approval::{ChannelApprover, Requests},
     inline::InlineTerminal,
-    input::TerminalInput,
+    input::{Startup, TerminalInput, Unanswered, ask_at_startup},
     notify::TerminalNotifier,
     plan::ExternalEditor,
     style::Theme,
@@ -313,11 +313,25 @@ async fn terminal_session(
 ) -> std::io::Result<Ending> {
     // From here on, a hangup or SIGTERM ends the session rather than harness.
     let shutdown = shutdown_signals()?;
-    // Asked before any events are read: both queries read the terminal's answer from stdin.
-    let keyboard = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    tokio::pin!(shutdown);
+    // Asked before the session's reader starts, which then is the only one to read the terminal;
+    // a terminal that closes meanwhile, or a signal, ends the session at once.
+    let startup = tokio::select! {
+        biased;
+        ending = &mut shutdown => return Ok(ending),
+        startup = ask_at_startup() => startup,
+    };
+    let Startup { keyboard, cursor } = match startup {
+        Ok(startup) => startup,
+        Err(Unanswered::HungUp) => return Ok(Ending::Hangup),
+        Err(Unanswered::Stuck) => {
+            return Err(std::io::Error::other(
+                "the terminal did not answer when asked about itself",
+            ));
+        }
+    };
     // The row after the cursor when the shell left it mid-line. A terminal that does not say
     // where its cursor is gets harness below its bottom row, drawing over nothing of the user's.
-    let cursor = crossterm::cursor::position().ok();
     let top = cursor.map_or(
         u16::MAX,
         |(column, row)| if column == 0 { row } else { row + 1 },
@@ -325,7 +339,7 @@ async fn terminal_session(
     // The editor for plans owns the terminal's modes, so they are undone while it runs, and
     // when the session ends; the terminal is not read for the session meanwhile.
     let modes = Modes::enter(std::io::stdout(), CrosstermRawMode, keyboard)?;
-    let input = TerminalInput::start();
+    let input = TerminalInput::start()?;
     options.text_editor = Some(Box::new(
         ExternalEditor::from_env(modes).pausing(input.pauser()),
     ));
@@ -338,7 +352,9 @@ async fn terminal_session(
     if cursor.is_none() {
         term = term.without_cursor_reports();
     }
-    let mut ui = Ui::start(agent, host, term, options, approvals).with_redactor(redactor);
+    let mut ui = Ui::start(agent, host, term, options, approvals)
+        .with_redactor(redactor)
+        .with_cursor_query(input.cursor_query());
     ui.app_mut().set_write_mode_warning(write_mode_warning);
     ui.run(input, shutdown).await
 }

@@ -213,22 +213,38 @@ where
         self.backend.flush().map_err(io_error)
     }
 
-    /// After the terminal changed size. Terminals move rows when they resize: xterm keeps the
-    /// cursor's row on screen as the window gets shorter, pushing the rows above it into
-    /// scrollback, and others pull rows back from scrollback as it gets taller, or rewrap them.
-    /// So the terminal is asked where its cursor is now, and the live region, cleared, is placed
-    /// as far above it as the cursor was below the region's top; the next draw makes the room it
-    /// needs. A terminal that cannot say is taken to have done what xterm does.
+    /// Whether the terminal is asked where its cursor is after a resize: it answered when
+    /// harness started, and every time since.
+    pub fn reports_cursor(&self) -> bool {
+        self.reports_cursor
+    }
+
+    /// After the terminal changed size, asking the backend where the cursor is now, as
+    /// [`resized_to`](Self::resized_to) says. For a backend that answers itself; the session asks
+    /// its terminal through the thread that reads it.
     pub fn resized(&mut self) -> io::Result<()> {
+        let cursor = if self.reports_cursor {
+            self.backend.get_cursor_position().ok()
+        } else {
+            None
+        };
+        self.resized_to(cursor)
+    }
+
+    /// After the terminal changed size, with its cursor at `cursor` now, as it said (`None`
+    /// when it did not say, or was not asked: it is not asked again). Terminals move rows when
+    /// they resize: xterm keeps the cursor's row on screen as the window gets shorter, pushing
+    /// the rows above it into scrollback, and others pull rows back from scrollback as it gets
+    /// taller, or rewrap them. So the live region, cleared, is placed as far above the cursor as
+    /// the cursor was below the region's top; the next draw makes the room it needs. A terminal
+    /// that cannot say is taken to have done what xterm does.
+    pub fn resized_to(&mut self, cursor: Option<Position>) -> io::Result<()> {
         self.screen = self.backend.size().map_err(io_error)?;
         let bottom = self.screen.height.saturating_sub(1);
         let below_top = i32::from(self.cursor_row) - i32::from(self.top);
-        let mut row = None;
-        if self.reports_cursor {
-            match self.backend.get_cursor_position() {
-                Ok(position) => row = Some(position.y.min(bottom)),
-                Err(_) => self.reports_cursor = false,
-            }
+        let row = cursor.map(|position| position.y.min(bottom));
+        if row.is_none() {
+            self.reports_cursor = false;
         }
         self.cursor_row = row.unwrap_or(self.cursor_row.min(bottom));
         let top = (i32::from(self.cursor_row) - below_top).clamp(0, i32::from(self.screen.height));

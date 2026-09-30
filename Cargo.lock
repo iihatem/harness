@@ -1378,6 +1378,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "unicode-width",
  "wiremock",
 ]
 

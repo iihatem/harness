@@ -760,10 +760,13 @@ async fn a_model_id_with_an_escape_byte_is_escaped_on_stderr() {
     assert!(stderr.contains("\\u{1b}"), "{stderr}");
 }
 
+// `harness` alone is the interactive session, which needs a terminal: without one (here, the
+// test's pipes) it exits 2 and names `harness ask`.
 #[test]
-fn no_subcommand_explains_that_interactive_mode_is_not_ready() {
+fn no_subcommand_without_a_terminal_exits_2_naming_harness_ask() {
     Command::new(BIN)
         .assert()
         .code(2)
+        .stderr(contains("interactive mode needs a terminal"))
         .stderr(contains("harness ask"));
 }

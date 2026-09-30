@@ -274,5 +274,8 @@ fn main() -> ExitCode {
             None => interactive::run(cli.model, cli.mode, session).await,
         }
     });
+    // A blocking task given up on (a file read for an approval's diff that never returned) must
+    // not hold up the exit: dropping the runtime would wait for it.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     ExitCode::from(code)
 }

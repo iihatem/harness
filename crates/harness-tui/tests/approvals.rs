@@ -859,3 +859,33 @@ async fn a_prompt_without_a_diff_still_shows_the_new_content() {
     settle(&mut ui).await;
     ui.finish().await.unwrap();
 }
+
+// Review D I1: a write to a FIFO is asked about at once, with the new content and a note.
+#[tokio::test]
+async fn a_write_to_a_fifo_is_asked_about_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(dir.path().join("pipe"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let provider = MockProvider::new(vec![
+        Script::tool_call("w1", "write", json!({"path": "pipe", "content": "data\n"})),
+        Script::text("Left it."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "write it");
+    until_asked(&mut ui).await;
+    let shown = screen(&ui).join("\n");
+    assert!(
+        shown.contains("pipe: not a regular file, so no diff is shown"),
+        "{shown}"
+    );
+    assert!(shown.contains("+data"), "{shown}");
+    press(&mut ui, KeyCode::Char('n'));
+    press(&mut ui, KeyCode::Enter);
+    settle(&mut ui).await;
+    ui.finish().await.unwrap();
+}

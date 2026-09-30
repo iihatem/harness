@@ -293,7 +293,7 @@ where
     }
 
     /// Shows an approval request, after the events that came before it.
-    fn approval(
+    async fn approval(
         &mut self,
         request: harness_core::agent::ApprovalRequest,
         reply: Reply,
@@ -308,7 +308,9 @@ where
                 self.app.on_event(&event);
             }
         }
-        self.app.on_approval(request, reply);
+        let (arguments, workspace, theme) = self.app.approval_context(&request);
+        let body = crate::approval::prepare_body(&request, arguments, workspace, theme).await;
+        self.app.on_approval(request, reply, body);
         self.draw()?;
         Ok(Flow::Continue)
     }
@@ -339,7 +341,7 @@ where
                 None => Ok(Flow::Quit),
             },
             Some(context) = self.contexts.recv() => self.context(context),
-            Some((request, reply)) = self.approvals.recv() => self.approval(request, reply),
+            Some((request, reply)) = self.approvals.recv() => self.approval(request, reply).await,
             _ = tokio::time::sleep(HOST_WARNINGS_EVERY) => self.idle(),
         }
     }
@@ -419,7 +421,7 @@ where
                 Some(context) = self.contexts.recv() => self.context(context)?,
                 // A request left unshown when the user leaves is denied when its reply drops.
                 Some((request, reply)) = self.approvals.recv() => match self.drain(&mut input)? {
-                    Flow::Continue => self.approval(request, reply)?,
+                    Flow::Continue => self.approval(request, reply).await?,
                     Flow::Quit => Flow::Quit,
                 },
                 _ = tokio::time::sleep(HOST_WARNINGS_EVERY) => self.idle()?,

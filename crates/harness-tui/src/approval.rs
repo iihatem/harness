@@ -5,7 +5,8 @@
 use std::{
     cell::{Cell, RefCell},
     io::Read,
-    path::Path,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -31,6 +32,10 @@ use crate::{
 
 /// Files larger than this are not read for a diff.
 const MAX_DIFF_FILE: u64 = 1024 * 1024;
+
+/// How long reading a file and diffing it for a prompt may take; the prompt shows without the
+/// diff after that.
+pub const BODY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long after a prompt is first drawn its keys start to answer it. A key pressed before then
 /// was typed for the input, before the user could have read the prompt.
@@ -118,15 +123,8 @@ pub struct Prompt {
 }
 
 impl Prompt {
-    /// The prompt for `request`, whose tool call has `arguments` (when known), in `workspace`.
-    pub fn new(
-        request: ApprovalRequest,
-        reply: Reply,
-        arguments: Option<&Value>,
-        workspace: &Path,
-        theme: &Theme,
-    ) -> Prompt {
-        let mut body = body(&request, arguments, workspace, theme);
+    /// The prompt for `request`, showing `body` (from [`body`]) under the reason.
+    pub fn new(request: ApprovalRequest, reply: Reply, mut body: Vec<Line<'static>>) -> Prompt {
         reveal_all(&mut body);
         Prompt {
             request,
@@ -331,8 +329,29 @@ impl Prompt {
     }
 }
 
+/// What the prompt for `request` shows under the reason, as [`body`] makes it, made off the
+/// async runtime: reading the file can block (a slow file system), and diffing a large file takes
+/// a while. After [`BODY_TIMEOUT`], a note says there is no diff.
+pub async fn prepare_body(
+    request: &ApprovalRequest,
+    arguments: Option<Value>,
+    workspace: PathBuf,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let for_body = request.clone();
+    let made = within(BODY_TIMEOUT, move || {
+        body(&for_body, arguments.as_ref(), &workspace, &theme)
+    });
+    made.await.unwrap_or_else(|| {
+        lines(
+            "reading the file for a diff took too long, so no diff is shown",
+            theme.dim(),
+        )
+    })
+}
+
 /// What the prompt shows under the reason: the command, or the file's change as a diff.
-fn body(
+pub fn body(
     request: &ApprovalRequest,
     arguments: Option<&Value>,
     workspace: &Path,
@@ -417,6 +436,17 @@ fn body(
     }
 }
 
+/// `work`'s result, from a thread off the async runtime; `None` once `limit` has passed.
+async fn within<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    tokio::time::timeout(limit, tokio::task::spawn_blocking(work))
+        .await
+        .ok()?
+        .ok()
+}
+
 /// Shows what is invisible in every span of `body`, which is one line each.
 fn reveal_all(body: &mut [Line<'static>]) {
     for line in body {
@@ -432,11 +462,22 @@ fn reveal_all(body: &mut [Line<'static>]) {
 /// The text of the file at `path`: `None` when it does not exist; an error saying why when it
 /// is too large or not text.
 fn read_small(path: &Path) -> Result<Option<String>, String> {
-    let file = match std::fs::File::open(path) {
+    // Opening waits for no writer (a FIFO) and makes no terminal harness's own; what was opened is
+    // then checked through its descriptor, and only a regular file is read.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+    {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("cannot read it for a diff ({e})")),
     };
+    match file.metadata() {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err("not a regular file, so no diff is shown".into()),
+        Err(e) => return Err(format!("cannot read it for a diff ({e})")),
+    }
     let mut bytes = Vec::new();
     file.take(MAX_DIFF_FILE + 1)
         .read_to_end(&mut bytes)
@@ -447,4 +488,47 @@ fn read_small(path: &Path) -> Result<Option<String>, String> {
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| "not text, so no diff is shown".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::mpsc, time::Duration};
+
+    use super::*;
+
+    // Review D I1, probe 4: a FIFO opened for reading waits for a writer, and a read of a terminal
+    // never ends. Only a regular file is read.
+    #[test]
+    fn a_fifo_is_not_read_and_nothing_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (tx, rx) = mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || tx.send(read_small(&path)));
+        let read = rx.recv_timeout(Duration::from_secs(2));
+        if read.is_err() {
+            // Lets the stuck read go before failing.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        }
+        let read = read.expect("reading the FIFO for a diff blocked");
+        assert_eq!(read, Err("not a regular file, so no diff is shown".into()));
+    }
+
+    // Review D I1: work that takes too long is given up on, so the prompt shows without it.
+    #[tokio::test]
+    async fn work_off_the_ui_is_given_up_on_after_its_time() {
+        assert_eq!(within(Duration::from_secs(5), || 7).await, Some(7));
+        let slow = within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(500));
+            7
+        });
+        assert_eq!(slow.await, None);
+    }
 }

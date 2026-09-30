@@ -233,11 +233,25 @@ impl App {
         std::mem::take(&mut self.notifications)
     }
 
-    /// The agent asks the user to approve `request`.
-    pub fn on_approval(&mut self, request: ApprovalRequest, reply: Reply) {
+    /// What the prompt for `request` needs to show what it asks about: the tool call's
+    /// arguments (when known), the workspace, and the theme.
+    pub fn approval_context(
+        &self,
+        request: &ApprovalRequest,
+    ) -> (Option<serde_json::Value>, std::path::PathBuf, Theme) {
         let arguments = self.transcript.arguments(&request.call_id).cloned();
-        let theme = self.theme();
-        let mut prompt = Prompt::new(request, reply, arguments.as_ref(), &self.workspace, &theme);
+        (arguments, self.workspace.clone(), self.theme())
+    }
+
+    /// The agent asks the user to approve `request`, showing `body`
+    /// ([`approval::body`](crate::approval::body)) under the reason.
+    pub fn on_approval(
+        &mut self,
+        request: ApprovalRequest,
+        reply: Reply,
+        body: Vec<Line<'static>>,
+    ) {
+        let mut prompt = Prompt::new(request, reply, body);
         if let Some(redactor) = &self.redactor {
             prompt.redact(redactor);
         }

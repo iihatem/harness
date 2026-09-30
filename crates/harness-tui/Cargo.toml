@@ -12,6 +12,7 @@ futures.workspace = true
 harness-context.workspace = true
 harness-core.workspace = true
 ignore.workspace = true
+libc.workspace = true
 nucleo-matcher.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true

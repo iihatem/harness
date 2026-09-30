@@ -731,3 +731,131 @@ async fn a_session_approval_that_cannot_be_kept_reads_approved_once() {
     );
     ui.finish().await.unwrap();
 }
+
+/// Pages down in the prompt until `seen` shows or `pages` run out; whether it showed.
+fn page_to(ui: &mut Ui<TestBackend>, seen: &str, pages: usize) -> bool {
+    for _ in 0..pages {
+        if screen(ui).join("\n").contains(seen) {
+            return true;
+        }
+        press(ui, KeyCode::PageDown);
+    }
+    screen(ui).join("\n").contains(seen)
+}
+
+// Review D C2, probe 1: a one-line command longer than the prompt says rows are hidden, and its
+// end can be scrolled to.
+#[tokio::test]
+async fn a_long_one_line_command_scrolls_to_its_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = format!("echo {} ; echo TAIL-MARKER", "x".repeat(3000));
+    let provider = MockProvider::new(vec![
+        Script::tool_call("b1", "bash", json!({ "command": command })),
+        Script::text("Done."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "go");
+    until_asked(&mut ui).await;
+    let shown = screen(&ui).join("\n");
+    assert!(!shown.contains("TAIL-MARKER"), "{shown}");
+    assert!(
+        shown.contains("rows 1-") && shown.contains(": Up, Down, PgUp and PgDn scroll"),
+        "{shown}"
+    );
+    assert!(page_to(&mut ui, "TAIL-MARKER", 10), "{:#?}", screen(&ui));
+    press(&mut ui, KeyCode::Char('n'));
+    press(&mut ui, KeyCode::Enter);
+    settle(&mut ui).await;
+    ui.finish().await.unwrap();
+}
+
+// Review D C2: so can a long line in a diff.
+#[tokio::test]
+async fn a_long_diff_line_scrolls_to_its_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = format!("{}TAIL-MARKER\n", "y".repeat(3000));
+    let provider = MockProvider::new(vec![
+        Script::tool_call(
+            "w1",
+            "write",
+            json!({"path": "bundle.js", "content": content}),
+        ),
+        Script::text("Written."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "write it");
+    until_asked(&mut ui).await;
+    let shown = screen(&ui).join("\n");
+    assert!(!shown.contains("TAIL-MARKER"), "{shown}");
+    assert!(shown.contains("rows 1-"), "{shown}");
+    assert!(page_to(&mut ui, "TAIL-MARKER", 10), "{:#?}", screen(&ui));
+    press(&mut ui, KeyCode::Char('y'));
+    settle(&mut ui).await;
+    ui.finish().await.unwrap();
+}
+
+// Review D M3: what is approved shows the characters that draw as nothing, so two commands or
+// paths that look the same are the same.
+#[tokio::test]
+async fn invisible_characters_in_what_is_approved_are_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call(
+            "b1",
+            "bash",
+            json!({"command": "rm -rf ./bu\u{200b}ild\u{2060} x\u{e0041}"}),
+        ),
+        Script::tool_call(
+            "w1",
+            "write",
+            json!({"path": "a\nb.txt", "content": "ok\u{feff}\n"}),
+        ),
+        Script::text("Done."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "go");
+    until_asked(&mut ui).await;
+    let shown = screen(&ui).join("\n");
+    assert!(
+        shown.contains("$ rm -rf ./bu\\u{200b}ild\\u{2060} x\\u{e0041}"),
+        "{shown}"
+    );
+    press(&mut ui, KeyCode::Char('n'));
+    press(&mut ui, KeyCode::Enter);
+    until_asked(&mut ui).await;
+    let shown = screen(&ui).join("\n");
+    assert!(shown.contains("write a\\nb.txt (+1 -0)"), "{shown}");
+    assert!(shown.contains("+ok\\u{feff}"), "{shown}");
+    press(&mut ui, KeyCode::Char('n'));
+    press(&mut ui, KeyCode::Enter);
+    settle(&mut ui).await;
+    ui.finish().await.unwrap();
+}
+
+// Review D M4: a file harness shows no diff of still shows what would be written.
+#[tokio::test]
+async fn a_prompt_without_a_diff_still_shows_the_new_content() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("logo.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call(
+            "w1",
+            "write",
+            json!({"path": "logo.bin", "content": "now text\n"}),
+        ),
+        Script::text("Written."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "write it");
+    until_asked(&mut ui).await;
+    let shown = screen(&ui).join("\n");
+    assert!(
+        shown.contains("logo.bin: not text, so no diff is shown"),
+        "{shown}"
+    );
+    assert!(shown.contains("+now text"), "{shown}");
+    press(&mut ui, KeyCode::Char('n'));
+    press(&mut ui, KeyCode::Enter);
+    settle(&mut ui).await;
+    ui.finish().await.unwrap();
+}

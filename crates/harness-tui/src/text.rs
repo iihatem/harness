@@ -35,6 +35,53 @@ fn is_bidi_control(c: char) -> bool {
     )
 }
 
+/// Whether `c` draws as nothing, or not where it is: format characters (Unicode's `Cf`: zero-width
+/// spaces and joiners, the soft hyphen, the byte-order mark, tag characters and the rest) and
+/// the line and paragraph separators. The terminal drops them, so two strings that differ only
+/// in them look the same.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
+/// `text`, already [sanitized](sanitize), with what would not show exactly as it is shown as an
+/// escape too: [invisible](is_invisible) characters, and `\n`, which one line cannot show. For
+/// what the user approves, where what they see must be what runs; elsewhere these characters
+/// (a joiner in an emoji, a non-joiner in Persian) are left to draw as they do.
+pub fn reveal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '\n' || is_invisible(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Columns `text` takes on screen.
 pub fn width(text: &str) -> usize {
     text.chars().map(|c| c.width().unwrap_or(0)).sum()

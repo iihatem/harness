@@ -3,7 +3,7 @@
 //! session, or no, with a reason for the model if they like.
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     io::Read,
     path::Path,
     sync::Arc,
@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     diff,
     style::Theme,
-    text::{lines, sanitize, wrap},
+    text::{lines, reveal, sanitize, wrap},
 };
 
 /// Files larger than this are not read for a diff.
@@ -106,10 +106,13 @@ pub struct Prompt {
     reply: Option<Reply>,
     /// What would run or change: the command, or the file's diff.
     body: Vec<Line<'static>>,
-    /// The first line of `body` shown.
+    /// `body` wrapped to the width it was last drawn at, and that width.
+    wrapped: RefCell<Option<(usize, Vec<Line<'static>>)>>,
+    /// The first row of the wrapped body shown.
     scroll: usize,
-    /// How many lines of `body` the last render showed, for paging.
+    /// How many rows of the body the last render had room for, and how many it has, for paging.
     room: Cell<usize>,
+    rows: Cell<usize>,
     /// While the user types why they deny.
     feedback: Option<String>,
 }
@@ -123,13 +126,16 @@ impl Prompt {
         workspace: &Path,
         theme: &Theme,
     ) -> Prompt {
-        let body = body(&request, arguments, workspace, theme);
+        let mut body = body(&request, arguments, workspace, theme);
+        reveal_all(&mut body);
         Prompt {
             request,
             reply: Some(reply),
             body,
+            wrapped: RefCell::new(None),
             scroll: 0,
             room: Cell::new(10),
+            rows: Cell::new(0),
             feedback: None,
         }
     }
@@ -150,6 +156,7 @@ impl Prompt {
                 }
             }
         }
+        self.wrapped.replace(None);
     }
 
     /// Sends `decision` to the agent.
@@ -199,7 +206,7 @@ impl Prompt {
             }
             return None;
         }
-        let last = self.body.len().saturating_sub(rows);
+        let last = self.rows.get().saturating_sub(rows);
         match key.code {
             KeyCode::Char('y') if plain => {
                 return Some(Answered::Decided(ApprovalDecision::Approve));
@@ -220,13 +227,15 @@ impl Prompt {
         None
     }
 
-    /// The prompt as at most `rows` lines `width` columns wide.
+    /// The prompt as at most `rows` lines `width` columns wide. The body scrolls by row, so
+    /// that a line longer than the prompt can be read to its end; whenever a row is hidden, a
+    /// line says which rows show.
     pub fn render(&self, width: usize, rows: usize, theme: &Theme) -> Vec<Line<'static>> {
         let mut head = wrap(
             &Line::from(vec![
                 Span::styled("approve? ", theme.warning()),
                 Span::styled(
-                    sanitize(&self.request.reason).replace('\n', " "),
+                    reveal(&sanitize(&self.request.reason).replace('\n', " ")),
                     theme.bold(),
                 ),
             ]),
@@ -266,22 +275,30 @@ impl Prompt {
         }
         let room = rows.saturating_sub(head.len() + foot.len() + 1).max(1);
         self.room.set(room);
-        let shown: Vec<Line<'static>> = self
-            .body
-            .iter()
-            .skip(self.scroll)
-            .take(room)
-            .flat_map(|line| wrap(line, width, &[Span::raw("  ")], &[Span::raw("  ")]))
-            .take(room)
-            .collect();
-        head.extend(shown);
-        if self.body.len() > room {
-            let end = (self.scroll + room).min(self.body.len());
+        let mut wrapped = self.wrapped.borrow_mut();
+        if wrapped.as_ref().is_none_or(|(at, _)| *at != width) {
+            let body = self
+                .body
+                .iter()
+                .flat_map(|line| wrap(line, width, &[Span::raw("  ")], &[Span::raw("  ")]))
+                .collect();
+            *wrapped = Some((width, body));
+        }
+        let body = wrapped
+            .as_ref()
+            .map(|(_, body)| body.as_slice())
+            .unwrap_or_default();
+        self.rows.set(body.len());
+        // A scroll left over from a narrower width stops at the last page.
+        let scroll = self.scroll.min(body.len().saturating_sub(room));
+        head.extend(body.iter().skip(scroll).take(room).cloned());
+        if body.len() > room {
+            let end = (scroll + room).min(body.len());
             head.push(Line::from(Span::styled(
                 format!(
-                    "  lines {}-{end} of {}: Up, Down, PgUp and PgDn scroll",
-                    self.scroll + 1,
-                    self.body.len()
+                    "  rows {}-{end} of {}: Up, Down, PgUp and PgDn scroll",
+                    scroll + 1,
+                    body.len()
                 ),
                 theme.dim(),
             )));
@@ -292,7 +309,7 @@ impl Prompt {
 
     /// Lines for the scrollback saying how the user answered.
     pub fn outcome(&self, answered: &Answered, theme: &Theme) -> Line<'static> {
-        let reason = sanitize(&self.request.reason).replace('\n', " ");
+        let reason = reveal(&sanitize(&self.request.reason).replace('\n', " "));
         let (mark, text) = match answered {
             Answered::Decided(ApprovalDecision::Approve) => ("✓", format!("approved: {reason}")),
             Answered::Decided(ApprovalDecision::ApproveForSession)
@@ -333,8 +350,20 @@ fn body(
             let target = resolve_path(workspace, Path::new(&path));
             let old = match read_small(&target) {
                 Ok(old) => old,
+                // No diff, but still what would be written, or what the edit replaces.
                 Err(why) => {
-                    return lines(&format!("{path}: {why}"), theme.dim());
+                    let mut out = lines(&format!("{path}: {why}"), theme.dim());
+                    if request.tool == "write" {
+                        out.extend(diff::unified("", &text("content"), 3, theme));
+                    } else {
+                        out.extend(diff::unified(
+                            &text("old_string"),
+                            &text("new_string"),
+                            3,
+                            theme,
+                        ));
+                    }
+                    return out;
                 }
             };
             let new = if request.tool == "write" {
@@ -385,6 +414,18 @@ fn body(
             Some(args) => lines(&args.to_string(), theme.dim()),
             None => Vec::new(),
         },
+    }
+}
+
+/// Shows what is invisible in every span of `body`, which is one line each.
+fn reveal_all(body: &mut [Line<'static>]) {
+    for line in body {
+        for span in &mut line.spans {
+            let shown = reveal(&span.content);
+            if shown != span.content {
+                span.content = shown.into();
+            }
+        }
     }
 }
 

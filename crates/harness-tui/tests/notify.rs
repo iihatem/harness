@@ -93,6 +93,26 @@ fn a_notification_is_an_osc_9_sequence_and_a_bell_each_when_enabled() {
     );
 }
 
+// Review A's M2: the approval notification carries the model's command, and a right-to-left
+// override or an invisible character in it disguised the command in the desktop notification.
+#[test]
+fn a_notification_drops_bidi_and_invisible_format_characters() {
+    assert_eq!(
+        sent(
+            true,
+            false,
+            "rm \u{202e}fdsa\u{202c} x\u{200b}y\u{2066}z\u{2069}\u{feff}\u{e0041}"
+        ),
+        "\x1b]9;harness: rm fdsa xyz\x07"
+    );
+    // Joiners inside an emoji stay, so it is still one emoji.
+    let family = "👨\u{200d}👩\u{200d}👧";
+    assert_eq!(
+        sent(true, false, family),
+        format!("\x1b]9;harness: {family}\x07")
+    );
+}
+
 #[test]
 fn durations_read_as_people_say_them() {
     assert_eq!(notify::duration(Duration::from_secs(12)), "12s");

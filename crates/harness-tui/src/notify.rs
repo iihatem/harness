@@ -37,12 +37,10 @@ impl<W: Write + Send> TerminalNotifier<W> {
 }
 
 /// `text` as an OSC 9 payload: control characters (which would end the sequence early, or start
-/// another) are dropped, and it is cut to [`MAX_TEXT`] characters.
+/// another) are dropped, and so are the characters that reorder text or draw nothing, which
+/// could disguise a command waiting for approval; it is cut to [`MAX_TEXT`] characters.
 fn payload(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_TEXT)
-        .collect()
+    crate::text::strip(text).chars().take(MAX_TEXT).collect()
 }
 
 impl<W: Write + Send> Notify for TerminalNotifier<W> {

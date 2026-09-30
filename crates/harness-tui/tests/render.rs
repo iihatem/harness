@@ -263,3 +263,33 @@ fn emoji_sequences_are_measured_and_wrapped_as_the_screen_draws_them() {
         .collect();
     assert!(bars.windows(2).all(|w| w[0] == w[1]), "{bars:?}");
 }
+
+// Review D's M3: invisible format characters (zero-width spaces and joiners, the soft hyphen, the
+// byte-order mark, tag characters, line separators) are not drawn, so a command, a path or a
+// diff line could differ invisibly from what is shown. They are shown escaped, as control and
+// bidirectional characters are, except where a script or an emoji needs them.
+#[test]
+fn invisible_format_characters_are_shown_escaped() {
+    for (text, shown) in [
+        ("rm\u{200b} -rf", "rm\\u{200b} -rf"),
+        ("a\u{200c}b a\u{200d}b", "a\\u{200c}b a\\u{200d}b"),
+        ("soft\u{ad}hyphen", "soft\\u{ad}hyphen"),
+        ("\u{feff}bom \u{2060}wj", "\\u{feff}bom \\u{2060}wj"),
+        ("tag\u{e0041}\u{e007f}", "tag\\u{e0041}\\u{e007f}"),
+        ("line\u{2028}para\u{2029}", "line\\u{2028}para\\u{2029}"),
+        ("\u{202e}rtl", "\\u{202e}rtl"),
+    ] {
+        assert_eq!(text::sanitize(text), shown);
+    }
+    // Emoji sequences, subdivision flags, and joiners in scripts that write with them are kept.
+    for text in [
+        "👨\u{200d}👩\u{200d}👧\u{200d}👦",
+        "🏳\u{fe0f}\u{200d}🌈",
+        "🏴\u{e0067}\u{e0062}\u{e0065}\u{e006e}\u{e0067}\u{e007f}",
+        "می\u{200c}خواهم",
+        "क्\u{200d}ष",
+        "\u{0600}١٢",
+    ] {
+        assert_eq!(text::sanitize(text), text);
+    }
+}

@@ -4,29 +4,67 @@ use ratatui::{
     style::Style,
     text::{Line, Span},
 };
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
 
 /// Columns a tab takes.
 const TAB: &str = "    ";
 
-/// `text` made safe to draw: every control character, and every character that reorders text on
-/// screen (bidirectional marks, embeddings, overrides and isolates), is shown as an escape such as
-/// `\u{1b}`, so it cannot move the cursor or disguise what is shown. A tab becomes four spaces;
-/// `\n` is kept, and `\r\n` becomes `\n`.
+/// `text` made safe to draw: every control character, every character that reorders text on
+/// screen (bidirectional marks, embeddings, overrides and isolates), and every invisible format
+/// character (zero-width spaces and joiners, the soft hyphen, the byte-order mark, tag
+/// characters, line and paragraph separators) is shown as an escape such as `\u{1b}`, so it
+/// cannot move the cursor, or disguise what is shown by reordering it or hiding in it. Joiners
+/// inside an emoji sequence or after a letter of a script written with them, and the tag
+/// characters of a subdivision flag, are kept. A tab becomes four spaces; `\n` is kept, and
+/// `\r\n` becomes `\n`.
 pub fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
         match c {
             '\n' => out.push('\n'),
             '\t' => out.push_str(TAB),
-            '\r' if chars.peek() == Some(&'\n') => {}
-            c if c.is_control() || is_bidi_control(c) => out.extend(c.escape_default()),
+            '\r' if chars.peek().is_some_and(|(_, next)| *next == '\n') => {}
+            c if hidden(text, at, c) => out.extend(c.escape_default()),
             c => out.push(c),
         }
     }
     out
+}
+
+/// `text` without what [`sanitize`] shows as escapes, line breaks and tabs included: for text
+/// that cannot show an escape, such as a desktop notification's.
+pub fn strip(text: &str) -> String {
+    text.char_indices()
+        .filter(|&(at, c)| !hidden(text, at, c))
+        .map(|(_, c)| c)
+        .collect()
+}
+
+/// Whether `c`, at byte `at` of `text`, is not drawn as it is: a control character, one that
+/// reorders text, or an invisible format character that the emoji or the script around it does
+/// not need.
+fn hidden(text: &str, at: usize, c: char) -> bool {
+    if c.is_control() || is_bidi_control(c) {
+        return true;
+    }
+    if !is_invisible(c) || is_visible_format(c) {
+        return false;
+    }
+    match c {
+        // A zero-width joiner inside a grapheme cluster joins it to what follows (an emoji ZWJ
+        // sequence, an Indic conjunct). Both joiners shape the letters of the scripts written
+        // with them (Persian, Arabic, the Indic scripts).
+        '\u{200c}' | '\u{200d}' => {
+            let joins = c == '\u{200d}' && !is_boundary(text, at + c.len_utf8());
+            let base = cluster_base(text, at);
+            !(joins || (base.is_alphabetic() && !base.is_ascii()))
+        }
+        // Tag characters spell a subdivision flag after a black flag.
+        '\u{e0020}'..='\u{e007f}' => cluster_base(text, at) != '\u{1f3f4}',
+        _ => true,
+    }
 }
 
 fn is_bidi_control(c: char) -> bool {
@@ -67,10 +105,25 @@ fn is_invisible(c: char) -> bool {
     )
 }
 
+/// The format characters that do draw: the signs written before a number in Arabic, Syriac and
+/// Kaithi (the Arabic number sign, the end of an ayah).
+fn is_visible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0600}'..='\u{0605}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+    )
+}
+
 /// `text`, already [sanitized](sanitize), with what would not show exactly as it is shown as an
-/// escape too: [invisible](is_invisible) characters, and `\n`, which one line cannot show. For
-/// what the user approves, where what they see must be what runs; elsewhere these characters
-/// (a joiner in an emoji, a non-joiner in Persian) are left to draw as they do.
+/// escape too: the [invisible](is_invisible) characters `sanitize` keeps for an emoji or a script
+/// (a joiner in an emoji, a non-joiner in Persian), and `\n`, which one line cannot show. For what
+/// the user approves, where what they see must be what runs.
 pub fn reveal(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -81,6 +134,27 @@ pub fn reveal(text: &str) -> String {
         }
     }
     out
+}
+
+/// Whether a grapheme cluster starts at byte `at` of `text`.
+fn is_boundary(text: &str, at: usize) -> bool {
+    GraphemeCursor::new(at, text.len(), true)
+        .is_boundary(text, 0)
+        .unwrap_or(true)
+}
+
+/// The first character of the grapheme cluster the character at byte `at` of `text` is in.
+fn cluster_base(text: &str, at: usize) -> char {
+    let start = if is_boundary(text, at) {
+        at
+    } else {
+        GraphemeCursor::new(at, text.len(), true)
+            .prev_boundary(text, 0)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    };
+    text[start..].chars().next().unwrap_or_default()
 }
 
 /// Columns `text` takes on screen, counted as ratatui draws it: by grapheme cluster, so an

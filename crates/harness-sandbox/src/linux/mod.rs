@@ -116,7 +116,7 @@ use tokio::process::Command;
 
 use crate::guard::{GitGuard, GuardSession};
 use crate::procs::{self, Registration};
-use crate::watch::{Lifetime, Target};
+use crate::watch::{End, Lifetime, Target};
 use crate::{FsAccess, SandboxPolicy, SandboxSettings};
 use inotify::Watcher;
 use mountns::MountPlan;
@@ -564,11 +564,23 @@ impl Watching {
         lock(&self.0.note).unsaid.take()
     }
 
+    /// Stops `watcher`, and has the next report say so if it had stopped on
+    /// its own (its wait failed, or a check panicked).
+    fn stop(&self, watcher: Watcher) {
+        if let Some(said) = watcher.stop().and_then(End::note) {
+            let mut note = lock(&self.0.note);
+            let unsaid = note.unsaid.get_or_insert_with(String::new);
+            if !unsaid.contains(&said) {
+                unsaid.push_str(&said);
+            }
+        }
+    }
+
     /// Stops every watcher between commands, and waits for them.
     fn stop_all_between(&self) {
         let watchers = std::mem::take(&mut *lock(&self.0.between));
         for watcher in watchers.into_values() {
-            watcher.stop();
+            self.stop(watcher);
         }
     }
 
@@ -577,7 +589,7 @@ impl Watching {
     fn stop_between(&self, workspace: &Path) {
         let watcher = lock(&self.0.between).remove(workspace);
         if let Some(watcher) = watcher {
-            watcher.stop();
+            self.stop(watcher);
         }
     }
 
@@ -609,7 +621,9 @@ impl Watching {
             done
         };
         // Joined once the lock is released.
-        drop(done);
+        for watcher in done {
+            self.stop(watcher);
+        }
     }
 }
 
@@ -740,7 +754,7 @@ impl CommandGuard for LinuxGuard {
             after,
         } = *self;
         if let Some(watcher) = watcher {
-            watcher.stop();
+            after.watching.stop(watcher);
         }
         drop(registration);
         let note = setup
@@ -841,6 +855,42 @@ mod tests {
         assert_eq!(finish(true), None, "said once");
         assert_eq!(finish(false), None);
         assert!(finish(true).is_some(), "said again once one started");
+    }
+
+    // Final review M5: a command's watcher that stops on its own is said in the next report, as
+    // one that cannot start is, rather than on stderr.
+    #[test]
+    fn a_watcher_that_stops_on_its_own_is_said_in_the_next_report() {
+        let _serial = procs::serial();
+        if !linux_sandbox_available() {
+            eprintln!("skipping: linux sandbox unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        let sandbox = LinuxSandbox::with_git_protection(
+            crate::SandboxSettings {
+                quarantine_dir: Some(dir.path().join("quarantine")),
+                ..crate::SandboxSettings::default()
+            },
+            GitProtection::Basic {
+                reason: "forced by the test".into(),
+            },
+        );
+        inotify::fail_next_wait();
+        let prepared = sandbox
+            .prepare(FsAccess::WorkspaceWrite, &ws, "/bin/true", &[])
+            .expect("prepare");
+        let report = prepared.guard.expect("a guard").finish().expect("a note");
+        assert!(!report.blocked, "{}", report.message);
+        assert!(
+            report.message.contains(
+                "harness stopped watching git metadata as it changes (waiting for changes failed)"
+            ),
+            "{}",
+            report.message
+        );
     }
 
     #[test]

@@ -83,6 +83,19 @@ pub(super) fn fail_next_start(errno: i32) {
     FAIL_NEXT.with(|next| next.set(Some(errno)));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The next watcher started on this thread fails its first wait.
+    static FAIL_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes the next watcher started on this thread fail its first wait for events, so that it
+/// ends on its own.
+#[cfg(test)]
+pub(super) fn fail_next_wait() {
+    FAIL_WAIT.with(|next| next.set(true));
+}
+
 /// Room for many events: one takes 16 bytes plus a name of up to 256.
 const BUF_BYTES: usize = 16 * 1024;
 
@@ -127,18 +140,11 @@ impl Watcher {
         let source = Inotify::new(root)?;
         let stop = Arc::clone(&source.stop);
         let watch = Watch::new(source, target, lifetime);
+        // How it ended goes to whoever stops it, for the next report: stderr is the terminal the
+        // session draws in raw mode.
         let thread = std::thread::Builder::new()
             .name(name.into())
-            .spawn(move || {
-                let end = watch::run_caught(watch);
-                if matches!(end, End::Failed | End::Panicked) {
-                    eprintln!(
-                        "harness: the git-metadata watcher stopped ({end:?}); the checks \
-                         around each command still run"
-                    );
-                }
-                end
-            })?;
+            .spawn(move || watch::run_caught(watch))?;
         Ok(Watcher {
             stop,
             thread: Some(thread),
@@ -146,9 +152,9 @@ impl Watcher {
     }
 
     /// Stops the thread and waits for it: no check of this watcher runs after
-    /// this returns.
-    pub(super) fn stop(mut self) {
-        self.shut_down();
+    /// this returns. How it ended, unless it was stopped already.
+    pub(super) fn stop(mut self) -> Option<End> {
+        self.shut_down()
     }
 
     /// Whether the thread has ended.
@@ -156,10 +162,8 @@ impl Watcher {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    fn shut_down(&mut self) {
-        let Some(thread) = self.thread.take() else {
-            return;
-        };
+    fn shut_down(&mut self) -> Option<End> {
+        let thread = self.thread.take()?;
         let one: u64 = 1;
         // SAFETY: writes the 8 bytes of `one` to the eventfd this watcher
         // owns; an eventfd write never blocks here, nor raises a signal.
@@ -170,7 +174,7 @@ impl Watcher {
                 std::mem::size_of::<u64>(),
             );
         }
-        let _ = thread.join();
+        thread.join().ok()
     }
 }
 
@@ -187,6 +191,9 @@ struct Inotify {
     stop: Arc<OwnedFd>,
     tree: Tree,
     buf: Vec<u8>,
+    /// Its next wait fails ([`fail_next_wait`]).
+    #[cfg(test)]
+    fail_wait: bool,
 }
 
 impl Inotify {
@@ -215,6 +222,8 @@ impl Inotify {
             stop,
             tree: Tree::new(root),
             buf: vec![0; BUF_BYTES],
+            #[cfg(test)]
+            fail_wait: FAIL_WAIT.with(std::cell::Cell::take),
         })
     }
 }
@@ -241,6 +250,10 @@ impl Source for Inotify {
     }
 
     fn wait(&mut self, timeout: Option<Duration>) -> io::Result<Wake> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_wait) {
+            return Err(io::Error::other("failed by the test"));
+        }
         let mut fds = [
             libc::pollfd {
                 fd: self.fd.as_raw_fd(),
@@ -578,6 +591,21 @@ mod tests {
         let (now, why) = watcher_failures();
         assert!(now > failed);
         assert!(why.is_some());
+    }
+
+    // Final review M5: a watcher that stops on its own wrote to stderr, which is the terminal the
+    // session draws in raw mode. Its end is handed to whoever stops it instead.
+    #[test]
+    fn a_watcher_that_stops_on_its_own_says_why_to_whoever_stops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, _) = Counting::new(&[dir.path()]);
+        fail_next_wait();
+        let watcher = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap();
+        wait_until("it stops", || watcher.ended());
+        assert_eq!(watcher.stop(), Some(End::Failed));
+        let (target, _) = Counting::new(&[dir.path()]);
+        let watcher = Watcher::start(&root(&dir), target, Lifetime::Command).unwrap();
+        assert_eq!(watcher.stop(), Some(End::Stopped));
     }
 
     #[test]

@@ -34,6 +34,22 @@ pub const HOST_WARNINGS_EVERY: Duration = Duration::from_millis(250);
 /// once.
 pub const REDRAW_EVERY: Duration = Duration::from_millis(30);
 
+/// How long the terminal's input is given to end after a write to the terminal failed.
+const GONE_WAIT: Duration = Duration::from_secs(1);
+
+/// After a write to the terminal failed with `error`: the terminal went away, when its input ends
+/// within [`GONE_WAIT`] (its reader tells a moment after it goes), or the write failed for some
+/// other reason.
+async fn gone_or<S>(input: &mut S, error: io::Error) -> io::Result<Ending>
+where
+    S: Stream<Item = io::Result<Event>> + Unpin,
+{
+    match tokio::time::timeout(GONE_WAIT, input.next()).await {
+        Ok(None | Some(Err(_))) => Ok(Ending::Hangup),
+        _ => Err(error),
+    }
+}
+
 /// Whether the session goes on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
@@ -522,10 +538,15 @@ where
                     None => self.approval(request, reply).await?,
                     Some(ending) => return Ok(ending),
                 },
-                _ = tokio::time::sleep_until(redraw_at), if redraw => {
-                    self.draw()?;
-                    Flow::Continue
-                }
+                // Drawn after the keys waiting, and not once the terminal has gone, which it may
+                // have just before its reader can tell.
+                _ = tokio::time::sleep_until(redraw_at), if redraw => match self.drain(input)? {
+                    None => match self.draw() {
+                        Ok(()) => Flow::Continue,
+                        Err(e) => return gone_or(input, e).await,
+                    },
+                    Some(ending) => return Ok(ending),
+                },
                 _ = tokio::time::sleep(HOST_WARNINGS_EVERY) => self.idle()?,
             };
             if flow == Flow::Quit {

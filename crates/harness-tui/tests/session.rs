@@ -646,3 +646,36 @@ async fn resizing_while_a_reply_streams_keeps_every_line_once() {
     }
     ui.finish().await.unwrap();
 }
+
+// A redraw put off while the agent's events stream can come just after the terminal went away,
+// before its reader has told the session: that is the terminal going away, not a failure.
+#[tokio::test(start_paused = true)]
+async fn a_put_off_redraw_after_the_terminal_went_away_ends_the_session_as_a_hangup() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::Hang(vec![ProviderEvent::TextDelta(
+        "streaming".into(),
+    )])]);
+    let (backend, gone) = support::gone::Breakable::new(TestBackend::new(60, 16));
+    let mut ui = Ui::start(
+        agent(provider, dir.path()),
+        Box::new(TestHost),
+        InlineTerminal::new(backend, 0).unwrap(),
+        options(dir.path()),
+        ChannelApprover::new().1,
+    );
+    let (keys, input) = futures::channel::mpsc::unbounded();
+    for code in [KeyCode::Char('g'), KeyCode::Char('o'), KeyCode::Enter] {
+        keys.unbounded_send(Ok(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))))
+            .unwrap();
+    }
+    let terminal_goes = async move {
+        // The keys and the reply's first events are taken in, and a redraw is put off.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The terminal's reader tells a moment later.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(keys);
+    };
+    let (ending, ()) = tokio::join!(ui.run(input, std::future::pending()), terminal_goes);
+    assert_eq!(ending.unwrap(), harness_tui::ui::Ending::Hangup);
+}

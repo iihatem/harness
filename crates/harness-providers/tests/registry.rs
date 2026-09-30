@@ -425,10 +425,11 @@ async fn refused(
     first.unwrap_err()
 }
 
-// Final review, M-3: a key the provider refuses is named by where it came from (the variable,
-// which wins over a stored key, or the stored profile), with what fixes it; never by its value.
+// Final review, M-3: a key the provider refuses outright (401) is named by where it came from
+// (the variable, which wins over a stored key, or the stored profile), with what fixes it; never
+// by its value.
 #[tokio::test]
-async fn a_refused_key_says_which_key_it_was_and_how_to_replace_it() {
+async fn a_401_says_which_key_it_was_and_how_to_replace_it() {
     use harness_core::provider::ProviderError;
     for protocol in [
         Protocol::OpenaiChat,
@@ -448,11 +449,11 @@ async fn a_refused_key_says_which_key_it_was_and_how_to_replace_it() {
         assert!(!error.is_retryable());
         let mut stored = Keys::new(&[], &[("mock", "sk-mock-stored-0123456789")]);
         stored.profile = "work".into();
-        let error = refused("mock/m", protocol, 403, stored).await;
+        let error = refused("mock/m", protocol, 401, stored).await;
         let ProviderError::KeyRefused { status, hint, .. } = &error else {
             panic!("{error:?}");
         };
-        assert_eq!(*status, 403);
+        assert_eq!(*status, 401);
         for part in [
             "stored",
             "profile `work`",
@@ -469,6 +470,48 @@ async fn a_refused_key_says_which_key_it_was_and_how_to_replace_it() {
         matches!(error, ProviderError::Http { status: 404, .. }),
         "{error:?}"
     );
+}
+
+// Final review, wave 5 re-review R2: a 403 is not always the key (OpenRouter answers it when a
+// model moderates the input away, OpenAI when a key's region or model is not allowed), so its
+// hint is conditional ("if it is the key: ...") rather than a flat instruction to correct it.
+#[tokio::test]
+async fn a_403_gets_a_conditional_hint_about_the_key() {
+    use harness_core::provider::ProviderError;
+    for protocol in [
+        Protocol::OpenaiChat,
+        Protocol::OpenaiResponses,
+        Protocol::AnthropicMessages,
+    ] {
+        let mut stored = Keys::new(&[], &[("mock", "sk-mock-stored-0123456789")]);
+        stored.profile = "work".into();
+        let error = refused("mock/m", protocol, 403, stored).await;
+        let ProviderError::KeyRefused { status, hint, .. } = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(*status, 403);
+        for part in [
+            "the provider refused the request",
+            "lacks access",
+            "region",
+            "the input was refused",
+            "if it is the key",
+            "profile `work`",
+            "`harness auth add mock --profile work`",
+        ] {
+            assert!(hint.contains(part), "{part}: {hint}");
+        }
+        assert!(!error.to_string().contains("sk-mock"), "{error}");
+        assert!(!error.is_retryable());
+    }
+    let from_env = Keys::new(&[("MOCK_API_KEY", "sk-mock-env-0123456789")], &[]);
+    let error = refused("mock/m", Protocol::OpenaiChat, 403, from_env).await;
+    let ProviderError::KeyRefused { hint, .. } = &error else {
+        panic!("{error:?}");
+    };
+    for part in ["$MOCK_API_KEY", "if it is the key"] {
+        assert!(hint.contains(part), "{part}: {hint}");
+    }
 }
 
 // Re-review A, N4: a `base_url` with a query or fragment would have the request's path appended

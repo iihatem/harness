@@ -250,8 +250,8 @@ fn api_key(
         .map(|key| (key, KeySource::Stored)))
 }
 
-/// What to say when `provider` refuses its key, from `source`: which key it was, and what
-/// replaces it. Never the key.
+/// What to say when `provider` answers 401: which key that was, and what replaces it. A 401 means
+/// the key itself, never the key's value.
 fn refused_key_hint(provider: &str, source: &KeySource, secrets: &impl Secrets) -> String {
     let profile = secrets
         .profile(provider)
@@ -267,16 +267,42 @@ fn refused_key_hint(provider: &str, source: &KeySource, secrets: &impl Secrets) 
     }
 }
 
-/// A provider whose refusal of its key (HTTP 401 or 403) says which key that was, and how to
-/// replace it.
+/// What to say when `provider` answers 403: unlike a 401, this does not always mean the key
+/// (OpenRouter answers it when a model moderates the input away; OpenAI, when a key's region or
+/// model is not allowed), so the hint about which key was sent, and what replaces it, is
+/// conditional on that being the reason. Never the key's value.
+fn refused_request_hint(provider: &str, source: &KeySource, secrets: &impl Secrets) -> String {
+    let profile = secrets
+        .profile(provider)
+        .unwrap_or_else(|_| DEFAULT_PROFILE.to_string());
+    let add = auth_add_command(provider, &profile);
+    let if_the_key = match source {
+        KeySource::Env(var) => format!(
+            "if it is the key: correct it in ${var}, or unset {var} to use the key stored with `{add}`"
+        ),
+        KeySource::Stored => format!(
+            "if it is the key: replace the one stored for {provider}'s profile `{profile}` with `{add}`"
+        ),
+    };
+    format!(
+        "the provider refused the request, which can mean the key lacks access to this model or region, or the input was refused; {if_the_key}"
+    )
+}
+
+/// A provider whose refusal of its key (HTTP 401) or of a request (HTTP 403) says which key that
+/// was, and how to replace it: a 401 outright, a 403 conditionally, since it is not always the
+/// key (see [`refused_request_hint`]).
 struct KeyHinted {
     inner: Arc<dyn Provider>,
-    hint: String,
+    /// The hint for a 401: the key itself.
+    key_hint: String,
+    /// The hint for a 403: maybe the key.
+    request_hint: String,
 }
 
 impl Provider for KeyHinted {
     fn stream(&self, request: ChatRequest) -> ProviderStream {
-        let hint = self.hint.clone();
+        let (key_hint, request_hint) = (self.key_hint.clone(), self.request_hint.clone());
         Box::pin(self.inner.stream(request).map(move |item| {
             item.map_err(|error| match error {
                 ProviderError::Http {
@@ -286,7 +312,11 @@ impl Provider for KeyHinted {
                 } => ProviderError::KeyRefused {
                     status,
                     body,
-                    hint: hint.clone(),
+                    hint: if status == 401 {
+                        key_hint.clone()
+                    } else {
+                        request_hint.clone()
+                    },
                 },
                 other => other,
             })
@@ -386,7 +416,8 @@ pub fn resolve(
     let provider: Arc<dyn Provider> = match &found {
         Some((_, source)) => Arc::new(KeyHinted {
             inner: provider,
-            hint: refused_key_hint(name, source, &secrets),
+            key_hint: refused_key_hint(name, source, &secrets),
+            request_hint: refused_request_hint(name, source, &secrets),
         }),
         None => provider,
     };

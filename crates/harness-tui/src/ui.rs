@@ -37,6 +37,17 @@ pub enum Flow {
     Quit,
 }
 
+/// How the session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// The user left.
+    Quit,
+    /// The terminal went away: a hangup (SIGHUP), or its input ended or failed.
+    Hangup,
+    /// harness was asked to stop (SIGTERM).
+    Terminated,
+}
+
 /// Work for the task that owns the agent.
 enum Job {
     Turn {
@@ -371,8 +382,8 @@ where
 
     /// Takes in the terminal events already waiting. Done before an agent's event or approval is
     /// shown, so that a key typed before a prompt appeared goes where it was typed for, never to
-    /// the prompt.
-    fn drain<S>(&mut self, input: &mut S) -> io::Result<Flow>
+    /// the prompt. `Some` when the session ends.
+    fn drain<S>(&mut self, input: &mut S) -> io::Result<Option<Ending>>
     where
         S: Stream<Item = io::Result<Event>> + Unpin,
     {
@@ -380,62 +391,85 @@ where
             match next {
                 Some(Ok(event)) => {
                     if self.handle(event)? == Flow::Quit {
-                        return Ok(Flow::Quit);
+                        return Ok(Some(Ending::Quit));
                     }
                 }
-                Some(Err(e)) => return Err(e),
-                None => return Ok(Flow::Quit),
+                Some(Err(_)) | None => return Ok(Some(Ending::Hangup)),
             }
         }
-        Ok(Flow::Continue)
+        Ok(None)
     }
 
-    /// Runs the session on `input`, the terminal's events, until the user leaves. Keys come
+    /// Runs the session on `input`, the terminal's events, until the user leaves, the terminal
+    /// goes away (its input ends or fails), or `shutdown` says to stop (a signal). Keys come
     /// first: what the user typed is taken in before what the agent sent meanwhile.
-    pub async fn run<S>(&mut self, mut input: S) -> io::Result<()>
+    ///
+    /// However it ends, the session [finishes](Self::finish): the turn stops, whatever waits
+    /// for an approval is denied, and the agent is dropped. Only after the user left does a
+    /// failure to write the terminal fail the run: once it went away, or harness was asked to
+    /// stop, there may be no terminal to write to.
+    pub async fn run<S, D>(&mut self, mut input: S, shutdown: D) -> io::Result<Ending>
     where
         S: Stream<Item = io::Result<Event>> + Unpin,
+        D: std::future::Future<Output = Ending>,
     {
+        let ending = self.serve(&mut input, shutdown).await;
+        let finished = self.finish().await;
+        match ending? {
+            Ending::Quit => finished.map(|()| Ending::Quit),
+            other => Ok(other),
+        }
+    }
+
+    /// The session's loop, for [`run`](Self::run): how it ended.
+    async fn serve<S, D>(&mut self, input: &mut S, shutdown: D) -> io::Result<Ending>
+    where
+        S: Stream<Item = io::Result<Event>> + Unpin,
+        D: std::future::Future<Output = Ending>,
+    {
+        tokio::pin!(shutdown);
         self.draw()?;
         loop {
             let flow = tokio::select! {
                 biased;
+                ending = &mut shutdown => return Ok(ending),
                 event = input.next() => match event {
                     Some(Ok(event)) => self.handle(event)?,
-                    Some(Err(e)) => {
-                        self.finish().await?;
-                        return Err(e);
-                    }
-                    None => Flow::Quit,
+                    Some(Err(_)) | None => return Ok(Ending::Hangup),
                 },
                 event = self.events.recv() => match event {
-                    Some(event) => match self.drain(&mut input)? {
-                        Flow::Continue => self.agent_event(event)?,
-                        Flow::Quit => {
+                    Some(event) => match self.drain(input)? {
+                        None => self.agent_event(event)?,
+                        Some(ending) => {
                             self.take_in(event);
-                            Flow::Quit
+                            return Ok(ending);
                         }
                     },
                     None => Flow::Quit,
                 },
                 Some(context) = self.contexts.recv() => self.context(context)?,
-                // A request left unshown when the user leaves is denied when its reply drops.
-                Some((request, reply)) = self.approvals.recv() => match self.drain(&mut input)? {
-                    Flow::Continue => self.approval(request, reply).await?,
-                    Flow::Quit => Flow::Quit,
+                // A request left unshown when the session ends is denied when its reply drops.
+                Some((request, reply)) = self.approvals.recv() => match self.drain(input)? {
+                    None => self.approval(request, reply).await?,
+                    Some(ending) => return Ok(ending),
                 },
                 _ = tokio::time::sleep(HOST_WARNINGS_EVERY) => self.idle()?,
             };
             if flow == Flow::Quit {
-                break;
+                return Ok(Ending::Quit);
             }
         }
-        self.finish().await
     }
 
-    /// Ends the session: stops a running turn, waits for the agent to be dropped (which
-    /// releases the session file), writes what finished meanwhile, and clears the live region.
+    /// Ends the session: denies what waits for an approval, shown or not, and whatever the
+    /// agent would ask from now on; stops a running turn, which stops the command it runs;
+    /// waits for the agent to be dropped (which releases the session file); writes what finished
+    /// meanwhile, and clears the live region.
     pub async fn finish(&mut self) -> io::Result<()> {
+        self.app.deny_waiting();
+        self.approvals.close();
+        // Dropping a reply denies it.
+        while self.approvals.try_recv().is_ok() {}
         if let Some(cancel) = &self.cancel {
             cancel.cancel();
         }

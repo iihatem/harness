@@ -15,6 +15,7 @@ use ratatui::{
 };
 
 use crate::{
+    input::InputPause,
     style::Theme,
     terminal::{Modes, RawMode},
     text::wrap,
@@ -30,6 +31,8 @@ pub struct ExternalEditor<W: Write + Send, R: RawMode + Send> {
     /// Run as `sh -c '<command> "$1"'`, so it may hold arguments, as `$EDITOR` often does.
     command: String,
     modes: Modes<W, R>,
+    /// Stops the session's reading of the terminal while the editor reads it.
+    input: Option<InputPause>,
 }
 
 impl<W: Write + Send, R: RawMode + Send> ExternalEditor<W, R> {
@@ -43,7 +46,18 @@ impl<W: Write + Send, R: RawMode + Send> ExternalEditor<W, R> {
     }
 
     pub fn new(command: String, modes: Modes<W, R>) -> Self {
-        ExternalEditor { command, modes }
+        ExternalEditor {
+            command,
+            modes,
+            input: None,
+        }
+    }
+
+    /// Stops the session's reading of the terminal with `input` while the editor runs, so every
+    /// key goes to the editor.
+    pub fn pausing(mut self, input: InputPause) -> Self {
+        self.input = Some(input);
+        self
     }
 }
 
@@ -73,6 +87,7 @@ impl<W: Write + Send, R: RawMode + Send> TextEditor for ExternalEditor<W, R> {
         let result = (|| {
             file.write_all(text.as_bytes())?;
             drop(file);
+            let _paused = self.input.as_ref().map(InputPause::pause);
             self.modes.suspend()?;
             let status = Command::new("/bin/sh")
                 .arg("-c")

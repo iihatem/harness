@@ -1,8 +1,11 @@
 //! `harness` without a subcommand: the interactive session in the terminal.
 
-use std::{io::IsTerminal, sync::Arc};
+use std::{
+    future::Future,
+    io::{IsTerminal, Write},
+    sync::Arc,
+};
 
-use crossterm::event::EventStream;
 use harness_config::config;
 use harness_context::{commands::Commands, project::project_root};
 use harness_core::{engine::PermissionEngine, permission::Mode};
@@ -11,11 +14,12 @@ use harness_tui::{
     app::{Host, Options, Prepared},
     approval::{ChannelApprover, Requests},
     inline::InlineTerminal,
+    input::TerminalInput,
     notify::TerminalNotifier,
     plan::ExternalEditor,
     style::Theme,
     terminal::{CrosstermRawMode, Modes},
-    ui::Ui,
+    ui::{Ending, Ui},
 };
 use ratatui::backend::CrosstermBackend;
 use tokio_util::sync::CancellationToken;
@@ -199,6 +203,8 @@ pub async fn run(
     };
     let notifications = setup.config.notifications;
     let redactor = setup.redactor.clone();
+    // The session's terminal modes are undone when it returns, before the sandbox's session
+    // ends.
     let result = terminal_session(
         agent,
         Box::new(host),
@@ -210,12 +216,64 @@ pub async fn run(
     .await;
     sandbox_session.end();
     match result {
-        Ok(()) => 0,
+        Ok(ending) => exit_code(ending),
         Err(e) => {
-            eprintln!("error: {}", terminal_safe(&e.to_string()));
+            // The terminal may be gone.
+            let _ = writeln!(
+                std::io::stderr(),
+                "error: {}",
+                terminal_safe(&e.to_string())
+            );
             1
         }
     }
+}
+
+/// The exit code for how the session ended: 128 plus the signal's number for a hangup (a
+/// terminal that closed counts as one) and for SIGTERM, as a shell reports them.
+fn exit_code(ending: Ending) -> u8 {
+    match ending {
+        Ending::Quit => 0,
+        Ending::Hangup => 129,
+        Ending::Terminated => 143,
+    }
+}
+
+/// Resolves when harness is asked to stop (SIGTERM) or its terminal hangs up (SIGHUP), so that
+/// the session still stops what runs, gives the terminal back, and ends the sandbox's session.
+/// Hangups that harness was started ignoring (`nohup`) stay ignored: the session then ends when
+/// the terminal's input does.
+fn shutdown_signals() -> std::io::Result<impl Future<Output = Ending>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = if ignored(nix::libc::SIGHUP) {
+        None
+    } else {
+        Some(signal(SignalKind::hangup())?)
+    };
+    Ok(async move {
+        let hung_up = async {
+            match hangup.as_mut() {
+                Some(hangup) => {
+                    hangup.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = terminate.recv() => Ending::Terminated,
+            () = hung_up => Ending::Hangup,
+        }
+    })
+}
+
+/// Whether this process ignores `signal`.
+fn ignored(signal: nix::libc::c_int) -> bool {
+    // SAFETY: an all-zero `sigaction` is valid for the call to overwrite; with no new action
+    // given, `sigaction` only reads the current one.
+    let mut current: nix::libc::sigaction = unsafe { std::mem::zeroed() };
+    let read = unsafe { nix::libc::sigaction(signal, std::ptr::null(), &mut current) };
+    read == 0 && current.sa_sigaction == nix::libc::SIG_IGN
 }
 
 /// Runs the session on this process's terminal, and gives the terminal back as it was.
@@ -226,15 +284,20 @@ async fn terminal_session(
     approvals: Requests,
     notifications: harness_config::config::Notifications,
     redactor: Arc<harness_core::redact::Redactor>,
-) -> std::io::Result<()> {
+) -> std::io::Result<Ending> {
+    // From here on, a hangup or SIGTERM ends the session rather than harness.
+    let shutdown = shutdown_signals()?;
     // Asked before any events are read: both queries read the terminal's answer from stdin.
     let keyboard = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     let (column, row) = crossterm::cursor::position().unwrap_or((0, 0));
     let top = if column == 0 { row } else { row + 1 };
     // The editor for plans owns the terminal's modes, so they are undone while it runs, and
-    // when the session ends.
+    // when the session ends; the terminal is not read for the session meanwhile.
     let modes = Modes::enter(std::io::stdout(), CrosstermRawMode, keyboard)?;
-    options.text_editor = Some(Box::new(ExternalEditor::from_env(modes)));
+    let input = TerminalInput::start();
+    options.text_editor = Some(Box::new(
+        ExternalEditor::from_env(modes).pausing(input.pauser()),
+    ));
     options.notifier = Some(Box::new(TerminalNotifier::new(
         std::io::stdout(),
         notifications.desktop,
@@ -242,7 +305,7 @@ async fn terminal_session(
     )));
     let term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)?;
     let mut ui = Ui::start(agent, host, term, options, approvals).with_redactor(redactor);
-    ui.run(EventStream::new()).await
+    ui.run(input, shutdown).await
 }
 
 #[cfg(test)]

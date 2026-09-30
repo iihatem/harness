@@ -276,6 +276,19 @@ impl App {
             .filter(|_| self.prompt.is_some() || self.plan_choice.is_some())
     }
 
+    /// Denies the approval waiting, if any, as the session ends: the turn stops.
+    pub fn deny_waiting(&mut self) {
+        if self.prompt.is_some() {
+            self.answer(Answered::Interrupt);
+        }
+    }
+
+    /// Leaves harness: nothing waits for an answer after.
+    fn quit(&mut self) -> Option<Action> {
+        self.deny_waiting();
+        Some(Action::Quit)
+    }
+
     /// The approval waiting for an answer.
     pub fn prompt(&self) -> Option<&Prompt> {
         self.prompt.as_ref()
@@ -507,7 +520,7 @@ impl App {
             // Until the prompt takes keys, they were typed for the input.
         }
         if ctrl && key.code == KeyCode::Char('d') && self.editor.is_empty() {
-            return Some(Action::Quit);
+            return self.quit();
         }
         if ctrl && key.code == KeyCode::Char('s') {
             return self.send_now();
@@ -588,7 +601,7 @@ impl App {
             .ctrl_c
             .is_some_and(|at| now.duration_since(at) <= QUIT_WINDOW)
         {
-            return Some(Action::Quit);
+            return self.quit();
         }
         self.ctrl_c = Some(now);
         self.hint = Some("press Ctrl+C again to exit".into());
@@ -688,7 +701,7 @@ impl App {
     fn builtin(&mut self, name: &str, full: &str) -> Option<Action> {
         let width = self.width;
         match name {
-            "quit" => return Some(Action::Quit),
+            "quit" => return self.quit(),
             "help" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);

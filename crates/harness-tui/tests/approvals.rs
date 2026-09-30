@@ -514,7 +514,8 @@ async fn a_key_queued_before_the_request_leaves_the_prompt_pending() {
         let (reply, mut answer) = oneshot::channel();
         requests.send((request("cargo test"), reply)).unwrap();
         // Long enough for both to be taken in.
-        let _ = tokio::time::timeout(Duration::from_millis(100), ui.run(input)).await;
+        let run = ui.run(input, std::future::pending());
+        let _ = tokio::time::timeout(Duration::from_millis(100), run).await;
         assert!(
             !is_approval(answer.try_recv()),
             "a typed-ahead key approved"

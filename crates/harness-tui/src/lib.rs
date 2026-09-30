@@ -9,6 +9,7 @@ pub mod diff;
 pub mod editor;
 pub mod highlight;
 pub mod inline;
+pub mod input;
 pub mod markdown;
 pub mod notify;
 pub mod plan;

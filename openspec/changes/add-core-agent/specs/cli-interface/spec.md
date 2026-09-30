@@ -16,7 +16,7 @@ Interactive mode SHALL render into the terminal's normal screen: completed messa
 - **THEN** harness exits with code 2 and says to use `harness ask`
 
 ### Requirement: Status line and per-turn stats
-Interactive mode SHALL display a status line showing the active model, approval mode, context usage as a percentage of the effective context window, and session token totals. After each turn it MUST show the model that answered, time to first token, output tokens per second, and prompt-cache hit rate when the provider reports cached tokens. The runtime MUST report these per-turn statistics as an event before the turn finishes, so `harness ask --json` prints them too.
+Interactive mode SHALL display a status line showing the active model, approval mode, context usage as a percentage of the effective context window, and session token totals. After each turn it MUST show the model that answered, time to first token, output tokens per second, and prompt-cache hit rate when the provider reports cached tokens. Time to first token MUST be measured from the reply's first streamed event of any kind, including a tool call's own first fragment, not from whichever event happens to carry the reply's content; output tokens per second MUST be computed over the generation window that follows from there. The runtime MUST report these per-turn statistics as an event before the turn finishes, so `harness ask --json` prints them too.
 
 #### Scenario: Status after switching model
 - **WHEN** the user switches to a model with a larger context window
@@ -25,6 +25,10 @@ Interactive mode SHALL display a status line showing the active model, approval 
 #### Scenario: Turn stats from a local model
 - **WHEN** a turn completes on a local model that reports cached prompt tokens
 - **THEN** a stats line shows the model, time to first token, tokens per second, and cache hit rate
+
+#### Scenario: Turn stats when the reply is a tool call
+- **WHEN** a turn's reply is a tool call whose arguments stream for a while before the call itself arrives
+- **THEN** time to first token and tokens per second are measured from the call's first fragment, not from when the whole call arrived
 
 ### Requirement: Keyboard interaction
 Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on empty input to open `/rewind`; Ctrl+C pressed twice within 2 seconds to exit; Shift+Tab to cycle approval modes; Alt+Enter or Shift+Enter to insert a newline, with Ctrl+J and a backslash before Enter as fallbacks for terminals that do not report Shift+Enter; Up arrow to recall previous inputs; `/` at the start of input for command completion; `@` for fuzzy completion of workspace file paths; Enter while a turn is running to queue input; and Ctrl+S while a turn is running to send input immediately (steering). An approval prompt MUST take y (approve once), a (approve for the session, when offered), n (deny, with an optional reason for the model) and Esc (deny and stop the turn). A prompt MUST be answered only by a key pressed for it: keys typed before it was drawn, or within 300 ms after, MUST go to the input; Enter, and the letters with Ctrl or Alt held, MUST NOT answer it.
@@ -36,6 +40,10 @@ Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on 
 #### Scenario: File completion
 - **WHEN** the user types `@mainrs`
 - **THEN** a completion list offers matching paths such as `src/main.rs`
+
+#### Scenario: File completion after the agent writes a file
+- **WHEN** a turn runs a tool that creates or writes a file, and the turn ends
+- **THEN** the next `@` completion offers that file
 
 #### Scenario: Steering key
 - **WHEN** the user types a message and presses Ctrl+S while a tool is running
@@ -109,7 +117,7 @@ It MUST NOT change system files itself.
 - **THEN** it reports the basic tier, the reason, and the commands that would enable the full tier
 
 ### Requirement: Management subcommands
-The system SHALL provide `harness models`, `harness login <provider>`, `harness logout <provider>`, `harness auth add <provider>`, `harness auth use <provider> <profile>`, `harness trust [--yes] [--revoke]`, and `harness sandbox doctor`, with `--profile` accepted by `login`, `logout`, and `auth add`, `--device` accepted by `login`, and the flags `--model`, `--mode`, `-c`, `--resume`, and `--debug`. `harness auth add` MUST read the key from standard input. `--debug` MUST make `harness ask` write the run's event stream, after the warnings it printed before the agent started, to a log file in the state directory that only the user can read, and print its path; other subcommands MUST refuse it.
+The system SHALL provide `harness models`, `harness login <provider>`, `harness logout <provider>`, `harness auth add <provider>`, `harness auth use <provider> <profile>`, `harness trust [--yes] [--revoke]`, and `harness sandbox doctor`, with `--profile` accepted by `login`, `logout`, and `auth add`, `--device` accepted by `login`, and the flags `--model`, `--mode`, `-c`, `--resume`, and `--debug`. `harness auth add` MUST read the key from standard input. `--debug` MUST make `harness ask` write the run's event stream, after the warnings it printed before the agent started, to a log file in the state directory that only the user can read, and print its path; every other subcommand, and the interactive session (no subcommand at all), MUST refuse it, since only `ask` has a run to log.
 
 #### Scenario: Help output
 - **WHEN** the user runs `harness --help`

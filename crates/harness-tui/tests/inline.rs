@@ -6,7 +6,12 @@ mod support;
 use std::sync::{Arc, Mutex};
 
 use harness_core::event::{AgentEvent, TurnEndReason};
-use harness_tui::{inline::InlineTerminal, markdown, style::Theme, transcript::Transcript};
+use harness_tui::{
+    inline::{CursorReport, InlineTerminal},
+    markdown,
+    style::Theme,
+    transcript::Transcript,
+};
 use ratatui::{
     backend::{Backend, ClearType, TestBackend, WindowSize},
     buffer::{Buffer, Cell},
@@ -252,6 +257,31 @@ fn after_a_resize_the_live_region_is_found_where_the_terminal_moved_it() {
     in_place(&term, 10);
     term.backend().vt().resize(30, 9);
     term.resized().unwrap();
+    draw_live(&mut term, "> ", 2);
+    in_place(&term, 10);
+}
+
+// Final review nit: an answer later than the wait once in a while (a slow SSH link) does not turn
+// cursor reports off for the session; three misses in a row do. A resize the terminal was not
+// asked about (keys it had not handed over waited) counts neither way.
+#[test]
+fn cursor_reports_stop_only_after_three_misses_in_a_row() {
+    let mut term = under_a_full_screen(10);
+    let at = |term: &InlineTerminal<VtBackend>| CursorReport::At(term.backend().vt().cursor());
+    for _ in 0..2 {
+        term.resized_to(CursorReport::Missed).unwrap();
+        assert!(term.reports_cursor());
+        term.resized_to(CursorReport::Unasked).unwrap();
+        assert!(term.reports_cursor());
+    }
+    let report = at(&term);
+    term.resized_to(report).unwrap();
+    for _ in 0..2 {
+        term.resized_to(CursorReport::Missed).unwrap();
+        assert!(term.reports_cursor());
+    }
+    term.resized_to(CursorReport::Missed).unwrap();
+    assert!(!term.reports_cursor());
     draw_live(&mut term, "> ", 2);
     in_place(&term, 10);
 }

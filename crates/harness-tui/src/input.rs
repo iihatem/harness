@@ -872,6 +872,54 @@ mod tests {
         thread.join().unwrap();
     }
 
+    /// A terminal that never says where its cursor is, as crossterm tells after its own wait.
+    struct Silent(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Source for Silent {
+        fn next(&mut self) -> io::Result<Option<Event>> {
+            Ok(None)
+        }
+
+        fn position(&mut self) -> io::Result<(u16, u16)> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(io::Error::other("no answer within a normal duration"))
+        }
+    }
+
+    // Final review nit: cursor reports stay on after a late answer, so the terminal is asked again
+    // at the next resize. Once crossterm gave up waiting for an answer, which may still come, that
+    // answer would be taken for the next question's: the terminal is not asked again.
+    #[tokio::test]
+    async fn once_an_answer_was_given_up_on_the_terminal_is_not_asked_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let mut source = Silent(asked.clone());
+        let fd = reader.as_raw_fd();
+        let control = Arc::new(Control::new().unwrap());
+        let (sender, events) = mpsc::unbounded_channel();
+        let reading = control.clone();
+        let thread = std::thread::spawn(move || {
+            let _reader = reader;
+            read(fd, &reading, &sender, &mut source);
+        });
+        let query = CursorQuery(control.clone());
+        assert_eq!(
+            query.position(Duration::from_secs(5)).await,
+            CursorReport::Missed
+        );
+        assert_eq!(asked.load(SeqCst), 1);
+        assert_eq!(
+            query.position(Duration::from_secs(5)).await,
+            CursorReport::Missed
+        );
+        assert_eq!(asked.load(SeqCst), 1, "asked again");
+        lock(&control).stopped = true;
+        control.wake();
+        drop(events);
+        thread.join().unwrap();
+    }
+
     // Review A N2: a resize the terminal signals reaches the session at once, ahead of what the
     // reader has not sent yet.
     #[tokio::test]

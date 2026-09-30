@@ -14,12 +14,17 @@ use ratatui::{
     widgets::Widget,
 };
 
+/// How many times in a row a terminal may not say where its cursor is after a resize before it is
+/// no longer asked: an answer can come late once in a while (over a slow link), while a terminal
+/// that never answers would hold up every resize.
+pub const CURSOR_MISSES: u8 = 3;
+
 /// What the terminal said, after a resize, of where its cursor is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorReport {
     /// Where it is.
     At(Position),
-    /// It did not say in time: it is not asked again.
+    /// It did not say in time: after [`CURSOR_MISSES`] in a row, it is not asked again.
     Missed,
     /// It was not asked: keys it has not handed over yet wait ahead of where its answer would
     /// come. Nothing is held against it.
@@ -40,6 +45,8 @@ pub struct InlineTerminal<B: Backend> {
     cursor_row: u16,
     /// The terminal answers when asked where its cursor is.
     reports_cursor: bool,
+    /// How many times in a row it did not say by the time it was waited for.
+    cursor_misses: u8,
 }
 
 fn io_error<E: std::error::Error + Send + Sync + 'static>(error: E) -> io::Error {
@@ -66,6 +73,7 @@ where
             shown: Buffer::empty(Rect::new(0, top, screen.width, 0)),
             cursor_row: top.min(screen.height.saturating_sub(1)),
             reports_cursor: true,
+            cursor_misses: 0,
         })
     }
 
@@ -252,15 +260,21 @@ where
     /// gets taller, or rewrap them. So the live region, cleared, is placed as far above the
     /// cursor as the cursor was below the region's top; the next draw makes the room it needs. A
     /// terminal that did not say, or was not asked, is taken to have done what xterm does; one
-    /// that did not say is not asked again.
+    /// that did not say [`CURSOR_MISSES`] times in a row is not asked again.
     pub fn resized_to(&mut self, cursor: CursorReport) -> io::Result<()> {
         self.screen = self.backend.size().map_err(io_error)?;
         let bottom = self.screen.height.saturating_sub(1);
         let below_top = i32::from(self.cursor_row) - i32::from(self.top);
         let row = match cursor {
-            CursorReport::At(position) => Some(position.y.min(bottom)),
+            CursorReport::At(position) => {
+                self.cursor_misses = 0;
+                Some(position.y.min(bottom))
+            }
             CursorReport::Missed => {
-                self.reports_cursor = false;
+                self.cursor_misses = self.cursor_misses.saturating_add(1);
+                if self.cursor_misses >= CURSOR_MISSES {
+                    self.reports_cursor = false;
+                }
                 None
             }
             CursorReport::Unasked => None,

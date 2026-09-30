@@ -39,7 +39,8 @@ pub const REDRAW_EVERY: Duration = Duration::from_millis(30);
 const GONE_WAIT: Duration = Duration::from_secs(1);
 
 /// How long the terminal has to say where its cursor is after a resize; one that does not
-/// answer by then is taken to have done what xterm does, and is not asked again.
+/// answer by then is taken to have done what xterm does, and after
+/// [`CURSOR_MISSES`](crate::inline::CURSOR_MISSES) such misses in a row is not asked again.
 pub const CURSOR_WAIT: Duration = Duration::from_millis(500);
 
 /// After a write to the terminal failed with `error`: the terminal went away, when its input ends

@@ -109,10 +109,12 @@ pub fn status_line(
     theme: &Theme,
 ) -> Line<'static> {
     let (input, output) = totals.sum();
+    // Nearest, not always up: rounding up made 3.07% read as "4%", which the status line then
+    // disagreed with itself about once anyone did the arithmetic.
     let used = if context.window == 0 {
         0
     } else {
-        (context.total * 100).div_ceil(context.window)
+        (context.total as f64 * 100.0 / context.window as f64).round() as u64
     };
     let mut spans = vec![Span::styled(
         format!(
@@ -177,8 +179,11 @@ pub fn context_report(
             .map(|(name, tokens)| (sanitize(name), *tokens)),
     );
     rows.push(("conversation".into(), context.messages));
-    let used = context.system + context.tools + context.messages;
-    rows.push(("free".into(), context.window.saturating_sub(used)));
+    // The status line's percentage is `context.total`: the provider-reported input, when there
+    // is one, plus estimates since. "free" must agree with it, rather than with the sum of the
+    // rows above, which are always estimates and can disagree with what the provider reported.
+    let estimated = context.system + context.tools + context.messages;
+    rows.push(("free".into(), context.window.saturating_sub(context.total)));
     let mut title = format!("Context window: {} tokens", thousands(context.window));
     if let Some(note) = window_note {
         title.push_str(&format!(" ({})", sanitize(note)));
@@ -198,6 +203,19 @@ pub fn context_report(
                 theme.dim(),
             ),
         ]));
+    }
+    // The rows above are estimates; once the provider has reported the last request's input
+    // tokens, the actual next request can differ from their sum, and this says by how much,
+    // matching the status line rather than leaving two disagreeing numbers on screen.
+    if context.total != estimated {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Next request \u{2248} {} tokens ({}), as the provider reported; the rows above are estimates.",
+                thousands(context.total),
+                percent(context.total, context.window),
+            ),
+            theme.dim(),
+        )));
     }
     lines
 }

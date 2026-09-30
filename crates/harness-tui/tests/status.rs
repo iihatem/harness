@@ -173,10 +173,33 @@ fn the_status_line_shows_the_model_mode_context_and_tokens() {
     let line = status::status_line("mock/m", Mode::Auto, &context, &totals, &theme);
     assert_eq!(
         plain(&line),
-        "mock/m · auto · 11% of context · 12k in, 1.1k out"
+        "mock/m · auto · 10% of context · 12k in, 1.1k out"
     );
     let full = status::status_line("mock/m", Mode::FullAccess, &context, &totals, &theme);
     assert!(plain(&full).ends_with("· full-access: no sandbox, no approvals"));
+}
+
+// Review C, minor 10: rounding up always made 3.07% read as "4%". Nearest rounding still rounds
+// up when that is nearer, but not just because the true value is not a whole number.
+#[test]
+fn context_percentage_rounds_to_the_nearest_not_always_up() {
+    let theme = Theme::monochrome();
+    let totals = Totals::default();
+    let mostly_free = ContextUsage {
+        window: 1_000,
+        system: 0,
+        tools: 0,
+        messages: 0,
+        total: 31, // 3.1%: nearest is 3%, `div_ceil` would have shown 4%.
+    };
+    let line = status::status_line("m", Mode::Auto, &mostly_free, &totals, &theme);
+    assert!(plain(&line).contains("3% of context"), "{}", plain(&line));
+    let closer_to_full = ContextUsage {
+        total: 36, // 3.6%: nearest, and `div_ceil`, both round up to 4%.
+        ..mostly_free
+    };
+    let line = status::status_line("m", Mode::Auto, &closer_to_full, &totals, &theme);
+    assert!(plain(&line).contains("4% of context"), "{}", plain(&line));
 }
 
 #[test]
@@ -206,8 +229,55 @@ async fn a_turn_on_a_local_model_ends_with_its_stats_and_updates_the_status_line
     let status = row_with(&ui, "mock/m · auto");
     assert!(status.contains("1.0k in, 50 out"), "{status}");
     // The provider reported 1,000 input tokens: about 3% of the 32,768-token window.
-    assert!(status.contains(" · 4% of context"), "{status}");
+    assert!(status.contains(" · 3% of context"), "{status}");
     ui.finish().await.unwrap();
+}
+
+// Review C, minor 1: the status line's percentage is `context.total` (the provider-reported
+// input, when there is one, plus estimates since); `/context`'s rows were pure estimates, so
+// "free" could disagree with the status line for the very same request.
+#[test]
+fn context_reports_free_from_the_same_total_as_the_status_line() {
+    let theme = Theme::monochrome();
+    let context = ContextUsage {
+        window: 10_000,
+        system: 1_000,
+        tools: 500,
+        messages: 500,
+        // The provider reported more input than the rows' estimates sum to (2,000 vs 3,000).
+        total: 3_000,
+    };
+    let lines: Vec<String> = status::context_report(&context, &[], None, &theme)
+        .iter()
+        .map(plain)
+        .collect();
+    let free = lines.iter().find(|l| l.contains("free")).unwrap();
+    // free = window - total (7,000), not window - the rows' sum (8,000).
+    assert!(free.contains("7,000"), "{free}");
+    let note = lines
+        .iter()
+        .find(|l| l.contains("Next request"))
+        .unwrap_or_else(|| panic!("no note reconciling the estimates: {lines:#?}"));
+    assert!(note.contains("3,000") && note.contains("30.0%"), "{note}");
+}
+
+// When the provider has not yet reported anything, the rows' estimates and `total` agree, so no
+// note is needed: the existing behaviour for a fresh `/context`.
+#[test]
+fn context_adds_no_note_when_the_provider_has_reported_nothing_yet() {
+    let theme = Theme::monochrome();
+    let context = ContextUsage {
+        window: 10_000,
+        system: 1_000,
+        tools: 500,
+        messages: 500,
+        total: 2_000,
+    };
+    let lines: Vec<String> = status::context_report(&context, &[], None, &theme)
+        .iter()
+        .map(plain)
+        .collect();
+    assert!(!lines.iter().any(|l| l.contains("Next request")), "{lines:#?}");
 }
 
 #[tokio::test]

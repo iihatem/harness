@@ -113,6 +113,23 @@ fn session_flags_with_another_subcommand_are_refused() {
     }
 }
 
+// Review C, minor 7: `--debug` alone opened the session and silently ignored the flag, since the
+// check for it only ran when a subcommand other than `ask` was given. `ask` is the only command
+// with a run to log, so the session refuses it too, before it ever touches the terminal.
+#[test]
+fn debug_alone_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    Command::new(env!("CARGO_BIN_EXE_harness"))
+        .arg("--debug")
+        .env("HARNESS_HOME", home.path())
+        .isolate()
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "--debug logs a run of `harness ask`; run `harness` without it",
+        ));
+}
+
 // Spec: "Help output" lists the credential commands.
 #[test]
 fn help_lists_the_credential_commands() {

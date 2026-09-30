@@ -227,6 +227,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    // The interactive session (no subcommand) has no run to log either: unlike `ask`, it ignored
+    // the flag silently rather than refusing it.
+    if cli.command.is_none() && cli.debug {
+        eprintln!("error: --debug logs a run of `harness ask`; run `harness` without it");
+        return ExitCode::from(2);
+    }
     let session = match (&cli.resume, cli.continue_session) {
         // Listing is what `--resume` alone does; with a subcommand, the id was forgotten.
         (Some(None), _) if cli.command.is_some() => {

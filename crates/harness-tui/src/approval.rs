@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use harness_core::{
     agent::{ApprovalDecision, ApprovalKind, ApprovalRequest, Approver},
     permission::resolve_path,
+    redact::Redactor,
 };
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -102,6 +103,20 @@ impl Prompt {
 
     pub fn request(&self) -> &ApprovalRequest {
         &self.request
+    }
+
+    /// Replaces the secrets `redactor` knows in what the prompt shows: the reason, and the
+    /// command or the file's diff, which is read from the file as it is on disk.
+    pub fn redact(&mut self, redactor: &Redactor) {
+        self.request.reason = redactor.redact(&self.request.reason);
+        for line in &mut self.body {
+            for span in &mut line.spans {
+                let redacted = redactor.redact(&span.content);
+                if redacted != span.content {
+                    span.content = redacted.into();
+                }
+            }
+        }
     }
 
     /// Sends `decision` to the agent.

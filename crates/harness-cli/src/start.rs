@@ -42,6 +42,8 @@ pub struct Started {
     /// Ends the sandbox's session; drop the agent first.
     pub sandbox_session: SessionEnd,
     pub policy: Arc<PermissionEngine>,
+    /// Where the context window's size comes from, for `/context`.
+    pub window_note: String,
 }
 
 /// A new run's id: its start time and the process id.
@@ -167,6 +169,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         },
         None => window::Running::Unknown,
     };
+    let window_note = window_note(running.tokens(), profile.context_window);
     let window = window::effective_window(&resolved.id, &profile, running, server);
     for warning in &window.warnings {
         notices.warn(warning);
@@ -219,7 +222,19 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         agent,
         sandbox_session,
         policy,
+        window_note: window_note.into(),
     })
+}
+
+/// Where the window comes from: the smaller of what the server runs the model with (`running`)
+/// and the model's profile (`profile`), or neither.
+fn window_note(running: Option<u64>, profile: Option<u64>) -> &'static str {
+    match (running, profile) {
+        (Some(running), Some(profile)) if profile < running => "from the model's profile",
+        (Some(_), _) => "what the server runs the model with",
+        (None, Some(_)) => "from the model's profile",
+        (None, None) => "assumed: neither the server nor a profile gives it",
+    }
 }
 
 /// Ends the run: first the agent, which releases the session file, then the sandbox's session,
@@ -429,6 +444,28 @@ mod tests {
             *self.free.lock().unwrap() = Some(free);
             None
         }
+    }
+
+    // `/context` says where the window comes from, now that it is no longer assumed.
+    #[test]
+    fn the_window_note_says_where_the_window_comes_from() {
+        assert_eq!(
+            window_note(Some(4_096), Some(32_768)),
+            "what the server runs the model with"
+        );
+        assert_eq!(
+            window_note(Some(65_536), Some(32_768)),
+            "from the model's profile"
+        );
+        assert_eq!(window_note(None, Some(200_000)), "from the model's profile");
+        assert_eq!(
+            window_note(Some(8_192), None),
+            "what the server runs the model with"
+        );
+        assert_eq!(
+            window_note(None, None),
+            "assumed: neither the server nor a profile gives it"
+        );
     }
 
     // Review D M9: ending the sandbox's session takes a few seconds on Linux; the session file

@@ -5,6 +5,7 @@
 
 use std::{
     collections::VecDeque,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -13,6 +14,7 @@ use harness_core::{
     agent::{ApprovalDecision, ApprovalRequest, ContextUsage},
     event::{AgentEvent, TurnEndReason},
     permission::Mode,
+    redact::Redactor,
     turn::{Steering, TurnInput},
 };
 use ratatui::{
@@ -68,6 +70,11 @@ pub trait Host: Send {
     fn is_command(&self, name: &str) -> bool;
     /// The turn for `typed`, which names a custom command or `/init`.
     fn prepare(&mut self, typed: &str) -> Prepared;
+    /// What the host has had to warn about since it was last asked, such as a renewed sign-in
+    /// that could not be stored. Each warning is given once.
+    fn take_warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Settings of the interactive session.
@@ -160,6 +167,8 @@ pub struct App {
     notifications: Vec<String>,
     workspace: std::path::PathBuf,
     width: usize,
+    /// Keeps the secrets harness knows out of what approvals show.
+    redactor: Option<Arc<Redactor>>,
 }
 
 impl App {
@@ -193,7 +202,18 @@ impl App {
             notifications: Vec::new(),
             workspace: options.workspace,
             width,
+            redactor: None,
         }
+    }
+
+    /// Shows approvals with the secrets `redactor` knows replaced.
+    pub fn set_redactor(&mut self, redactor: Arc<Redactor>) {
+        self.redactor = Some(redactor);
+    }
+
+    /// What the CLI provides.
+    pub fn host(&self) -> &dyn Host {
+        &*self.host
     }
 
     fn theme(&self) -> Theme {
@@ -212,17 +232,15 @@ impl App {
 
     /// The agent asks the user to approve `request`.
     pub fn on_approval(&mut self, request: ApprovalRequest, reply: Reply) {
-        self.notifications
-            .push(format!("approval needed: {}", request.reason));
         let arguments = self.transcript.arguments(&request.call_id).cloned();
         let theme = self.theme();
-        self.prompt = Some(Prompt::new(
-            request,
-            reply,
-            arguments.as_ref(),
-            &self.workspace,
-            &theme,
-        ));
+        let mut prompt = Prompt::new(request, reply, arguments.as_ref(), &self.workspace, &theme);
+        if let Some(redactor) = &self.redactor {
+            prompt.redact(redactor);
+        }
+        self.notifications
+            .push(format!("approval needed: {}", prompt.request().reason));
+        self.prompt = Some(prompt);
     }
 
     /// The approval waiting for an answer.

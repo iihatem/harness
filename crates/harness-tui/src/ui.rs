@@ -1,12 +1,17 @@
 //! The interactive session: the agent runs in a task of its own, fed turns through a channel,
 //! while this side draws the terminal, reads keys, and takes in the agent's events.
 
-use std::{io, time::Instant};
+use std::{
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures::{Stream, StreamExt};
 use harness_core::{
     agent::{Agent, ContextUsage},
     event::AgentEvent,
+    redact::{EventRedactor, Redactor},
     turn::TurnInput,
 };
 use ratatui::{backend::Backend, crossterm::event::Event};
@@ -20,6 +25,10 @@ use crate::{
     notify::Notify,
     plan::TextEditor,
 };
+
+/// How often the host's warnings are looked for while nothing else comes, as `harness ask` does:
+/// a renewal waiting for another process says so while it waits.
+pub const HOST_WARNINGS_EVERY: Duration = Duration::from_millis(250);
 
 /// Whether the session goes on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +62,8 @@ pub struct Ui<B: Backend> {
     cancel: Option<CancellationToken>,
     text_editor: Option<Box<dyn TextEditor>>,
     notifier: Option<Box<dyn Notify>>,
+    /// Keeps the secrets harness knows out of what the agent's events show.
+    redactor: Option<EventRedactor>,
 }
 
 impl<B> Ui<B>
@@ -102,7 +113,16 @@ where
             cancel: None,
             text_editor,
             notifier,
+            redactor: None,
         }
+    }
+
+    /// Shows the agent's events, approvals and the host's warnings with the secrets `redactor`
+    /// knows replaced by `[redacted]`, even when the model streams one in pieces.
+    pub fn with_redactor(mut self, redactor: Arc<Redactor>) -> Self {
+        self.redactor = Some(EventRedactor::new(redactor.clone()));
+        self.app.set_redactor(redactor);
+        self
     }
 
     pub fn app(&self) -> &App {
@@ -217,13 +237,44 @@ where
         Ok(flow)
     }
 
+    /// Takes in `event`, redacted: none, one or more events, since the redactor holds back the
+    /// end of a reply that could still become a secret.
+    fn show(&mut self, event: AgentEvent) {
+        let shown = match &mut self.redactor {
+            Some(redactor) => redactor.push(event),
+            None => vec![event],
+        };
+        for event in &shown {
+            self.app.on_event(event);
+        }
+    }
+
+    /// Shows what the host has had to warn about; whether there was anything.
+    fn host_warnings(&mut self) -> bool {
+        let warnings = self.app.host().take_warnings();
+        let any = !warnings.is_empty();
+        for message in warnings {
+            self.show(AgentEvent::Warning { message });
+        }
+        any
+    }
+
+    /// Takes in an event from the agent, after what the host has had to warn about by then: a
+    /// sign-in renewed during the turn that could not be stored, say, is told before what the
+    /// provider sent after the renewal.
+    fn take_in(&mut self, event: AgentEvent) {
+        self.host_warnings();
+        self.show(event);
+    }
+
     /// Takes in an event from the agent, and the others already waiting; once a turn has
     /// ended, switches to the mode chosen during it.
     fn agent_event(&mut self, event: AgentEvent) -> io::Result<Flow> {
-        self.app.on_event(&event);
+        self.take_in(event);
         while let Ok(event) = self.events.try_recv() {
-            self.app.on_event(&event);
+            self.take_in(event);
         }
+        self.host_warnings();
         if let Some(action) = self.app.take_pending_mode() {
             self.dispatch(action)?;
         }
@@ -241,7 +292,14 @@ where
         reply: Reply,
     ) -> io::Result<Flow> {
         while let Ok(event) = self.events.try_recv() {
-            self.app.on_event(&event);
+            self.take_in(event);
+        }
+        self.host_warnings();
+        // What the redactor holds back comes before the prompt.
+        if let Some(redactor) = &mut self.redactor {
+            for event in redactor.finish() {
+                self.app.on_event(&event);
+            }
         }
         self.app.on_approval(request, reply);
         self.draw()?;
@@ -252,11 +310,21 @@ where
     fn context(&mut self, context: ContextUsage) -> io::Result<Flow> {
         self.awaiting_context = false;
         self.app.set_context(context);
+        self.host_warnings();
         self.draw()?;
         Ok(Flow::Continue)
     }
 
-    /// Waits for the agent's next event, or the runner's next message, and takes it in.
+    /// Shows what the host has had to warn about while nothing else came.
+    fn idle(&mut self) -> io::Result<Flow> {
+        if self.host_warnings() {
+            self.draw()?;
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Waits for the agent's next event, the runner's next message, or
+    /// [`HOST_WARNINGS_EVERY`], and takes it in.
     pub async fn next(&mut self) -> io::Result<Flow> {
         tokio::select! {
             event = self.events.recv() => match event {
@@ -265,6 +333,7 @@ where
             },
             Some(context) = self.contexts.recv() => self.context(context),
             Some((request, reply)) = self.approvals.recv() => self.approval(request, reply),
+            _ = tokio::time::sleep(HOST_WARNINGS_EVERY) => self.idle(),
         }
     }
 
@@ -313,6 +382,7 @@ where
                 },
                 Some(context) = self.contexts.recv() => self.context(context)?,
                 Some((request, reply)) = self.approvals.recv() => self.approval(request, reply)?,
+                _ = tokio::time::sleep(HOST_WARNINGS_EVERY) => self.idle()?,
             };
             if flow == Flow::Quit {
                 break;
@@ -332,7 +402,13 @@ where
             let _ = runner.await;
         }
         while let Ok(event) = self.events.try_recv() {
-            self.app.on_event(&event);
+            self.take_in(event);
+        }
+        self.host_warnings();
+        if let Some(redactor) = &mut self.redactor {
+            for event in redactor.finish() {
+                self.app.on_event(&event);
+            }
         }
         let finished = self.app.transcript.take_finished();
         self.term.insert(&finished)?;

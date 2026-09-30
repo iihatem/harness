@@ -134,6 +134,7 @@ pub async fn run(
         mut agent,
         sandbox_session,
         policy,
+        ..
     }) = start::start(
         Request {
             setup: &setup,

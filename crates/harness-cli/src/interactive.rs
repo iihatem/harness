@@ -49,6 +49,10 @@ impl Host for CliHost {
         self.commands.get(name).is_some()
     }
 
+    fn take_warnings(&self) -> Vec<String> {
+        self.setup.credentials.take_warnings()
+    }
+
     fn prepare(&mut self, typed: &str) -> Prepared {
         let expanded =
             slash::turn_input(typed, "", Some(&self.commands), &self.setup, &*self.policy);
@@ -57,10 +61,12 @@ impl Host for CliHost {
             notes: Vec::new(),
             warnings: Vec::new(),
         };
+        // Redacted, as `harness ask` prints them.
+        let redacted = |text: String| self.setup.redactor.redact(&text);
         for message in expanded.messages {
             match message {
-                Message::Warning(text) => prepared.warnings.push(text),
-                Message::Note(text) => prepared.notes.push(text),
+                Message::Warning(text) => prepared.warnings.push(redacted(text)),
+                Message::Note(text) => prepared.notes.push(redacted(text)),
             }
         }
         prepared
@@ -120,7 +126,10 @@ pub async fn run(
         return 2;
     };
     let resolved = registry::resolve(&model_id, &setup.config.providers, setup.keys());
-    setup.print_credential_warnings();
+    // Redacted, as `harness ask` prints them; those raised later go to the transcript.
+    for warning in setup.credentials.take_warnings() {
+        notices.warn(&warning);
+    }
     let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(e) => {
@@ -146,6 +155,7 @@ pub async fn run(
         agent,
         sandbox_session,
         policy,
+        window_note,
     }) = start::start(
         Request {
             setup: &setup,
@@ -172,7 +182,7 @@ pub async fn run(
         workspace: setup.workspace.clone(),
         history,
         instruction_files: crate::context::instruction_files(&setup),
-        window_note: Some("assumed until model profiles report the model's own".into()),
+        window_note: Some(window_note),
         // Where Build goes when the session started in plan mode.
         default_mode: setup
             .config
@@ -188,7 +198,16 @@ pub async fn run(
         policy,
     };
     let notifications = setup.config.notifications;
-    let result = terminal_session(agent, Box::new(host), options, approvals, notifications).await;
+    let redactor = setup.redactor.clone();
+    let result = terminal_session(
+        agent,
+        Box::new(host),
+        options,
+        approvals,
+        notifications,
+        redactor,
+    )
+    .await;
     sandbox_session.end();
     match result {
         Ok(()) => 0,
@@ -206,6 +225,7 @@ async fn terminal_session(
     mut options: Options,
     approvals: Requests,
     notifications: harness_config::config::Notifications,
+    redactor: Arc<harness_core::redact::Redactor>,
 ) -> std::io::Result<()> {
     // Asked before any events are read: both queries read the terminal's answer from stdin.
     let keyboard = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -221,13 +241,70 @@ async fn terminal_session(
         notifications.bell,
     )));
     let term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)?;
-    let ui = Ui::start(agent, host, term, options, approvals);
+    let ui = Ui::start(agent, host, term, options, approvals).with_redactor(redactor);
     ui.run(EventStream::new()).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use harness_config::{config::Config, paths::Paths, trust::TrustStore};
+    use harness_core::{
+        engine::{EngineConfig, RuleSet},
+        redact::Redactor,
+    };
+    use harness_providers::credentials::Credentials;
+
+    // What a custom command's expansion says reaches the transcript with the secrets harness
+    // knows redacted, as `harness ask` prints it through its notices.
+    #[test]
+    fn what_a_command_says_is_redacted() {
+        const SECRET: &str = "sk-canary-0123456789abcdef";
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        std::fs::create_dir_all(workspace.join(".harness/commands")).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        std::fs::write(
+            workspace.join(".harness/commands/deploy.md"),
+            format!("---\nmodel: openai/{SECRET}\n---\nDeploy it.\n"),
+        )
+        .unwrap();
+        let home = dir.path().join("home");
+        let paths =
+            Paths::from_env(|key| (key == "HARNESS_HOME").then(|| home.display().to_string()))
+                .unwrap();
+        let redactor = Arc::new(Redactor::default());
+        redactor.add(SECRET);
+        let setup = Arc::new(Setup {
+            config: Config::default(),
+            workspace: workspace.clone(),
+            trust: TrustStore::load(&paths.data_dir).unwrap(),
+            credentials: Arc::new(Credentials::with_keychain(&paths.data_dir, None)),
+            redactor,
+            paths,
+        });
+        let commands =
+            harness_context::commands::discover(&workspace, &setup.paths.config_dir, None);
+        let policy = Arc::new(PermissionEngine::new(EngineConfig {
+            mode: Mode::Auto,
+            workspace: workspace.clone(),
+            read_dirs: Vec::new(),
+            rules: RuleSet::default(),
+            sandbox_available: false,
+            writes_need_approval: false,
+        }));
+        let mut host = CliHost {
+            setup,
+            commands,
+            policy,
+        };
+        assert!(host.is_command("deploy"));
+        let prepared = host.prepare("/deploy");
+        let said = [prepared.notes, prepared.warnings].concat().join("\n");
+        assert!(said.contains("asks for model openai/[redacted]"), "{said}");
+        assert!(!said.contains(&SECRET[8..]), "{said}");
+    }
 
     #[test]
     fn without_a_terminal_it_names_harness_ask() {

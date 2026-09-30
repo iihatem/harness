@@ -136,8 +136,8 @@ The system MUST NOT write the API keys, OAuth access tokens, or refresh tokens i
 - **THEN** harness reports the file, line and column of the unknown setting without printing the line or the key
 
 #### Scenario: A key pasted as the variable's name
-- **WHEN** a config file sets `api_key_env = "sk-proj-…"`
-- **THEN** harness refuses the file, saying `api_key_env` names an environment variable, and prints the key nowhere: not in that error, a missing-key hint, an untrusted-project warning or `harness trust`
+- **WHEN** a config file sets `api_key_env` to a value that cannot be an environment variable's name (it has a character other than a letter, a digit or `_`, as `"sk-proj-…"` does)
+- **THEN** harness refuses the file, saying `api_key_env` names an environment variable, and prints that value nowhere: not in that error, a missing-key hint, an untrusted-project warning or `harness trust`. A value that could be a variable's name (letters, digits and `_` only, such as a key with no `-` or `.` in it) is accepted and used as one instead, printed wherever the variable it names would be, even though it looks like a key.
 
 #### Scenario: A password in a tool call
 - **WHEN** the model runs a command holding the value of `DB_PASSWORD`, which contains a quote and a backslash

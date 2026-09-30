@@ -35,6 +35,8 @@ pub struct Transcript {
     /// The assistant's reply as it streams: its complete blocks go into the finished lines as
     /// they complete, the rest is shown in the live region.
     reply: Stream,
+    /// Blocks of the reply streaming now have gone into the finished lines.
+    reply_shown: bool,
     /// The model is reasoning (its reasoning is not shown).
     thinking: bool,
     calls: HashMap<String, Call>,
@@ -52,6 +54,7 @@ impl Transcript {
             theme,
             pending: Vec::new(),
             reply: Stream::default(),
+            reply_shown: false,
             thinking: false,
             calls: HashMap::new(),
             running: None,
@@ -138,6 +141,7 @@ impl Transcript {
             AgentEvent::TurnStarted => {
                 self.busy = true;
                 self.reply = Stream::default();
+                self.reply_shown = false;
             }
             AgentEvent::TextDelta { text } => {
                 self.thinking = false;
@@ -153,6 +157,7 @@ impl Transcript {
                 let rest = self.reply.finish(Some(content));
                 let lines = markdown::render(&rest, width, &self.theme);
                 self.push_reply(lines);
+                self.reply_shown = false;
             }
             AgentEvent::ToolCallRequested {
                 id,
@@ -224,6 +229,7 @@ impl Transcript {
                 let rest = self.reply.finish(None);
                 let lines = markdown::render(&rest, width, &self.theme);
                 self.push_reply(lines);
+                self.reply_shown = false;
                 match reason {
                     TurnEndReason::Interrupted => self.push_note("interrupted", width),
                     TurnEndReason::StepLimit => {
@@ -258,12 +264,20 @@ impl Transcript {
         }
     }
 
-    /// Rendered blocks of the reply, after a blank line.
+    /// Rendered blocks of the reply, after a blank line: always after its blocks before, as
+    /// between any two blocks (the last line of a code block can look blank), and for its first,
+    /// unless the line before is blank.
     fn push_reply(&mut self, lines: Vec<Line<'static>>) {
-        if !lines.is_empty() {
-            self.gap();
-            self.emit(lines);
+        if lines.is_empty() {
+            return;
         }
+        if self.reply_shown {
+            self.emit([Line::default()]);
+        } else {
+            self.gap();
+        }
+        self.reply_shown = true;
+        self.emit(lines);
     }
 
     /// The lines for a finished tool call: what it did, then a short look at its result.

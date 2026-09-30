@@ -616,6 +616,11 @@ that goes on -->
 after the fence
 ```
 
+```text
+a code block that ends blank
+
+```
+
 Last line.";
 
 fn coloured(lines: &[Line<'_>]) -> bool {

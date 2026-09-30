@@ -64,7 +64,7 @@ impl TerminalInput {
         let reader = control.clone();
         std::thread::Builder::new()
             .name("harness-input".into())
-            .spawn(move || read(libc::STDIN_FILENO, &reader, &sender))
+            .spawn(move || reader_thread(libc::STDIN_FILENO, &reader, sender))
             .expect("failed to start the terminal reader");
         TerminalInput { events, control }
     }
@@ -161,6 +161,15 @@ fn terminal(fd: RawFd, wait: Duration) -> Terminal {
     Terminal::Ready
 }
 
+/// The reader's thread: reads until done, then says so, so that a pause does not wait for it.
+/// The stream of events ends as `events` drops.
+fn reader_thread(fd: RawFd, control: &Control, events: mpsc::UnboundedSender<io::Result<Event>>) {
+    read(fd, control, &events);
+    let mut state = lock(control);
+    state.reading = false;
+    control.changed.notify_all();
+}
+
 /// The reader's loop: sends the terminal's events until the terminal closes, its input fails,
 /// or the session stops reading them.
 fn read(fd: RawFd, control: &Control, events: &mpsc::UnboundedSender<io::Result<Event>>) {
@@ -234,6 +243,19 @@ mod tests {
         assert_eq!(terminal(fd, Duration::ZERO), Terminal::Quiet);
         drop(writer);
         assert_eq!(terminal(fd, Duration::ZERO), Terminal::Closed);
+    }
+
+    // The terminal's end ends the stream of events, and the reader: a pause no longer waits
+    // for it.
+    #[test]
+    fn at_the_terminals_end_the_events_end_and_the_reader_stops() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(writer);
+        let control = Control::default();
+        let (sender, mut events) = mpsc::unbounded_channel();
+        reader_thread(reader.as_raw_fd(), &control, sender);
+        assert!(!lock(&control).reading);
+        assert!(events.try_recv().is_err() && events.is_closed());
     }
 
     // A pause waits for a read under way to finish, so the editor gets every key after it.

@@ -30,6 +30,8 @@ const PAUSE_WAIT: Duration = Duration::from_secs(1);
 pub struct TerminalInput {
     events: mpsc::UnboundedReceiver<io::Result<Event>>,
     control: Arc<Control>,
+    /// The terminal read.
+    fd: RawFd,
 }
 
 /// Stops [`TerminalInput`]'s reader while another program reads the terminal.
@@ -66,7 +68,11 @@ impl TerminalInput {
             .name("harness-input".into())
             .spawn(move || reader_thread(libc::STDIN_FILENO, &reader, sender))
             .expect("failed to start the terminal reader");
-        TerminalInput { events, control }
+        TerminalInput {
+            events,
+            control,
+            fd: libc::STDIN_FILENO,
+        }
     }
 
     /// Stops the reader while another program reads the terminal.
@@ -78,8 +84,14 @@ impl TerminalInput {
 impl Stream for TerminalInput {
     type Item = io::Result<Event>;
 
+    /// The next event; the end once the terminal hung up, even should crossterm be reading its
+    /// end on the reader's thread (it closed in the middle of an escape sequence, which crossterm
+    /// reads on for). The session looks here at least every few hundred milliseconds.
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.events.poll_recv(cx)
+        match self.events.poll_recv(cx) {
+            Poll::Pending if hung_up(self.fd) => Poll::Ready(None),
+            polled => polled,
+        }
     }
 }
 
@@ -159,6 +171,20 @@ fn terminal(fd: RawFd, wait: Duration) -> Terminal {
         return Terminal::Closed;
     }
     Terminal::Ready
+}
+
+/// Whether the terminal on `fd` hung up (its other side closed) or cannot be polled. Unlike
+/// [`terminal`], this reads nothing about what waits to be read, which the reader's thread may be
+/// reading at the same moment.
+fn hung_up(fd: RawFd) -> bool {
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid `pollfd`, and its count.
+    let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+    ready > 0 && poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
 /// The reader's thread: reads until done, then says so, so that a pause does not wait for it.
@@ -243,6 +269,26 @@ mod tests {
         assert_eq!(terminal(fd, Duration::ZERO), Terminal::Quiet);
         drop(writer);
         assert_eq!(terminal(fd, Duration::ZERO), Terminal::Closed);
+    }
+
+    // Should crossterm still read the terminal's end on the reader's thread (it closed in the
+    // middle of an escape sequence, which crossterm reads on for), the stream ends anyway.
+    #[tokio::test]
+    async fn the_stream_ends_at_the_terminals_end_whatever_the_reader_does() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let (sender, events) = mpsc::unbounded_channel();
+        let mut input = TerminalInput {
+            events,
+            control: Arc::new(Control::default()),
+            fd: reader.as_raw_fd(),
+        };
+        sender.send(Ok(Event::FocusGained)).unwrap();
+        drop(writer);
+        use futures::StreamExt;
+        assert!(matches!(input.next().await, Some(Ok(Event::FocusGained))));
+        let end = tokio::time::timeout(Duration::from_secs(2), input.next()).await;
+        assert!(matches!(end, Ok(None)), "the stream went on");
+        drop(sender);
     }
 
     // The terminal's end ends the stream of events, and the reader: a pause no longer waits

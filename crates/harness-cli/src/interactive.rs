@@ -93,12 +93,11 @@ impl Host for CliHost {
     }
 }
 
-/// Runs the interactive session; the exit code.
-pub async fn run(
-    model_flag: Option<String>,
-    mode_flag: Option<Mode>,
-    choice: sessions::Choice,
-) -> u8 {
+/// What the interactive session does before the async runtime starts, while harness is one
+/// thread: it checks the terminal, and asks the first-use trust question, whose pause holds back
+/// the signals that would end harness until the terminal's modes are back (a signal mask only
+/// covers the process while it has one thread). `Some` exit code when harness is to exit.
+pub fn prepare() -> Option<u8> {
     let unfit = || {
         let term = std::env::var("TERM").ok();
         unfit_terminal(term.as_deref(), crossterm::terminal::size().ok())
@@ -110,7 +109,7 @@ pub async fn run(
     .or_else(unfit)
     {
         eprintln!("error: {message}");
-        return 2;
+        return Some(2);
     }
     // Before the configuration loads, so that settings trusted now apply at once.
     if let (Ok(workspace), Ok(paths)) = (
@@ -126,9 +125,18 @@ pub async fn run(
         );
         if let Err(e) = asked {
             eprintln!("error: {}", terminal_safe(&e.to_string()));
-            return 1;
+            return Some(1);
         }
     }
+    None
+}
+
+/// Runs the interactive session, once [`prepare`] has; the exit code.
+pub async fn run(
+    model_flag: Option<String>,
+    mode_flag: Option<Mode>,
+    choice: sessions::Choice,
+) -> u8 {
     let setup = match setup::load() {
         Ok(setup) => Arc::new(setup),
         Err(message) => {

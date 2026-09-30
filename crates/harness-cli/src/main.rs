@@ -244,6 +244,12 @@ fn main() -> ExitCode {
         (None, true) => sessions::Choice::Continue,
         (None, false) => sessions::Choice::New,
     };
+    // Before the runtime starts its threads: see `interactive::prepare`.
+    if cli.command.is_none()
+        && let Some(code) = interactive::prepare()
+    {
+        return ExitCode::from(code);
+    }
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the tokio runtime");
     let code = runtime.block_on(async move {
         match cli.command {

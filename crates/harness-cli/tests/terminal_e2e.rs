@@ -426,6 +426,23 @@ impl Session {
     fn cpu(&self) -> Duration {
         cpu_time(self.child.lock().unwrap().id())
     }
+
+    /// Sends harness `signal`.
+    fn signal(&self, signal: libc::c_int) {
+        let pid = self.child.lock().unwrap().id() as libc::pid_t;
+        // SAFETY: sends a signal to the process this test started.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+    }
+
+    /// Whether the terminal is in its usual modes: lines edited and echoed, and Ctrl+C, Ctrl+\
+    /// and Ctrl+Z sending their signals.
+    fn cooked(&self) -> bool {
+        let modes = nix::sys::termios::tcgetattr(&*self.master).unwrap();
+        use nix::sys::termios::LocalFlags;
+        modes
+            .local_flags
+            .contains(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG)
+    }
 }
 
 impl Drop for Session {
@@ -606,6 +623,33 @@ fn the_trust_question_takes_an_answer_only_after_a_pause() {
     session.wait_for("mock/test-model · ask", Duration::from_secs(20));
     assert!(!session.shown().contains("Trusted"), "{}", session.shown());
     session.quit();
+}
+
+// Final review M1 (its `seams.py` T4): SIGTERM or SIGHUP while the user types at the trust
+// question, as it waits for a pause with the terminal's echo and line editing off, still ends
+// harness with the terminal given back as it was.
+#[test]
+fn a_signal_during_the_trust_questions_pause_gives_the_terminal_back() {
+    use std::os::unix::process::ExitStatusExt;
+    for signal in [libc::SIGTERM, libc::SIGHUP] {
+        let provider = Provider::start(Vec::new());
+        let env = Env::new(&provider);
+        std::fs::create_dir(env.ws.path().join(".harness")).unwrap();
+        std::fs::write(
+            env.ws.path().join(".harness/config.toml"),
+            "[permissions]\nallow = [\"bash:make *\"]\n",
+        )
+        .unwrap();
+        let mut session = Session::start(&env, Start::default());
+        session.wait_for("Trust this workspace", Duration::from_secs(20));
+        session.type_keys(b"abc");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!session.cooked(), "the pause had not begun ({signal})");
+        session.signal(signal);
+        let status = session.exit_within(Duration::from_secs(10));
+        assert_eq!(status.signal(), Some(signal), "{status:?}");
+        assert!(session.cooked(), "left without its modes ({signal})");
+    }
 }
 
 /// Window sizes as a user drags a window's corner.

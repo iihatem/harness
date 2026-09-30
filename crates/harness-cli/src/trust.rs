@@ -46,7 +46,8 @@ impl Typing for StdinTyping {
 
     /// Keys are seen as they are typed, rather than a line at a time, and not echoed, until the
     /// user pauses; the terminal's modes are then put back. Ctrl+C, Ctrl+\ and Ctrl+Z still do
-    /// what they do, with the modes put back first.
+    /// what they do, with the modes put back first. So do SIGTERM, SIGHUP and SIGQUIT sent
+    /// meanwhile: held until the modes are back, they take effect then.
     fn pause(&mut self, quiet: Duration) -> bool {
         let stdin = std::io::stdin();
         let Ok(cooked) = tcgetattr(&stdin) else {
@@ -59,6 +60,8 @@ impl Typing for StdinTyping {
             .remove(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG);
         waiting.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
         waiting.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
+        // Dropped after the modes are put back, whichever way this returns.
+        let held = Held::new();
         if tcsetattr(&stdin, SetArg::TCSANOW, &waiting).is_err() {
             std::thread::sleep(quiet);
             return false;
@@ -103,7 +106,9 @@ impl Typing for StdinTyping {
             let read = &buf[..read as usize];
             if let Some(signal) = signal_key(&cooked, read) {
                 let _ = tcsetattr(&stdin, SetArg::TCSANOW, &cooked);
+                held.release();
                 let _ = nix::sys::signal::raise(signal);
+                held.hold();
                 // Back from a stop (Ctrl+Z): wait for the pause again.
                 if tcsetattr(&stdin, SetArg::TCSANOW, &waiting).is_err() {
                     return typed;
@@ -112,7 +117,66 @@ impl Typing for StdinTyping {
             }
         }
         let _ = tcsetattr(&stdin, SetArg::TCSANOW, &cooked);
+        drop(held);
         typed
+    }
+}
+
+/// SIGTERM, SIGHUP and SIGQUIT, blocked until dropped, while the terminal's modes are not its
+/// own: one sent meanwhile stays pending, and is delivered once the modes are put back and the
+/// signals are unblocked. The mask is this thread's, which is the process's: the question is
+/// asked before harness starts any other thread.
+struct Held {
+    signals: nix::sys::signal::SigSet,
+    /// The mask before, put back when dropped.
+    before: Option<nix::sys::signal::SigSet>,
+}
+
+impl Held {
+    fn new() -> Held {
+        use nix::sys::signal::{SigSet, Signal};
+        let mut signals = SigSet::empty();
+        for signal in [Signal::SIGTERM, Signal::SIGHUP, Signal::SIGQUIT] {
+            signals.add(signal);
+        }
+        let mut before = SigSet::empty();
+        let blocked = nix::sys::signal::pthread_sigmask(
+            nix::sys::signal::SigmaskHow::SIG_BLOCK,
+            Some(&signals),
+            Some(&mut before),
+        );
+        Held {
+            signals,
+            before: blocked.is_ok().then_some(before),
+        }
+    }
+
+    /// Unblocks them, for a signal a key sends: one pending is delivered now.
+    fn release(&self) {
+        if let Some(before) = &self.before {
+            let _ = nix::sys::signal::pthread_sigmask(
+                nix::sys::signal::SigmaskHow::SIG_SETMASK,
+                Some(before),
+                None,
+            );
+        }
+    }
+
+    /// Blocks them again.
+    fn hold(&self) {
+        if self.before.is_some() {
+            let _ = nix::sys::signal::pthread_sigmask(
+                nix::sys::signal::SigmaskHow::SIG_BLOCK,
+                Some(&self.signals),
+                None,
+            );
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 

@@ -171,6 +171,8 @@ pub struct App {
     width: usize,
     /// Keeps the secrets harness knows out of what approvals show.
     redactor: Option<Arc<Redactor>>,
+    /// Said when the session first switches to a mode that writes.
+    write_mode_warning: Option<String>,
 }
 
 impl App {
@@ -206,7 +208,14 @@ impl App {
             workspace: options.workspace,
             width,
             redactor: None,
+            write_mode_warning: None,
         }
+    }
+
+    /// What the modes that write (ask, auto) lack, said the first time the session switches to
+    /// one: a session that started in another mode was not told as it started.
+    pub fn set_write_mode_warning(&mut self, warning: Option<String>) {
+        self.write_mode_warning = warning;
     }
 
     /// Shows approvals with the secrets `redactor` knows replaced.
@@ -582,6 +591,11 @@ impl App {
         self.mode = mode;
         self.transcript
             .push_note(&format!("switched to {mode} mode"), self.width);
+        if matches!(mode, Mode::Ask | Mode::Auto)
+            && let Some(warning) = self.write_mode_warning.take()
+        {
+            self.transcript.push_warning(&warning, self.width);
+        }
         // Leaving plan mode, as the user chose during the planning turn or before the plan took
         // keys, leaves its plan: Build would switch to a mode other than the one they chose.
         if mode != Mode::Plan && self.plan_choice.take().is_some() {

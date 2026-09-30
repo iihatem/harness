@@ -218,3 +218,24 @@ async fn leaving_full_access_goes_to_plan_and_drops_its_warning() {
     assert!(!now.contains("full-access"), "{now}");
     ui.finish().await.unwrap();
 }
+
+// Review D M2: a session that starts in plan mode is told what ask and auto lack when it first
+// switches to one of them.
+#[tokio::test]
+async fn switching_to_a_mode_that_writes_says_what_it_lacks_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ui = start(MockProvider::new(vec![]), dir.path(), Mode::Plan);
+    ui.app_mut().set_write_mode_warning(Some(
+        "the workspace is your home directory or above, so the sandbox is off".into(),
+    ));
+    for _ in 0..3 {
+        press(&mut ui, KeyCode::BackTab, KeyModifiers::SHIFT);
+    }
+    let shown = rows(ui.terminal().backend().scrollback())
+        .into_iter()
+        .chain(rows(ui.terminal().backend().buffer()))
+        .filter(|r| r.contains("so the sandbox is off"))
+        .count();
+    assert_eq!(shown, 1);
+    ui.finish().await.unwrap();
+}

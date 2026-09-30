@@ -160,6 +160,7 @@ pub async fn run(
         sandbox_session,
         policy,
         window_note,
+        write_mode_warning,
     }) = start::start(
         Request {
             setup: &setup,
@@ -212,6 +213,7 @@ pub async fn run(
         approvals,
         notifications,
         redactor,
+        write_mode_warning,
     )
     .await;
     sandbox_session.end();
@@ -284,6 +286,7 @@ async fn terminal_session(
     approvals: Requests,
     notifications: harness_config::config::Notifications,
     redactor: Arc<harness_core::redact::Redactor>,
+    write_mode_warning: Option<String>,
 ) -> std::io::Result<Ending> {
     // From here on, a hangup or SIGTERM ends the session rather than harness.
     let shutdown = shutdown_signals()?;
@@ -305,6 +308,7 @@ async fn terminal_session(
     )));
     let term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)?;
     let mut ui = Ui::start(agent, host, term, options, approvals).with_redactor(redactor);
+    ui.app_mut().set_write_mode_warning(write_mode_warning);
     ui.run(input, shutdown).await
 }
 

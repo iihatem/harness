@@ -6,7 +6,7 @@ use std::{io::Write, path::Path, sync::Arc};
 
 use harness_config::config::LinuxGitProtection;
 use harness_core::{
-    agent::{Agent, AgentConfig, Approver},
+    agent::{Agent, AgentConfig, Approver, Sandboxes},
     engine::{EngineConfig, PermissionEngine, RuleSet},
     permission::{FsAccess, Mode},
     session::Session,
@@ -44,6 +44,9 @@ pub struct Started {
     pub policy: Arc<PermissionEngine>,
     /// Where the context window's size comes from, for `/context`.
     pub window_note: String,
+    /// What the modes that write lack, for an interactive session that did not start in one to
+    /// say when it first switches to one.
+    pub write_mode_warning: Option<String>,
 }
 
 /// A new run's id: its start time and the process id.
@@ -103,11 +106,20 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     let (sandboxes, write_warning) =
         sandbox::for_modes(detected.clone(), workspace_too_broad, required);
     let sandbox = sandboxes.for_mode(mode);
+    let lack = write_modes(
+        write_warning.clone(),
+        sandboxes.workspace_write.is_some(),
+        env_says_none,
+        workspace_too_broad,
+        &setup.workspace,
+    );
     // Only a mode that writes through the sandbox has anything to warn about.
     let warning = write_warning.filter(|_| matches!(mode, Mode::Ask | Mode::Auto));
     if let Some(warning) = &warning {
         notices.warn(warning);
     }
+    // What was said about the sandbox as the session starts.
+    let mut said = warning.clone();
     // From here on, however the run is left, the sandbox's session ends: on Linux that ends what
     // sandboxed commands left running, and checks git metadata once more.
     let session_sandbox = if interactive {
@@ -118,22 +130,27 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     let sandbox_session = SessionEnd::new(session_sandbox.clone());
     let sandboxed = sandbox.is_some();
     if mode != Mode::FullAccess && !sandboxed && warning.is_none() {
-        if sandbox_disabled_by_env {
-            notices.warn(
-                "the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval",
-            );
+        let text = if sandbox_disabled_by_env {
+            "the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval".to_string()
         } else if write_too_broad {
-            notices.warn(&format!(
+            format!(
                 "the workspace {} is your home directory or above, where the sandbox would make your dotfiles writable, so it is off; every shell command will need approval",
                 setup.workspace.display()
-            ));
+            )
         } else {
-            notices.warn("no OS sandbox is available; every shell command will need approval");
-        }
+            "no OS sandbox is available; every shell command will need approval".to_string()
+        };
+        notices.warn(&text);
+        said = Some(text);
     }
+    // An interactive session that starts in another mode is told when it first switches to one
+    // that writes, unless that was said already.
+    let write_mode_warning = lack
+        .warning
+        .filter(|warning| interactive && said.as_ref() != Some(warning));
     let mut read_dirs = setup.config.read_dirs.clone();
     read_dirs.push(output_dir.clone());
-    let policy = Arc::new(PermissionEngine::new(EngineConfig {
+    let mut policy = PermissionEngine::new(EngineConfig {
         mode,
         workspace: setup.workspace.clone(),
         read_dirs,
@@ -144,7 +161,11 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         },
         sandbox_available: sandboxed,
         writes_need_approval: workspace_too_broad,
-    }));
+    });
+    if let Some(why) = lack.unsandboxed {
+        policy = policy.with_unsandboxed_reason(why);
+    }
+    let policy = Arc::new(policy);
     for rule in policy.unknown_rules() {
         notices.warn(&format!(
             "rule `{rule}` names an unknown tool (use bash:, read:, or write:)"
@@ -196,13 +217,13 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         threshold: setup.config.compaction.threshold(),
         keep_recent: setup.config.compaction.keep_recent(),
     };
-    // Sandboxed commands run without approval: what they can write to must not hold the
-    // checkpoint repository, which harness's own git reads outside the sandbox.
-    let writable = if sandboxed {
-        harness_sandbox::writable_roots(&settings, &setup.workspace)
-    } else {
-        Vec::new()
-    };
+    let writable = exposed_roots(
+        interactive,
+        sandboxed,
+        &sandboxes,
+        &settings,
+        &setup.workspace,
+    );
     let checkpoints = crate::sessions::checkpoints(setup, &session, &writable, notices);
     let mut agent = Agent::new(
         resolved.provider,
@@ -223,7 +244,86 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         sandbox_session,
         policy,
         window_note: window_note.into(),
+        write_mode_warning,
     })
+}
+
+/// What sandboxed commands can write to, which the checkpoint repository must stay out of, since
+/// they run without approval and harness's own git reads it outside the sandbox. A run in a mode
+/// with a sandbox (`sandboxed`) needs it; an interactive session also needs it whenever the modes
+/// that write (ask, auto) have a sandbox, since it can switch to them.
+fn exposed_roots(
+    interactive: bool,
+    sandboxed: bool,
+    sandboxes: &Sandboxes,
+    settings: &harness_sandbox::SandboxSettings,
+    workspace: &Path,
+) -> Vec<std::path::PathBuf> {
+    if sandboxed || (interactive && sandboxes.workspace_write.is_some()) {
+        harness_sandbox::writable_roots(settings, workspace)
+    } else {
+        Vec::new()
+    }
+}
+
+/// What the modes that write through the sandbox (ask, auto) lack.
+#[derive(Debug)]
+struct WriteModes {
+    /// Said when the session starts in one of them, or first switches to one.
+    warning: Option<String>,
+    /// Why they have no sandbox, when it is not that the system has none, for the reason to ask
+    /// about each command.
+    unsandboxed: Option<&'static str>,
+}
+
+/// What the modes that write lack, given the warning [`sandbox::for_modes`] gave for them
+/// (`warning`), whether they have a sandbox (`sandboxed`), whether `HARNESS_SANDBOX=none` turned
+/// it off (`env_says_none`), and whether `workspace` is too broad to make writable.
+fn write_modes(
+    warning: Option<String>,
+    sandboxed: bool,
+    env_says_none: bool,
+    too_broad: bool,
+    workspace: &Path,
+) -> WriteModes {
+    if sandboxed {
+        return WriteModes {
+            warning,
+            unsandboxed: None,
+        };
+    }
+    if env_says_none {
+        return WriteModes {
+            warning: Some(
+                "the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval".into(),
+            ),
+            unsandboxed: Some("the sandbox is disabled by HARNESS_SANDBOX=none"),
+        };
+    }
+    if too_broad {
+        return WriteModes {
+            warning: Some(format!(
+                "the workspace {} is your home directory or above, where the sandbox would make your dotfiles writable, so it is off; every shell command will need approval",
+                workspace.display()
+            )),
+            unsandboxed: Some("the workspace is your home directory or above"),
+        };
+    }
+    match warning {
+        // The Linux basic tier, with git metadata protection required.
+        Some(warning) => WriteModes {
+            warning: Some(warning),
+            unsandboxed: Some(
+                "git metadata protection is required, but user namespaces are unavailable",
+            ),
+        },
+        None => WriteModes {
+            warning: Some(
+                "no OS sandbox is available; every shell command will need approval".into(),
+            ),
+            unsandboxed: None,
+        },
+    }
 }
 
 /// Where the window comes from: the smaller of what the server runs the model with (`running`)
@@ -443,6 +543,105 @@ mod tests {
             let free = harness_core::session::Session::open(&self.path).is_ok();
             *self.free.lock().unwrap() = Some(free);
             None
+        }
+    }
+
+    fn settings() -> harness_sandbox::SandboxSettings {
+        harness_sandbox::SandboxSettings {
+            extra_writable: Vec::new(),
+            allow_localhost: false,
+            quarantine_dir: None,
+            require_full_git_protection: false,
+        }
+    }
+
+    // Review D I4: an interactive session can switch to ask or auto, whose sandboxed commands
+    // write without approval, whatever mode it starts in; the checkpoints stay out of what those
+    // commands can write to then too.
+    #[test]
+    fn checkpoints_stay_out_of_what_any_mode_the_session_can_switch_to_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let sandbox: Arc<dyn CommandSandbox> = Arc::new(Recording::default());
+        let both = Sandboxes {
+            read_only: Some(sandbox.clone()),
+            workspace_write: Some(sandbox.clone()),
+        };
+        // Started in full-access: no sandbox now, but auto is a Shift+Tab away.
+        let exposed = exposed_roots(true, false, &both, &settings(), &workspace);
+        assert!(exposed.contains(&workspace), "{exposed:?}");
+        // `harness ask` stays in its mode.
+        assert!(exposed_roots(false, false, &both, &settings(), &workspace).is_empty());
+        assert!(exposed_roots(false, true, &both, &settings(), &workspace).contains(&workspace));
+        // Without a sandbox for the modes that write, no command writes without approval.
+        let read_only = Sandboxes {
+            read_only: Some(sandbox),
+            workspace_write: None,
+        };
+        assert!(exposed_roots(true, false, &read_only, &settings(), &workspace).is_empty());
+    }
+
+    // Review D M2: what the modes that write lack is said whichever mode the session starts in,
+    // and the reason to ask about a command says why it has no sandbox.
+    #[test]
+    fn what_the_modes_that_write_lack_is_said_by_cause() {
+        let workspace = Path::new("/Users/someone");
+        let basic = "user namespaces are unavailable (…), so the sandbox can only check git hooks";
+        let cases = [
+            // (warning for the modes that write, sandbox for them, env says none, too broad)
+            (None, true, false, false, None, None),
+            (
+                None,
+                false,
+                true,
+                false,
+                Some(
+                    "the sandbox is disabled by HARNESS_SANDBOX=none; every shell command will need approval",
+                ),
+                Some("the sandbox is disabled by HARNESS_SANDBOX=none"),
+            ),
+            (
+                None,
+                false,
+                false,
+                true,
+                Some(
+                    "the workspace /Users/someone is your home directory or above, where the sandbox would make your dotfiles writable, so it is off; every shell command will need approval",
+                ),
+                Some("the workspace is your home directory or above"),
+            ),
+            (
+                Some(
+                    "git metadata protection is required (…); every shell command will need approval",
+                ),
+                false,
+                false,
+                false,
+                Some(
+                    "git metadata protection is required (…); every shell command will need approval",
+                ),
+                Some("git metadata protection is required, but user namespaces are unavailable"),
+            ),
+            (Some(basic), true, false, false, Some(basic), None),
+            (
+                None,
+                false,
+                false,
+                false,
+                Some("no OS sandbox is available; every shell command will need approval"),
+                None,
+            ),
+        ];
+        for (warning, sandboxed, env_says_none, too_broad, said, reason) in cases {
+            let lack = write_modes(
+                warning.map(String::from),
+                sandboxed,
+                env_says_none,
+                too_broad,
+                workspace,
+            );
+            assert_eq!(lack.warning.as_deref(), said);
+            assert_eq!(lack.unsandboxed, reason);
         }
     }
 

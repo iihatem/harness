@@ -967,11 +967,12 @@ async fn the_watcher_between_commands_ends_once_the_processes_left_are_gone() {
     let (output, report) = run(&sandbox, &env, "(sleep 1) > /dev/null 2>&1 &").await;
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(report, None);
-    assert_eq!(
-        threads_named("harness-watch"),
-        0,
-        "the command's watcher stopped"
-    );
+    // `finish` joins the command's watcher, but an exited thread can stay listed in
+    // /proc/self/task for a moment after the join returns.
+    wait_until("the command's watcher stopped", || {
+        threads_named("harness-watch") == 0
+    })
+    .await;
     wait_until(
         "a watcher runs between commands while the job lives",
         || threads_named("harness-between") == 1,

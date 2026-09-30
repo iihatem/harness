@@ -102,6 +102,10 @@ impl Session {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        // Until harness is started, no other test starts a process: one started meanwhile would
+        // hold this terminal's other side, which is not close-on-exec until set so below.
+        static STARTING: Mutex<()> = Mutex::new(());
+        let _starting = STARTING.lock().unwrap_or_else(|e| e.into_inner());
         let pty = openpty(Some(&size), None).unwrap();
         // harness must not inherit the terminal's other side, or it never closes.
         for fd in [pty.master.as_raw_fd(), pty.slave.as_raw_fd()] {

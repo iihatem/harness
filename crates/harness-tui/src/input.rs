@@ -268,7 +268,9 @@ mod tests {
         reader.read_exact(&mut [0]).unwrap();
         assert_eq!(terminal(fd, Duration::ZERO), Terminal::Quiet);
         drop(writer);
-        assert_eq!(terminal(fd, Duration::ZERO), Terminal::Closed);
+        // Waits a while: on macOS, a process another test starts meanwhile can hold a copy of
+        // the pipe's end for a moment.
+        assert_eq!(terminal(fd, Duration::from_secs(5)), Terminal::Closed);
     }
 
     // Should crossterm still read the terminal's end on the reader's thread (it closed in the
@@ -284,10 +286,19 @@ mod tests {
         };
         sender.send(Ok(Event::FocusGained)).unwrap();
         drop(writer);
-        use futures::StreamExt;
+        use futures::{FutureExt, StreamExt};
         assert!(matches!(input.next().await, Some(Ok(Event::FocusGained))));
-        let end = tokio::time::timeout(Duration::from_secs(2), input.next()).await;
-        assert!(matches!(end, Ok(None)), "the stream went on");
+        // As the session does, looking again every so often: on macOS, a process another test
+        // starts meanwhile can hold a copy of the pipe's end for a moment.
+        let mut end = None;
+        for _ in 0..250 {
+            if let Some(next) = input.next().now_or_never() {
+                end = Some(next);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(matches!(end, Some(None)), "the stream went on");
         drop(sender);
     }
 

@@ -120,16 +120,39 @@ fn add_key(setup: &Setup, provider: &str, profile: &str) -> u8 {
         eprintln!("error: {refused}");
         return 2;
     }
-    match setup.credentials.set(provider, profile, &key) {
-        Ok(place) => {
+    report_added(
+        setup.credentials.set(provider, profile, &key),
+        provider,
+        profile,
+        &var,
+    )
+}
+
+/// What `harness auth add` says, and exits with, once the key is stored (or not): where it went
+/// on success; on [`Stored::stale_file_copy`](credentials::Stored), a plain failure, since the
+/// new key has not actually replaced the old one everywhere it is read from. `add` prints the
+/// warnings queued by [`Credentials::set`](harness_providers::credentials::Credentials::set)
+/// either way, which gives the fix for a stale file copy.
+fn report_added(
+    stored: Result<credentials::Stored, CredentialError>,
+    provider: &str,
+    profile: &str,
+    var: &str,
+) -> u8 {
+    match stored {
+        Ok(stored) if stored.stale_file_copy => {
+            eprintln!("error: {}", credentials::STALE_FILE_COPY);
+            1
+        }
+        Ok(stored) => {
             println!(
                 "Stored the API key for {provider} (profile {profile}) in {}.",
-                terminal_safe(&place)
+                terminal_safe(&stored.place)
             );
-            if setup::env(&var).is_some_and(|value| !value.is_empty()) {
+            if setup::env(var).is_some_and(|value| !value.is_empty()) {
                 eprintln!(
                     "note: ${} is set, and wins over the stored key while it is",
-                    terminal_safe(&var)
+                    terminal_safe(var)
                 );
             }
             0
@@ -434,5 +457,48 @@ mod tests {
         // Blank lines count towards the limit too.
         let blank = vec![b'\n'; MAX_KEY_BYTES as usize + 1];
         assert!(key(&blank).unwrap_err().contains("too long"));
+    }
+
+    // Final review, wave 5 re-review R1: a keychain store that could not remove an older file
+    // copy has not actually replaced the credential everywhere it is read from, so `harness auth
+    // add` must fail loudly rather than report success.
+    #[test]
+    fn a_stale_file_copy_after_storing_a_key_fails_loudly() {
+        let stored = Ok(credentials::Stored {
+            place: "the keychain".into(),
+            stale_file_copy: true,
+        });
+        assert_eq!(report_added(stored, "mock", "default", "MOCK_API_KEY"), 1);
+    }
+
+    #[test]
+    fn a_clean_store_reports_success() {
+        let stored = Ok(credentials::Stored {
+            place: "the keychain".into(),
+            stale_file_copy: false,
+        });
+        assert_eq!(report_added(stored, "mock", "default", "MOCK_API_KEY"), 0);
+    }
+
+    #[test]
+    fn a_credential_error_storing_a_key_is_a_plain_failure() {
+        let stored = Err(CredentialError::Keychain("the collection is locked".into()));
+        assert_eq!(report_added(stored, "mock", "default", "MOCK_API_KEY"), 1);
+    }
+
+    #[test]
+    fn the_stale_file_copy_message_says_what_happened() {
+        for part in [
+            "keychain",
+            "older copy",
+            "credentials.json",
+            "used until it is",
+        ] {
+            assert!(
+                credentials::STALE_FILE_COPY.contains(part),
+                "{part}: {}",
+                credentials::STALE_FILE_COPY
+            );
+        }
     }
 }

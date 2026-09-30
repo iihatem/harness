@@ -118,9 +118,30 @@ async fn sign_in(setup: &Setup, profile: &str, device: bool) -> u8 {
     };
     let stored = setup.credentials.set(CHATGPT, profile, &tokens.to_json());
     drop(renewing);
+    report_signed_in(stored, &tokens, profile)
+}
+
+/// What `harness login chatgpt` says, and exits with, once the tokens are stored (or not): the
+/// tokens' place on success; on [`Stored::stale_file_copy`](harness_providers::credentials::Stored),
+/// a plain failure, since the new sign-in has not actually replaced the old one everywhere it is
+/// read from. `run` prints the warnings queued by [`Credentials::set`](harness_providers::credentials::Credentials::set)
+/// either way, which gives the fix for a stale file copy. A background renewal never calls this:
+/// see `chatgpt::auth::save`, which just warns.
+#[cfg(feature = "chatgpt-login")]
+fn report_signed_in(
+    stored: Result<
+        harness_providers::credentials::Stored,
+        harness_providers::credentials::CredentialError,
+    >,
+    tokens: &harness_providers::chatgpt::oauth::Tokens,
+    profile: &str,
+) -> u8 {
     match stored {
-        Ok(place) => {
-            setup.print_credential_warnings();
+        Ok(stored) if stored.stale_file_copy => {
+            eprintln!("error: {}", harness_providers::credentials::STALE_FILE_COPY);
+            1
+        }
+        Ok(stored) => {
             let who = tokens
                 .email
                 .as_deref()
@@ -128,7 +149,7 @@ async fn sign_in(setup: &Setup, profile: &str, device: bool) -> u8 {
                 .unwrap_or_default();
             println!(
                 "Signed in to ChatGPT{who} (profile {profile}); the tokens are in {}.",
-                terminal_safe(&place)
+                terminal_safe(&stored.place)
             );
             println!("Use a model your plan includes with --model chatgpt/<model>.");
             0
@@ -293,5 +314,43 @@ mod tests {
         assert!(!wants_device_flow(env(&[("WAYLAND_DISPLAY", "wayland-0")])));
         // macOS always has a browser; Linux without a display has none.
         assert_eq!(wants_device_flow(env(&[])), cfg!(target_os = "linux"));
+    }
+
+    fn tokens() -> harness_providers::chatgpt::oauth::Tokens {
+        harness_providers::chatgpt::oauth::Tokens {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            account_id: None,
+            email: Some("dev@example.com".into()),
+        }
+    }
+
+    // Final review, wave 5 re-review R1: a keychain store that could not remove an older file
+    // copy has not actually replaced the credential everywhere it is read from, so `harness
+    // login` must fail loudly rather than report success.
+    #[test]
+    fn a_stale_file_copy_after_signing_in_fails_loudly() {
+        let stored = Ok(harness_providers::credentials::Stored {
+            place: "the keychain".into(),
+            stale_file_copy: true,
+        });
+        assert_eq!(report_signed_in(stored, &tokens(), "default"), 1);
+    }
+
+    #[test]
+    fn a_clean_sign_in_reports_success() {
+        let stored = Ok(harness_providers::credentials::Stored {
+            place: "the keychain".into(),
+            stale_file_copy: false,
+        });
+        assert_eq!(report_signed_in(stored, &tokens(), "default"), 0);
+    }
+
+    #[test]
+    fn a_credential_error_signing_in_is_a_plain_failure() {
+        let stored = Err(harness_providers::credentials::CredentialError::Keychain(
+            "the collection is locked".into(),
+        ));
+        assert_eq!(report_signed_in(stored, &tokens(), "default"), 1);
     }
 }

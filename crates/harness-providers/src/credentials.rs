@@ -524,6 +524,26 @@ pub struct RenewalLock {
     _file: File,
 }
 
+/// Where [`Credentials::set`] stored a credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    /// Where it went, for a message: the keychain's name, or the file's path.
+    pub place: String,
+    /// The credential is now in the keychain, but an older copy of it in `credentials.json`
+    /// could not be removed, and is used (see [`Credentials::newer`]) until it is: an
+    /// interactive command (`harness auth add`, `harness login`) storing a credential this way
+    /// has not actually replaced it, and should say so loudly rather than report success. A
+    /// background renewal only warns and goes on with what it has (a store it retries at its
+    /// next renewal), since failing it would end the session.
+    pub stale_file_copy: bool,
+}
+
+/// What `harness auth add` and `harness login` say, and exit with (1), when [`Stored`] reports
+/// [`stale_file_copy`](Stored::stale_file_copy): the per-run warning [`Credentials::set`] already
+/// queued gives the fix (make the data directory writable and store it again, or remove the
+/// file's entry by hand).
+pub const STALE_FILE_COPY: &str = "the new credential is in the keychain, but an older copy of it in credentials.json could not be removed and will be used until it is";
+
 /// Connects to a keychain.
 type Connect = Box<dyn Fn() -> Result<Box<dyn SecretStore>, CredentialError> + Send + Sync>;
 
@@ -732,10 +752,12 @@ impl Credentials {
         self.file.get(&account)
     }
 
-    /// The newer of `secret`, the keychain's copy of `account`, and the file's. A keychain that
-    /// stores a credential removes the file's copy, so a different copy in the file was stored
-    /// later: while the keychain could not be reached, or with the file chosen, when the keychain
-    /// kept its older copy. That one is used, with a warning once a run. A file that cannot be
+    /// The credential in use for `account`: the file's copy when it differs from `secret`, the
+    /// keychain's. The file usually differs because it holds a copy stored more recently, while
+    /// the keychain could not be reached or with the file chosen; it can also hold an older copy
+    /// a keychain store since could not remove (see [`Stored::stale_file_copy`]), which this
+    /// cannot tell apart from the usual case. Either way the file's copy is used, with a neutral
+    /// warning once a run that says how to end up with one copy again. A file that cannot be
     /// read leaves the keychain's copy in use, with a warning too.
     fn newer(&self, keychain: &dyn SecretStore, account: &str, secret: String) -> String {
         let warn_once = |warning: String| {
@@ -751,9 +773,10 @@ impl Credentials {
         match self.file.peek(account) {
             Ok(Some(copy)) if copy != secret => {
                 warn_once(format!(
-                    "{} and {} hold different copies of {account}; using the file's, the newer one (it was stored while the keychain could not be reached, or with {STORE_ENV}=file). To keep one copy, store it again in a run that reaches the keychain",
+                    "{} and {} hold different copies of {account}; the file's is used. Make {} writable, then store the key again, or delete the file's entry for {account} by hand",
                     self.file.describe(),
-                    keychain.describe()
+                    keychain.describe(),
+                    self.dir.display()
                 ));
                 copy
             }
@@ -863,15 +886,17 @@ impl Credentials {
     }
 
     /// Stores `secret` for `provider` under `profile`, in the keychain when one works, else in
-    /// the file with a warning. Returns where it went. With the file chosen, an older copy in the
-    /// keychain is removed too, as [`remove`](Self::remove) does: it would be used again as soon
-    /// as the file is no longer chosen. A keychain that cannot remove it is a warning.
+    /// the file with a warning. Returns where it went, and whether an older file copy the
+    /// keychain store could not remove is used until it is (see [`Stored::stale_file_copy`]).
+    /// With the file chosen, an older copy in the keychain is removed too, as
+    /// [`remove`](Self::remove) does: it would be used again as soon as the file is no longer
+    /// chosen. A keychain that cannot remove it is a warning.
     pub fn set(
         &self,
         provider: &str,
         profile: &str,
         secret: &str,
-    ) -> Result<String, CredentialError> {
+    ) -> Result<Stored, CredentialError> {
         let account = account(provider, profile)?;
         // Why the file is used, and whether a keychain reached later may hold an older copy;
         // nothing to say when the file was chosen (`HARNESS_CREDENTIAL_STORE`).
@@ -879,14 +904,20 @@ impl Credentials {
             Some(Ok(keychain)) => match keychain.set(&account, secret) {
                 Ok(()) => {
                     // An older copy in the file must not outlive this one.
-                    if let Err(e) = self.file.delete(&account) {
+                    let stale_file_copy = if let Err(e) = self.file.delete(&account) {
                         self.warn(format!(
                             "the credential is in {}, but an older copy of it could not be removed from {} ({e}), and harness uses that copy while it is there; remove that file's entry for {account} by hand",
                             keychain.describe(),
                             self.file.describe()
                         ));
-                    }
-                    return Ok(keychain.describe());
+                        true
+                    } else {
+                        false
+                    };
+                    return Ok(Stored {
+                        place: keychain.describe(),
+                        stale_file_copy,
+                    });
                 }
                 Err(refused) => {
                     // An older copy in the keychain would be read before the file's.
@@ -920,7 +951,10 @@ impl Credentials {
         if self.choice == StoreChoice::File {
             self.clear_keychain_copy(&account);
         }
-        Ok(self.file.describe())
+        Ok(Stored {
+            place: self.file.describe(),
+            stale_file_copy: false,
+        })
     }
 
     /// Removes the keychain's copy of `account`, just stored in the file (the file chosen), once

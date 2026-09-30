@@ -140,7 +140,8 @@ fn keys_go_to_the_keychain_and_never_to_the_file() {
     let stored = creds
         .set("openai", DEFAULT_PROFILE, "sk-in-keychain")
         .unwrap();
-    assert_eq!(stored, "the recording keychain");
+    assert_eq!(stored.place, "the recording keychain");
+    assert!(!stored.stale_file_copy);
     assert!(creds.take_warnings().is_empty());
     assert_eq!(
         keychain.0.lock().unwrap().as_slice(),
@@ -166,7 +167,8 @@ fn without_a_keychain_keys_go_to_a_private_file_with_a_warning() {
         let creds = Credentials::with_keychain(&data, keychain);
         let stored = creds.set("openrouter", DEFAULT_PROFILE, "sk-or-1").unwrap();
         let file = data.join("credentials.json");
-        assert_eq!(stored, file.display().to_string());
+        assert_eq!(stored.place, file.display().to_string());
+        assert!(!stored.stale_file_copy);
         let warnings = creds.take_warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("no keychain"), "{warnings:?}");
@@ -299,13 +301,14 @@ fn a_key_the_keychain_refuses_replaces_the_one_it_held() {
     let dir = tempfile::tempdir().unwrap();
     let keychain = ReadOnly::holding(&[("openai/default", "sk-OLD-leaked")]);
     let creds = Credentials::with_keychain(dir.path(), Some(Box::new(keychain.clone())));
-    let place = creds
+    let stored = creds
         .set("openai", DEFAULT_PROFILE, "sk-NEW-rotated")
         .unwrap();
     assert_eq!(
-        place,
+        stored.place,
         dir.path().join("credentials.json").display().to_string()
     );
+    assert!(!stored.stale_file_copy);
     assert_eq!(
         creds.active("openai").unwrap().as_deref(),
         Some("sk-NEW-rotated")
@@ -352,12 +355,52 @@ fn an_older_file_copy_that_cannot_be_removed_is_a_warning() {
     let creds = Credentials::with_keychain(&data, Some(Box::new(Recording::default())));
     let stored = creds.set("openai", DEFAULT_PROFILE, "sk-in-keychain");
     std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(stored.unwrap(), "the recording keychain");
+    let stored = stored.unwrap();
+    assert_eq!(stored.place, "the recording keychain");
+    // Final review, wave 5 re-review R1: the caller (`harness auth add`, `harness login`) is
+    // told the credential is not yet replaced everywhere it is read from, and must fail loudly.
+    assert!(stored.stale_file_copy);
     let warnings = creds.take_warnings();
     assert!(
         warnings.iter().any(|w| w.contains("credentials.json")),
         "{warnings:?}"
     );
+}
+
+// Final review, wave 5 re-review R1 (probe c): after a keychain store that could not remove an
+// older file copy (a read-only data directory, say, or a full disk), the older key in the file
+// is used until the file's entry is removed by hand. The per-run warning at the next read must
+// not claim the file's copy is the newer one: here it is the keychain's that is.
+#[test]
+fn a_stale_file_copy_is_read_back_with_a_neutral_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    Credentials::with_keychain(&data, None)
+        .set("openai", DEFAULT_PROFILE, "sk-OLD-in-file-0123")
+        .unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let creds = Credentials::with_keychain(&data, Some(Box::new(Recording::default())));
+    let stored = creds
+        .set("openai", DEFAULT_PROFILE, "sk-NEW-rotated-4567")
+        .unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(stored.stale_file_copy);
+    creds.take_warnings();
+    // Every later read uses the file's (older) copy until the entry is removed by hand: see
+    // `Credentials::newer`.
+    let key = creds.active("openai").unwrap().unwrap();
+    assert_eq!(key, "sk-OLD-in-file-0123");
+    let warnings = creds.take_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    for part in [
+        "hold different copies",
+        "the file's is used",
+        "openai/default",
+    ] {
+        assert!(warnings[0].contains(part), "{part}: {warnings:?}");
+    }
+    assert!(!warnings[0].contains("newer one"), "{warnings:?}");
+    assert!(!warnings[0].contains("sk-"), "{warnings:?}");
 }
 
 // Review B, I2: `logout` must not report success while the keychain keeps the key.
@@ -468,9 +511,10 @@ fn a_key_stored_in_file_mode_is_not_shadowed_by_an_older_keychain_copy() {
         .set("openai", DEFAULT_PROFILE, "sk-NEW-rotated")
         .unwrap();
     assert_eq!(
-        place,
+        place.place,
         dir.path().join("credentials.json").display().to_string()
     );
+    assert!(!place.stale_file_copy);
     assert!(file_mode.take_warnings().is_empty());
     assert_eq!(
         file_mode.active("openai").unwrap().as_deref(),
@@ -857,10 +901,14 @@ fn a_key_stored_in_file_mode_without_a_keychain_is_not_shadowed_later() {
         "credentials.json",
         "openai/default",
         "the recording keychain",
-        "newer",
+        "hold different copies",
+        "the file's is used",
     ] {
         assert!(first[0].contains(part), "{part}: {first:?}");
     }
+    // Final review, wave 5 re-review R1: the warning must not claim the file's copy is the
+    // newer one, since it cannot always tell (see `a_stale_file_copy_is_read_back_with_a_neutral_warning`).
+    assert!(!first[0].contains("newer one"), "{first:?}");
     assert!(!first[0].contains("sk-"), "{first:?}");
     // Once a run.
     assert!(second.is_empty(), "{second:?}");

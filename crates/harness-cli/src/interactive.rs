@@ -347,6 +347,7 @@ async fn terminal_session(
     // The editor for plans owns the terminal's modes, so they are undone while it runs, and
     // when the session ends; the terminal is not read for the session meanwhile.
     let modes = Modes::enter(std::io::stdout(), CrosstermRawMode, keyboard)?;
+    modes.leave_on_panic(std::io::stdout, CrosstermRawMode);
     let input = TerminalInput::start()?;
     options.text_editor = Some(Box::new(
         ExternalEditor::from_env(modes).pausing(input.pauser()),

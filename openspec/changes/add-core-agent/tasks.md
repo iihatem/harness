@@ -50,13 +50,13 @@ M1 is delivered in five phases, each with its own Superpowers implementation pla
 
 ## 4. P4 Providers (`docs/superpowers/plans/2026-09-28-m1-p4-providers.md`)
 
-- [ ] 4.1 OpenAI Responses adapter; verify with recorded SSE fixtures
-- [ ] 4.2 Anthropic Messages adapter; verify with recorded SSE fixtures
-- [ ] 4.3 Credential store (keychain, `0600` fallback), account profiles, `auth add`/`auth use`/`logout`; verify the provider-auth storage and profile scenarios as tests
-- [ ] 4.4 ChatGPT sign-in (browser PKCE, device code, refresh on 401) and the Claude-credential prohibition; verify against a mock OAuth server
-- [ ] 4.5 Model profiles and effective-context detection with warnings; verify the model-providers profile and context scenarios as tests
-- [ ] 4.6 Text tool-call recovery and truncation handling; verify the matching model-providers scenarios as tests
-- [ ] 4.7 Secret-redaction audit across logs, sessions, tool output, and NDJSON; verify with a canary-key test
+- [x] 4.1 OpenAI Responses adapter; verify with recorded SSE fixtures
+- [x] 4.2 Anthropic Messages adapter; verify with recorded SSE fixtures
+- [x] 4.3 Credential store (keychain, `0600` fallback), account profiles, `auth add`/`auth use`/`logout`; verify the provider-auth storage and profile scenarios as tests
+- [x] 4.4 ChatGPT sign-in (browser PKCE, device code, refresh on 401) and the Claude-credential prohibition; verify against a mock OAuth server
+- [x] 4.5 Model profiles and effective-context detection with warnings; verify the model-providers profile and context scenarios as tests
+- [x] 4.6 Text tool-call recovery and truncation handling; verify the matching model-providers scenarios as tests
+- [x] 4.7 Secret-redaction audit across logs, sessions, tool output, and NDJSON; verify with a canary-key test
 
 ## 5. P5 Terminal UI (plan written after P4)
 

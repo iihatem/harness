@@ -632,7 +632,8 @@ where
     /// Ends the session: denies what waits for an approval, shown or not, and whatever the
     /// agent would ask from now on; stops a running turn, which stops the command it runs;
     /// waits for the agent to be dropped (which releases the session file); writes what finished
-    /// meanwhile, and clears the live region.
+    /// meanwhile, and clears the live region. An agent whose task panicked (its events then end,
+    /// as if the user had left) fails it, saying so.
     pub async fn finish(&mut self) -> io::Result<()> {
         self.app.deny_waiting();
         self.approvals.close();
@@ -642,8 +643,14 @@ where
             cancel.cancel();
         }
         self.jobs = None;
-        if let Some(runner) = self.runner.take() {
-            let _ = runner.await;
+        let mut stopped = Ok(());
+        if let Some(runner) = self.runner.take()
+            && let Err(error) = runner.await
+        {
+            stopped = Err(io::Error::other(format!(
+                "the agent stopped unexpectedly ({})",
+                why_stopped(error)
+            )));
         }
         while let Ok(event) = self.events.try_recv() {
             self.take_in(event);
@@ -655,7 +662,23 @@ where
             }
         }
         let finished = self.app.transcript.take_finished();
-        self.term.insert(&finished)?;
-        self.term.clear()
+        let written = self.term.insert(&finished).and_then(|()| self.term.clear());
+        stopped.and(written)
+    }
+}
+
+/// Why the agent's task ended early: it panicked, with its message when it has one.
+fn why_stopped(error: tokio::task::JoinError) -> String {
+    if !error.is_panic() {
+        return "its task was cancelled".into();
+    }
+    let payload = error.into_panic();
+    match payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+    {
+        Some(message) => format!("it panicked: {message}"),
+        None => "it panicked".into(),
     }
 }

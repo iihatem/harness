@@ -498,3 +498,80 @@ async fn a_terminal_closed_while_the_agents_events_are_drawn_is_a_hangup() {
     .await;
     assert_eq!(ending, Ending::Hangup);
 }
+
+/// Panics when run, as a bug in a tool would.
+struct Panics;
+
+#[async_trait::async_trait]
+impl Tool for Panics {
+    fn spec(&self) -> harness_core::message::ToolSpec {
+        harness_core::message::ToolSpec {
+            name: "panics".into(),
+            description: "panics".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    fn action(&self, _args: &serde_json::Value, ctx: &ToolContext) -> Action {
+        Action::Read(ctx.workspace.clone())
+    }
+    async fn run(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> harness_core::tool::ToolOutput {
+        panic!("a bug in the tool")
+    }
+}
+
+// Final review M3: a panic in the agent's task closed its events, and the session ended as if the
+// user had left, with exit 0. It is an error (exit 1) that says what happened.
+#[tokio::test]
+async fn a_panic_in_the_agents_task_ends_the_session_with_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::tool_call("p1", "panics", json!({}))]);
+    let policy = Arc::new(PermissionEngine::new(EngineConfig {
+        mode: Mode::Auto,
+        workspace: dir.path().to_path_buf(),
+        read_dirs: Vec::new(),
+        rules: RuleSet::default(),
+        sandbox_available: true,
+        writes_need_approval: false,
+    }));
+    let (approver, approvals) = ChannelApprover::new();
+    let agent = Agent::new(
+        provider,
+        ToolRegistry::new(vec![Arc::new(Panics)]),
+        policy,
+        approver,
+        AgentConfig::new("mock/m", "m", "system", dir.path().join("out")),
+        ToolContext::new(dir.path()),
+    );
+    let options = Options {
+        theme: Theme::monochrome(),
+        model: "mock/m".into(),
+        mode: Mode::Auto,
+        commands: Vec::new(),
+        workspace: dir.path().to_path_buf(),
+        history: Vec::new(),
+        instruction_files: Vec::new(),
+        window_note: None,
+        default_mode: Mode::Auto,
+        text_editor: None,
+        notifier: None,
+    };
+    let term = InlineTerminal::new(TestBackend::new(80, 24), 0).unwrap();
+    let mut ui = Ui::start(agent, Box::new(NoCommands), term, options, approvals);
+    let (keys, input) = futures::channel::mpsc::unbounded();
+    for event in typed("go") {
+        keys.unbounded_send(Ok(event)).unwrap();
+    }
+    keep_open(keys);
+    let ended = tokio::time::timeout(
+        Duration::from_secs(10),
+        ui.run(input, std::future::pending()),
+    )
+    .await
+    .expect("the session ends promptly");
+    let error = ended.expect_err("ended as if the user left");
+    assert!(error.to_string().contains("a bug in the tool"), "{error}");
+}

@@ -204,3 +204,60 @@ fn wide_characters_take_two_columns_for_the_cursor_and_wrapping() {
     assert_eq!(text, ["› abc", "  🙂"]);
     assert_eq!(cursor, Position::new(4, 1));
 }
+
+// Review B's I1: what looks like one character can be several code points: a ZWJ family, a flag
+// (two regional indicators), a letter with a combining mark. Editing moved and deleted one code
+// point at a time, leaving half a glyph behind.
+#[test]
+fn keys_move_and_delete_whole_grapheme_clusters() {
+    let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+    for (typed, cluster) in [
+        ("hi ", family),
+        ("go ", "🇯🇵"),
+        ("caf", "e\u{301}"),
+        ("warn ", "⚠\u{fe0f}"),
+    ] {
+        let mut editor = Editor::new(Vec::new());
+        type_text(&mut editor, &format!("{typed}{cluster}"));
+        editor.key(key(KeyCode::Backspace));
+        assert_eq!(editor.text(), typed, "Backspace after {cluster:?}");
+        // Left and Right step over the cluster; Delete removes it whole.
+        type_text(&mut editor, &format!("{cluster}x"));
+        editor.key(key(KeyCode::Left));
+        editor.key(key(KeyCode::Left));
+        assert_eq!(editor.cursor(), typed.len(), "Left over {cluster:?}");
+        editor.key(key(KeyCode::Right));
+        assert_eq!(
+            editor.cursor(),
+            typed.len() + cluster.len(),
+            "Right over {cluster:?}"
+        );
+        editor.key(key(KeyCode::Left));
+        editor.key(key(KeyCode::Delete));
+        assert_eq!(editor.text(), format!("{typed}x"), "Delete of {cluster:?}");
+    }
+    // The cursor goes after the cluster's two columns.
+    let mut editor = Editor::new(Vec::new());
+    type_text(&mut editor, &format!("a{family}"));
+    let (lines, cursor) = editor.render("› ", 40, &Theme::monochrome());
+    assert_eq!(plain(&lines[0]), format!("› a{family}"));
+    assert_eq!(cursor, Position::new(2 + 1 + 2, 0));
+    type_text(&mut editor, "⚠\u{fe0f}");
+    let (_, cursor) = editor.render("› ", 40, &Theme::monochrome());
+    assert_eq!(cursor, Position::new(2 + 1 + 2 + 2, 0));
+    // A ZWJ typed between two emoji joins them; the cursor goes after the joined cluster.
+    let mut editor = Editor::new(Vec::new());
+    type_text(&mut editor, "👨👩");
+    editor.key(key(KeyCode::Left));
+    type_text(&mut editor, "\u{200d}");
+    assert_eq!(editor.cursor(), editor.text().len());
+    let (_, cursor) = editor.render("› ", 40, &Theme::monochrome());
+    assert_eq!(cursor, Position::new(4, 0));
+    // Up and Down keep the column on screen, not the count of characters.
+    let mut editor = Editor::new(Vec::new());
+    type_text(&mut editor, "日本語");
+    editor.key(with(KeyCode::Enter, KeyModifiers::ALT));
+    type_text(&mut editor, "abcd");
+    editor.key(key(KeyCode::Up));
+    assert_eq!(editor.cursor(), "日本".len());
+}

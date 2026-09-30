@@ -6,9 +6,12 @@ use ratatui::{
     layout::Position,
     text::{Line, Span},
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
-use crate::{style::Theme, text::sanitize};
+use crate::{
+    style::Theme,
+    text::{grapheme_width, sanitize, width as text_width},
+};
 
 /// A paste with more lines than this is collapsed.
 pub const PASTE_MAX_LINES: usize = 10;
@@ -39,7 +42,8 @@ pub enum Edit {
 #[derive(Debug, Clone, Default)]
 pub struct Editor {
     text: String,
-    /// A byte offset into `text`, always at a character boundary and never inside a placeholder.
+    /// A byte offset into `text`, always between grapheme clusters and never inside a
+    /// placeholder.
     cursor: usize,
     pastes: Vec<Paste>,
     /// Pastes collapsed so far, for their numbers.
@@ -155,11 +159,12 @@ impl Editor {
         self.recall = None;
     }
 
-    /// Types `text` at the cursor.
+    /// Types `text` at the cursor, which goes after it: after the grapheme cluster it ends in,
+    /// when it joins the text after it into one (a ZWJ typed between two emoji).
     pub fn insert(&mut self, text: &str) {
         let at = self.cursor;
         self.splice(at, at, text);
-        self.cursor = at + text.len();
+        self.cursor = self.cluster_end(at + text.len());
     }
 
     /// Pastes `text`: collapsed to `[Pasted text #n, N lines]` when it has more than
@@ -205,24 +210,42 @@ impl Editor {
         true
     }
 
+    /// Where the grapheme cluster (or placeholder) before `offset` starts: what Left moves over
+    /// and Backspace deletes.
     fn previous_boundary(&self, offset: usize) -> usize {
         if let Some(i) = self.paste_ending_at(offset) {
             return self.pastes[i].start;
         }
-        self.text[..offset]
-            .char_indices()
-            .next_back()
-            .map_or(0, |(i, _)| i)
+        GraphemeCursor::new(offset, self.text.len(), true)
+            .prev_boundary(&self.text, 0)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
     }
 
+    /// Where the grapheme cluster (or placeholder) after `offset` ends: what Right moves over and
+    /// Delete deletes.
     fn next_boundary(&self, offset: usize) -> usize {
         if let Some(i) = self.paste_starting_at(offset) {
             return self.pastes[i].end;
         }
-        self.text[offset..]
-            .chars()
-            .next()
-            .map_or(offset, |c| offset + c.len_utf8())
+        GraphemeCursor::new(offset, self.text.len(), true)
+            .next_boundary(&self.text, 0)
+            .ok()
+            .flatten()
+            .unwrap_or(self.text.len())
+    }
+
+    /// `offset`, or the end of the grapheme cluster it is inside.
+    fn cluster_end(&self, offset: usize) -> usize {
+        let boundary = GraphemeCursor::new(offset, self.text.len(), true)
+            .is_boundary(&self.text, 0)
+            .unwrap_or(true);
+        if boundary {
+            offset
+        } else {
+            self.next_boundary(offset)
+        }
     }
 
     fn line_start(&self, offset: usize) -> usize {
@@ -273,14 +296,14 @@ impl Editor {
             .iter()
             .fold(end, |e, p| if p.start < e && e < p.end { p.end } else { e });
         self.splice(start, end, "");
-        self.cursor = start;
+        self.cursor = self.cluster_end(start);
     }
 
-    /// Moves the cursor a row up (`-1`) or down (`1`), keeping its column; `false` at the first
-    /// or last row.
+    /// Moves the cursor a row up (`-1`) or down (`1`), keeping its column on screen; `false` at
+    /// the first or last row.
     fn move_row(&mut self, direction: isize) -> bool {
         let start = self.line_start(self.cursor);
-        let column = self.text[start..self.cursor].chars().count();
+        let column = text_width(&self.text[start..self.cursor]);
         let target = if direction < 0 {
             if start == 0 {
                 return false;
@@ -294,10 +317,15 @@ impl Editor {
             end + 1
         };
         let end = self.line_end(target);
-        let offset = self.text[target..end]
-            .char_indices()
-            .nth(column)
-            .map_or(end, |(i, _)| target + i);
+        let mut offset = target;
+        let mut used = 0;
+        for (i, grapheme) in self.text[target..end].grapheme_indices(true) {
+            used += grapheme_width(grapheme);
+            if used > column {
+                break;
+            }
+            offset = target + i + grapheme.len();
+        }
         self.cursor = self.settle(offset);
         true
     }
@@ -414,80 +442,109 @@ impl Editor {
     }
 
     /// The editor as lines `width` columns wide, the first starting with `prompt` and the rest
-    /// indented as far, and where the cursor is in them. Long lines wrap at the width.
+    /// indented as far, and where the cursor is in them. Long lines wrap at the width, between
+    /// grapheme clusters.
     pub fn render(
         &self,
         prompt: &str,
         width: usize,
         theme: &Theme,
     ) -> (Vec<Line<'static>>, Position) {
-        let prompt_width = crate::text::width(prompt);
+        let prompt_width = text_width(prompt);
         let indent = " ".repeat(prompt_width);
         let width = width.max(prompt_width + 2);
-        // Each row: its prefix, then its text.
-        let mut rows: Vec<(Span<'static>, Vec<Span<'static>>)> =
-            vec![(Span::styled(prompt.to_string(), theme.accent()), Vec::new())];
-        let mut column = prompt_width;
-        let mut cursor = None;
-        let mut offset = 0;
-        let new_row = |rows: &mut Vec<(Span<'static>, Vec<Span<'static>>)>| {
-            rows.push((Span::raw(indent.clone()), Vec::new()));
+        let mut rows = Rows {
+            rows: vec![(Span::styled(prompt.to_string(), theme.accent()), Vec::new())],
+            indent,
+            column: prompt_width,
+            prompt_width,
+            width,
+            cursor: None,
         };
+        let mut at = 0;
+        let mut pastes = self.pastes.iter();
         loop {
-            if offset == self.cursor && cursor.is_none() {
-                if column >= width {
-                    new_row(&mut rows);
-                    column = prompt_width;
+            let paste = pastes.next();
+            let end = paste.map_or(self.text.len(), |p| p.start);
+            for (i, grapheme) in self.text[at..end].grapheme_indices(true) {
+                rows.cursor_before(at + i, self.cursor);
+                if grapheme == "\n" {
+                    rows.new_row();
+                    continue;
                 }
-                cursor = Some(Position::new(column as u16, (rows.len() - 1) as u16));
+                let shown = sanitize(grapheme);
+                let w = text_width(&shown);
+                if rows.column + w > width {
+                    rows.new_row();
+                }
+                rows.push(&shown, w, theme.plain());
             }
-            if offset >= self.text.len() {
+            let Some(paste) = paste else {
                 break;
+            };
+            rows.cursor_before(paste.start, self.cursor);
+            let label = self.text[paste.start..paste.end].to_string();
+            let w = text_width(&label);
+            if rows.column + w > width && rows.column > prompt_width {
+                rows.new_row();
             }
-            if let Some(paste) = self.pastes.iter().find(|p| p.start == offset) {
-                let label = self.text[paste.start..paste.end].to_string();
-                let w = crate::text::width(&label);
-                if column + w > width && column > prompt_width {
-                    new_row(&mut rows);
-                    column = prompt_width;
-                }
-                if let Some((_, content)) = rows.last_mut() {
-                    content.push(Span::styled(label, theme.dim()));
-                }
-                column += w;
-                offset = paste.end;
-                continue;
-            }
-            let c = self.text[offset..].chars().next().unwrap_or(' ');
-            offset += c.len_utf8();
-            if c == '\n' {
-                new_row(&mut rows);
-                column = prompt_width;
-                continue;
-            }
-            let shown = sanitize(c.encode_utf8(&mut [0; 4]));
-            let w: usize = shown.chars().map(|c| c.width().unwrap_or(0)).sum();
-            if column + w > width {
-                new_row(&mut rows);
-                column = prompt_width;
-            }
-            if let Some((_, content)) = rows.last_mut() {
-                match content.last_mut() {
-                    Some(last) if last.style == theme.plain() => {
-                        last.content.to_mut().push_str(&shown)
-                    }
-                    _ => content.push(Span::styled(shown, theme.plain())),
-                }
-            }
-            column += w;
+            rows.push(&label, w, theme.dim());
+            at = paste.end;
         }
+        rows.cursor_before(self.text.len(), self.cursor);
+        let cursor = rows.cursor.unwrap_or_default();
         let lines = rows
+            .rows
             .into_iter()
             .map(|(prefix, mut content)| {
                 content.insert(0, prefix);
                 Line::from(content)
             })
             .collect();
-        (lines, cursor.unwrap_or_default())
+        (lines, cursor)
+    }
+}
+
+/// The editor's rows as they are laid out: each row's prefix, then its text.
+struct Rows {
+    rows: Vec<(Span<'static>, Vec<Span<'static>>)>,
+    indent: String,
+    /// The column the next text goes in.
+    column: usize,
+    prompt_width: usize,
+    width: usize,
+    cursor: Option<Position>,
+}
+
+impl Rows {
+    fn new_row(&mut self) {
+        self.rows.push((Span::raw(self.indent.clone()), Vec::new()));
+        self.column = self.prompt_width;
+    }
+
+    /// Places the cursor here, before the text at `offset`, if it is at or before `offset` and
+    /// not placed yet. A cursor at the end of a full row goes to the start of the next.
+    fn cursor_before(&mut self, offset: usize, cursor: usize) {
+        if self.cursor.is_some() || cursor > offset {
+            return;
+        }
+        if self.column >= self.width {
+            self.new_row();
+        }
+        self.cursor = Some(Position::new(
+            self.column as u16,
+            (self.rows.len() - 1) as u16,
+        ));
+    }
+
+    /// Adds `text`, `width` columns wide, to the last row.
+    fn push(&mut self, text: &str, width: usize, style: ratatui::style::Style) {
+        if let Some((_, content)) = self.rows.last_mut() {
+            match content.last_mut() {
+                Some(last) if last.style == style => last.content.to_mut().push_str(text),
+                _ => content.push(Span::styled(text.to_string(), style)),
+            }
+        }
+        self.column += width;
     }
 }

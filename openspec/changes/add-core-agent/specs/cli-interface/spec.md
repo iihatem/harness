@@ -58,7 +58,7 @@ Interactive mode SHALL display a status line showing the active model, approval 
 - **THEN** time to first token and tokens per second are measured from the call's first fragment, not from when the whole call arrived
 
 ### Requirement: Keyboard interaction
-Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on empty input to open `/rewind`; Ctrl+C pressed twice within 2 seconds to exit; Shift+Tab to cycle approval modes; Alt+Enter or Shift+Enter to insert a newline, with Ctrl+J and a backslash before Enter as fallbacks for terminals that do not report Shift+Enter; Up arrow to recall previous inputs; `/` at the start of input for command completion; `@` for fuzzy completion of workspace file paths; Enter while a turn is running to queue input; and Ctrl+S while a turn is running to send input immediately (steering). An approval prompt MUST take y (approve once), a (approve for the session, when offered), n (deny, with an optional reason for the model) and Esc (deny and stop the turn). A prompt MUST be answered only by a key pressed for it, once the user has paused: keys typed before it was drawn, and keys typed before 500 ms have passed with no key since it was drawn, MUST go to the input, and the prompt MUST say so; keys MUST be timed by when they were read from the terminal. Enter, and the letters with Ctrl or Alt held, MUST NOT answer it.
+Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on empty input to open `/rewind`; Ctrl+C pressed twice within 2 seconds to exit; Shift+Tab to cycle approval modes; Alt+Enter or Shift+Enter to insert a newline, with Ctrl+J and a backslash before Enter as fallbacks for terminals that do not report Shift+Enter; Up arrow to recall previous inputs; `/` at the start of input for command completion; `@` for fuzzy completion of workspace file paths; Enter while a turn is running to queue input; and Ctrl+S while a turn is running to send input immediately (steering). An approval prompt MUST take y (approve once), a (approve for the session, when offered), n (deny, with an optional reason for the model) and Esc (deny and stop the turn). A prompt MUST be answered only by a key pressed for it, once the user has paused: keys typed before it was drawn, and keys typed before 500 ms have passed with no key since it was drawn, MUST go to the input, and the prompt MUST say so; keys MUST be timed by when they were read from the terminal. Enter, and the letters with Ctrl or Alt held, MUST NOT answer it. On Linux, the rest of a burst of more than 1 KiB of typed keys without bracketed paste MAY wait in the terminal until the next key; harness MUST NOT spin meanwhile, and keys that waited MUST count as typed when the wait began, so that they never answer a prompt that appeared meanwhile. Bracketed pastes MUST arrive whole.
 
 #### Scenario: A key typed ahead of a prompt
 - **WHEN** the user is typing a message as an approval prompt appears, and the next key is `y` or Enter
@@ -68,6 +68,10 @@ Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on 
 - **WHEN** the user keeps typing a message at 12 keys a second from before an approval prompt appears until a second after it
 - **THEN** every key goes to the message, `a`, `n` and `y` included, and the prompt still waits and says where the keys went
 - **AND** a key pressed after a 500 ms pause answers it
+
+#### Scenario: A long burst of plain keys on Linux
+- **WHEN** `tmux send-keys` types 3,000 characters into harness on Linux while an approval prompt appears, and the user presses `y` for it after a pause
+- **THEN** the characters that waited in the terminal go to the message, `y` included, and the prompt still waits for an answer
 
 #### Scenario: File completion
 - **WHEN** the user types `@mainrs`
@@ -82,11 +86,19 @@ Interactive mode SHALL support: Esc to interrupt the running turn; Esc twice on 
 - **THEN** the message is delivered to the model at the next tool-result boundary
 
 ### Requirement: Interactive sessions end cleanly
-However an interactive session ends, it SHALL stop the running turn and the command it runs, deny any approval that waits, restore the terminal's modes, and end the sandbox's session. A hangup (SIGHUP) or SIGTERM MUST end it this way, with exit code 129 or 143; a terminal whose input ends or fails MUST end it as a hangup, whether or not harness ignores SIGHUP, and never leave harness reading it, as the session starts too; a wakeup that finds nothing to read MUST NOT count as the terminal's end. While an external editor has the terminal, SIGINT and SIGQUIT MUST NOT end harness, and their earlier actions MUST be restored afterwards.
+However an interactive session ends, it SHALL stop the running turn and the command it runs, deny any approval that waits, restore the terminal's modes, and end the sandbox's session. A panic MUST print its message with the terminal out of harness's modes; a panic in the agent's task MUST end the session with exit code 1 and say so; and a command whose turn is dropped while it runs MUST have its whole process group ended. A hangup (SIGHUP) or SIGTERM MUST end it this way, with exit code 129 or 143; a terminal whose input ends or fails MUST end it as a hangup, whether or not harness ignores SIGHUP, and never leave harness reading it, as the session starts too; a wakeup that finds nothing to read MUST NOT count as the terminal's end. While an external editor has the terminal, SIGINT and SIGQUIT MUST NOT end harness, and their earlier actions MUST be restored afterwards. SIGTERM, SIGHUP or SIGQUIT received while the first-use trust question waits for the user to pause MUST take effect only once the terminal's modes are restored.
 
 #### Scenario: Terminal closed during a command
 - **WHEN** the user closes the terminal window while a command runs
 - **THEN** the command's processes are ended, the sandbox's session ends, and harness exits with code 129
+
+#### Scenario: The agent's task panics
+- **WHEN** a bug makes the agent's task panic during a turn
+- **THEN** the panic's message is legible, the session ends with exit code 1 saying the agent stopped unexpectedly, and the terminal's modes are restored
+
+#### Scenario: Signal during the trust question
+- **WHEN** harness receives SIGTERM while the user types at the first-use trust question
+- **THEN** harness ends, and the shell gets its terminal back with echo and line editing on
 
 #### Scenario: Ctrl+C in the editor
 - **WHEN** the user presses Ctrl+C while editing a plan in `$EDITOR`

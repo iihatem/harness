@@ -277,7 +277,10 @@ fn context_adds_no_note_when_the_provider_has_reported_nothing_yet() {
         .iter()
         .map(plain)
         .collect();
-    assert!(!lines.iter().any(|l| l.contains("Next request")), "{lines:#?}");
+    assert!(
+        !lines.iter().any(|l| l.contains("Next request")),
+        "{lines:#?}"
+    );
 }
 
 #[tokio::test]

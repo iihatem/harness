@@ -77,7 +77,10 @@ fn a_tool_calls_first_fragment_reports_output_started_before_it_is_assembled() {
     let third = parser
         .push(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"glob","arguments":""}}]}}]}"#)
         .unwrap();
-    assert!(third.is_empty(), "a second call does not repeat it: {third:?}");
+    assert!(
+        third.is_empty(),
+        "a second call does not repeat it: {third:?}"
+    );
 }
 
 // Review Focus: servers that omit tool-call ids or indexes.

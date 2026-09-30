@@ -309,3 +309,29 @@ fn a_very_long_code_block_is_shown_plain() {
     let short = block(2_000);
     assert!(!colours(&draw(short[..5].to_vec(), 40)).is_empty());
 }
+
+// Review A's M4: each line of an HTML block was pushed onto the line before it, so a block of
+// several lines ran together and was wrapped as one, and nothing separated it from what followed.
+#[test]
+fn html_blocks_keep_their_lines_and_the_space_around_them() {
+    let lines = markdown::render(
+        "before\n\n<details>\n<summary>x</summary>\n</details>\n\nafter para\n\n<br>\nmore",
+        40,
+        &Theme::monochrome(),
+    );
+    assert_eq!(
+        lines.iter().map(text::plain).collect::<Vec<_>>(),
+        [
+            "before",
+            "",
+            "<details>",
+            "<summary>x</summary>",
+            "</details>",
+            "",
+            "after para",
+            "",
+            "<br>",
+            "more",
+        ]
+    );
+}

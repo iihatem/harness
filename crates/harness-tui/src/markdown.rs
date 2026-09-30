@@ -198,9 +198,16 @@ impl Renderer<'_> {
                     self.push(&format!("`{code}`"), style);
                 }
             }
-            Event::Html(html) | Event::InlineHtml(html) => {
-                self.push(html.trim_end_matches('\n'), self.theme.dim())
+            // An HTML block comes a line at a time, each with its line break.
+            Event::Html(html) => {
+                for (i, line) in html.split('\n').enumerate() {
+                    if i > 0 {
+                        self.flush();
+                    }
+                    self.push(line, self.theme.dim());
+                }
             }
+            Event::InlineHtml(html) => self.push(&html, self.theme.dim()),
             Event::FootnoteReference(label) => self.push(&format!("[^{label}]"), self.style()),
             Event::SoftBreak => self.push(" ", self.style()),
             Event::HardBreak => self.flush(),
@@ -278,6 +285,7 @@ impl Renderer<'_> {
                 self.block();
                 self.table = Some(Table::default());
             }
+            Tag::HtmlBlock => self.block(),
             Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
             Tag::Emphasis => self.styles.push(self.theme.italic()),
             Tag::Strong => self.styles.push(self.theme.bold()),
@@ -346,6 +354,10 @@ impl Renderer<'_> {
                 if let Some(table) = self.table.take() {
                     self.end_table(table);
                 }
+                self.needs_blank = true;
+            }
+            TagEnd::HtmlBlock => {
+                self.flush();
                 self.needs_blank = true;
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {

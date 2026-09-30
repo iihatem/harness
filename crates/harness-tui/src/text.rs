@@ -4,7 +4,8 @@ use ratatui::{
     style::Style,
     text::{Line, Span},
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Columns a tab takes.
 const TAB: &str = "    ";
@@ -82,9 +83,29 @@ pub fn reveal(text: &str) -> String {
     out
 }
 
-/// Columns `text` takes on screen.
+/// Columns `text` takes on screen, counted as ratatui draws it: by grapheme cluster, so an
+/// emoji with a variation selector (⚠️), a ZWJ sequence (👨‍👩‍👧‍👦) or a flag is one character two
+/// columns wide, and a letter with combining marks is one column.
 pub fn width(text: &str) -> usize {
-    text.chars().map(|c| c.width().unwrap_or(0)).sum()
+    text.graphemes(true).map(grapheme_width).sum()
+}
+
+/// Columns one grapheme cluster takes, as ratatui's buffer counts them: a cluster with a
+/// control character in it is not drawn at all.
+pub fn grapheme_width(grapheme: &str) -> usize {
+    if grapheme.contains(char::is_control) {
+        return 0;
+    }
+    if grapheme.len() == 1 {
+        return 1;
+    }
+    // unicode-width counts the halfwidth (han)dakuten as combining; terminals, and ratatui,
+    // give each a column.
+    let marks = grapheme
+        .chars()
+        .filter(|c| matches!(c, '\u{ff9e}' | '\u{ff9f}'))
+        .count();
+    grapheme.width() + marks
 }
 
 /// One line per line of `text` (sanitized), each in `style`.
@@ -96,8 +117,8 @@ pub fn lines(text: &str, style: Style) -> Vec<Line<'static>> {
 }
 
 /// `line` broken into lines at most `width` columns wide: between words where it can, inside a
-/// word where it must. The first line starts with `first`, the others with `rest`, which count
-/// towards the width. Spaces where a line breaks are dropped.
+/// word (between grapheme clusters) where it must. The first line starts with `first`, the others
+/// with `rest`, which count towards the width. Spaces where a line breaks are dropped.
 pub fn wrap(
     line: &Line<'_>,
     width: usize,
@@ -105,20 +126,20 @@ pub fn wrap(
     rest: &[Span<'static>],
 ) -> Vec<Line<'static>> {
     let prefix_width = |p: &[Span<'static>]| p.iter().map(|s| self::width(&s.content)).sum();
-    let chars: Vec<(char, Style)> = line
+    let cells: Vec<(&str, Style)> = line
         .spans
         .iter()
         .flat_map(|span| {
             let style = line.style.patch(span.style);
-            span.content.chars().map(move |c| (c, style))
+            span.content.graphemes(true).map(move |g| (g, style))
         })
         .collect();
     let mut out = Vec::new();
-    let mut current: Vec<(char, Style)> = Vec::new();
+    let mut current: Vec<(&str, Style)> = Vec::new();
     let mut used = 0;
     let mut available = width.saturating_sub(prefix_width(first)).max(1);
-    let finish = |current: &mut Vec<(char, Style)>, out: &mut Vec<Line<'static>>| {
-        while current.last().is_some_and(|(c, _)| *c == ' ') {
+    let finish = |current: &mut Vec<(&str, Style)>, out: &mut Vec<Line<'static>>| {
+        while current.last().is_some_and(|(g, _)| *g == " ") {
             current.pop();
         }
         let prefix = if out.is_empty() { first } else { rest };
@@ -128,39 +149,39 @@ pub fn wrap(
         current.clear();
     };
     let mut i = 0;
-    while i < chars.len() {
+    while i < cells.len() {
         // The next word and the spaces after it.
         let start = i;
-        while i < chars.len() && chars[i].0 != ' ' {
+        while i < cells.len() && cells[i].0 != " " {
             i += 1;
         }
         let word_end = i;
-        while i < chars.len() && chars[i].0 == ' ' {
+        while i < cells.len() && cells[i].0 == " " {
             i += 1;
         }
-        let word: usize = chars[start..word_end]
+        let word: usize = cells[start..word_end]
             .iter()
-            .map(|(c, _)| c.width().unwrap_or(0))
+            .map(|(g, _)| grapheme_width(g))
             .sum();
         if used + word > available && used > 0 {
             finish(&mut current, &mut out);
             used = 0;
             available = width.saturating_sub(prefix_width(rest)).max(1);
         }
-        for &(c, style) in &chars[start..i] {
-            let w = c.width().unwrap_or(0);
-            if c == ' ' && used == 0 && !current.is_empty() {
+        for &(g, style) in &cells[start..i] {
+            let w = grapheme_width(g);
+            if g == " " && used == 0 && !current.is_empty() {
                 continue;
             }
             if used + w > available {
-                if c == ' ' {
+                if g == " " {
                     continue;
                 }
                 finish(&mut current, &mut out);
                 used = 0;
                 available = width.saturating_sub(prefix_width(rest)).max(1);
             }
-            current.push((c, style));
+            current.push((g, style));
             used += w;
         }
     }
@@ -168,13 +189,13 @@ pub fn wrap(
     out
 }
 
-/// Consecutive characters of the same style as one span each.
-fn merge(chars: &[(char, Style)]) -> Vec<Span<'static>> {
+/// Consecutive grapheme clusters of the same style as one span each.
+fn merge(cells: &[(&str, Style)]) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for &(c, style) in chars {
+    for &(g, style) in cells {
         match spans.last_mut() {
-            Some(last) if last.style == style => last.content.to_mut().push(c),
-            _ => spans.push(Span::styled(c.to_string(), style)),
+            Some(last) if last.style == style => last.content.to_mut().push_str(g),
+            _ => spans.push(Span::styled(g.to_string(), style)),
         }
     }
     spans

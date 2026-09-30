@@ -214,3 +214,52 @@ fn wrapping_keeps_styles_and_prefixes() {
     assert_eq!(wrapped[0].spans[1].style.fg, Some(Color::Red));
     assert_eq!(text::width("日本"), 4);
 }
+
+// Review A's I3: ratatui draws a grapheme cluster (an emoji with VS16, a ZWJ sequence, a flag) as
+// one character two columns wide. Measured by code point, such emoji counted one column or none,
+// so wrapped rows came out wider than the screen and their ends were cut off.
+#[test]
+fn emoji_sequences_are_measured_and_wrapped_as_the_screen_draws_them() {
+    assert_eq!(text::width("⚠️"), 2);
+    assert_eq!(text::width("👨‍👩‍👧‍👦"), 2);
+    assert_eq!(text::width("🇯🇵"), 2);
+    assert_eq!(text::width("e\u{301}"), 1);
+    assert_eq!(text::width("日本"), 4);
+    let words: Vec<String> = (1..=40).map(|i| format!("w{i:02}")).collect();
+    let source = format!("⚠️ ⚠️ ⚠️ ⚠️ ⚠️ ✔️ ❤️ {}", words.join(" "));
+    let wrapped = text::wrap(&Line::from(source.clone()), 40, &[], &[]);
+    for line in &wrapped {
+        assert!(
+            line.width() <= 40,
+            "{:?} is {} wide",
+            text::plain(line),
+            line.width()
+        );
+    }
+    // Nothing is cut when the rows are drawn.
+    let shown = rows(&draw(wrapped, 40)).join(" ");
+    assert_eq!(
+        shown.split_whitespace().collect::<Vec<_>>(),
+        source.split_whitespace().collect::<Vec<_>>()
+    );
+    // A cluster is never split between rows.
+    let family = "👨‍👩‍👧‍👦".repeat(3);
+    let wrapped = text::wrap(&Line::from(family), 4, &[], &[]);
+    let texts: Vec<String> = wrapped.iter().map(text::plain).collect();
+    assert_eq!(texts, ["👨‍👩‍👧‍👦👨‍👩‍👧‍👦", "👨‍👩‍👧‍👦"]);
+    // Table columns line up.
+    let table = markdown::render(
+        "| sign | word |\n|---|---|\n| ⚠️⚠️ | warn |\n| 👍🏽 | fine |\n| ok | x |\n",
+        40,
+        &Theme::monochrome(),
+    );
+    let bars: Vec<usize> = table
+        .iter()
+        .map(|line| {
+            let plain = text::plain(line);
+            let before = plain.split(['│', '┼']).next().unwrap_or_default();
+            text::width(before)
+        })
+        .collect();
+    assert!(bars.windows(2).all(|w| w[0] == w[1]), "{bars:?}");
+}

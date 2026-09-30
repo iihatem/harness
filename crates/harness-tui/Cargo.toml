@@ -22,6 +22,7 @@ similar.workspace = true
 syntect.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]

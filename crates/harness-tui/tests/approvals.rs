@@ -5,7 +5,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use harness_core::{
-    agent::{Agent, AgentConfig},
+    agent::{Agent, AgentConfig, ApprovalDecision, ApprovalKind, ApprovalRequest},
     engine::{EngineConfig, PermissionEngine, RuleSet},
     message::{Message, ToolSpec},
     permission::{Action, Mode},
@@ -14,7 +14,7 @@ use harness_core::{
 };
 use harness_tui::{
     app::{Host, Options, Prepared},
-    approval::ChannelApprover,
+    approval::{ARMING_DELAY, ChannelApprover, Requests},
     inline::InlineTerminal,
     style::Theme,
     ui::Ui,
@@ -25,6 +25,7 @@ use ratatui::{
     crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
 };
 use serde_json::{Value, json};
+use tokio::sync::{mpsc, oneshot};
 
 struct NoCommands;
 
@@ -63,6 +64,16 @@ impl Tool for Boxed {
 }
 
 fn start(provider: Arc<MockProvider>, dir: &Path, mode: Mode) -> Ui<TestBackend> {
+    start_with(provider, dir, mode, None)
+}
+
+/// Like [`start`], with the session's approvals coming from `approvals` instead of the agent.
+fn start_with(
+    provider: Arc<MockProvider>,
+    dir: &Path,
+    mode: Mode,
+    approvals: Option<Requests>,
+) -> Ui<TestBackend> {
     let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode,
         workspace: dir.to_path_buf(),
@@ -76,7 +87,8 @@ fn start(provider: Arc<MockProvider>, dir: &Path, mode: Mode) -> Ui<TestBackend>
     for name in ["read", "write", "edit", "bash"] {
         tools.push(harness_tools::builtin().get(name).unwrap());
     }
-    let (approver, approvals) = ChannelApprover::new();
+    let (approver, agent_approvals) = ChannelApprover::new();
+    let approvals = approvals.unwrap_or(agent_approvals);
     let agent = Agent::new(
         provider,
         ToolRegistry::new(tools),
@@ -139,7 +151,14 @@ fn send(ui: &mut Ui<TestBackend>, text: &str) {
     press(ui, KeyCode::Enter);
 }
 
+/// Waits until an approval is shown and takes keys.
 async fn until_asked(ui: &mut Ui<TestBackend>) {
+    until_shown(ui).await;
+    tokio::time::sleep(ARMING_DELAY).await;
+}
+
+/// Waits until an approval is shown.
+async fn until_shown(ui: &mut Ui<TestBackend>) {
     tokio::time::timeout(
         Duration::from_secs(10),
         ui.until(|app| app.prompt().is_some()),
@@ -147,6 +166,28 @@ async fn until_asked(ui: &mut Ui<TestBackend>) {
     .await
     .expect("an approval is asked for")
     .unwrap();
+}
+
+fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+    Event::Key(KeyEvent::new(code, modifiers))
+}
+
+fn is_approval(answer: Result<ApprovalDecision, oneshot::error::TryRecvError>) -> bool {
+    matches!(
+        answer,
+        Ok(ApprovalDecision::Approve | ApprovalDecision::ApproveForSession)
+    )
+}
+
+fn request(command: &str) -> ApprovalRequest {
+    ApprovalRequest {
+        call_id: "c1".into(),
+        tool: "bash".into(),
+        action: Action::Bash(command.into()),
+        reason: format!("run `{command}`"),
+        kind: ApprovalKind::Action,
+        kept_for_session: true,
+    }
 }
 
 async fn settle(ui: &mut Ui<TestBackend>) {
@@ -451,5 +492,242 @@ async fn a_narrowed_terminal_wraps_the_prompt_and_still_takes_the_answer() {
     press(&mut ui, KeyCode::Char('y'));
     settle(&mut ui).await;
     assert!(tool_result(&provider, "b1").contains("a-long-argument"));
+    ui.finish().await.unwrap();
+}
+
+// Review D C1, probe 3: a key the user typed before the approval was asked for is theirs, not the
+// prompt's answer, however the key and the request reach the session.
+#[tokio::test]
+async fn a_key_queued_before_the_request_leaves_the_prompt_pending() {
+    for _ in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let (requests, approvals) = mpsc::unbounded_channel();
+        let mut ui = start_with(
+            MockProvider::new(vec![]),
+            dir.path(),
+            Mode::Ask,
+            Some(approvals),
+        );
+        let (keys, input) = futures::channel::mpsc::unbounded();
+        keys.unbounded_send(Ok(key(KeyCode::Char('y'), KeyModifiers::NONE)))
+            .unwrap();
+        let (reply, mut answer) = oneshot::channel();
+        requests.send((request("cargo test"), reply)).unwrap();
+        // Long enough for both to be taken in.
+        let _ = tokio::time::timeout(Duration::from_millis(100), ui.run(input)).await;
+        assert!(
+            !is_approval(answer.try_recv()),
+            "a typed-ahead key approved"
+        );
+        assert!(ui.app().prompt().is_some());
+        assert_eq!(ui.app().editor().text(), "y");
+        drop(keys);
+        ui.finish().await.unwrap();
+    }
+}
+
+// Review D C1, probe 2: only y, a, n and Esc answer, and not with Ctrl or Alt held; Enter, the
+// new-line keys and readline's Ctrl+A were typed for the input.
+#[tokio::test]
+async fn enter_and_modified_keys_do_not_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("b1", "bash", json!({"command": "echo one"})),
+        Script::tool_call("b2", "bash", json!({"command": "echo two"})),
+        Script::text("Done."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "go");
+    until_asked(&mut ui).await;
+    for (code, modifiers) in [
+        (KeyCode::Enter, KeyModifiers::NONE),
+        (KeyCode::Enter, KeyModifiers::ALT),
+        (KeyCode::Enter, KeyModifiers::SHIFT),
+        (KeyCode::Char('a'), KeyModifiers::CONTROL),
+        (KeyCode::Char('y'), KeyModifiers::ALT),
+        (KeyCode::Char('y'), KeyModifiers::CONTROL),
+        (KeyCode::Char('n'), KeyModifiers::ALT),
+        (KeyCode::Char('Y'), KeyModifiers::SHIFT),
+    ] {
+        ui.handle(key(code, modifiers)).unwrap();
+        assert!(
+            ui.app().prompt().is_some(),
+            "{modifiers:?}+{code:?} answered the prompt"
+        );
+    }
+    assert!(
+        !screen(&ui)
+            .iter()
+            .any(|r| r.starts_with("tell the model why"))
+    );
+    press(&mut ui, KeyCode::Char('y'));
+    until_asked(&mut ui).await;
+    // The second command is asked about: nothing was approved for the session.
+    assert!(screen(&ui).iter().any(|r| r.trim_start() == "$ echo two"));
+    press(&mut ui, KeyCode::Char('y'));
+    settle(&mut ui).await;
+    assert!(tool_result(&provider, "b1").contains("one"));
+    assert!(tool_result(&provider, "b2").contains("two"));
+    ui.finish().await.unwrap();
+}
+
+// Review D C1: a prompt takes keys only a moment after it is drawn; a key before that was typed
+// for the input, which it goes to.
+#[tokio::test]
+async fn a_key_within_the_grace_period_does_not_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("b1", "bash", json!({"command": "echo hi"})),
+        Script::text("Done."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "go");
+    until_shown(&mut ui).await;
+    let armed = ui.app().armed_at().expect("the prompt was drawn");
+    let early = armed - Duration::from_millis(1);
+    ui.handle_at(key(KeyCode::Char('y'), KeyModifiers::NONE), early)
+        .unwrap();
+    assert!(ui.app().prompt().is_some());
+    assert_eq!(ui.app().editor().text(), "y");
+    ui.handle_at(key(KeyCode::Char('y'), KeyModifiers::NONE), armed)
+        .unwrap();
+    assert!(ui.app().prompt().is_none());
+    settle(&mut ui).await;
+    assert!(tool_result(&provider, "b1").contains("hi"));
+    assert_eq!(ui.app().editor().text(), "y");
+    ui.finish().await.unwrap();
+}
+
+// Review D C1: `n` typed ahead goes into the input, and the rest of the draft never becomes a
+// reason sent to the model.
+#[tokio::test]
+async fn n_typed_ahead_does_not_turn_the_draft_into_a_denial_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("b1", "bash", json!({"command": "echo hi"})),
+        Script::text("Done."),
+        Script::text("Later."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "go");
+    until_shown(&mut ui).await;
+    let early = ui.app().armed_at().unwrap() - Duration::from_millis(100);
+    for c in "no rush\r".chars() {
+        let code = if c == '\r' {
+            KeyCode::Enter
+        } else {
+            KeyCode::Char(c)
+        };
+        ui.handle_at(key(code, KeyModifiers::NONE), early).unwrap();
+    }
+    assert!(ui.app().prompt().is_some());
+    assert!(
+        !screen(&ui)
+            .iter()
+            .any(|r| r.starts_with("tell the model why"))
+    );
+    tokio::time::sleep(ARMING_DELAY).await;
+    press(&mut ui, KeyCode::Char('y'));
+    settle(&mut ui).await;
+    // Typed ahead with Enter: queued, and sent once the turn ended.
+    assert!(tool_result(&provider, "b1").contains("hi"));
+    assert!(
+        everything(&ui).iter().any(|r| r == "› no rush"),
+        "{:#?}",
+        everything(&ui)
+    );
+    ui.finish().await.unwrap();
+}
+
+// Review D C1: Esc before the prompt takes keys still stops the turn, and so denies.
+#[tokio::test]
+async fn esc_before_the_prompt_takes_keys_still_denies_and_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("b1", "bash", json!({"command": "echo hi"})),
+        Script::text("never asked"),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "go");
+    until_shown(&mut ui).await;
+    let early = ui.app().armed_at().unwrap() - Duration::from_millis(100);
+    ui.handle_at(key(KeyCode::Esc, KeyModifiers::NONE), early)
+        .unwrap();
+    settle(&mut ui).await;
+    assert!(ui.app().prompt().is_none());
+    assert!(
+        everything(&ui)
+            .iter()
+            .any(|r| r.starts_with("✗ denied, and stopped"))
+    );
+    assert_eq!(provider.requests().len(), 1);
+    ui.finish().await.unwrap();
+}
+
+// Review E M1: Ctrl+S while an approval waits says why nothing is sent.
+#[tokio::test]
+async fn ctrl_s_while_an_approval_waits_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("b1", "bash", json!({"command": "echo hi"})),
+        Script::text("Done."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "go");
+    until_asked(&mut ui).await;
+    ui.handle(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(ui.app().prompt().is_some());
+    let shown = screen(&ui).join("\n");
+    assert!(shown.contains("answer the approval first"), "{shown}");
+    press(&mut ui, KeyCode::Char('y'));
+    settle(&mut ui).await;
+    ui.finish().await.unwrap();
+}
+
+// Review D M6: a paste while typing why goes into the reason.
+#[tokio::test]
+async fn a_paste_while_typing_the_reason_goes_into_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    let provider = MockProvider::new(edit_script("a.txt", "one", "two"));
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "change it");
+    until_asked(&mut ui).await;
+    press(&mut ui, KeyCode::Char('n'));
+    ui.handle(Event::Paste("see the style guide".into()))
+        .unwrap();
+    press(&mut ui, KeyCode::Enter);
+    settle(&mut ui).await;
+    assert_eq!(
+        tool_result(&provider, "e1"),
+        "the user denied this action: see the style guide"
+    );
+    assert_eq!(ui.app().editor().text(), "");
+    ui.finish().await.unwrap();
+}
+
+// Review D M5: approving for the session what the policy cannot keep reads "approved once".
+#[tokio::test]
+async fn a_session_approval_that_cannot_be_kept_reads_approved_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("b1", "bash", json!({"command": "git reset --hard HEAD"})),
+        Script::text("Done."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Ask);
+    send(&mut ui, "go");
+    until_asked(&mut ui).await;
+    press(&mut ui, KeyCode::Char('a'));
+    settle(&mut ui).await;
+    let all = everything(&ui);
+    assert!(
+        all.iter().any(|r| r.starts_with("✓ approved once:")),
+        "{all:#?}"
+    );
+    assert!(
+        !all.iter()
+            .any(|r| r.starts_with("✓ approved for this session"))
+    );
     ui.finish().await.unwrap();
 }

@@ -19,7 +19,7 @@ use harness_core::{
 };
 use harness_tui::{
     app::{Host, Options, Prepared},
-    approval::ChannelApprover,
+    approval::{ARMING_DELAY, ChannelApprover},
     inline::InlineTerminal,
     plan::{ExternalEditor, TextEditor},
     style::Theme,
@@ -144,6 +144,12 @@ fn send(ui: &mut Ui<TestBackend>, text: &str) {
     press(ui, KeyCode::Enter);
 }
 
+/// Chooses with `key` once the plan choice takes keys.
+async fn choose(ui: &mut Ui<TestBackend>, key: char) {
+    tokio::time::sleep(ARMING_DELAY).await;
+    press(ui, KeyCode::Char(key));
+}
+
 async fn settle(ui: &mut Ui<TestBackend>) {
     tokio::time::timeout(Duration::from_secs(10), ui.settle())
         .await
@@ -223,7 +229,7 @@ async fn build_goes_back_to_the_mode_before_plan_and_implements_the_plan() {
     )))
     .unwrap();
     plan(&mut ui).await;
-    press(&mut ui, KeyCode::Char('b'));
+    choose(&mut ui, 'b').await;
     settle(&mut ui).await;
     assert!(
         status(&ui).starts_with("mock/m · auto ·"),
@@ -263,7 +269,7 @@ async fn an_edited_plan_is_shown_again_and_built_as_edited() {
     let provider = planning_script(vec![Script::text("Implemented.")]);
     let mut ui = start(provider.clone(), dir.path(), Mode::Plan, Mode::Auto);
     plan(&mut ui).await;
-    press(&mut ui, KeyCode::Char('e'));
+    choose(&mut ui, 'e').await;
     let screen = everything(&ui);
     let edited = screen
         .iter()
@@ -280,7 +286,7 @@ async fn an_edited_plan_is_shown_again_and_built_as_edited() {
             .iter()
             .any(|r| r.starts_with("The edited plan is ready: [b] build it"))
     );
-    press(&mut ui, KeyCode::Enter);
+    choose(&mut ui, 'b').await;
     settle(&mut ui).await;
     let build = last_user(&provider);
     assert!(
@@ -296,7 +302,7 @@ async fn keep_planning_stays_in_plan_mode_and_returns_to_the_input() {
     let provider = planning_script(vec![Script::text("A better plan.")]);
     let mut ui = start(provider.clone(), dir.path(), Mode::Plan, Mode::Auto);
     plan(&mut ui).await;
-    press(&mut ui, KeyCode::Char('k'));
+    choose(&mut ui, 'k').await;
     assert!(ui.app().plan_choice().is_none());
     assert!(
         everything(&ui)
@@ -318,9 +324,44 @@ async fn a_session_started_in_plan_mode_is_told_to_plan_and_builds_in_the_defaul
     plan(&mut ui).await;
     let first = format!("{:?}", provider.requests()[0].messages);
     assert!(first.contains("The approval mode is now plan"), "{first}");
-    press(&mut ui, KeyCode::Char('b'));
+    choose(&mut ui, 'b').await;
     settle(&mut ui).await;
     assert!(status(&ui).starts_with("mock/m · ask ·"), "{}", status(&ui));
+    ui.finish().await.unwrap();
+}
+
+// Review E C1: keys typed before the plan choice takes them are the input's, and Enter, the
+// input's send key, never builds.
+#[tokio::test]
+async fn enter_and_keys_typed_ahead_do_not_choose() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = planning_script(vec![Script::text("A better plan.")]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Plan, Mode::Auto);
+    plan(&mut ui).await;
+    let early = ui.app().armed_at().expect("the choice was drawn") - Duration::from_millis(1);
+    for code in [KeyCode::Char('b'), KeyCode::Enter] {
+        ui.handle_at(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), early)
+            .unwrap();
+    }
+    assert!(ui.app().plan_choice().is_some());
+    assert!(status(&ui).starts_with("mock/m · plan ·"));
+    tokio::time::sleep(ARMING_DELAY).await;
+    for (code, modifiers) in [
+        (KeyCode::Enter, KeyModifiers::NONE),
+        (KeyCode::Char('b'), KeyModifiers::ALT),
+        (KeyCode::Char('b'), KeyModifiers::CONTROL),
+    ] {
+        ui.handle(Event::Key(KeyEvent::new(code, modifiers)))
+            .unwrap();
+        assert!(ui.app().plan_choice().is_some(), "{modifiers:?}+{code:?}");
+    }
+    assert!(status(&ui).starts_with("mock/m · plan ·"));
+    assert_eq!(provider.requests().len(), 2);
+    // Keep planning: what was typed ahead is sent then, still in plan mode.
+    press(&mut ui, KeyCode::Char('k'));
+    settle(&mut ui).await;
+    assert_eq!(last_user(&provider), "b");
+    assert!(status(&ui).starts_with("mock/m · plan ·"));
     ui.finish().await.unwrap();
 }
 

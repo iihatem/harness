@@ -24,7 +24,7 @@ use ratatui::{
 };
 
 use crate::{
-    approval::{Answered, Prompt, Reply},
+    approval::{Answered, Arming, Prompt, Reply},
     complete::{self, Completer, Offer},
     editor::{Edit, Editor},
     notify::{self, Notify},
@@ -144,6 +144,8 @@ pub struct App {
     window_note: Option<String>,
     /// An approval waiting for the user's answer.
     prompt: Option<Prompt>,
+    /// When the approval or the plan choice shown starts to take keys.
+    arming: Arming,
     /// The mode chosen while a turn runs, to switch to when it ends.
     pending_mode: Option<Mode>,
     /// Input to send when the running turn ends: as shown, and in full.
@@ -189,6 +191,7 @@ impl App {
             instruction_files: options.instruction_files,
             window_note: options.window_note,
             prompt: None,
+            arming: Arming::default(),
             pending_mode: None,
             queued: VecDeque::new(),
             steering: Steering::new(),
@@ -241,6 +244,22 @@ impl App {
         self.notifications
             .push(format!("approval needed: {}", prompt.request().reason));
         self.prompt = Some(prompt);
+        self.arming = Arming::default();
+    }
+
+    /// The live region was drawn at `now`: an approval or a plan choice it showed for the first
+    /// time takes keys from [`ARMING_DELAY`](crate::approval::ARMING_DELAY) later.
+    pub fn drawn(&mut self, now: Instant) {
+        if self.prompt.is_some() || self.plan_choice.is_some() {
+            self.arming.drawn(now);
+        }
+    }
+
+    /// When the approval or plan choice shown takes keys: `None` while none has been drawn.
+    pub fn armed_at(&self) -> Option<Instant> {
+        self.arming
+            .armed_at()
+            .filter(|_| self.prompt.is_some() || self.plan_choice.is_some())
     }
 
     /// The approval waiting for an answer.
@@ -334,6 +353,7 @@ impl App {
                 plan: self.last_reply.clone(),
                 edited: false,
             });
+            self.arming = Arming::default();
         }
         let left = self.steering.take();
         self.sent_now.clear();
@@ -389,7 +409,7 @@ impl App {
                 self.plan_choice = None;
                 self.transcript
                     .push_note("still planning: say what to change", width);
-                None
+                self.next_queued()
             }
             Choice::Edit => {
                 let plan = self.plan_choice.as_ref()?.plan.clone();
@@ -424,6 +444,7 @@ impl App {
                 self.transcript
                     .push_lines(crate::markdown::render(&plan, width, &theme), width);
                 self.plan_choice = Some(PlanChoice { plan, edited: true });
+                self.arming = Arming::default();
             }
             Err(e) => self
                 .transcript
@@ -431,8 +452,13 @@ impl App {
         }
     }
 
-    /// Takes in a paste.
+    /// Takes in a paste: into the reason for a denial being typed, else into the input.
     pub fn on_paste(&mut self, text: &str) {
+        if let Some(prompt) = &mut self.prompt
+            && prompt.paste(text)
+        {
+            return;
+        }
         self.editor.paste(text);
         self.update_completion();
     }
@@ -455,15 +481,16 @@ impl App {
         }
         self.ctrl_c = None;
         self.hint = None;
-        if let Some(prompt) = &mut self.prompt {
-            let answered = prompt.key(key)?;
-            let interrupt = answered == Answered::Interrupt;
-            self.answer(answered);
-            return interrupt.then_some(Action::Interrupt);
-        }
-        if let Some(choice) = &self.plan_choice {
-            let choice = choice.key(key)?;
-            return self.choose(choice);
+        if self.prompt.is_some() || self.plan_choice.is_some() {
+            if self.arming.armed(now) {
+                return self.prompt_key(key);
+            }
+            // Esc stops the turn, as it does without the prompt: the approval is denied.
+            if key.code == KeyCode::Esc && self.prompt.is_some() {
+                self.answer(Answered::Interrupt);
+                return Some(Action::Interrupt);
+            }
+            // Until the prompt takes keys, they were typed for the input.
         }
         if ctrl && key.code == KeyCode::Char('d') && self.editor.is_empty() {
             return Some(Action::Quit);
@@ -486,6 +513,26 @@ impl App {
             Edit::Ignored => {}
         }
         None
+    }
+
+    /// A key for the approval or the plan choice, once it takes keys.
+    fn prompt_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.hint = Some(if self.prompt.is_some() {
+                "answer the approval first: nothing is sent while it waits".into()
+            } else {
+                "choose b, e or k first: nothing is sent while the plan waits".into()
+            });
+            return None;
+        }
+        if let Some(prompt) = &mut self.prompt {
+            let answered = prompt.key(key)?;
+            let interrupt = answered == Answered::Interrupt;
+            self.answer(answered);
+            return interrupt.then_some(Action::Interrupt);
+        }
+        let choice = self.plan_choice.as_ref()?.key(key)?;
+        self.choose(choice)
     }
 
     /// Shift+Tab: the next of plan, ask and auto, now, or when the running turn ends.
@@ -590,7 +637,8 @@ impl App {
             return self.builtin(&name, &full);
         }
         let (shown, full) = self.editor.submit();
-        if self.busy() {
+        // Input typed ahead of a plan choice waits for it, as input typed during a turn does.
+        if self.busy() || self.plan_choice.is_some() {
             self.queued.push_back((shown, full));
             return None;
         }
@@ -746,6 +794,13 @@ impl App {
         let width = self.width;
         let mut below: Vec<Line<'static>> = Vec::new();
         below.extend(wrap(&self.status(), width, &[], &[]));
+        if let Some(hint) = self
+            .hint
+            .as_ref()
+            .filter(|_| self.prompt.is_some() || self.plan_choice.is_some())
+        {
+            below.push(Line::from(Span::styled(sanitize(hint), theme.dim())));
+        }
         if let Some(prompt) = &self.prompt {
             let mut lines = prompt.render(width, rows.saturating_sub(below.len()), &theme);
             lines.extend(below);

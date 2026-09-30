@@ -182,6 +182,7 @@ async fn an_approval_notifies() {
         *recording.0.lock().unwrap(),
         ["approval needed: run `echo hi`"]
     );
+    tokio::time::sleep(harness_tui::approval::ARMING_DELAY).await;
     ui.handle(Event::Key(KeyEvent::new(
         KeyCode::Char('y'),
         KeyModifiers::NONE,

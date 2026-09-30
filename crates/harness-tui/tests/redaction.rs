@@ -198,6 +198,7 @@ async fn an_approval_shows_a_file_diff_without_the_secret() {
     assert_hidden(&shown);
     assert!(shown.contains("KEY=[redacted]"), "{shown}");
     assert!(shown.contains("MODE=prod"), "{shown}");
+    tokio::time::sleep(harness_tui::approval::ARMING_DELAY).await;
     press(&mut ui, KeyCode::Char('n'));
     press(&mut ui, KeyCode::Enter);
     settle(&mut ui).await;

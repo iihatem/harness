@@ -10,7 +10,7 @@ use std::{
 };
 
 use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent},
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     text::{Line, Span},
 };
 
@@ -112,12 +112,17 @@ pub struct PlanChoice {
 }
 
 impl PlanChoice {
-    /// The choice a key makes, if any.
+    /// The choice a key makes, if any: `b`, `e` and `k`, without Ctrl or Alt, and Esc to keep
+    /// planning. Enter was typed for the input.
     pub fn key(&self, key: KeyEvent) -> Option<Choice> {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match key.code {
-            KeyCode::Char('b') | KeyCode::Enter => Some(Choice::Build),
-            KeyCode::Char('e') => Some(Choice::Edit),
-            KeyCode::Char('k') | KeyCode::Esc => Some(Choice::KeepPlanning),
+            KeyCode::Char('b') if plain => Some(Choice::Build),
+            KeyCode::Char('e') if plain => Some(Choice::Edit),
+            KeyCode::Char('k') if plain => Some(Choice::KeepPlanning),
+            KeyCode::Esc => Some(Choice::KeepPlanning),
             _ => None,
         }
     }

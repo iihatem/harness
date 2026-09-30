@@ -241,7 +241,7 @@ async fn terminal_session(
         notifications.bell,
     )));
     let term = InlineTerminal::new(CrosstermBackend::new(std::io::stdout()), top)?;
-    let ui = Ui::start(agent, host, term, options, approvals).with_redactor(redactor);
+    let mut ui = Ui::start(agent, host, term, options, approvals).with_redactor(redactor);
     ui.run(EventStream::new()).await
 }
 

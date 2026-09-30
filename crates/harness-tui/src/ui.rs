@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use harness_core::{
     agent::{Agent, ContextUsage},
     event::AgentEvent,
@@ -163,7 +163,9 @@ where
                 buf.set_line(area.x, area.y + i as u16, line, area.width);
             }
             cursor.map(|c| ratatui::layout::Position::new(area.x + c.x, area.y + c.y))
-        })
+        })?;
+        self.app.drawn(Instant::now());
+        Ok(())
     }
 
     fn dispatch(&mut self, action: Action) -> io::Result<Flow> {
@@ -215,8 +217,13 @@ where
 
     /// Takes in one terminal event: a key, a paste, or a resize.
     pub fn handle(&mut self, event: Event) -> io::Result<Flow> {
+        self.handle_at(event, Instant::now())
+    }
+
+    /// Takes in one terminal event read at `now`.
+    pub fn handle_at(&mut self, event: Event, now: Instant) -> io::Result<Flow> {
         let flow = match event {
-            Event::Key(key) => match self.app.on_key(key, Instant::now()) {
+            Event::Key(key) => match self.app.on_key(key, now) {
                 Some(action) => self.dispatch(action)?,
                 None => Flow::Continue,
             },
@@ -360,14 +367,37 @@ where
         Ok(())
     }
 
-    /// Runs the session on `input`, the terminal's events, until the user leaves.
-    pub async fn run<S>(mut self, mut input: S) -> io::Result<()>
+    /// Takes in the terminal events already waiting. Done before an agent's event or approval is
+    /// shown, so that a key typed before a prompt appeared goes where it was typed for, never to
+    /// the prompt.
+    fn drain<S>(&mut self, input: &mut S) -> io::Result<Flow>
+    where
+        S: Stream<Item = io::Result<Event>> + Unpin,
+    {
+        while let Some(next) = input.next().now_or_never() {
+            match next {
+                Some(Ok(event)) => {
+                    if self.handle(event)? == Flow::Quit {
+                        return Ok(Flow::Quit);
+                    }
+                }
+                Some(Err(e)) => return Err(e),
+                None => return Ok(Flow::Quit),
+            }
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Runs the session on `input`, the terminal's events, until the user leaves. Keys come
+    /// first: what the user typed is taken in before what the agent sent meanwhile.
+    pub async fn run<S>(&mut self, mut input: S) -> io::Result<()>
     where
         S: Stream<Item = io::Result<Event>> + Unpin,
     {
         self.draw()?;
         loop {
             let flow = tokio::select! {
+                biased;
                 event = input.next() => match event {
                     Some(Ok(event)) => self.handle(event)?,
                     Some(Err(e)) => {
@@ -377,11 +407,21 @@ where
                     None => Flow::Quit,
                 },
                 event = self.events.recv() => match event {
-                    Some(event) => self.agent_event(event)?,
+                    Some(event) => match self.drain(&mut input)? {
+                        Flow::Continue => self.agent_event(event)?,
+                        Flow::Quit => {
+                            self.take_in(event);
+                            Flow::Quit
+                        }
+                    },
                     None => Flow::Quit,
                 },
                 Some(context) = self.contexts.recv() => self.context(context)?,
-                Some((request, reply)) = self.approvals.recv() => self.approval(request, reply)?,
+                // A request left unshown when the user leaves is denied when its reply drops.
+                Some((request, reply)) = self.approvals.recv() => match self.drain(&mut input)? {
+                    Flow::Continue => self.approval(request, reply)?,
+                    Flow::Quit => Flow::Quit,
+                },
                 _ = tokio::time::sleep(HOST_WARNINGS_EVERY) => self.idle()?,
             };
             if flow == Flow::Quit {

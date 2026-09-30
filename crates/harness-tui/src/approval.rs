@@ -2,7 +2,13 @@
 //! request, with a diff for a file change, until the user answers: once, for the rest of the
 //! session, or no, with a reason for the model if they like.
 
-use std::{cell::Cell, io::Read, path::Path, sync::Arc};
+use std::{
+    cell::Cell,
+    io::Read,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use harness_core::{
@@ -25,6 +31,33 @@ use crate::{
 
 /// Files larger than this are not read for a diff.
 const MAX_DIFF_FILE: u64 = 1024 * 1024;
+
+/// How long after a prompt is first drawn its keys start to answer it. A key pressed before then
+/// was typed for the input, before the user could have read the prompt.
+pub const ARMING_DELAY: Duration = Duration::from_millis(300);
+
+/// When a prompt starts to take keys: [`ARMING_DELAY`] after it was first drawn.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Arming {
+    drawn: Option<Instant>,
+}
+
+impl Arming {
+    /// The prompt was drawn at `now`; only the first time counts.
+    pub fn drawn(&mut self, now: Instant) {
+        self.drawn.get_or_insert(now);
+    }
+
+    /// When keys start to answer the prompt: `None` until it is drawn.
+    pub fn armed_at(&self) -> Option<Instant> {
+        self.drawn.map(|at| at + ARMING_DELAY)
+    }
+
+    /// Whether a key read at `now` answers the prompt.
+    pub fn armed(&self, now: Instant) -> bool {
+        self.armed_at().is_some_and(|at| now >= at)
+    }
+}
 
 /// Where the user's answer goes.
 pub type Reply = oneshot::Sender<ApprovalDecision>;
@@ -126,9 +159,29 @@ impl Prompt {
         }
     }
 
-    /// Handles a key.
+    /// Whether the user is typing why they deny.
+    pub fn typing_reason(&self) -> bool {
+        self.feedback.is_some()
+    }
+
+    /// Takes a paste into the reason the user is typing; `false` when they are not typing one.
+    pub fn paste(&mut self, text: &str) -> bool {
+        match &mut self.feedback {
+            Some(feedback) => {
+                feedback.push_str(text);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Handles a key. Only `y`, `a` (where offered), `n` and Esc answer, and the letters only
+    /// without Ctrl or Alt: Enter, the new-line keys and readline's keys were typed for the input.
     pub fn key(&mut self, key: KeyEvent) -> Option<Answered> {
         let rows = self.room.get();
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if let Some(text) = &mut self.feedback {
             match key.code {
                 KeyCode::Enter => {
@@ -141,20 +194,20 @@ impl Prompt {
                 KeyCode::Backspace => {
                     text.pop();
                 }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => text.push(c),
+                KeyCode::Char(c) if plain => text.push(c),
                 _ => {}
             }
             return None;
         }
         let last = self.body.len().saturating_sub(rows);
         match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
+            KeyCode::Char('y') if plain => {
                 return Some(Answered::Decided(ApprovalDecision::Approve));
             }
-            KeyCode::Char('a') if self.request.kind == ApprovalKind::Action => {
+            KeyCode::Char('a') if plain && self.request.kind == ApprovalKind::Action => {
                 return Some(Answered::Decided(ApprovalDecision::ApproveForSession));
             }
-            KeyCode::Char('n') => self.feedback = Some(String::new()),
+            KeyCode::Char('n') if plain => self.feedback = Some(String::new()),
             KeyCode::Esc => return Some(Answered::Interrupt),
             KeyCode::Down => self.scroll = (self.scroll + 1).min(last),
             KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
@@ -242,8 +295,14 @@ impl Prompt {
         let reason = sanitize(&self.request.reason).replace('\n', " ");
         let (mark, text) = match answered {
             Answered::Decided(ApprovalDecision::Approve) => ("✓", format!("approved: {reason}")),
-            Answered::Decided(ApprovalDecision::ApproveForSession) => {
+            Answered::Decided(ApprovalDecision::ApproveForSession)
+                if self.request.kept_for_session =>
+            {
                 ("✓", format!("approved for this session: {reason}"))
+            }
+            // The policy asks about it every time, so the approval applies once.
+            Answered::Decided(ApprovalDecision::ApproveForSession) => {
+                ("✓", format!("approved once: {reason}"))
             }
             Answered::Decided(ApprovalDecision::Deny {
                 feedback: Some(why),

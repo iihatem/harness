@@ -197,6 +197,65 @@ fn after_a_screen_tall_live_region_the_end_of_the_reply_stays_on_screen() {
     assert_eq!(vt.cursor(), Position::new(0, 7));
 }
 
+/// A terminal 20 wide and `rows` tall, full of a shell's lines, with harness below them.
+fn under_a_full_screen(rows: u16) -> InlineTerminal<VtBackend> {
+    let mut vt = Vt::new(20, rows);
+    for i in 0..rows + 3 {
+        vt.print(&format!("shell {i}\n"));
+    }
+    let top = vt.cursor().y;
+    let mut term = InlineTerminal::new(VtBackend::new(vt), top).unwrap();
+    term.insert(&[Line::from("done 1"), Line::from("done 2")])
+        .unwrap();
+    draw_live(&mut term, "> ", 2);
+    term
+}
+
+/// What harness drew is on screen once, and the live region is right below it.
+fn in_place(term: &InlineTerminal<VtBackend>, rows: u16) {
+    let vt = term.backend().vt();
+    let everything = vt.everything();
+    for line in (0..rows + 3)
+        .map(|i| format!("shell {i}"))
+        .chain(["done 1".into(), "done 2".into()])
+    {
+        let count = everything.iter().filter(|r| **r == line).count();
+        assert_eq!(count, 1, "{line}: {everything:#?}");
+    }
+    let screen = vt.screen();
+    let input = screen
+        .iter()
+        .position(|r| r == ">")
+        .expect("the live region");
+    assert_eq!(screen[input - 1], "done 2", "{screen:#?}");
+    assert_eq!(term.top() as usize, input);
+}
+
+#[test]
+fn after_a_resize_the_live_region_is_found_where_the_terminal_moved_it() {
+    // Shorter, as xterm does it: the rows above the cursor go into scrollback.
+    let mut term = under_a_full_screen(10);
+    term.backend().vt().resize(20, 6);
+    term.resized().unwrap();
+    draw_live(&mut term, "> ", 2);
+    in_place(&term, 10);
+    // Taller, with rows coming back from scrollback: the terminal says where its cursor went.
+    term.backend().vt().grow_from_scrollback(12);
+    term.resized().unwrap();
+    draw_live(&mut term, "> ", 2);
+    in_place(&term, 10);
+    // A terminal that cannot say where its cursor is is taken to do what xterm does.
+    let mut term = under_a_full_screen(10).without_cursor_reports();
+    term.backend().vt().resize(20, 6);
+    term.resized().unwrap();
+    draw_live(&mut term, "> ", 2);
+    in_place(&term, 10);
+    term.backend().vt().resize(30, 9);
+    term.resized().unwrap();
+    draw_live(&mut term, "> ", 2);
+    in_place(&term, 10);
+}
+
 /// A `TestBackend` that records the rows of every cell it is asked to draw.
 struct Recording {
     inner: TestBackend,

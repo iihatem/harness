@@ -466,3 +466,169 @@ async fn while_a_reply_streams_the_screen_is_redrawn_at_most_every_30_ms() {
     assert!(screen.iter().any(|r| r.contains("w199")), "{screen:#?}");
     ui.finish().await.unwrap();
 }
+
+use support::vt::{Vt, VtBackend};
+
+/// A session on a terminal `cols` by `rows` whose screen is full of a shell's lines.
+fn start_on_vt(
+    provider: Arc<dyn Provider>,
+    dir: &Path,
+    cols: u16,
+    rows: u16,
+) -> (Ui<VtBackend>, Arc<std::sync::Mutex<Vt>>) {
+    let mut vt = Vt::new(cols, rows);
+    for i in 0..rows + 5 {
+        vt.print(&format!("shell line {i}\n"));
+    }
+    let top = vt.cursor().y;
+    let backend = VtBackend::new(vt);
+    let shared = backend.shared();
+    let mut ui = Ui::start(
+        agent(provider, dir),
+        Box::new(TestHost),
+        InlineTerminal::new(backend, top).unwrap(),
+        options(dir),
+        ChannelApprover::new().1,
+    );
+    ui.draw().unwrap();
+    (ui, shared)
+}
+
+/// The window changes size, then harness hears of it.
+fn resize(ui: &mut Ui<VtBackend>, vt: &std::sync::Mutex<Vt>, cols: u16, rows: u16) {
+    vt.lock().unwrap().resize(cols, rows);
+    ui.handle(Event::Resize(cols, rows)).unwrap();
+}
+
+fn send(ui: &mut Ui<VtBackend>, text: &str) {
+    for c in text.chars() {
+        ui.handle(Event::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    }
+    ui.handle(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .unwrap();
+}
+
+/// Each of `lines` is shown exactly once, in scrollback or on screen, in this order, and so is
+/// the stats line of each of `turns`.
+fn once_in_order(vt: &std::sync::Mutex<Vt>, lines: &[String], turns: usize) {
+    let everything = vt.lock().unwrap().everything();
+    let stats = everything
+        .iter()
+        .filter(|r| r.starts_with("mock/m · first token"))
+        .count();
+    assert_eq!(stats, turns, "{everything:#?}");
+    let mut at = 0;
+    for line in lines {
+        let found: Vec<usize> = everything
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| *row == line)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "{line:?} is shown {} times: {everything:#?}",
+            found.len()
+        );
+        assert!(found[0] >= at, "{line:?} is out of order: {everything:#?}");
+        at = found[0];
+    }
+    // The live region is on screen once, at the bottom of what harness drew.
+    let status = everything
+        .iter()
+        .filter(|r| r.starts_with("mock/m · auto"))
+        .count();
+    assert_eq!(status, 1, "{everything:#?}");
+}
+
+// Review A's I2: after a resize, harness assumed the rows had stayed where they were. A terminal
+// that keeps its cursor on screen as the window gets shorter pushes the rows above it into
+// scrollback, so harness cleared transcript rows that had moved into its old place.
+#[tokio::test]
+async fn resizing_at_an_idle_prompt_keeps_every_line_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::text("first answer"),
+        Script::text("second answer"),
+    ]);
+    let (mut ui, vt) = start_on_vt(provider, dir.path(), 60, 20);
+    send(&mut ui, "one");
+    tokio::time::timeout(Duration::from_secs(10), ui.settle())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut lines: Vec<String> = (0..25).map(|i| format!("shell line {i}")).collect();
+    lines.extend(["› one".to_string(), "first answer".to_string()]);
+    let mut turns = 1;
+    once_in_order(&vt, &lines, turns);
+    resize(&mut ui, &vt, 60, 10);
+    once_in_order(&vt, &lines, turns);
+    send(&mut ui, "two");
+    tokio::time::timeout(Duration::from_secs(10), ui.settle())
+        .await
+        .unwrap()
+        .unwrap();
+    lines.extend(["› two".to_string(), "second answer".to_string()]);
+    turns += 1;
+    once_in_order(&vt, &lines, turns);
+    // Wider and taller, then narrower.
+    resize(&mut ui, &vt, 80, 24);
+    once_in_order(&vt, &lines, turns);
+    resize(&mut ui, &vt, 40, 24);
+    once_in_order(&vt, &lines, turns);
+    let screen = vt.lock().unwrap().screen();
+    let input = screen.iter().position(|r| r == "›").expect("the input");
+    assert!(
+        screen[input - 1].starts_with("mock/m · first token"),
+        "{screen:#?}"
+    );
+    assert!(
+        screen[..input].iter().any(|r| r == "second answer"),
+        "{screen:#?}"
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn resizing_while_a_reply_streams_keeps_every_line_once() {
+    let numbered = |from: usize, to: usize| -> String {
+        (from..=to)
+            .map(|i| format!("NUM-{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::Hang(vec![ProviderEvent::TextDelta(numbered(1, 30))]),
+        Script::Hang(vec![ProviderEvent::TextDelta(numbered(31, 60))]),
+    ]);
+    let (mut ui, vt) = start_on_vt(provider, dir.path(), 60, 20);
+    let mut lines: Vec<String> = (0..25).map(|i| format!("shell line {i}")).collect();
+    for (turn, (from, to), (cols, rows)) in [(1, (1, 30), (60, 10)), (2, (31, 60), (80, 24))] {
+        send(&mut ui, &format!("turn {turn}"));
+        let last = format!("NUM-{to:03}");
+        while !vt.lock().unwrap().everything().contains(&last) {
+            ui.next().await.unwrap();
+        }
+        resize(&mut ui, &vt, cols, rows);
+        ui.handle(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), ui.settle())
+            .await
+            .unwrap()
+            .unwrap();
+        lines.push(format!("› turn {turn}"));
+        lines.extend((from..=to).map(|i| format!("NUM-{i:03}")));
+        let turns = turn;
+        once_in_order(&vt, &lines, turns);
+    }
+    ui.finish().await.unwrap();
+}

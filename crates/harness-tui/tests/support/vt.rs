@@ -262,6 +262,20 @@ impl Vt {
         self.pending_wrap = false;
     }
 
+    /// The window gets taller as iTerm2's and Terminal.app's do: rows come back from scrollback
+    /// at the top, moving the screen's rows and the cursor down.
+    pub fn grow_from_scrollback(&mut self, rows: u16) {
+        let back = (rows.saturating_sub(self.rows) as usize).min(self.scrollback.len());
+        for _ in 0..back {
+            let row = self.scrollback.pop().unwrap();
+            self.grid.insert(0, row);
+        }
+        self.y += back as u16;
+        self.grid.resize(rows as usize, blank_row(self.cols));
+        self.rows = rows;
+        self.pending_wrap = false;
+    }
+
     /// The rows on screen, without trailing spaces.
     pub fn screen(&self) -> Vec<String> {
         self.grid.iter().map(|row| text(row)).collect()

@@ -24,6 +24,10 @@ pub struct InlineTerminal<B: Backend> {
     height: u16,
     /// What the live region shows, so a redraw writes only what changed.
     shown: Buffer,
+    /// The row harness left the terminal's cursor on.
+    cursor_row: u16,
+    /// The terminal answers when asked where its cursor is.
+    reports_cursor: bool,
 }
 
 fn io_error<E: std::error::Error + Send + Sync + 'static>(error: E) -> io::Error {
@@ -46,7 +50,16 @@ where
             top,
             height: 0,
             shown: Buffer::empty(Rect::new(0, top, screen.width, 0)),
+            cursor_row: top,
+            reports_cursor: true,
         })
+    }
+
+    /// For a terminal that did not say where its cursor was when harness started: it is not
+    /// asked again after a resize.
+    pub fn without_cursor_reports(mut self) -> Self {
+        self.reports_cursor = false;
+        self
     }
 
     pub fn backend(&self) -> &B {
@@ -78,10 +91,17 @@ where
             return Ok(());
         }
         let bottom = self.screen.height.saturating_sub(1);
-        self.backend
-            .set_cursor_position(Position::new(0, bottom))
-            .map_err(io_error)?;
+        self.move_cursor(Position::new(0, bottom))?;
         self.backend.append_lines(rows).map_err(io_error)
+    }
+
+    /// Moves the terminal's cursor to `position`, and remembers its row.
+    fn move_cursor(&mut self, position: Position) -> io::Result<()> {
+        self.backend
+            .set_cursor_position(position)
+            .map_err(io_error)?;
+        self.cursor_row = position.y;
+        Ok(())
     }
 
     /// Clears from the live region's top to the bottom of the screen, and forgets what it showed.
@@ -89,9 +109,7 @@ where
     /// screen to clear.
     fn clear_live(&mut self) -> io::Result<()> {
         if self.top < self.screen.height {
-            self.backend
-                .set_cursor_position(Position::new(0, self.top))
-                .map_err(io_error)?;
+            self.move_cursor(Position::new(0, self.top))?;
             self.backend
                 .clear_region(ClearType::AfterCursor)
                 .map_err(io_error)?;
@@ -133,6 +151,7 @@ where
         // reached it.
         self.top = y.min(self.screen.height);
         self.shown = Buffer::empty(Rect::new(0, self.top, width, 0));
+        self.move_cursor(Position::new(0, self.top.min(self.screen.height - 1)))?;
         self.backend.flush().map_err(io_error)
     }
 
@@ -163,14 +182,17 @@ where
         let cursor = render(area, &mut next);
         let updates = self.shown.diff(&next);
         self.backend.draw(updates.into_iter()).map_err(io_error)?;
+        // The cursor is left where it is known to be, for after a resize.
         match cursor {
             Some(position) => {
-                self.backend
-                    .set_cursor_position(position)
-                    .map_err(io_error)?;
+                self.move_cursor(position)?;
                 self.backend.show_cursor().map_err(io_error)?;
             }
-            None => self.backend.hide_cursor().map_err(io_error)?,
+            None => {
+                self.backend.hide_cursor().map_err(io_error)?;
+                let row = self.top.min(self.screen.height.saturating_sub(1));
+                self.move_cursor(Position::new(0, row))?;
+            }
         }
         self.shown = next;
         self.backend.flush().map_err(io_error)
@@ -186,14 +208,27 @@ where
         self.backend.flush().map_err(io_error)
     }
 
-    /// After the terminal changed size: the live region stays on screen and is drawn anew.
+    /// After the terminal changed size. Terminals move rows when they resize: xterm keeps the
+    /// cursor's row on screen as the window gets shorter, pushing the rows above it into
+    /// scrollback, and others pull rows back from scrollback as it gets taller, or rewrap them.
+    /// So the terminal is asked where its cursor is now, and the live region, cleared, is placed
+    /// as far above it as the cursor was below the region's top; the next draw makes the room it
+    /// needs. A terminal that cannot say is taken to have done what xterm does.
     pub fn resized(&mut self) -> io::Result<()> {
         self.screen = self.backend.size().map_err(io_error)?;
-        let height = self.height.min(self.screen.height);
-        self.top = self
-            .top
-            .min(self.screen.height.saturating_sub(height.max(1)));
-        self.height = height;
+        let bottom = self.screen.height.saturating_sub(1);
+        let below_top = i32::from(self.cursor_row) - i32::from(self.top);
+        let mut row = None;
+        if self.reports_cursor {
+            match self.backend.get_cursor_position() {
+                Ok(position) => row = Some(position.y.min(bottom)),
+                Err(_) => self.reports_cursor = false,
+            }
+        }
+        self.cursor_row = row.unwrap_or(self.cursor_row.min(bottom));
+        let top = (i32::from(self.cursor_row) - below_top).clamp(0, i32::from(self.screen.height));
+        self.top = top as u16;
+        self.height = 0;
         self.clear_live()
     }
 }

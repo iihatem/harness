@@ -23,8 +23,10 @@ use harness_tui::{
     ui::{Ending, Flow, Ui},
 };
 use ratatui::{
-    backend::TestBackend,
+    backend::{Backend, ClearType, TestBackend, WindowSize},
+    buffer::Cell,
     crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
+    layout::{Position, Size},
 };
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
@@ -59,6 +61,29 @@ fn start(
     approvals: Option<Requests>,
     notified: Option<mpsc::UnboundedSender<String>>,
 ) -> Ui<TestBackend> {
+    start_on(
+        TestBackend::new(80, 24),
+        provider,
+        dir,
+        mode,
+        approvals,
+        notified,
+    )
+}
+
+/// Like [`start`], drawing on `backend`.
+fn start_on<B>(
+    backend: B,
+    provider: Arc<MockProvider>,
+    dir: &Path,
+    mode: Mode,
+    approvals: Option<Requests>,
+    notified: Option<mpsc::UnboundedSender<String>>,
+) -> Ui<B>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+{
     let policy = Arc::new(PermissionEngine::new(EngineConfig {
         mode,
         workspace: dir.to_path_buf(),
@@ -90,7 +115,7 @@ fn start(
         text_editor: None,
         notifier: notified.map(|n| Box::new(Forward(n)) as Box<dyn Notify>),
     };
-    let term = InlineTerminal::new(TestBackend::new(80, 24), 0).unwrap();
+    let term = InlineTerminal::new(backend, 0).unwrap();
     let mut ui = Ui::start(
         agent,
         Box::new(NoCommands),
@@ -203,13 +228,15 @@ async fn finishing_denies_every_approval_waiting() {
 }
 
 /// Runs `ui` on keys from a channel until it ends, while `drive` sends them; how it ended.
-async fn run_while<F>(
-    ui: &mut Ui<TestBackend>,
+async fn run_while<F, B>(
+    ui: &mut Ui<B>,
     shutdown: impl std::future::Future<Output = Ending>,
     drive: impl FnOnce(Keys) -> F,
 ) -> Ending
 where
     F: std::future::Future<Output = ()>,
+    B: Backend,
+    B::Error: Send + Sync + 'static,
 {
     let (keys, input) = futures::channel::mpsc::unbounded();
     let (ending, ()) = tokio::join!(
@@ -355,4 +382,119 @@ async fn a_shutdown_stops_the_running_command_and_ends_the_session() {
         assert!(!group_alive(group), "the command's processes still run");
         assert!(!dir.path().join("survived").exists());
     }
+}
+
+/// A `TestBackend` whose writes fail once `gone` is set, as a closed terminal's do; `failed` is
+/// told when one does.
+struct Breaking {
+    inner: TestBackend,
+    gone: Arc<std::sync::atomic::AtomicBool>,
+    failed: Arc<tokio::sync::Notify>,
+}
+
+impl Breaking {
+    fn write(&self) -> std::io::Result<()> {
+        if self.gone.load(std::sync::atomic::Ordering::SeqCst) {
+            self.failed.notify_one();
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        Ok(())
+    }
+}
+
+impl Backend for Breaking {
+    type Error = std::io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        self.write()?;
+        let Ok(()) = self.inner.draw(content);
+        Ok(())
+    }
+    fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
+        self.write()?;
+        let Ok(()) = self.inner.append_lines(n);
+        Ok(())
+    }
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        self.write()?;
+        let Ok(()) = self.inner.hide_cursor();
+        Ok(())
+    }
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        self.write()?;
+        let Ok(()) = self.inner.show_cursor();
+        Ok(())
+    }
+    fn get_cursor_position(&mut self) -> std::io::Result<Position> {
+        let Ok(position) = self.inner.get_cursor_position();
+        Ok(position)
+    }
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
+        self.write()?;
+        let Ok(()) = self.inner.set_cursor_position(position);
+        Ok(())
+    }
+    fn clear(&mut self) -> std::io::Result<()> {
+        self.write()?;
+        let Ok(()) = self.inner.clear();
+        Ok(())
+    }
+    fn clear_region(&mut self, clear_type: ClearType) -> std::io::Result<()> {
+        self.write()?;
+        let Ok(()) = self.inner.clear_region(clear_type);
+        Ok(())
+    }
+    fn size(&self) -> std::io::Result<Size> {
+        let Ok(size) = self.inner.size();
+        Ok(size)
+    }
+    fn window_size(&mut self) -> std::io::Result<WindowSize> {
+        let Ok(size) = self.inner.window_size();
+        Ok(size)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.write()?;
+        let Ok(()) = self.inner.flush();
+        Ok(())
+    }
+}
+
+// Final review M2 (its `s_close_stream.py`): the terminal closes while the agent's events are
+// drawn, and a write to it fails a moment before its reader can tell. However the draw came about,
+// the session ends as a hangup (exit 129), rather than with the write's error (exit 1).
+#[tokio::test]
+async fn a_terminal_closed_while_the_agents_events_are_drawn_is_a_hangup() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("b1", "bash", json!({"command": "touch started; sleep 1"})),
+        Script::text("finished"),
+    ]);
+    let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failed = Arc::new(tokio::sync::Notify::new());
+    let backend = Breaking {
+        inner: TestBackend::new(80, 24),
+        gone: gone.clone(),
+        failed: failed.clone(),
+    };
+    let mut ui = start_on(backend, provider, dir.path(), Mode::Auto, None, None);
+    let started = dir.path().join("started");
+    let ending = run_while(&mut ui, std::future::pending(), |keys| async move {
+        for event in typed("go") {
+            keys.unbounded_send(Ok(event)).unwrap();
+        }
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Nothing waits to be drawn: the next draw comes with the command's result.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        failed.notified().await;
+        // Its reader tells a moment later: its input ends.
+        drop(keys);
+    })
+    .await;
+    assert_eq!(ending, Ending::Hangup);
 }

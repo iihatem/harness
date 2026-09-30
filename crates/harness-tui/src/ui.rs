@@ -562,8 +562,24 @@ where
         }
     }
 
-    /// The session's loop, for [`run`](Self::run): how it ended.
+    /// The session's loop, for [`run`](Self::run): how it ended. Its only failures are writes to
+    /// the terminal, and a terminal that closed fails a write a moment before its reader can
+    /// tell: however the draw came about (a key, the agent's events, an approval), a failed one
+    /// ends the session as a hangup when the terminal's input ends soon after.
     async fn serve<S, E, D>(&mut self, input: &mut S, shutdown: D) -> io::Result<Ending>
+    where
+        S: Stream<Item = io::Result<E>> + Unpin,
+        E: Into<Timed>,
+        D: std::future::Future<Output = Ending>,
+    {
+        match self.serve_until_done(input, shutdown).await {
+            Ok(ending) => Ok(ending),
+            Err(error) => gone_or(input, error).await,
+        }
+    }
+
+    /// The loop [`serve`](Self::serve) runs.
+    async fn serve_until_done<S, E, D>(&mut self, input: &mut S, shutdown: D) -> io::Result<Ending>
     where
         S: Stream<Item = io::Result<E>> + Unpin,
         E: Into<Timed>,
@@ -600,13 +616,9 @@ where
                     None => self.approval(request, reply).await?,
                     Some(ending) => return Ok(ending),
                 },
-                // Drawn after the keys waiting, and not once the terminal has gone, which it may
-                // have just before its reader can tell.
+                // Drawn after the keys waiting.
                 _ = tokio::time::sleep_until(redraw_at), if redraw => match self.keys(None, input).await? {
-                    None => match self.draw() {
-                        Ok(()) => Flow::Continue,
-                        Err(e) => return gone_or(input, e).await,
-                    },
+                    None => self.draw().map(|()| Flow::Continue)?,
                     Some(ending) => return Ok(ending),
                 },
                 _ = tokio::time::sleep(HOST_WARNINGS_EVERY) => self.idle()?,

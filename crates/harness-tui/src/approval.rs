@@ -342,18 +342,17 @@ impl Prompt {
     }
 }
 
-/// What the prompt for `request` shows under the reason, as [`body`] makes it, made off the
-/// async runtime: reading the file can block (a slow file system), and diffing a large file takes
-/// a while. After [`BODY_TIMEOUT`], a note says there is no diff.
+/// What the prompt for `request` shows under the reason, as [`body`] makes it from the call's
+/// arguments, made off the async runtime: reading the file can block (a slow file system), and
+/// diffing a large file takes a while. After [`BODY_TIMEOUT`], a note says there is no diff.
 pub async fn prepare_body(
     request: &ApprovalRequest,
-    arguments: Option<Value>,
     workspace: PathBuf,
     theme: Theme,
 ) -> Vec<Line<'static>> {
     let for_body = request.clone();
     let made = within(BODY_TIMEOUT, move || {
-        body(&for_body, arguments.as_ref(), &workspace, &theme)
+        body(&for_body, Some(&for_body.arguments), &workspace, &theme)
     });
     made.await.unwrap_or_else(|| {
         lines(
@@ -363,7 +362,9 @@ pub async fn prepare_body(
     })
 }
 
-/// What the prompt shows under the reason: the command, or the file's change as a diff.
+/// What the prompt shows under the reason: the command, or the file's change as a diff, from the
+/// call's `arguments` as the model sent them, so that it describes what approving does; the
+/// secrets harness knows are redacted from what it shows ([`Prompt::redact`]).
 pub fn body(
     request: &ApprovalRequest,
     arguments: Option<&Value>,

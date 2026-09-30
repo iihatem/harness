@@ -150,6 +150,9 @@ pub enum ApprovalKind {
 pub struct ApprovalRequest {
     pub call_id: String,
     pub tool: String,
+    /// The call's arguments as the model sent them, before any redaction: what an approver shows
+    /// of the change must be worked out from them, and only what it shows redacted.
+    pub arguments: Value,
     pub action: Action,
     pub reason: String,
     pub kind: ApprovalKind,
@@ -1641,6 +1644,7 @@ impl Agent {
                 let request = ApprovalRequest {
                     call_id: call.id.clone(),
                     tool: call.name.clone(),
+                    arguments: args.clone(),
                     kept_for_session: self.policy.can_remember(&action),
                     action,
                     reason: reason.clone(),
@@ -1764,6 +1768,7 @@ impl Agent {
         let request = ApprovalRequest {
             call_id: call.id.clone(),
             tool: call.name.clone(),
+            arguments: args.clone(),
             action: Action::Bash(command.to_string()),
             reason,
             kind: ApprovalKind::RunUnsandboxed,
@@ -1817,6 +1822,7 @@ impl Agent {
         let request = ApprovalRequest {
             call_id: call.id.clone(),
             tool: call.name.clone(),
+            arguments: args.clone(),
             action: tool.action(&args, &self.ctx),
             reason,
             kind: ApprovalKind::RunUnsandboxed,

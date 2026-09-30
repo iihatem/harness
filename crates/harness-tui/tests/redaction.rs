@@ -205,6 +205,49 @@ async fn an_approval_shows_a_file_diff_without_the_secret() {
     ui.finish().await.unwrap();
 }
 
+// Final review M4: the prompt was built from the edit's arguments as the transcript holds them,
+// redacted, so an edit whose text to replace holds a secret was said not to match the file,
+// although approving it applies it. The prompt is built from the arguments as the model sent
+// them, and only what it shows is redacted.
+#[tokio::test]
+async fn an_edit_of_a_secret_is_described_as_it_would_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".env"), format!("KEY={SECRET}\nMODE=dev\n")).unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("r1", "read", json!({"path": ".env"})),
+        Script::tool_call(
+            "e1",
+            "edit",
+            json!({"path": ".env", "old_string": format!("KEY={SECRET}"), "new_string": "KEY=rotated"}),
+        ),
+        Script::text("Rotated."),
+    ]);
+    let mut ui = start(provider, dir.path(), Mode::Ask, Warns::default());
+    send(&mut ui, "rotate the key");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ui.until(|app| app.prompt().is_some()),
+    )
+    .await
+    .expect("an approval is asked for")
+    .unwrap();
+    let shown = everything(&ui);
+    assert_hidden(&shown);
+    assert!(!shown.contains("not in the file"), "{shown}");
+    assert!(shown.contains("edit .env (+1 -1)"), "{shown}");
+    assert!(shown.contains("-KEY=[redacted]"), "{shown}");
+    assert!(shown.contains("+KEY=rotated"), "{shown}");
+    tokio::time::sleep(harness_tui::approval::ARMING_DELAY).await;
+    press(&mut ui, KeyCode::Char('y'));
+    settle(&mut ui).await;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".env")).unwrap(),
+        "KEY=rotated\nMODE=dev\n"
+    );
+    assert_hidden(&everything(&ui));
+    ui.finish().await.unwrap();
+}
+
 #[tokio::test]
 async fn the_hosts_warnings_are_shown_once() {
     let dir = tempfile::tempdir().unwrap();

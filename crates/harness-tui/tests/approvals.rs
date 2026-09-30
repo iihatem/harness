@@ -190,6 +190,7 @@ fn request(command: &str) -> ApprovalRequest {
     ApprovalRequest {
         call_id: "c1".into(),
         tool: "bash".into(),
+        arguments: serde_json::Value::Null,
         action: Action::Bash(command.into()),
         reason: format!("run `{command}`"),
         kind: ApprovalKind::Action,

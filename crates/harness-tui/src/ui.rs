@@ -434,8 +434,8 @@ where
                 self.app.on_event(&event);
             }
         }
-        let (arguments, workspace, theme) = self.app.approval_context(&request);
-        let body = crate::approval::prepare_body(&request, arguments, workspace, theme).await;
+        let (workspace, theme) = self.app.approval_context();
+        let body = crate::approval::prepare_body(&request, workspace, theme).await;
         self.app.on_approval(request, reply, body);
         self.draw()?;
         Ok(Flow::Continue)

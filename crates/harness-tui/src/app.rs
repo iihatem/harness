@@ -255,14 +255,10 @@ impl App {
         std::mem::take(&mut self.notifications)
     }
 
-    /// What the prompt for `request` needs to show what it asks about: the tool call's
-    /// arguments (when known), the workspace, and the theme.
-    pub fn approval_context(
-        &self,
-        request: &ApprovalRequest,
-    ) -> (Option<serde_json::Value>, std::path::PathBuf, Theme) {
-        let arguments = self.transcript.arguments(&request.call_id).cloned();
-        (arguments, self.workspace.clone(), self.theme())
+    /// What a prompt needs, besides its request, to show what it asks about: the workspace, and
+    /// the theme.
+    pub fn approval_context(&self) -> (std::path::PathBuf, Theme) {
+        (self.workspace.clone(), self.theme())
     }
 
     /// The agent asks the user to approve `request`, showing `body`

@@ -148,6 +148,7 @@ fn request() -> ApprovalRequest {
     ApprovalRequest {
         call_id: "c1".into(),
         tool: "bash".into(),
+        arguments: serde_json::Value::Null,
         action: Action::Bash("cargo test".into()),
         reason: "run `cargo test`".into(),
         kind: ApprovalKind::Action,

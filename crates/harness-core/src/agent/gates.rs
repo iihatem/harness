@@ -79,6 +79,17 @@ impl GateRun {
 }
 
 impl Agent {
+    /// Counts a gate that ended as `status` in the current turn's outcome record: a command that
+    /// did not run (blocked, or skipped) is `skipped`; one that timed out failed.
+    fn count_gate(&mut self, status: GateStatus) {
+        let counts = &mut self.gate_counts;
+        match status {
+            GateStatus::Passed => counts.passed += 1,
+            GateStatus::Failed | GateStatus::TimedOut => counts.failed += 1,
+            GateStatus::Blocked | GateStatus::Skipped => counts.skipped += 1,
+        }
+    }
+
     /// Whether no gate may run: the approval mode is `plan` or `read-only`, or this turn's shell is
     /// read-only (`/init`), where a test would fail for writing.
     pub(super) fn gates_skipped(&self) -> bool {
@@ -101,6 +112,9 @@ impl Agent {
         }
         self.turn_changed = true;
         if self.gates_skipped() {
+            if self.gates.after_edit.is_some() {
+                self.count_gate(GateStatus::Skipped);
+            }
             return None;
         }
         let mut checks = Vec::new();
@@ -183,8 +197,9 @@ impl Agent {
                 .ok()
             })
             .flatten();
-        // A run the user stopped did not fail: nothing is said of it.
+        // A run the user stopped did not fail: nothing is said of it, and it is not counted.
         if !(outcome.interrupted || self.ctx.cancel.is_cancelled()) {
+            self.count_gate(outcome.status);
             let _ = events.send(AgentEvent::GateResult {
                 gate: kind,
                 command: Some(command.to_string()),
@@ -237,6 +252,10 @@ impl Agent {
             return done;
         };
         if self.gates_skipped() {
+            // Counted when the turn changed files, as a test would have run; said once.
+            if self.turn_changed {
+                self.count_gate(GateStatus::Skipped);
+            }
             // Said once while the mode stays: one line after every reply is noise.
             if !std::mem::replace(&mut self.gate_skip_said, true) {
                 let _ = events.send(AgentEvent::GateResult {

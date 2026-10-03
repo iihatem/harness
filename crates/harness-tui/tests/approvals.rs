@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use harness_core::{
     agent::{Agent, AgentConfig, ApprovalDecision, ApprovalKind, ApprovalRequest},
     engine::{EngineConfig, PermissionEngine, RuleSet},
+    event::{AgentEvent, TurnEndReason},
     message::{Message, ToolSpec},
     permission::{Action, Mode},
     testing::{MockProvider, Script},
@@ -1109,5 +1110,57 @@ async fn keys_typed_ahead_do_not_answer_the_language_server_question() {
         answer.try_recv(),
         Ok(ApprovalDecision::Deny { feedback: None })
     );
+    ui.finish().await.unwrap();
+}
+
+// The language-server question and the offer to resume at a limit's reset both take `y` and `n`:
+// only one is armed at a time, and the second waits. The question came first, so it gets the
+// keys, and the offer shows and answers only once it is gone.
+#[tokio::test]
+async fn the_offer_to_resume_waits_while_the_language_server_question_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut answer, _requests) = asked_about_servers(dir.path());
+    until_server_question(&mut ui).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // A limit ended an earlier turn, and the offer is made while the question is open.
+    let app = ui.app_mut();
+    app.on_event(&AgentEvent::LimitReached {
+        resets_at: now + 1_800,
+    });
+    app.on_event(&AgentEvent::TurnFinished {
+        reason: TurnEndReason::Error,
+    });
+    ui.draw().unwrap();
+    let shown = screen(&ui).join("\n");
+    assert!(shown.contains(SERVERS_QUESTION), "{shown}");
+    // The question is what asks: the offer's line is not shown beside it.
+    assert!(
+        !shown.contains("answer y or n to resume automatically"),
+        "{shown}"
+    );
+    // `y` answers the question, not the offer.
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Char('y'));
+    assert_eq!(answer.try_recv(), Ok(ApprovalDecision::Approve));
+    assert!(
+        !ui.app().resume_waiting(),
+        "the offer was answered by the question's key"
+    );
+    // With the question gone the offer is what asks, after a fresh pause: a key at once is typing.
+    ui.draw().unwrap();
+    let shown = screen(&ui).join("\n");
+    assert!(
+        shown.contains("answer y or n to resume automatically"),
+        "{shown}"
+    );
+    press(&mut ui, KeyCode::Char('y'));
+    assert!(!ui.app().resume_waiting());
+    press(&mut ui, KeyCode::Backspace);
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Char('y'));
+    assert!(ui.app().resume_waiting());
     ui.finish().await.unwrap();
 }

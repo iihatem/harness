@@ -392,6 +392,8 @@ pub struct Agent {
     gates: Gates,
     /// Whether an edit tool changed a file in the current turn.
     turn_changed: bool,
+    /// How the gates of the current turn ended, for its outcome record.
+    gate_counts: GateCounts,
     /// Gate commands run so far, for their call ids.
     gate_calls: u64,
     /// What the end-of-turn test gate has done in the current turn.
@@ -447,6 +449,7 @@ impl Agent {
             model_chosen_by_user: false,
             gates: Gates::default(),
             turn_changed: false,
+            gate_counts: GateCounts::default(),
             gate_calls: 0,
             gate_turn: gates::GateTurn::default(),
             gate_skip_said: false,
@@ -490,7 +493,7 @@ impl Agent {
             finish_reason: reason.as_str().to_string(),
             started_at,
             ended_at: crate::time::now_unix(),
-            gates: GateCounts::default(),
+            gates: self.gate_counts,
         });
     }
 
@@ -1126,6 +1129,7 @@ impl Agent {
         self.turn_baseline = None;
         self.tested_tree = None;
         self.turn_changed = false;
+        self.gate_counts = GateCounts::default();
         self.gate_turn = gates::GateTurn::default();
         // Settings that apply to this turn only.
         self.turn_model = input.model.clone();

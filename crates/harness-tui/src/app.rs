@@ -777,6 +777,10 @@ impl App {
     fn resume_line(&self, theme: &Theme) -> Option<Line<'static>> {
         let now = (self.clock)();
         let text = match self.resume? {
+            // What asks first has the keys, and the offer waits behind it (the language-server
+            // question, an approval, a picker, a running turn): two prompts for `y` and `n`
+            // would not say which one a key answers.
+            Resume::Asking { .. } if !self.offer_active() => return None,
             Resume::Asking { .. } => "answer y or n to resume automatically".to_string(),
             Resume::Waiting { at, .. } => {
                 let left = at.saturating_sub(now);

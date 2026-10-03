@@ -226,36 +226,42 @@ async fn resume_without_another_session_says_so() {
 }
 
 // Review Focus: the chosen session is open in another harness process. Resuming it is refused,
-// and the session in use goes on as it was.
+// and the session in use goes on as it was. The error names the session's path, so where the
+// screen wraps it depends on how long that is (on the CI runners it fell inside the sentence):
+// the message is found whatever the width of the path.
 #[tokio::test]
 async fn a_session_another_process_holds_is_not_resumed() {
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = dir.path().join("sessions");
-    let old = saved(&sessions, dir.path(), &[("old question", "old answer")]);
-    // Another process has it open: the lock is held.
-    let (_held, _) = Session::open(&sessions.join(format!("{old}.jsonl"))).unwrap();
-    let provider = MockProvider::new(vec![Script::text("One."), Script::text("Two.")]);
-    let (mut ui, _log) = open(provider.clone(), &sessions, dir.path());
-    send(&mut ui, "the current session");
-    settle(&mut ui).await;
-    send(&mut ui, "/resume");
-    until_armed(&ui).await;
-    press(&mut ui, KeyCode::Enter);
-    settle(&mut ui).await;
-    assert!(
-        shows(&ui, "error: could not resume the session:")
-            && shows(&ui, "is open in another harness process"),
-        "{:#?}",
-        everything(&ui)
-    );
-    assert!(!ui.app().busy());
-    send(&mut ui, "still here");
-    settle(&mut ui).await;
-    assert_eq!(
-        user_messages(&provider),
-        ["the current session", "still here"]
-    );
-    ui.finish().await.unwrap();
+    for pad in (0..60).step_by(5) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("d".repeat(pad + 1));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sessions = dir.join("sessions");
+        let old = saved(&sessions, &dir, &[("old question", "old answer")]);
+        // Another process has it open: the lock is held.
+        let (_held, _) = Session::open(&sessions.join(format!("{old}.jsonl"))).unwrap();
+        let provider = MockProvider::new(vec![Script::text("One."), Script::text("Two.")]);
+        let (mut ui, _log) = open(provider.clone(), &sessions, &dir);
+        send(&mut ui, "the current session");
+        settle(&mut ui).await;
+        send(&mut ui, "/resume");
+        until_armed(&ui).await;
+        press(&mut ui, KeyCode::Enter);
+        settle(&mut ui).await;
+        assert!(
+            shows_wrapped(&ui, "error: could not resume the session:")
+                && shows_wrapped(&ui, "is open in another harness process"),
+            "{pad}: {:#?}",
+            everything(&ui)
+        );
+        assert!(!ui.app().busy());
+        send(&mut ui, "still here");
+        settle(&mut ui).await;
+        assert_eq!(
+            user_messages(&provider),
+            ["the current session", "still here"]
+        );
+        ui.finish().await.unwrap();
+    }
 }
 
 // The session picker takes keys once the user has paused, as an approval does: an Enter typed

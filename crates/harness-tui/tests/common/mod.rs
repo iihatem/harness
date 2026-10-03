@@ -114,6 +114,14 @@ pub fn shows(ui: &Ui<TestBackend>, text: &str) -> bool {
     everything(ui).iter().any(|row| row.contains(text))
 }
 
+/// Whether the screen and scrollback show `text`, whatever way they wrapped it: the rows are
+/// joined and runs of whitespace collapsed (a wrap at a space leaves none, or one).
+pub fn shows_wrapped(ui: &Ui<TestBackend>, text: &str) -> bool {
+    let joined = everything(ui).join(" ");
+    let flat = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.contains(text)
+}
+
 pub fn press(ui: &mut Ui<TestBackend>, code: KeyCode) {
     ui.handle(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
         .unwrap();

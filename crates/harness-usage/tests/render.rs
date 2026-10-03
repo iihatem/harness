@@ -30,6 +30,7 @@ fn an_empty_ledger_says_earlier_versions_are_not_included() {
         rows: Vec::new(),
         total: row("total", 0, money(0.0, 0), money(0.0, 0)),
         ledger_empty: true,
+        free: Default::default(),
     };
     let text = render(&report).join("\n");
     assert!(text.contains("No usage recorded yet"), "{text}");
@@ -49,6 +50,7 @@ fn a_row_shows_its_figures_and_what_has_no_price() {
         total: row("total", 14, money(1.7, 3), money(1.7, 3)),
         rows,
         ledger_empty: false,
+        free: Default::default(),
     };
     let lines = render(&report);
     let text = lines.join("\n");
@@ -80,6 +82,7 @@ fn small_amounts_keep_their_digits() {
         rows: vec![row("2026-10-02", 1, money(0.0013, 0), money(0.0013, 0))],
         total: row("total", 1, money(0.0013, 0), money(0.0013, 0)),
         ledger_empty: false,
+        free: Default::default(),
     };
     let text = render(&report).join("\n");
     assert!(text.contains("$0.0013"), "{text}");

@@ -268,6 +268,15 @@ fn pricing_problem(pricing: &BTreeMap<String, PriceSettings>) -> Option<String> 
     pricing.iter().find_map(|(key, price)| price.problem(key))
 }
 
+/// `[usage]`: how usage is shown.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageSettings {
+    /// The `<provider>/<model>` that "avoided" cost is measured against; none means no avoided
+    /// figure is shown.
+    pub baseline: Option<String>,
+}
+
 /// `[notifications]`: what the interactive session does when a long turn ends or an approval
 /// waits. A project may set it without trust: it changes nothing the agent may do.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -326,6 +335,8 @@ pub struct ConfigFile {
     pub notifications: NotificationSettings,
     #[serde(default)]
     pub pricing: BTreeMap<String, PriceSettings>,
+    #[serde(default)]
+    pub usage: UsageSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -360,6 +371,8 @@ pub struct Config {
     /// The user's prices by model-id glob (global config only: a project cannot make a model
     /// look free).
     pub pricing: BTreeMap<String, PriceSettings>,
+    /// `[usage]` (global config only).
+    pub usage: UsageSettings,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -627,6 +640,7 @@ pub fn load(
         cfg.linux_git_protection = global.sandbox.linux_git_protection.unwrap_or_default();
         cfg.profiles = global.profiles;
         cfg.pricing = global.pricing;
+        cfg.usage = global.usage;
         cfg.notifications = cfg.notifications.overlaid(&global.notifications);
     }
     let path = project_file(workspace);
@@ -645,6 +659,12 @@ pub fn load(
         if !project.pricing.is_empty() {
             cfg.warnings.push(format!(
                 "{}: ignoring [pricing]: prices are read from the global config only, so a cloned repository cannot make a model look free",
+                path.display()
+            ));
+        }
+        if project.usage != UsageSettings::default() {
+            cfg.warnings.push(format!(
+                "{}: ignoring [usage]: it is read from the global config only",
                 path.display()
             ));
         }

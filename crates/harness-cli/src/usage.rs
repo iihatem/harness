@@ -4,7 +4,7 @@
 use harness_usage::{
     date::is_date,
     paths::Dirs,
-    store::{Group, Query, Store, render},
+    store::{Group, Query, Store, avoided_line, render},
 };
 
 use crate::{setup, term::terminal_safe};
@@ -54,6 +54,13 @@ pub fn report(by: &str, since: Option<String>, until: Option<String>) -> u8 {
         Ok(report) => {
             for line in render(&report) {
                 println!("{}", terminal_safe(&line));
+            }
+            // Only with a baseline named: never a number without one.
+            if let Some(baseline) = &setup.config.usage.baseline {
+                let avoided = report.avoided(&crate::pricing::load(&setup), Some(baseline));
+                if let Some(line) = avoided_line(baseline, &avoided) {
+                    println!("{}", terminal_safe(&line));
+                }
             }
             0
         }

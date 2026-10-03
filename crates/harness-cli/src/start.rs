@@ -227,10 +227,11 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     .with_redactor(setup.redactor.clone())
     .with_session(session)
     .with_checkpoints(checkpoints)
-    .with_meter(Arc::new(harness_usage::meter::UsageMeter::open(
-        &setup.paths.data_dir,
-        &setup.workspace,
-    )));
+    .with_meter(Arc::new(
+        harness_usage::meter::UsageMeter::open(&setup.paths.data_dir, &setup.workspace)
+            .with_pricing(crate::pricing::load(setup))
+            .with_baseline(setup.config.usage.baseline.clone()),
+    ));
     if interactive {
         agent = agent.with_sandboxes(sandboxes);
     }

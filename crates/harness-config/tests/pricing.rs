@@ -62,3 +62,22 @@ fn a_project_config_cannot_set_prices() {
         cfg.warnings
     );
 }
+
+// `[usage] baseline` names the model "avoided" is measured against; global config only.
+#[test]
+fn the_baseline_is_read_from_the_global_config_only() {
+    let cfg = load(
+        "[usage]\nbaseline = \"openai/gpt-5\"\n",
+        Some("[usage]\nbaseline = \"openai/gpt-5-nano\"\n"),
+    )
+    .unwrap();
+    assert_eq!(cfg.usage.baseline.as_deref(), Some("openai/gpt-5"));
+    assert!(
+        cfg.warnings
+            .iter()
+            .any(|w| w.contains("[usage]") && w.contains("global config")),
+        "{:?}",
+        cfg.warnings
+    );
+    assert_eq!(load("", None).unwrap().usage.baseline, None);
+}

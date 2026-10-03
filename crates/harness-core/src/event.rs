@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::message::Usage;
+use crate::{message::Usage, meter::RequestCost};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +54,12 @@ pub enum AgentEvent {
     Usage {
         model: String,
         usage: Usage,
+    },
+    /// What a model request cost, right after it ended: billed, estimated at list price, and
+    /// (with a baseline named) avoided.
+    Metered {
+        model: String,
+        cost: RequestCost,
     },
     Retrying {
         attempt: u32,

@@ -13,7 +13,7 @@ use harness_core::{
     agent::NonInteractive,
     event::{AgentEvent, TurnEndReason},
     message::Usage,
-    meter::{Meter, RequestRecord},
+    meter::{AccountKind, Avoided, Meter, RequestCost, RequestRecord},
     permission::Mode,
     provider::{FinishReason, ProviderError, ProviderEvent},
     testing::{MockProvider, Script},
@@ -28,8 +28,14 @@ struct Recording {
 }
 
 impl Meter for Recording {
-    fn record_request(&self, request: &RequestRecord) {
+    fn record_request(&self, request: &RequestRecord) -> RequestCost {
         self.records.lock().unwrap().push(request.clone());
+        RequestCost {
+            account: AccountKind::ApiKey,
+            billed_usd: Some(0.25),
+            list_usd: Some(0.25),
+            avoided: Avoided::NotApplicable,
+        }
     }
 
     fn take_warnings(&self) -> Vec<String> {
@@ -217,4 +223,27 @@ fn failures_have_a_kind_for_the_ledger() {
         "context_overflow"
     );
     assert_eq!(ProviderError::Protocol("x".into()).kind(), "protocol");
+}
+
+// Each request's cost reaches the frontends as an event, after the request ended, so the status
+// line and `--json` can show it without a price table of their own.
+#[tokio::test]
+async fn a_request_s_cost_is_an_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![reply_with_usage(None, 100, 10)]);
+    let meter = Arc::new(Recording::default());
+    let mut agent =
+        agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path()).with_meter(meter.clone());
+    let (_, events) = run(&mut agent, "go").await;
+    let metered: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Metered { .. }))
+        .collect();
+    assert_eq!(metered.len(), 1, "{events:?}");
+    let AgentEvent::Metered { model, cost } = metered[0] else {
+        unreachable!()
+    };
+    assert_eq!(model, "mock/m1");
+    assert_eq!(cost.billed_usd, Some(0.25));
+    assert_eq!(cost.account, AccountKind::ApiKey);
 }

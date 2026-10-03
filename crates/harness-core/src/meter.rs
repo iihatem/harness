@@ -64,10 +64,35 @@ pub struct RequestRecord {
     pub outcome: String,
 }
 
+/// What the tokens avoided against a named baseline model, when there is one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Avoided {
+    /// Nothing to show: no baseline is named, or the request was paid for with an API key.
+    NotApplicable,
+    /// The baseline has no known price: shown as "price unknown", never as $0.
+    Unknown,
+    /// What the baseline would have charged for the tokens, in USD.
+    Usd(f64),
+}
+
+/// What one request cost, in the three figures that are never added together.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RequestCost {
+    pub account: AccountKind,
+    /// What was billed: the table price on an API-key account, 0 on a subscription or a local
+    /// one; `None` when the model has no price.
+    pub billed_usd: Option<f64>,
+    /// What the same tokens cost at the table's price (an estimate), 0 for a local model;
+    /// `None` when the model has no price.
+    pub list_usd: Option<f64>,
+    pub avoided: Avoided,
+}
+
 /// Where the runtime reports what each model request took. Implemented by `harness-usage`.
 pub trait Meter: Send + Sync {
-    /// Records `request`.
-    fn record_request(&self, request: &RequestRecord);
+    /// Records `request`, and says what it cost.
+    fn record_request(&self, request: &RequestRecord) -> RequestCost;
 
     /// What went wrong keeping the record, such as a ledger that cannot be written, each given
     /// once; the runtime shows them as warnings.

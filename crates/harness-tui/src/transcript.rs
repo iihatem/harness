@@ -260,6 +260,7 @@ impl Transcript {
             }
             AgentEvent::ApprovalNeeded { .. }
             | AgentEvent::Usage { .. }
+            | AgentEvent::Metered { .. }
             | AgentEvent::CheckpointCreated { .. } => {}
         }
     }

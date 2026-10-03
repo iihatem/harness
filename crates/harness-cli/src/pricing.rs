@@ -3,10 +3,32 @@
 
 use harness_usage::{
     paths::Dirs,
-    pricing::{self, MODELS_DEV_URL},
+    pricing::{self, MODELS_DEV_URL, Price, Pricing},
 };
 
-use crate::term::terminal_safe;
+use crate::{setup::Setup, term::terminal_safe};
+
+/// The price tables and the user's `[pricing]` overrides, for `setup`.
+pub fn load(setup: &Setup) -> Pricing {
+    let overrides = setup
+        .config
+        .pricing
+        .iter()
+        .map(|(glob, p)| {
+            (
+                glob.clone(),
+                Price {
+                    input: p.input,
+                    output: p.output,
+                    cache_read: p.cache_read,
+                    cache_write: p.cache_write,
+                    cache_write_1h: p.cache_write_1h,
+                },
+            )
+        })
+        .collect();
+    Pricing::load(&Dirs::under(&setup.paths.data_dir).pricing, overrides)
+}
 
 /// `harness pricing update`: fetches the table, stores it, and says how many models it prices.
 /// Exit code 1, with the old table left in place, when the fetch or the data is no good.

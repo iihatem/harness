@@ -356,3 +356,28 @@ fn pricing_is_listed_in_help() {
     let help = stdout(&run_usage(&env, &["pricing", "--help"]));
     assert!(help.contains("update"), "{help}");
 }
+
+// With a baseline named, `harness usage` shows what the tokens that ran on a local model would
+// have cost there; without one, no avoided figure.
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_shows_the_avoided_figure_only_with_a_baseline() {
+    let server = MockServer::start().await;
+    let config = "[usage]\nbaseline = \"openai/gpt-5\"\n[pricing.\"openai/gpt-5\"]\ninput = 2.0\noutput = 2.0\n";
+    let env = ask_twice(Env::new(&server.uri(), config), &server).await;
+    let with = stdout(&run_usage(&env, &["usage"]));
+    // 500 input and 30 output tokens, at $2 per million, are $0.00106.
+    assert!(with.contains("Avoided vs openai/gpt-5: $0.0011"), "{with}");
+    // The local server's own figures stay $0.00 billed and estimated.
+    let row = with
+        .lines()
+        .find(|l| l.starts_with("mock/test-model"))
+        .unwrap();
+    assert_eq!(row.matches("$0.00").count(), 2, "{row}");
+    std::fs::write(
+        env.home.path().join("config/config.toml"),
+        "[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"http://127.0.0.1:9/v1\"\n",
+    )
+    .unwrap();
+    let without = stdout(&run_usage(&env, &["usage"]));
+    assert!(!without.contains("Avoided"), "{without}");
+}

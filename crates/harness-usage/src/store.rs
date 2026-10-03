@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
 };
 
-use harness_core::time::civil_date;
+use harness_core::{message::Buckets, meter::Avoided, time::civil_date};
 use rusqlite::{Connection, params};
 
 use crate::{
@@ -120,6 +120,19 @@ pub struct Report {
     pub rows: Vec<Row>,
     pub total: Row,
     pub ledger_empty: bool,
+    /// The tokens that ran on local and subscription models, which "avoided" prices.
+    pub free: Buckets,
+}
+
+impl Report {
+    /// What the tokens that ran on local or subscription models would have cost on `baseline`,
+    /// at the table's price; `NotApplicable` without a baseline, `Unknown` when it has no price.
+    pub fn avoided(&self, pricing: &crate::pricing::Pricing, baseline: Option<&str>) -> Avoided {
+        match baseline {
+            Some(baseline) => crate::meter::avoided_for(pricing, baseline, &self.free),
+            None => Avoided::NotApplicable,
+        }
+    }
 }
 
 /// The cache, over the ledger it is built from.
@@ -292,6 +305,26 @@ impl Store {
             total.list.usd += row.list.usd;
             total.list.unknown += row.list.unknown;
         }
+        let free = self.db.query_row(
+            "SELECT COALESCE(SUM(input),0), COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0),
+                    COALESCE(SUM(cache_write_1h),0), COALESCE(SUM(output),0), COALESCE(SUM(reasoning),0)
+             FROM requests
+             WHERE account != 'api_key' AND (?1 IS NULL OR day >= ?1) AND (?2 IS NULL OR day <= ?2)",
+            params![query.since, query.until],
+            |r| {
+                let n = |i: usize| -> rusqlite::Result<u64> {
+                    Ok(r.get::<_, i64>(i)?.max(0) as u64)
+                };
+                Ok(Buckets {
+                    input: n(0)?,
+                    cache_read: n(1)?,
+                    cache_write: n(2)?,
+                    cache_write_1h: n(3)?,
+                    output: n(4)?,
+                    reasoning: n(5)?,
+                })
+            },
+        )?;
         let ledger_empty: i64 = self
             .db
             .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))?;
@@ -300,6 +333,7 @@ impl Store {
             rows,
             total,
             ledger_empty: ledger_empty == 0,
+            free,
         })
     }
 
@@ -456,4 +490,22 @@ pub fn render(report: &Report) -> Vec<String> {
         ));
     }
     lines
+}
+
+/// The line that shows the avoided figure, with the baseline it is measured against; `None` when
+/// there is nothing to show (no baseline is named).
+pub fn avoided_line(baseline: &str, avoided: &Avoided) -> Option<String> {
+    match avoided {
+        Avoided::NotApplicable => None,
+        Avoided::Unknown => Some(format!(
+            "Avoided vs {baseline}: price unknown (the baseline has no price; set one with [pricing])"
+        )),
+        Avoided::Usd(usd) => Some(format!(
+            "Avoided vs {baseline}: {} (tokens that ran on local or subscription models, at the baseline's list price; plan and hardware fees not counted)",
+            money_cell(&Money {
+                usd: *usd,
+                unknown: 0
+            })
+        )),
+    }
 }

@@ -432,7 +432,7 @@ impl Agent {
             Some(turn) => turn.options().local,
             None => self.config.request.local,
         };
-        meter.record_request(&RequestRecord {
+        let cost = meter.record_request(&RequestRecord {
             session: self.session.id().to_string(),
             role: MAIN_ROLE.to_string(),
             model: self.model_id().to_string(),
@@ -440,6 +440,10 @@ impl Agent {
             usage,
             duration: started.elapsed(),
             outcome,
+        });
+        let _ = events.send(AgentEvent::Metered {
+            model: self.model_id().to_string(),
+            cost,
         });
         for message in meter.take_warnings() {
             let _ = events.send(AgentEvent::Warning { message });

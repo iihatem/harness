@@ -6,6 +6,7 @@ pub mod date;
 pub mod error;
 pub mod export;
 pub mod ledger;
+pub mod lock;
 pub mod meter;
 pub mod outcomes;
 pub mod paths;

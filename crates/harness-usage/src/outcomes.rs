@@ -2,7 +2,7 @@
 //! in `outcomes/YYYY-MM.jsonl` (0600). Local, on by default, and separate from the ledger.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -110,7 +110,7 @@ impl OutcomeLog {
     /// Appends `record` to its month's file, creating it (0600) and the directory (0700).
     pub fn append(&self, record: &OutcomeRecord) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
-        crate::paths::create_private_dir(&self.dir)?;
+        let _lock = crate::lock::shared(&self.dir)?;
         let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
         line.push('\n');
         let mut file = std::fs::OpenOptions::new()
@@ -139,33 +139,68 @@ impl OutcomeLog {
         files
     }
 
-    /// Marks the records of `turns` of `session` as `rewound`, rewriting the files that hold them
-    /// through a temporary file.
-    pub fn mark_rewound(&self, session: &str, turns: &[String]) -> std::io::Result<()> {
-        let wanted: HashSet<&str> = turns.iter().map(String::as_str).collect();
+    /// Says the user rewound `turns` of `session`, at `now`: one amendment line each,
+    /// `{"kind":"signal","session":..,"turn":..,"signal":"rewound","t":..}`, appended to the
+    /// current month's file (0600). The records are not rewritten; readers apply the latest
+    /// signal for a turn (see `read`).
+    pub fn mark_rewound(&self, session: &str, turns: &[String], now: u64) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if turns.is_empty() {
+            return Ok(());
+        }
+        let _lock = crate::lock::shared(&self.dir)?;
+        let mut lines = String::new();
+        for turn in turns {
+            lines.push_str(
+                &serde_json::json!({
+                    "kind": "signal",
+                    "session": session,
+                    "turn": turn,
+                    "signal": "rewound",
+                    "t": now,
+                })
+                .to_string(),
+            );
+            lines.push('\n');
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(self.dir.join(format!("{}.jsonl", month_of(now))))?;
+        file.write_all(lines.as_bytes())
+    }
+
+    /// Every turn's record, oldest month first, each with the latest signal said for it: an
+    /// amendment line replaces the `user_signal` of the record of its session and turn, wherever
+    /// that record is. A line that is neither a record nor an amendment is skipped.
+    pub fn read(&self) -> Vec<OutcomeRecord> {
+        let mut records = Vec::new();
+        let mut signals: HashMap<(String, String), String> = HashMap::new();
         for path in self.files() {
-            let text = std::fs::read_to_string(&path)?;
-            let mut changed = false;
-            let mut out = String::with_capacity(text.len());
+            let text = std::fs::read_to_string(path).unwrap_or_default();
             for line in text.lines() {
-                match serde_json::from_str::<Value>(line) {
-                    Ok(mut value)
-                        if value["session"] == session
-                            && value["turn"].as_str().is_some_and(|t| wanted.contains(t))
-                            && value["user_signal"] != "rewound" =>
-                    {
-                        value["user_signal"] = Value::String("rewound".into());
-                        out.push_str(&value.to_string());
-                        changed = true;
+                let Ok(value) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if value["kind"] == "signal" {
+                    if let (Some(session), Some(turn), Some(signal)) = (
+                        value["session"].as_str(),
+                        value["turn"].as_str(),
+                        value["signal"].as_str(),
+                    ) {
+                        signals.insert((session.to_string(), turn.to_string()), signal.to_string());
                     }
-                    _ => out.push_str(line),
+                } else if let Ok(record) = serde_json::from_value::<OutcomeRecord>(value) {
+                    records.push(record);
                 }
-                out.push('\n');
-            }
-            if changed {
-                crate::export::replace_private(&path, out.as_bytes())?;
             }
         }
-        Ok(())
+        for record in &mut records {
+            if let Some(signal) = signals.get(&(record.session.clone(), record.turn.clone())) {
+                record.user_signal = signal.clone();
+            }
+        }
+        records
     }
 }

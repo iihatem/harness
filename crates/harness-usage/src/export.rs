@@ -175,6 +175,15 @@ fn usage_files(dirs: &Dirs) -> Vec<PathBuf> {
     files
 }
 
+/// The exclusive lock on `dir`, when there is a directory (nothing to lock, and nothing to
+/// forget, when there is not).
+fn lock_if_exists(dir: &Path) -> Result<Option<crate::lock::DirLock>> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    Ok(Some(crate::lock::exclusive(dir)?))
+}
+
 /// Deletes the ledger, window and outcome files before `before` (a UTC date), or all of them when
 /// `None`, then brings the report cache in line. A month that holds `before` loses only the
 /// records before it. Returns how many files were deleted or rewritten.
@@ -187,6 +196,10 @@ pub fn forget(dirs: &Dirs, before: Option<&str>) -> Result<usize> {
         })?),
         None => None,
     };
+    // The only rewriter of usage files: appends wait for these locks (usage first, then
+    // outcomes, always in that order) while it runs.
+    let _usage_lock = lock_if_exists(&dirs.usage)?;
+    let _outcomes_lock = lock_if_exists(&dirs.outcomes)?;
     let mut touched = 0;
     for path in usage_files(dirs) {
         let Some(cutoff) = cutoff else {
@@ -225,6 +238,7 @@ pub fn forget(dirs: &Dirs, before: Option<&str>) -> Result<usize> {
             touched += 1;
         }
     }
+    drop((_outcomes_lock, _usage_lock));
     // The cache follows the ledger: files that are gone or shorter are read again or forgotten.
     if dirs.usage.exists() {
         Store::open(dirs)?.sync()?;

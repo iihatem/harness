@@ -298,7 +298,7 @@ impl Meter for UsageMeter {
         if !self.outcomes_enabled || turns.is_empty() {
             return;
         }
-        if let Err(e) = self.outcomes.mark_rewound(session, turns) {
+        if let Err(e) = self.outcomes.mark_rewound(session, turns, (self.clock)()) {
             self.warn(format!(
                 "cannot update the outcome log in {}: {e}",
                 self.dirs.outcomes.display()

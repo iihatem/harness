@@ -72,10 +72,11 @@ impl Ledger {
     }
 
     /// Appends `record` to its month's file, creating the file (0600) and directory (0700) when
-    /// needed. One `write` of the whole line, so records from two processes do not mix.
+    /// needed. One `write` of the whole line, so records from two processes do not mix, under the
+    /// directory's lock taken shared (`forget` holds it exclusive while it rewrites).
     pub fn append(&self, record: &LedgerRecord) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
-        crate::paths::create_private_dir(&self.dir)?;
+        let _lock = crate::lock::shared(&self.dir)?;
         let path = self.file_for(record.t);
         let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
         line.push('\n');
@@ -94,7 +95,7 @@ impl Ledger {
         snapshot: &harness_core::meter::WindowSnapshot,
     ) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
-        crate::paths::create_private_dir(&self.dir)?;
+        let _lock = crate::lock::shared(&self.dir)?;
         let windows: Vec<serde_json::Value> = snapshot
             .windows
             .iter()

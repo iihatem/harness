@@ -144,7 +144,12 @@ fn forget_all_deletes_the_ledger_the_outcomes_and_the_windows() {
     forget(&dirs, None).unwrap();
     assert!(Ledger::new(&dirs.usage).files().is_empty());
     assert!(!dirs.usage.join("windows-2026-09.jsonl").exists());
-    assert!(std::fs::read_dir(&dirs.outcomes).map_or(true, |d| d.count() == 0));
+    // Only the empty lock file stays: deleting it under a process that waits on it would let two
+    // holders in.
+    assert!(
+        std::fs::read_dir(&dirs.outcomes)
+            .map_or(true, |d| d.flatten().all(|e| e.file_name() == ".lock"))
+    );
     let mut store = Store::open(&dirs).unwrap();
     store.sync().unwrap();
     let report = store.report(&Query::all(Group::Model)).unwrap();

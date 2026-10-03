@@ -7,7 +7,7 @@ use harness_core::{
     message::Usage,
     meter::{GateCounts, Meter, RequestRecord, TurnRecord},
 };
-use harness_usage::{ledger::Ledger, meter::UsageMeter, paths::Dirs};
+use harness_usage::{ledger::Ledger, meter::UsageMeter, outcomes::OutcomeLog, paths::Dirs};
 use serde_json::Value;
 
 /// 2026-10-02 12:00:00 UTC.
@@ -143,9 +143,10 @@ fn an_interrupted_turn_has_that_signal() {
     assert_eq!(records(data.path())[0]["user_signal"], "interrupted");
 }
 
-// The user rewinds to before a turn: that turn's record has user signal `rewound`.
+// The user rewinds to before a turn: an amendment line is appended and the turn's record is
+// not rewritten; readers see the turn as `rewound`.
 #[test]
-fn a_rewound_turn_is_marked_and_the_others_are_not() {
+fn a_rewound_turn_is_amended_by_a_line_and_the_records_are_not_rewritten() {
     let data = tempfile::tempdir().unwrap();
     let m = meter(data.path());
     m.record_turn(&turn("e1", "completed"));
@@ -153,17 +154,33 @@ fn a_rewound_turn_is_marked_and_the_others_are_not() {
     let mut other = turn("e2", "completed");
     other.session = "s2".into();
     m.record_turn(&other);
+    let file = Dirs::under(data.path()).outcomes.join("2026-10.jsonl");
+    let before = std::fs::read_to_string(&file).unwrap();
     m.turns_rewound("s1", &["e2".to_string()]);
-    let signals: Vec<(String, String, String)> = records(data.path())
-        .iter()
-        .map(|r| {
-            (
-                r["session"].as_str().unwrap().into(),
-                r["turn"].as_str().unwrap().into(),
-                r["user_signal"].as_str().unwrap().into(),
-            )
-        })
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        after.starts_with(&before),
+        "the earlier bytes are untouched"
+    );
+    let appended: Vec<Value> = after[before.len()..]
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
         .collect();
+    assert_eq!(appended.len(), 1);
+    assert_eq!(appended[0]["kind"], "signal");
+    assert_eq!(appended[0]["turn"], "e2");
+    assert_eq!(appended[0]["session"], "s1");
+    assert_eq!(appended[0]["signal"], "rewound");
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let signals: Vec<(String, String, String)> =
+        OutcomeLog::new(&Dirs::under(data.path()).outcomes)
+            .read()
+            .iter()
+            .map(|r| (r.session.clone(), r.turn.clone(), r.user_signal.clone()))
+            .collect();
     assert_eq!(
         signals,
         [
@@ -172,11 +189,30 @@ fn a_rewound_turn_is_marked_and_the_others_are_not() {
             ("s2".into(), "e2".into(), "continued".into()),
         ]
     );
-    let file = Dirs::under(data.path()).outcomes.join("2026-10.jsonl");
+}
+
+// A rewind in a later month is appended to that month's file, and readers apply it to the record
+// in the earlier month's file.
+#[test]
+fn a_rewind_in_a_later_month_lands_in_the_current_file_and_applies_across_files() {
+    let data = tempfile::tempdir().unwrap();
+    meter(data.path()).record_turn(&turn("e1", "completed"));
+    let november = OCTOBER + 40 * 86_400;
+    UsageMeter::open(data.path(), data.path())
+        .with_clock(Arc::new(move || november))
+        .turns_rewound("s1", &["e1".to_string()]);
+    let outcomes = Dirs::under(data.path()).outcomes;
+    assert!(outcomes.join("2026-11.jsonl").exists());
     assert_eq!(
-        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-        0o600
+        std::fs::read_to_string(outcomes.join("2026-10.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
     );
+    let read = OutcomeLog::new(&outcomes).read();
+    assert_eq!(read.len(), 1, "an amendment is not a record");
+    assert_eq!(read[0].user_signal, "rewound");
 }
 
 // `[outcomes] enabled = false` and a turn finishes: no file under `outcomes/` is created or

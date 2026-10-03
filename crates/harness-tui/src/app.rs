@@ -437,6 +437,9 @@ pub struct App {
     plan_note_pending: bool,
     /// A plan waiting for the user's choice.
     plan_choice: Option<PlanChoice>,
+    /// The plan a build turn implements, until the model has answered: a turn that ends in an
+    /// error before then leaves it approved, and the choice comes back.
+    building: Option<PlanChoice>,
     /// The model the session uses, until it has answered once.
     unproven: Option<Unproven>,
     /// When the running turn started.
@@ -522,6 +525,7 @@ impl App {
             default_mode: options.default_mode,
             plan_note_pending: options.mode == Mode::Plan,
             plan_choice: None,
+            building: None,
             unproven: None,
             turn_started: None,
             notifications: Vec::new(),
@@ -1169,6 +1173,16 @@ impl App {
 
     /// Takes in an event from the agent that came at `now`.
     pub fn on_event_at(&mut self, event: &AgentEvent, now: Instant) {
+        // Once the model has answered, the build is under way, whatever becomes of it.
+        if matches!(
+            event,
+            AgentEvent::TextDelta { .. }
+                | AgentEvent::AssistantMessage { .. }
+                | AgentEvent::ToolCallRequested { .. }
+                | AgentEvent::Usage { .. }
+        ) {
+            self.building = None;
+        }
         match event {
             AgentEvent::TurnStarted => {
                 self.last_reply.clear();
@@ -1261,6 +1275,13 @@ impl App {
                 self.notifications
                     .push(format!("{how} after {}", notify::duration(took)));
             }
+        }
+        // A build that never reached the model leaves the plan approved: Build can be chosen again.
+        if let Some(choice) = self.building.take()
+            && reason == TurnEndReason::Error
+        {
+            self.plan_choice = Some(choice);
+            self.arming = Arming::default();
         }
         if reason == TurnEndReason::Completed
             && self.mode == Mode::Plan
@@ -1430,6 +1451,7 @@ impl App {
             }
             Choice::Build => {
                 let choice = self.plan_choice.take()?;
+                self.building = Some(choice.clone());
                 let mode = self.mode_before_plan.take().unwrap_or(self.default_mode);
                 self.mode = mode;
                 self.transcript

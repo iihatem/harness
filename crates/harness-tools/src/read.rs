@@ -14,6 +14,10 @@ const BYTE_BUDGET: usize = 8_000;
 
 pub struct ReadTool;
 
+/// `read` for the `hashline` edit format: each line starts with its address (see
+/// [`crate::hashline`]).
+pub struct HashlineReadTool;
+
 /// A file is treated as binary when its first 8 KB contain a NUL byte.
 pub fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
@@ -43,6 +47,31 @@ impl Tool for ReadTool {
     }
 
     async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
+        render(args, ctx, false).await
+    }
+}
+
+#[async_trait]
+impl Tool for HashlineReadTool {
+    fn spec(&self) -> ToolSpec {
+        let mut spec = ReadTool.spec();
+        spec.description = "Read a text file. Each line starts with its address (number#hash) for hashline_edit; use offset (1-based) and limit to page through large files.".into();
+        spec
+    }
+
+    fn action(&self, args: &Value, ctx: &ToolContext) -> Action {
+        ReadTool.action(args, ctx)
+    }
+
+    async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
+        render(args, ctx, true).await
+    }
+}
+
+/// Reads the file `args` names, with the lines' addresses in place of their numbers when
+/// `hashline`.
+async fn render(args: Value, ctx: &ToolContext, hashline: bool) -> ToolOutput {
+    {
         let path = ctx.resolve(args["path"].as_str().unwrap_or_default());
         let bytes = match tokio::fs::read(&path).await {
             Ok(bytes) => bytes,
@@ -68,9 +97,12 @@ impl Tool for ReadTool {
         for (index, line) in lines.iter().enumerate().skip(offset - 1).take(limit) {
             let formatted = if line.chars().count() > MAX_LINE_CHARS {
                 let truncated: String = line.chars().take(MAX_LINE_CHARS).collect();
-                format!("{:>6}\t{truncated} [line truncated]\n", index + 1)
+                format!(
+                    "{}\t{truncated} [line truncated]\n",
+                    label(index + 1, line, hashline)
+                )
             } else {
-                format!("{:>6}\t{line}\n", index + 1)
+                format!("{}\t{line}\n", label(index + 1, line, hashline))
             };
             // Always show at least one line, even if that line alone exceeds the budget.
             if shown > 0 && out.len() + formatted.len() > BYTE_BUDGET {
@@ -100,5 +132,14 @@ impl Tool for ReadTool {
             );
         }
         ToolOutput::ok(out)
+    }
+}
+
+/// What starts a line of output: its number, or its address.
+fn label(number: usize, line: &str, hashline: bool) -> String {
+    if hashline {
+        format!("{:>10}", crate::hashline::address(number, line))
+    } else {
+        format!("{number:>6}")
     }
 }

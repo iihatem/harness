@@ -57,7 +57,8 @@ fn log(line: &str) {
             .append(true)
             .open(path)
             .unwrap();
-        writeln!(file, "{line}").unwrap();
+        // One write, so lines of servers sharing the log never interleave.
+        file.write_all(format!("{line}\n").as_bytes()).unwrap();
     }
 }
 

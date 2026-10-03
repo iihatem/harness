@@ -76,6 +76,11 @@ impl ReadTracker {
             .insert(path.to_path_buf(), Self::hash(bytes));
     }
 
+    /// Whether the file was read in this session, whether or not it changed since.
+    pub fn was_read(&self, path: &Path) -> bool {
+        self.hashes.lock().expect("tracker lock").contains_key(path)
+    }
+
     /// `Ok` if the file was read in this session and is unchanged on disk since.
     pub fn check_fresh(&self, path: &Path, current: &[u8]) -> Result<(), String> {
         match self.hashes.lock().expect("tracker lock").get(path) {

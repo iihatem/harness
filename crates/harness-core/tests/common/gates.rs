@@ -201,3 +201,28 @@ pub fn agent(
     )
     .with_gates(setup.gates)
 }
+
+/// [`agent`], with no `bash` tool at all.
+pub fn agent_without_bash(
+    provider: Arc<MockProvider>,
+    dir: &std::path::Path,
+    setup: Setup,
+) -> Agent {
+    let policy = Arc::new(PermissionEngine::new(EngineConfig {
+        mode: setup.mode,
+        workspace: dir.to_path_buf(),
+        read_dirs: vec![],
+        rules: setup.rules,
+        sandbox_available: true,
+        writes_need_approval: false,
+    }));
+    Agent::new(
+        provider,
+        ToolRegistry::new(vec![Arc::new(Edit)]),
+        policy,
+        setup.approver,
+        AgentConfig::new("mock/m1", "m1", "system prompt", dir.join(".spill")),
+        ToolContext::new(dir).with_sandbox(None, setup.mode.fs_access()),
+    )
+    .with_gates(setup.gates)
+}

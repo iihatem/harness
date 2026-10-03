@@ -259,3 +259,18 @@ fn the_edit_tool_is_a_write_and_names_its_file() {
     assert_eq!(HashlineEditTool.spec().name, "hashline_edit");
     assert_eq!(HashlineReadTool.spec().name, "read");
 }
+
+// Review Focus: a file with Windows line endings keeps them.
+#[tokio::test]
+async fn a_crlf_file_keeps_its_line_endings() {
+    let (_dir, ctx) = setup();
+    put(&ctx, "f.txt", "a\r\nb\r\nc\r\n");
+    read(&ctx, "f.txt").await;
+    let out = edit(
+        &ctx,
+        json!({"path": "f.txt", "start": address(2, "b"), "new_text": "B\nB2"}),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(text(&ctx, "f.txt"), "a\r\nB\r\nB2\r\nc\r\n");
+}

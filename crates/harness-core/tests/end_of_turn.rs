@@ -6,7 +6,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{
-    gates::{ScriptedBash, Setup, agent, failing, passing},
+    gates::{ScriptedBash, Setup, agent, agent_without_bash, failing, passing},
     run, run_with,
 };
 use harness_core::{
@@ -410,4 +410,27 @@ async fn the_next_turn_does_not_inherit_the_changes() {
     run(&mut agent, "change it").await;
     run(&mut agent, "what is 2+2").await;
     assert_eq!(ran.commands(), [TEST]);
+}
+
+// Review Focus: gates configured for a session with no `bash` tool cannot run, and do not break it.
+#[tokio::test]
+async fn gates_with_no_bash_tool_run_nothing_and_the_turn_goes_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![edit("e1"), Script::text("done")]);
+    let mut agent = agent_without_bash(
+        provider,
+        dir.path(),
+        Setup {
+            gates: Gates {
+                after_edit: Some("lint".into()),
+                test: Some(TEST.into()),
+                ..Gates::default()
+            },
+            ..Setup::default()
+        },
+    );
+    let (reason, events) = run(&mut agent, "change it").await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert_eq!(common::finished_outputs(&events)[0].0, "edited");
+    assert!(test_results(&events).is_empty());
 }

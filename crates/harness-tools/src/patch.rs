@@ -290,6 +290,17 @@ fn find(lines: &[&str], wanted: &[&str], from: usize, at_end: bool) -> Option<(u
     None
 }
 
+/// The line ending a file is written back with: `\r\n` when every line break in it is one, else
+/// `\n` (a file of mixed endings gets plain ones).
+pub fn line_ending(text: &str) -> &'static str {
+    let breaks = text.matches('\n').count();
+    if breaks > 0 && text.matches("\r\n").count() == breaks {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
 fn indent(line: &str) -> &str {
     &line[..line.len() - line.trim_start().len()]
 }
@@ -372,9 +383,10 @@ pub fn apply_hunks(path: &str, original: &str, hunks: &[Hunk]) -> Result<String,
         pos = at;
     }
     out.extend(lines[pos..].iter().map(|l| l.to_string()));
-    let mut text = out.join("\n");
+    let eol = line_ending(original);
+    let mut text = out.join(eol);
     if ends_with_newline && !out.is_empty() {
-        text.push('\n');
+        text.push_str(eol);
     }
     Ok(text)
 }

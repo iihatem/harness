@@ -196,3 +196,37 @@ async fn a_new_session_resets_the_servers_and_closing_shuts_them_down() {
     agent.close().await;
     assert_eq!(*fake.shutdowns.lock().unwrap(), 1);
 }
+
+/// Never answers in time.
+struct Slow;
+
+#[async_trait]
+impl Diagnostics for Slow {
+    async fn after_edit(&self, _edited: &EditedFiles<'_>) -> Option<String> {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        Some("[diagnostics: too late]".into())
+    }
+    fn reset(&self) {}
+    async fn shutdown(&self) {}
+}
+
+// Review Focus: Esc during the wait for a language server stops the turn at once.
+#[tokio::test]
+async fn stopping_the_turn_does_not_wait_for_a_language_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bash, _) = ScriptedBash::new(vec![]);
+    let mut agent =
+        agent(edits(), dir.path(), bash, Setup::default()).with_diagnostics(Arc::new(Slow));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stop = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stop.cancel();
+    });
+    let started = std::time::Instant::now();
+    let (reason, events) = common::run_with(&mut agent, "edit", cancel).await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(reason, harness_core::event::TurnEndReason::Interrupted);
+    // The edit itself was done, and its result says no more.
+    assert_eq!(finished_outputs(&events)[0].0, "edited");
+}

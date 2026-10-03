@@ -131,9 +131,10 @@ impl Tool for HashlineEditTool {
         let mut result: Vec<&str> = lines[..start.0 - 1].to_vec();
         result.extend(&replacement);
         result.extend(&lines[end.0..]);
-        let mut updated = result.join("\n");
+        let eol = crate::patch::line_ending(&text);
+        let mut updated = result.join(eol);
         if text.ends_with('\n') && !result.is_empty() {
-            updated.push('\n');
+            updated.push_str(eol);
         }
         if let Err(e) = tokio::fs::write(&path, &updated).await {
             return ToolOutput::error(format!("cannot write {}: {e}", path.display()));

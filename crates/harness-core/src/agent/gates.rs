@@ -111,7 +111,12 @@ impl Agent {
                 access: self.ctx.access,
                 unsandboxed_ok: self.policy.mode() == Some(Mode::FullAccess),
             };
-            if let Some(said) = diagnostics.after_edit(&edited).await {
+            // Esc does not wait for a language server.
+            let said = tokio::select! {
+                said = diagnostics.after_edit(&edited) => said,
+                () = self.ctx.cancel.cancelled() => None,
+            };
+            if let Some(said) = said {
                 checks.push(said);
             }
         }

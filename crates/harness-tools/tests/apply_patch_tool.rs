@@ -391,3 +391,18 @@ fn the_definition_names_the_format_and_stays_small() {
     };
     assert!(props.contains_key("input"));
 }
+
+// Review Focus: a path that goes through a link out of the workspace is checked where it leads.
+#[tokio::test]
+async fn a_path_through_a_link_that_leaves_the_workspace_is_a_write_there() {
+    let (dir, ctx) = setup();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_path = outside.path().canonicalize().unwrap();
+    std::os::unix::fs::symlink(&outside_path, ctx.workspace.join("link")).unwrap();
+    let args = json!({"input": wrap("*** Add File: link/x.txt\n+y\n")});
+    let actions = ApplyPatchTool.actions(&args, &ctx);
+    assert_eq!(actions, [Action::Write(outside_path.join("x.txt"))]);
+    // That is outside the workspace, so even in `auto` mode it is not simply allowed.
+    let policy = engine(Mode::Auto, dir.path());
+    assert!(!matches!(policy.check(&actions[0]), Decision::Allow));
+}

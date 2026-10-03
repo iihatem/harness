@@ -164,3 +164,23 @@ async fn a_turn_that_ends_on_a_gate_failure_shows_the_last_failure() {
     assert!(!ui.app().transcript.busy());
     ui.finish().await.unwrap();
 }
+
+// Review Focus: terminal escapes in a failing command's output are not passed to the terminal.
+#[tokio::test]
+async fn escapes_in_a_gate_failure_do_not_reach_the_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = script();
+    let agent = agent(provider, dir.path(), Mode::Auto).with_gates(Gates {
+        test: Some(r"printf '\033[31mRED\033[0m \033]0;owned\007 end\n'; exit 1".into()),
+        ..Gates::default()
+    });
+    let (mut ui, _) = start(agent, Box::new(NoCommands), options(dir.path(), Mode::Auto));
+    type_text(&mut ui, "write a.txt");
+    press(&mut ui, KeyCode::Enter);
+    settle(&mut ui).await;
+    assert!(shows(&ui, "RED"), "{:#?}", screen(&ui));
+    for row in common::everything(&ui) {
+        assert!(!row.contains('\u{1b}') && !row.contains('\u{7}'), "{row:?}");
+    }
+    ui.finish().await.unwrap();
+}

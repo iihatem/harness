@@ -235,3 +235,19 @@ fn a_header_that_does_not_occur_is_an_error() {
 fn removing_lines_to_nothing_and_an_empty_result_work() {
     assert_eq!(applied("a\n", "@@\n-a\n").unwrap(), "");
 }
+
+// Review Focus: a file with Windows line endings keeps them.
+#[test]
+fn a_crlf_file_keeps_its_line_endings() {
+    assert_eq!(
+        applied("a\r\nb\r\nc\r\n", "@@\n a\n-b\n+B\n+B2\n c\n").unwrap(),
+        "a\r\nB\r\nB2\r\nc\r\n"
+    );
+    // Without a final line ending too.
+    assert_eq!(applied("a\r\nb", "@@\n-b\n+B\n").unwrap(), "a\r\nB");
+}
+
+#[test]
+fn a_file_of_mixed_line_endings_is_written_with_plain_ones() {
+    assert_eq!(applied("a\r\nb\nc\n", "@@\n-b\n+B\n").unwrap(), "a\nB\nc\n");
+}

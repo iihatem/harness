@@ -25,6 +25,11 @@ tokio-util.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
+# crossterm's default input source on Linux (mio, edge-triggered, 1 KiB a read) leaves keys
+# waiting in the terminal until more arrive; `/dev/tty` polled by level does not.
+[target.'cfg(target_os = "linux")'.dependencies]
+crossterm = { workspace = true, features = ["use-dev-tty"] }
+
 [dev-dependencies]
 harness-tools.workspace = true
 tempfile.workspace = true

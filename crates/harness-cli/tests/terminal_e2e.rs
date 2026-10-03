@@ -662,7 +662,10 @@ fn dragged(i: usize) -> (u16, u16) {
 // resizes 50 ms apart, as a window's corner is dragged.
 #[test]
 fn resizes_never_end_the_session() {
-    let provider = Provider::start(vec![Reply::numbered(80, 30, Duration::from_millis(40))]);
+    let provider = Provider::start(vec![
+        Reply::numbered(80, 30, Duration::from_millis(40)),
+        Reply::text("pong"),
+    ]);
     let env = Env::new(&provider);
     let mut session = Session::start(
         &env,
@@ -697,6 +700,19 @@ fn resizes_never_end_the_session() {
     session.wait_for("NUM-080", Duration::from_secs(30));
     std::thread::sleep(Duration::from_millis(300));
     assert!(session.alive());
+    // What is typed right after the resizes arrives by itself, without another key to push it
+    // through (the answers to the cursor queries a resize makes come with the keys).
+    session.resize(70, 20);
+    session.type_keys(b"ping\r");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while provider.requests().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the message typed after the resizes never arrived:\n{}",
+            session.shown()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     session.quit();
 }
 
@@ -786,11 +802,8 @@ fn keys_typed_while_harness_starts_are_drawn_at_once() {
 // Review D N6: 3,000 plain keys at once (`tmux send-keys`, or a paste into a terminal without
 // bracketed paste) all arrive, whole, and harness does not spin after them.
 //
-// On macOS they arrive within a second. On Linux (final review I1), crossterm is told of the
-// terminal's bytes only as more arrive (epoll, edge-triggered) and reads 1 KiB at a time, so the
-// rest of the burst can stall in the terminal until more keys come, each letting up to 1 KiB
-// more through: a limitation M1 keeps, and documents. There harness must not spin while the rest
-// waits, and nothing may be lost once more keys are sent (a harmless Enter, on an empty input).
+// On Linux harness reads the terminal level-triggered (crossterm's `use-dev-tty`), so what a
+// read of 1 KiB leaves waiting is taken in at once, as on macOS (final review I1).
 #[test]
 fn a_burst_of_keys_arrives_whole_and_nothing_spins() {
     let provider = Provider::start(Vec::new());
@@ -801,27 +814,6 @@ fn a_burst_of_keys_arrives_whole_and_nothing_spins() {
     let typed = "x".repeat(3000);
     let sent = Instant::now();
     session.type_keys(format!("{typed}\r").as_bytes());
-    if cfg!(target_os = "linux") {
-        std::thread::sleep(Duration::from_millis(300));
-        let before = session.cpu();
-        std::thread::sleep(Duration::from_secs(2));
-        let spent = session.cpu().saturating_sub(before);
-        assert!(
-            spent < Duration::from_millis(500),
-            "{spent:?} of CPU in 2 s while the rest of the burst waited"
-        );
-        let mut more = 0;
-        while provider.requests().is_empty() {
-            assert!(
-                more < 10,
-                "the keys were not all taken in after {more} more:\n{}",
-                session.shown()
-            );
-            session.type_keys(b"\r");
-            more += 1;
-            std::thread::sleep(Duration::from_millis(300));
-        }
-    }
     while provider.requests().is_empty() {
         assert!(
             sent.elapsed() < Duration::from_secs(1),

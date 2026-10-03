@@ -8,13 +8,13 @@
 //! ends when it hangs up: a wakeup that finds nothing to read is not its end. While an editor has
 //! the terminal, the reader stops reading, so the keys go to the editor.
 //!
-//! On Linux, crossterm is told of the terminal's bytes only as more arrive (its readiness is
-//! edge-triggered), and reads 1 KiB of them at a time: the rest of a longer burst of keys (a
-//! paste without bracketed paste, `tmux send-keys`) stalls in the terminal until the next key.
-//! The reader does not spin meanwhile, and what comes after a stall counts as read when the stall
-//! began: it was typed then, before any prompt that appeared meanwhile, so it never answers one.
-//! Nor is the terminal asked where its cursor is during a stall, as its answer would come behind
-//! the keys waiting.
+//! On Linux crossterm reads the terminal level-triggered (its `use-dev-tty` input source), so
+//! what a read of 1 KiB leaves waiting is read at once. Were bytes ever to wait without crossterm
+//! being told (a stall), the reader does not spin meanwhile, and what comes after counts as read
+//! when the stall began: it was typed then, before any prompt that appeared meanwhile, so it
+//! never answers one. Nor is the terminal asked where its cursor is during a stall, as its answer
+//! would come behind the keys waiting. This is a safety net: macOS, whose mio source is not
+//! edge-triggered in this way, does not need it either.
 //!
 //! A resize is taken from SIGWINCH as the session next looks at its input, rather than from the
 //! reader, so that the next draw already uses the new size.
@@ -272,9 +272,20 @@ trait Source {
 /// crossterm's reader of the process's terminal.
 struct Crossterm;
 
+/// How long crossterm is given to find what the terminal has, in `Source::next`. On Linux
+/// crossterm reads the terminal level-triggered (`use-dev-tty`), and only looks at it when polled
+/// for a time: a zero timeout returns what it parsed already and never reads. So it is given a
+/// moment there, which is also what bytes left from a read of 1 KiB are taken in with. macOS
+/// reads through mio, which a zero timeout does serve.
+const LOOK: Duration = if cfg!(target_os = "linux") {
+    Duration::from_millis(2)
+} else {
+    Duration::ZERO
+};
+
 impl Source for Crossterm {
     fn next(&mut self) -> io::Result<Option<Event>> {
-        if event::poll(Duration::ZERO)? {
+        if event::poll(LOOK)? {
             event::read().map(Some)
         } else {
             Ok(None)

@@ -106,6 +106,7 @@ fn turn(id: &str) -> TurnRecord {
         started_at: NOW - 1,
         ended_at: NOW,
         gates: GateCounts::default(),
+        handoff: None,
     }
 }
 

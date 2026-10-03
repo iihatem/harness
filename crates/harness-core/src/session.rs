@@ -15,7 +15,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{compaction, message::Message, redact::Redactor, time};
+use crate::{
+    compaction,
+    message::Message,
+    redact::Redactor,
+    role::{Handoff, Role, SwitchReason},
+    time,
+};
 
 /// The session file format written by this version. Version 2 added the workspace of each
 /// checkpoint: a harness that reads version 1 only would restore them in the wrong place. A file
@@ -53,6 +59,10 @@ pub enum EntryKind {
         /// that does not know the field ignores it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan: Option<String>,
+        /// For an assistant message, the role it was written for and why its model is not the
+        /// role's, when it is not. A harness that does not know the field ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attribution: Option<Attribution>,
     },
     /// A summary that replaces the conversation before `first_kept` (all of it when `None`) on
     /// this branch. The summarized entries stay in the file.
@@ -91,6 +101,18 @@ pub enum EntryKind {
     /// refuses the file, as it refuses a newer header. It hangs off the leaf it was written
     /// after, without becoming the leaf.
     Version { version: u32 },
+}
+
+/// Which role an assistant message was written for, and why its model is not the one that role is
+/// configured to use; for a Build message, its hand-off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attribution {
+    pub role: Role,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_reason: Option<SwitchReason>,
+    /// On the message that asks to build a plan: how the turn got the conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
 }
 
 /// What a rewind restores.

@@ -38,7 +38,7 @@ pub async fn run(
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("failed to install a SIGINT handler");
     let setup = match setup::load() {
-        Ok(setup) => setup,
+        Ok(setup) => Arc::new(setup),
         Err(message) => {
             eprintln!("error: {}", terminal_safe(&message));
             return 2;
@@ -61,7 +61,7 @@ pub async fn run(
             return 2;
         }
     };
-    let Some(model_id) = model_flag.or_else(|| setup.config.model.clone()) else {
+    let Some(model_id) = crate::start::configured_model(&setup, model_flag) else {
         eprintln!("error: no model configured.");
         let found = models::available(&setup).await;
         credential_warnings(&setup, &mut notices);
@@ -496,6 +496,40 @@ impl Shown {
                 if let Some(tail) = tail {
                     eprintln!("{}", terminal_safe_text(tail.trim_end()));
                 }
+            }
+            AgentEvent::ModelSwitched {
+                from,
+                to,
+                role,
+                reason,
+                detail,
+            } if !json => {
+                eprintln!(
+                    "{}",
+                    terminal_safe(&harness_core::role::switched_text(
+                        from,
+                        to,
+                        *role,
+                        *reason,
+                        detail.as_deref()
+                    ))
+                );
+            }
+            AgentEvent::HandoffReduced {
+                to,
+                history_tokens,
+                window,
+                forced,
+            } if !json => {
+                eprintln!(
+                    "warning: {}",
+                    terminal_safe(&harness_core::role::handoff_reduced_text(
+                        to,
+                        *history_tokens,
+                        *window,
+                        *forced
+                    ))
+                );
             }
             AgentEvent::Error { message, .. } if !json => {
                 eprintln!("error: {}", terminal_safe(message))

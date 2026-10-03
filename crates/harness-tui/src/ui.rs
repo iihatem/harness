@@ -15,6 +15,7 @@ use harness_core::{
     meter::WindowSnapshot,
     provider::Provider,
     redact::{EventRedactor, Redactor},
+    role::{Role, SwitchReason},
     session::{RewindScope, Session},
     turn::TurnInput,
 };
@@ -105,6 +106,11 @@ enum Job {
     SwitchModel {
         model: Box<SessionModel>,
         window_note: String,
+        reason: SwitchReason,
+    },
+    SetRole {
+        role: Role,
+        id: String,
     },
 }
 
@@ -113,7 +119,16 @@ enum Background {
     /// The models the host found.
     Models(Vec<String>),
     /// The model to switch to, made ready, or why it could not be.
-    Switch(Result<ModelSwitch, String>),
+    Switch {
+        reason: SwitchReason,
+        result: Result<ModelSwitch, String>,
+    },
+    /// Whether the model asked for a role can be used.
+    RoleChecked {
+        role: Role,
+        id: String,
+        result: Result<(), String>,
+    },
     /// The session to continue in, opened, or why it could not be.
     Session {
         resumed: bool,
@@ -141,6 +156,8 @@ enum Background {
 /// the job ended when that has something to tell.
 struct Update {
     context: ContextUsage,
+    /// Each role's model and where it came from.
+    roles: Vec<harness_core::role::RoleLine>,
     /// What the conversation can be rewound to, and whether the last rewind can be undone.
     rewind: (Vec<RewindPoint>, bool),
     /// The session the agent continues in.
@@ -207,6 +224,7 @@ where
         let provider = agent.provider();
         let agent = agent.with_steering(app.steering());
         app.set_context(agent.context_usage());
+        app.set_roles(agent.role_lines());
         app.set_rewind(agent.rewind_points(), agent.can_undo_rewind());
         app.set_session_id(agent.session().id());
         let runner = tokio::spawn(async move {
@@ -248,8 +266,28 @@ where
                             result: Ok(view),
                         })
                     }
-                    Job::SwitchModel { model, window_note } => {
-                        agent.switch_model(*model);
+                    Job::SetRole { role, id } => {
+                        let from = agent.role_model_id(role);
+                        agent.set_role_model(role, &id);
+                        let _ = events_tx.send(AgentEvent::ModelSwitched {
+                            from,
+                            to: id.clone(),
+                            role,
+                            reason: harness_core::role::SwitchReason::User,
+                            detail: None,
+                        });
+                        Some(Done::Role {
+                            role,
+                            id,
+                            result: Ok(()),
+                        })
+                    }
+                    Job::SwitchModel {
+                        model,
+                        window_note,
+                        reason,
+                    } => {
+                        let _ = events_tx.send(agent.switch_model_as(*model, reason));
                         let view = ModelView {
                             id: agent.model_id().to_string(),
                             window_note,
@@ -259,6 +297,7 @@ where
                 };
                 let _ = updates_tx.send(Update {
                     context: agent.context_usage(),
+                    roles: agent.role_lines(),
                     rewind: (agent.rewind_points(), agent.can_undo_rewind()),
                     session: agent.session().id().to_string(),
                     done,
@@ -462,13 +501,27 @@ where
                 });
                 Flow::Continue
             }
-            Action::SwitchModel(id) => {
+            Action::SwitchModel { id, reason } => {
                 let cancel = CancellationToken::new();
                 self.cancel = Some(cancel.clone());
                 let switch = self.app.host().switch_model(&id, cancel);
                 let tx = self.background_tx.clone();
                 tokio::spawn(async move {
-                    let _ = tx.send(Background::Switch(switch.await));
+                    let _ = tx.send(Background::Switch {
+                        reason,
+                        result: switch.await,
+                    });
+                });
+                Flow::Continue
+            }
+            Action::SetRole { role, id } => {
+                let cancel = CancellationToken::new();
+                self.cancel = Some(cancel.clone());
+                let check = self.app.host().check_model(&id, cancel);
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let result = check.await;
+                    let _ = tx.send(Background::RoleChecked { role, id, result });
                 });
                 Flow::Continue
             }
@@ -736,6 +789,7 @@ where
             self.show(event);
         }
         self.app.set_context(update.context);
+        self.app.set_roles(update.roles);
         let (points, can_undo) = update.rewind;
         self.app.set_rewind(points, can_undo);
         self.app.set_session_id(&update.session);
@@ -784,7 +838,10 @@ where
     fn background(&mut self, done: Background) -> io::Result<Flow> {
         match done {
             Background::Models(ids) => self.app.on_models(ids),
-            Background::Switch(Ok(switch)) => {
+            Background::Switch {
+                reason,
+                result: Ok(switch),
+            } => {
                 for message in switch.warnings {
                     self.show(AgentEvent::Warning { message });
                 }
@@ -793,9 +850,29 @@ where
                 self.send_job(Job::SwitchModel {
                     model: Box::new(switch.model),
                     window_note: switch.window_note,
+                    reason,
                 });
             }
-            Background::Switch(Err(why)) => {
+            Background::RoleChecked {
+                role,
+                id,
+                result: Ok(()),
+            } => self.send_job(Job::SetRole { role, id }),
+            Background::RoleChecked {
+                role,
+                id,
+                result: Err(why),
+            } => {
+                self.app.on_done(Done::Role {
+                    role,
+                    id,
+                    result: Err(why),
+                });
+                self.next_actions()?;
+            }
+            Background::Switch {
+                result: Err(why), ..
+            } => {
                 self.app.on_done(Done::Model(Err(why)));
                 self.next_actions()?;
             }

@@ -5,7 +5,7 @@ use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 
 use harness_core::{
     message::Usage,
-    meter::{GateCounts, Meter, RequestRecord, TurnRecord},
+    meter::{GateCounts, HandoffRecord, Meter, RequestRecord, TurnRecord},
 };
 use harness_usage::{ledger::Ledger, meter::UsageMeter, outcomes::OutcomeLog, paths::Dirs};
 use serde_json::Value;
@@ -31,6 +31,7 @@ fn turn(id: &str, reason: &str) -> TurnRecord {
         started_at: OCTOBER - 5,
         ended_at: OCTOBER,
         gates: GateCounts::default(),
+        handoff: None,
     }
 }
 
@@ -249,4 +250,77 @@ fn the_outcome_log_does_not_need_the_ledger() {
             .is_empty()
     );
     assert_eq!(records(data.path()).len(), 1);
+}
+
+/// A Build turn that got its conversation as `kind`, with `gates`.
+fn build_turn(kind: &str, forced: bool, gates: GateCounts) -> TurnRecord {
+    TurnRecord {
+        role: "build".into(),
+        handoff: Some(HandoffRecord {
+            kind: kind.into(),
+            forced,
+        }),
+        gates,
+        ..turn("b1", "completed")
+    }
+}
+
+// Spec "A completed turn": no hand-off for a turn that is not a Build turn; a Build turn records
+// the kind, whether it was forced, and how its gates went.
+#[test]
+fn a_build_turns_handoff_is_recorded_with_its_kind_and_result() {
+    let data = tempfile::tempdir().unwrap();
+    let m = meter(data.path());
+    m.record_turn(&build_turn(
+        "history",
+        false,
+        GateCounts {
+            passed: 1,
+            failed: 0,
+            skipped: 0,
+        },
+    ));
+    m.record_turn(&build_turn(
+        "plan_only",
+        true,
+        GateCounts {
+            passed: 1,
+            failed: 2,
+            skipped: 0,
+        },
+    ));
+    m.record_turn(&build_turn("same_model", false, GateCounts::default()));
+    let records = records(data.path());
+    assert_eq!(records.len(), 3);
+    assert_eq!(
+        records[0]["handoff"],
+        serde_json::json!({"kind": "history", "forced": false, "result": "passed"})
+    );
+    assert_eq!(
+        records[1]["handoff"],
+        serde_json::json!({"kind": "plan_only", "forced": true, "result": "failed"})
+    );
+    // No gate ran: nothing to say of how the build went.
+    assert_eq!(
+        records[2]["handoff"],
+        serde_json::json!({"kind": "same_model", "forced": false, "result": "none"})
+    );
+    assert_eq!(records[0]["role"], "build");
+}
+
+#[test]
+fn how_a_turn_was_selected_is_recorded_as_given() {
+    let data = tempfile::tempdir().unwrap();
+    let m = meter(data.path());
+    for by in ["config", "user", "fallback", "escalation"] {
+        m.record_turn(&TurnRecord {
+            selected_by: by.into(),
+            ..turn(by, "completed")
+        });
+    }
+    let by: Vec<String> = records(data.path())
+        .iter()
+        .map(|r| r["selected_by"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(by, ["config", "user", "fallback", "escalation"]);
 }

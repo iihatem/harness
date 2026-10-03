@@ -380,6 +380,12 @@ async fn a_shutdown_stops_the_running_command_and_ends_the_session() {
             .trim()
             .parse()
             .unwrap();
+        // The group is signalled before the session ends, but a killed process lingers until it
+        // is reaped; on a loaded machine that can take a moment, so allow it a short while.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while group_alive(group) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(!group_alive(group), "the command's processes still run");
         assert!(!dir.path().join("survived").exists());
     }

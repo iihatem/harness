@@ -277,10 +277,17 @@ impl Redactor {
             // They hold nothing but harness's words for how the turn went.
             AgentEvent::TurnStarted | AgentEvent::TurnFinished { .. } => return event.clone(),
             // A reply is a whole message: its edges can be parts of secrets.
-            AgentEvent::AssistantMessage { content, model } => {
+            AgentEvent::AssistantMessage {
+                content,
+                model,
+                role,
+                switch_reason,
+            } => {
                 return AgentEvent::AssistantMessage {
                     content: self.redact_message(content),
                     model: self.redact(model),
+                    role: *role,
+                    switch_reason: *switch_reason,
                 };
             }
             _ => {}

@@ -140,7 +140,11 @@ async fn model_alone_lists_the_models_and_switches_to_the_chosen_one() {
     press(&mut ui, KeyCode::Enter);
     settle(&mut ui).await;
     assert_eq!(*log.lock().unwrap(), ["enter", "leave"]);
-    assert!(shows(&ui, "switched to mock/big"));
+    // Spec "User switch": the `ModelSwitched` event is the line.
+    assert!(shows(
+        &ui,
+        "switched to mock/big (main role, from mock/m; you chose it)"
+    ));
     assert!(shows(&ui, "warning: a warning about the window"));
     // What was typed ahead went to the input.
     assert_eq!(ui.app().editor().text(), "big");

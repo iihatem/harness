@@ -15,6 +15,7 @@ pub mod permission;
 pub mod provider;
 pub mod redact;
 pub mod retry;
+pub mod role;
 pub mod session;
 pub mod subprocess;
 pub mod testing;

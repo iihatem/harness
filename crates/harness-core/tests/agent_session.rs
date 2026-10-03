@@ -155,6 +155,7 @@ fn message(message: Message) -> EntryKind {
         display: None,
         note: false,
         plan: None,
+        attribution: None,
     }
 }
 

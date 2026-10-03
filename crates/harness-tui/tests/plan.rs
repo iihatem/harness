@@ -275,6 +275,39 @@ async fn build_goes_back_to_the_mode_before_plan_and_implements_the_plan() {
     );
 }
 
+// A build turn that ends before the model answered (a plan that does not fit its window, a model
+// that cannot be used) leaves the plan approved: the choices come back, and Build tries again.
+#[tokio::test]
+async fn a_build_turn_that_never_reached_the_model_offers_the_plan_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = planning_script(vec![
+        Script::error(harness_core::provider::ProviderError::Http {
+            status: 401,
+            body: "bad key".into(),
+            retry_after: None,
+        }),
+        Script::text("Implemented."),
+    ]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Auto, Mode::Ask);
+    ui.handle(Event::Key(KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )))
+    .unwrap();
+    plan(&mut ui).await;
+    choose(&mut ui, 'b').await;
+    settle(&mut ui).await;
+    let live = rows(ui.terminal().backend().buffer());
+    assert!(
+        live.iter().any(|r| r.contains("The plan is ready:")),
+        "{live:?}"
+    );
+    choose(&mut ui, 'b').await;
+    settle(&mut ui).await;
+    assert!(everything(&ui).iter().any(|r| r == "Implemented."));
+    ui.finish().await.unwrap();
+}
+
 #[tokio::test]
 async fn an_edited_plan_is_shown_again_and_built_as_edited() {
     let dir = tempfile::tempdir().unwrap();

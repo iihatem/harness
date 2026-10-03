@@ -233,6 +233,9 @@ async fn a_turn_model_uses_its_own_edit_format_and_the_sessions_comes_back() {
             local: false,
             tools: Some(registry(&["read", "apply_patch", "bash"])),
             edit_section: Some(SECTION_B.into()),
+            context_window: None,
+            request: None,
+            text_tool_calls: false,
         }),
         ..TurnInput::from("patch it")
     };

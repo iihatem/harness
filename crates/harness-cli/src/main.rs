@@ -11,6 +11,7 @@ mod models;
 mod notices;
 mod pricing;
 mod prompt;
+mod routes;
 mod sandbox;
 mod sessions;
 mod setup;

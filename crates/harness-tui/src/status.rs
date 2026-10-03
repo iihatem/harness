@@ -462,3 +462,26 @@ pub fn cost_lines(costs: &Costs, ctx: &UsageContext, theme: &Theme) -> Vec<Line<
     }
     lines
 }
+
+/// `/roles`: each role's model, and where it came from.
+pub fn roles_report(roles: &[harness_core::role::RoleLine], theme: &Theme) -> Vec<Line<'static>> {
+    use harness_core::role::RoleSource;
+    let model_width = roles
+        .iter()
+        .map(|r| sanitize(&r.model).chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec![Line::from(Span::styled("Roles", theme.bold()))];
+    for line in roles {
+        let source = match line.source {
+            RoleSource::Inherited => "inherited from main".to_string(),
+            other => other.as_str().to_string(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<10}", line.role.as_str()), theme.accent()),
+            Span::raw(format!("  {:<model_width$}", sanitize(&line.model))),
+            Span::styled(format!("  {source}"), theme.dim()),
+        ]));
+    }
+    lines
+}

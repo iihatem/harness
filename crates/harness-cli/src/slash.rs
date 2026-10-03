@@ -20,6 +20,7 @@ use harness_core::{
 use harness_providers::{
     profiles,
     registry::{self, Resolved},
+    window,
 };
 
 use crate::{context::home, notices::Notices, setup::Setup};
@@ -137,8 +138,11 @@ pub fn turn_input(
     if let Some(model) = expansion.model {
         match registry::resolve(&model, &setup.config.providers, setup.keys()) {
             Ok(resolved) => {
-                messages.push(Message::Note(runs_on(&command.name, &resolved.id)));
-                input.model = Some(turn_model(resolved, &setup.config.profiles));
+                input.model = Some(turn_model(
+                    resolved,
+                    &setup.config.profiles,
+                    window::Running::Unknown,
+                ));
             }
             Err(e) => messages.push(Message::Warning(cannot_use(
                 &command.name,
@@ -150,28 +154,31 @@ pub fn turn_input(
     Expanded { input, messages }
 }
 
-/// The model for one turn on `resolved`, as a command's `model:` asks for it and as a role will:
-/// local when its profile (from `user`) says so, with the edit tool set and the prompt's edit
-/// section of the profile's `edit_format`, as the session has them after `/model`.
+/// The model for one turn on `resolved`, as a command's `model:` asks for it and as a role does:
+/// the whole profile of the model, as the session has it after `/model`. Local when its profile
+/// (from `user`) says so, with the edit tool set and the prompt's edit section of its
+/// `edit_format`, the request options and text tool calls its profile gives, and the context
+/// window harness uses for it: the profile's, or what `running` says the server runs it with when
+/// that is less.
 pub(crate) fn turn_model(
     resolved: Resolved,
     user: &BTreeMap<String, ProfileSettings>,
+    running: window::Running,
 ) -> TurnModel {
     let local = profiles::is_local(&resolved.id, &resolved.base_url);
     let profile = profiles::resolve(&resolved.id, local, user);
+    let window = window::effective_window(&resolved.id, &profile, running, None);
     TurnModel {
         local: profile.local,
         tools: Some(harness_tools::builtin_for(profile.edit_format)),
         edit_section: Some(crate::prompt::edit_section(profile.edit_format)),
+        context_window: Some(window.tokens),
+        request: Some(profile.request_options()),
+        text_tool_calls: profile.text_tool_calls,
         provider: resolved.provider,
         id: resolved.id,
         name: resolved.model,
     }
-}
-
-/// The note that command `name` runs on `model`.
-fn runs_on(name: &str, model: &str) -> String {
-    format!("/{name} runs on {model}, as its command file asks")
 }
 
 /// The warning that command `name` asks for `model`, which `error` keeps from being used.
@@ -185,6 +192,7 @@ fn cannot_use(name: &str, model: &str, error: &str) -> String {
 mod tests {
     use super::*;
     use crate::term::terminal_safe;
+    use harness_providers::window::Running;
 
     // Final review, I-1: a command's model on a local server gets a local server's wait, and its
     // rule that a reply that never starts is not asked for again; a profile may say otherwise.
@@ -199,8 +207,8 @@ mod tests {
             registry::resolve(id, &providers, |_: &str| Some("sk-test-key".to_string())).unwrap()
         };
         let none = BTreeMap::new();
-        assert!(turn_model(resolved("ollama/qwen3"), &none).local);
-        assert!(!turn_model(resolved("openrouter/qwen3"), &none).local);
+        assert!(turn_model(resolved("ollama/qwen3"), &none, Running::Unknown).local);
+        assert!(!turn_model(resolved("openrouter/qwen3"), &none, Running::Unknown).local);
         let hosted = BTreeMap::from([(
             "ollama/*".to_string(),
             ProfileSettings {
@@ -208,7 +216,7 @@ mod tests {
                 ..ProfileSettings::default()
             },
         )]);
-        let model = turn_model(resolved("ollama/qwen3"), &hosted);
+        let model = turn_model(resolved("ollama/qwen3"), &hosted, Running::Unknown);
         assert!(!model.local);
         assert_eq!(
             (model.id.as_str(), model.name.as_str()),
@@ -252,8 +260,8 @@ mod tests {
                 .map(|s| s.name)
                 .collect()
         };
-        let patcher = turn_model(resolved("openrouter/patcher"), &user);
-        let replacer = turn_model(resolved("openrouter/replacer"), &user);
+        let patcher = turn_model(resolved("openrouter/patcher"), &user, Running::Unknown);
+        let replacer = turn_model(resolved("openrouter/replacer"), &user, Running::Unknown);
         assert!(names(&patcher).contains(&"apply_patch".to_string()));
         assert!(!names(&patcher).contains(&"edit".to_string()));
         assert!(names(&replacer).contains(&"edit".to_string()));
@@ -268,19 +276,61 @@ mod tests {
         );
     }
 
+    // Tasks.md 3.2 / the notes on roles: a role's model is switched to whole for its turn: the
+    // window, the request options and whether it takes text tool calls, as well as the edit
+    // format. The profile decides, and a local server's own window can only lower it.
+    #[test]
+    fn a_turn_model_has_the_whole_profile_of_its_model() {
+        use std::collections::BTreeMap;
+
+        use harness_config::config::ProfileSettings;
+
+        let providers = BTreeMap::new();
+        let resolved = |id: &str| {
+            registry::resolve(id, &providers, |_: &str| Some("sk-test-key".to_string())).unwrap()
+        };
+        let none = BTreeMap::new();
+        // The built-in profile of the Qwen3-Coder family.
+        let coder = turn_model(resolved("ollama/qwen3-coder"), &none, Running::Unknown);
+        assert_eq!(coder.context_window, Some(262_144));
+        assert_eq!(coder.request.as_ref().unwrap().temperature, Some(0.7));
+        assert!(coder.request.as_ref().unwrap().local);
+        // A local model takes text tool calls unless its profile says otherwise.
+        assert!(coder.text_tool_calls);
+        // What the server runs it with, when that is less.
+        let small = turn_model(
+            resolved("ollama/qwen3-coder"),
+            &none,
+            Running::Tokens(8_192),
+        );
+        assert_eq!(small.context_window, Some(8_192));
+        // A hosted model answers with its own profile.
+        let hosted = BTreeMap::from([(
+            "openrouter/big".to_string(),
+            ProfileSettings {
+                context_window: Some(500_000),
+                max_output_tokens: Some(4_096),
+                ..ProfileSettings::default()
+            },
+        )]);
+        let big = turn_model(resolved("openrouter/big"), &hosted, Running::Unknown);
+        assert_eq!(big.context_window, Some(500_000));
+        assert_eq!(big.request.as_ref().unwrap().max_output_tokens, Some(4_096));
+        assert!(!big.text_tool_calls);
+        // No profile and no server: the window harness assumes for such a model.
+        let unknown = turn_model(resolved("openrouter/mystery"), &none, Running::Unknown);
+        assert_eq!(unknown.context_window, Some(8_192));
+    }
+
     // Review C, minor 7: a command's name is printed like any other text from a file: the
     // messages carry it as it is, and are escaped where they are printed.
     #[test]
-    fn model_messages_name_the_command_and_are_printed_safely() {
+    fn model_warning_names_the_command_and_is_printed_safely() {
         let name = "x\u{1b}[2J";
-        for message in [
-            runs_on(name, "mock/m"),
-            cannot_use(name, "mock/m", "unknown provider"),
-        ] {
-            assert!(message.contains("/x\u{1b}[2J"), "{message:?}");
-            let printed = terminal_safe(&message);
-            assert!(!printed.contains('\u{1b}'), "{printed:?}");
-            assert!(printed.contains("/x\\u{1b}[2J"), "{printed:?}");
-        }
+        let message = cannot_use(name, "mock/m", "unknown provider");
+        assert!(message.contains("/x\u{1b}[2J"), "{message:?}");
+        let printed = terminal_safe(&message);
+        assert!(!printed.contains('\u{1b}'), "{printed:?}");
+        assert!(printed.contains("/x\\u{1b}[2J"), "{printed:?}");
     }
 }

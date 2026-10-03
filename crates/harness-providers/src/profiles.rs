@@ -132,12 +132,19 @@ pub fn resolve(
     }
 }
 
-/// The profiles whose keys match `model_id`, the most specific first.
-fn matching<'a>(
-    profiles: impl Iterator<Item = (&'a str, &'a ProfileSettings)>,
+/// The value of the entry whose glob key matches `model_id` and is the most specific (the most
+/// characters other than `*` and `?`), case aside, as profiles are chosen. The first of equally
+/// specific keys wins.
+pub fn best_match<'a, V>(
+    entries: impl Iterator<Item = (&'a str, &'a V)>,
     model_id: &str,
-) -> Vec<&'a ProfileSettings> {
-    let mut found: Vec<(usize, &ProfileSettings)> = profiles
+) -> Option<&'a V> {
+    matching(entries, model_id).into_iter().next()
+}
+
+/// The profiles whose keys match `model_id`, the most specific first.
+fn matching<'a, V>(profiles: impl Iterator<Item = (&'a str, &'a V)>, model_id: &str) -> Vec<&'a V> {
+    let mut found: Vec<(usize, &V)> = profiles
         .filter(|(key, _)| matches(key, model_id))
         .map(|(key, profile)| {
             (

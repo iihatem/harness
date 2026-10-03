@@ -21,6 +21,7 @@ use harness_core::{
     meter::WindowSnapshot,
     permission::Mode,
     redact::Redactor,
+    role::{Role, RoleSource, SwitchReason},
     session::{RewindScope, Session, SessionSummary},
     turn::{Steering, TurnInput},
 };
@@ -143,6 +144,13 @@ pub enum Done {
     },
     /// `/model`: the model the session continues on, or why it could not switch.
     Model(Result<ModelView, String>),
+    /// `/model --role`: the role now runs on the model `id` for the session, or why it does
+    /// not.
+    Role {
+        role: Role,
+        id: String,
+        result: Result<(), String>,
+    },
     /// `/login`: what to tell the user, or why it did not sign in.
     LoggedIn(Result<String, String>),
 }
@@ -238,6 +246,19 @@ pub trait Host: Send {
         _cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<ModelSwitch, String>> {
         Box::pin(async { Err("the model cannot change".into()) })
+    }
+    /// The model `/escalate` switches to: `[escalation] to`, when one is configured.
+    fn escalation(&self) -> Option<String> {
+        None
+    }
+    /// Whether model `id` can be used for a role: its provider and credentials are ready. Errors
+    /// say why not. `cancel` stops it while a local server is asked for its window.
+    fn check_model(
+        &self,
+        _id: &str,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Err("roles cannot be set here".into()) })
     }
     /// The settings `/usage` shows beside what the session knows.
     fn usage_context(&self) -> UsageContext {
@@ -356,7 +377,9 @@ pub enum Action {
     /// Look for the models, for the model picker.
     ListModels,
     /// Continue on the model with this id.
-    SwitchModel(String),
+    SwitchModel { id: String, reason: SwitchReason },
+    /// Run `role` on the model `id` for the session, once the host has checked it can be used.
+    SetRole { role: Role, id: String },
     /// Sign in to a provider, with a device code when `device` is set.
     Login { provider: String, device: bool },
     /// Stop the running turn.
@@ -414,6 +437,9 @@ pub struct App {
     plan_note_pending: bool,
     /// A plan waiting for the user's choice.
     plan_choice: Option<PlanChoice>,
+    /// The plan a build turn implements, until the model has answered: a turn that ends in an
+    /// error before then leaves it approved, and the choice comes back.
+    building: Option<PlanChoice>,
     /// The model the session uses, until it has answered once.
     unproven: Option<Unproven>,
     /// When the running turn started.
@@ -465,6 +491,8 @@ pub struct App {
     resume: Option<Resume>,
     /// The user's answer to the offer to resume automatically, for the session.
     resume_answer: Option<bool>,
+    /// Each role's model, as the agent last said.
+    roles: Vec<harness_core::role::RoleLine>,
     /// The time, in seconds since the Unix epoch.
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -497,6 +525,7 @@ impl App {
             default_mode: options.default_mode,
             plan_note_pending: options.mode == Mode::Plan,
             plan_choice: None,
+            building: None,
             unproven: None,
             turn_started: None,
             notifications: Vec::new(),
@@ -523,6 +552,7 @@ impl App {
             costs: Costs::default(),
             windows: None,
             window_warnings: std::collections::HashMap::new(),
+            roles: Vec::new(),
             clock: Arc::new(harness_core::time::now_unix),
             host,
         }
@@ -925,8 +955,7 @@ impl App {
                 let wanted = self.switching.take().unwrap_or_default();
                 match result {
                     Ok(view) => {
-                        self.transcript
-                            .push_note(&format!("switched to {}", view.id), width);
+                        // The `ModelSwitched` event is the line that says so.
                         // The countdown reads the windows of the provider it began with.
                         self.resume = None;
                         self.limit_reset = None;
@@ -943,6 +972,27 @@ impl App {
                         self.transcript.push_error(&text, width);
                     }
                 }
+            }
+            // The `ModelSwitched` event is its line.
+            Done::Role { result: Ok(()), .. } => {}
+            // Esc while the model was checked.
+            Done::Role {
+                role,
+                id,
+                result: Err(why),
+            } if why == "stopped" => {
+                let text = self.redacted(&format!(
+                    "stopped checking {id}; the {role} role is unchanged"
+                ));
+                self.transcript.push_note(&text, width);
+            }
+            Done::Role {
+                role,
+                id,
+                result: Err(why),
+            } => {
+                let text = self.redacted(&format!("could not set the {role} role to {id}: {why}"));
+                self.transcript.push_error(&text, width);
             }
             Done::UndidRewind(Ok(())) => self.transcript.push_note("undid the last rewind", width),
             Done::UndidRewind(Err(why)) => self
@@ -1123,6 +1173,16 @@ impl App {
 
     /// Takes in an event from the agent that came at `now`.
     pub fn on_event_at(&mut self, event: &AgentEvent, now: Instant) {
+        // Once the model has answered, the build is under way, whatever becomes of it.
+        if matches!(
+            event,
+            AgentEvent::TextDelta { .. }
+                | AgentEvent::AssistantMessage { .. }
+                | AgentEvent::ToolCallRequested { .. }
+                | AgentEvent::Usage { .. }
+        ) {
+            self.building = None;
+        }
         match event {
             AgentEvent::TurnStarted => {
                 self.last_reply.clear();
@@ -1216,6 +1276,13 @@ impl App {
                     .push(format!("{how} after {}", notify::duration(took)));
             }
         }
+        // A build that never reached the model leaves the plan approved: Build can be chosen again.
+        if let Some(choice) = self.building.take()
+            && reason == TurnEndReason::Error
+        {
+            self.plan_choice = Some(choice);
+            self.arming = Arming::default();
+        }
         if reason == TurnEndReason::Completed
             && self.mode == Mode::Plan
             && !self.last_reply.trim().is_empty()
@@ -1256,6 +1323,11 @@ impl App {
         }
         let (shown, full) = self.queued.pop_front()?;
         self.send(shown, full)
+    }
+
+    /// Each role's model and where it came from, now.
+    pub fn set_roles(&mut self, roles: Vec<harness_core::role::RoleLine>) {
+        self.roles = roles;
     }
 
     /// Where the next request's tokens go, now.
@@ -1379,6 +1451,7 @@ impl App {
             }
             Choice::Build => {
                 let choice = self.plan_choice.take()?;
+                self.building = Some(choice.clone());
                 let mode = self.mode_before_plan.take().unwrap_or(self.default_mode);
                 self.mode = mode;
                 self.transcript
@@ -1389,6 +1462,7 @@ impl App {
                     parts: vec![harness_core::turn::InputPart::Text(choice.build_message())],
                     display: Some("Build the plan".into()),
                     plan: Some(choice.plan),
+                    role: Some(Role::Build),
                     ..TurnInput::default()
                 };
                 Some(Action::RunIn(mode, input))
@@ -1739,7 +1813,22 @@ impl App {
         match name {
             "quit" => return self.quit(),
             "mode" | "compact" | "rewind" | "new" | "resume" | "model" | "login" | "budget"
+            | "escalate"
                 if !self.between_turns(name) => {}
+            "escalate" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return match self.host.escalation() {
+                    Some(to) => self.switch_for(&to, SwitchReason::Escalation),
+                    None => {
+                        self.transcript.push_error(
+                            "no escalation model is configured: set `to = \"<provider>/<model>\"` under [escalation] in config.toml",
+                            width,
+                        );
+                        None
+                    }
+                };
+            }
             "budget" => {
                 let amount = args.trim().trim_start_matches('$');
                 let set = if amount.is_empty() {
@@ -1795,6 +1884,21 @@ impl App {
             "model" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
+                if let Some(rest) = args.strip_prefix("--role")
+                    && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+                {
+                    return self.set_role(rest);
+                }
+                if args.starts_with("--") {
+                    let option = args.split_whitespace().next().unwrap_or(args);
+                    self.transcript.push_error(
+                        &format!(
+                            "unknown option `{option}`: /model takes a model, or --role <role> <model>"
+                        ),
+                        width,
+                    );
+                    return None;
+                }
                 if !args.is_empty() {
                     return self.switch_to(args);
                 }
@@ -1846,6 +1950,13 @@ impl App {
                     self.window_note.as_deref(),
                     &theme,
                 );
+                self.transcript.push_lines(lines, width);
+            }
+            "roles" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                let theme = self.theme();
+                let lines = status::roles_report(&self.roles, &theme);
                 self.transcript.push_lines(lines, width);
             }
             "usage" => {
@@ -1959,8 +2070,52 @@ impl App {
         }
     }
 
+    /// `/model --role <role> <id>`, with `rest` after `--role`.
+    fn set_role(&mut self, rest: &str) -> Option<Action> {
+        let width = self.width;
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let [role, id] = words[..] else {
+            self.transcript.push_error(
+                "/model --role takes a role and a model, such as /model --role build ollama/qwen3-coder",
+                width,
+            );
+            return None;
+        };
+        let role = match role.parse::<Role>() {
+            Ok(role) => role,
+            Err(why) => {
+                self.transcript.push_error(&why, width);
+                return None;
+            }
+        };
+        if role == Role::Main {
+            return self.switch_to(id);
+        }
+        // Chosen already, in the configuration or in this session; one that only inherits `main`
+        // is still pinned by choosing it.
+        if self
+            .roles
+            .iter()
+            .any(|r| r.role == role && r.model == id && r.source != RoleSource::Inherited)
+        {
+            self.transcript
+                .push_note(&format!("{role} already runs on {id}"), width);
+            return None;
+        }
+        self.work(&format!("checking {id}"), true);
+        Some(Action::SetRole {
+            role,
+            id: id.to_string(),
+        })
+    }
+
     /// Switches the session to model `id`, unless it is on it already.
     fn switch_to(&mut self, id: &str) -> Option<Action> {
+        self.switch_for(id, SwitchReason::User)
+    }
+
+    /// [`switch_to`](Self::switch_to), for `reason`.
+    fn switch_for(&mut self, id: &str, reason: SwitchReason) -> Option<Action> {
         if id == self.model {
             self.transcript
                 .push_note(&format!("already on {id}"), self.width);
@@ -1968,7 +2123,10 @@ impl App {
         }
         self.work(&format!("switching to {id}"), true);
         self.switching = Some(id.to_string());
-        Some(Action::SwitchModel(id.to_string()))
+        Some(Action::SwitchModel {
+            id: id.to_string(),
+            reason,
+        })
     }
 
     /// Opens the session picker, as `harness --resume` does when the session starts.

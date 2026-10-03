@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::Agent;
 use crate::{
-    event::{AgentEvent, ChangeSource, GateKind, GateStatus, TurnEndReason},
+    event::{AgentEvent, ChangeSource, EscalationTrigger, GateKind, GateStatus, TurnEndReason},
     gate::{Outcome, Tail, outcome, tail},
     message::{Message, ToolCall},
     output::spill,
@@ -202,6 +202,17 @@ impl Agent {
         // A run the user stopped did not fail: nothing is said of it, and it is not counted.
         if !(outcome.interrupted || self.ctx.cancel.is_cancelled()) {
             self.count_gate(outcome.status);
+            if matches!(outcome.status, GateStatus::Failed | GateStatus::TimedOut) {
+                let first = super::first_line(&redacted);
+                let count = {
+                    let n = self.escalation.gates.entry(kind).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                if count == 2 {
+                    self.suggest_escalation(EscalationTrigger::GateFailed, count, first, events);
+                }
+            }
             let _ = events.send(AgentEvent::GateResult {
                 gate: kind,
                 command: Some(command.to_string()),

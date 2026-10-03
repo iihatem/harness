@@ -102,6 +102,29 @@ pub fn summary_message(summary: &str) -> Message {
     }
 }
 
+/// Where a build turn's approved plan starts in a summary: the plan is kept as written, after
+/// what the summary says of the rest.
+pub const PLAN_HEADER: &str = "[The plan the user approved, kept as written]";
+
+/// `summary` with `plan` after it, as written.
+pub fn with_plan(summary: &str, plan: &str) -> String {
+    format!("{summary}\n\n{PLAN_HEADER}\n{plan}")
+}
+
+/// `message`, when it is an earlier summary that carries a plan, without the plan: a new summary
+/// is asked for around it, and the plan is put back as written.
+pub fn without_plan(message: &Message) -> Message {
+    match message {
+        Message::User { content } if content.starts_with(SUMMARY_PREFIX) => {
+            let at = content.find(&format!("\n\n{PLAN_HEADER}\n"));
+            Message::User {
+                content: at.map_or(content.clone(), |at| content[..at].to_string()),
+            }
+        }
+        other => other.clone(),
+    }
+}
+
 /// The request asking `model` to summarize `messages`, with the user's `focus` if any. The
 /// transcript is kept within `max_tokens` by leaving out the oldest messages.
 pub fn summary_request(
@@ -244,6 +267,27 @@ mod tests {
         assert_eq!(cut(&messages, 10_000), None);
         // Not even the last message fits.
         assert_eq!(cut(&messages, 1), None);
+    }
+
+    #[test]
+    fn a_plan_is_kept_after_a_summary_and_taken_off_it_again() {
+        let plan = "1. Do it\n\n2. Then this";
+        let stored = summary_message(&with_plan("what happened", plan));
+        let Message::User { content } = &stored else {
+            panic!()
+        };
+        assert!(content.ends_with(plan));
+        assert_eq!(
+            without_plan(&stored),
+            summary_message("what happened"),
+            "a new summary is written around the plan"
+        );
+        // Anything else is left alone.
+        assert_eq!(without_plan(&user("hi")), user("hi"));
+        assert_eq!(
+            without_plan(&summary_message("plain")),
+            summary_message("plain")
+        );
     }
 
     #[test]

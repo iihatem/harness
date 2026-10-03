@@ -11,6 +11,7 @@ fn user(text: &str) -> EntryKind {
         display: None,
         note: false,
         plan: None,
+        attribution: None,
     }
 }
 
@@ -24,6 +25,7 @@ fn assistant(text: &str) -> EntryKind {
         display: None,
         note: false,
         plan: None,
+        attribution: None,
     }
 }
 
@@ -173,6 +175,7 @@ fn sessions_are_listed_most_recent_first_with_their_first_message() {
         display: Some("/opsx:propose add-login".into()),
         note: false,
         plan: None,
+        attribution: None,
     });
     std::thread::sleep(std::time::Duration::from_millis(20));
     let mut newer = Session::create(dir.path(), Path::new("/work"));
@@ -183,6 +186,7 @@ fn sessions_are_listed_most_recent_first_with_their_first_message() {
         display: None,
         note: true,
         plan: None,
+        attribution: None,
     });
     newer.append(user("fix the tests"));
     let listed = session::list(dir.path());

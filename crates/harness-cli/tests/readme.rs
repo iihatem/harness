@@ -79,3 +79,54 @@ fn the_readme_documents_gates_language_servers_edit_formats_and_the_eval() {
         assert!(text.contains(word), "the README does not mention {word}");
     }
 }
+
+#[test]
+fn the_example_sets_roles_a_hand_off_a_fallback_chain_and_an_escalation_model() {
+    let blocks = toml_blocks(&readme()).join("\n");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, &blocks).unwrap();
+    let file = config::parse_file(&path).unwrap().unwrap();
+    assert!(file.roles.plan.is_some() && file.roles.build.is_some());
+    assert!(file.roles.background.is_some());
+    assert!(file.roles.handoff.mode.is_some());
+    assert!(!file.fallback.is_empty());
+    assert!(file.escalation.to.is_some());
+    // And the whole of it is accepted as a configuration, not only as TOML.
+    let trust = harness_config::trust::TrustStore::load(&dir.path().join("data")).unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let loaded = config::load(&path, &workspace, &trust).unwrap();
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert!(loaded.roles.build.is_some() && loaded.escalation_to.is_some());
+}
+
+#[test]
+fn the_readme_documents_roles_hand_off_fallback_and_escalation() {
+    let text = readme();
+    for word in [
+        "[roles]",
+        "/roles",
+        "/model --role",
+        "[roles.handoff]",
+        "plan_only",
+        "HandoffReduced",
+        "[fallback]",
+        "ModelSwitched",
+        "enforced_spend_limit_reached",
+        "[escalation]",
+        "/escalate",
+        "EscalationSuggested",
+        "selected_by",
+    ] {
+        assert!(text.contains(word), "the README does not mention {word}");
+    }
+    // What needs trust is said.
+    let trust = text
+        .lines()
+        .find(|line| line.starts_with("Project-level `.harness/config.toml` settings"))
+        .unwrap();
+    for word in ["[roles]", "[fallback]", "[escalation]"] {
+        assert!(trust.contains(word), "the trust paragraph omits {word}");
+    }
+}

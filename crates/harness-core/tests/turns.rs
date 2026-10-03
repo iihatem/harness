@@ -163,19 +163,27 @@ async fn a_turn_model_answers_only_its_turn() {
             local: false,
             tools: None,
             edit_section: None,
+            context_window: None,
+            request: None,
+            text_tool_calls: false,
         }),
         ..TurnInput::from("one")
     };
     let (_, events) = run_input(&mut agent, first).await;
     assert!(events.contains(&AgentEvent::AssistantMessage {
         content: "from m2".into(),
-        model: "mock/m2".into()
+        model: "mock/m2".into(),
+        role: harness_core::role::Role::Main,
+        // A command that names a model asks for it: the user's switch.
+        switch_reason: Some(harness_core::role::SwitchReason::User),
     }));
     assert_eq!(command_model.requests()[0].model, "m2");
     let (_, events) = run(&mut agent, "two").await;
     assert!(events.contains(&AgentEvent::AssistantMessage {
         content: "from m1".into(),
-        model: "mock/m1".into()
+        model: "mock/m1".into(),
+        role: harness_core::role::Role::Main,
+        switch_reason: None,
     }));
     assert_eq!(session_model.requests().len(), 1);
 }

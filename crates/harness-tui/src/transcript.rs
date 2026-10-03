@@ -295,6 +295,41 @@ impl Transcript {
                     self.push_lines(lines(shown.trim_end(), dim), width);
                 }
             }
+            AgentEvent::ModelSwitched {
+                from,
+                to,
+                role,
+                reason,
+                detail,
+            } => {
+                let text =
+                    harness_core::role::switched_text(from, to, *role, *reason, detail.as_deref());
+                self.push_note(&text, width);
+            }
+            AgentEvent::EscalationSuggested {
+                trigger,
+                count,
+                first_line,
+                to,
+            } => {
+                let text = harness_core::role::escalation_text(
+                    *trigger,
+                    *count,
+                    first_line.as_deref(),
+                    to,
+                );
+                self.push_note(&text, width);
+            }
+            AgentEvent::HandoffReduced {
+                to,
+                history_tokens,
+                window,
+                forced,
+            } => {
+                let text =
+                    harness_core::role::handoff_reduced_text(to, *history_tokens, *window, *forced);
+                self.push_warning(&text, width);
+            }
             AgentEvent::ApprovalNeeded { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::Metered { .. }

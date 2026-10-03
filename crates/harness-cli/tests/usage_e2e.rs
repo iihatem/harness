@@ -615,3 +615,82 @@ async fn usage_forget_needs_a_range_and_forget_all_empties_the_report() {
     let help = stdout(&run_usage(&env, &["usage", "--help"]));
     assert!(help.contains("export") && help.contains("forget"), "{help}");
 }
+
+/// The README's text, which documents the commands and the settings the tests below run.
+const README: &str = include_str!("../../../README.md");
+
+/// The lines of the fenced block that follows `marker` in the README.
+fn block_after(marker: &str) -> Vec<String> {
+    let after = README
+        .split(marker)
+        .nth(1)
+        .unwrap_or_else(|| panic!("the README has no {marker}"));
+    let mut lines = after.lines().skip_while(|l| !l.starts_with("```"));
+    lines.next();
+    lines
+        .take_while(|l| !l.starts_with("```"))
+        .map(String::from)
+        .collect()
+}
+
+// The commands the README documents run as written: against a ledger with records, a pricing
+// server on this machine, and the user's own data directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_documented_usage_commands_run_as_written() {
+    let models_dev = pricing_server(200, MODELS_DEV).await;
+    let server = MockServer::start().await;
+    let env = ask_twice(Env::new(&server.uri(), ""), &server).await;
+    let url = format!("{}/api.json", models_dev.uri());
+    let commands = block_after("<!-- documented-commands -->");
+    assert!(commands.len() >= 6, "{commands:?}");
+    tokio::task::spawn_blocking(move || {
+        for line in commands {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // `harness usage export … > usage.csv`: the redirect is the shell's, not an argument.
+            let command = line
+                .split(" > ")
+                .next()
+                .unwrap()
+                .split(" #")
+                .next()
+                .unwrap();
+            let words: Vec<&str> = command.split_whitespace().collect();
+            assert_eq!(words[0], "harness", "{line}");
+            let out = env
+                .cmd()
+                .env("HARNESS_PRICING_URL", &url)
+                .args(&words[1..])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "`{line}` failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
+// The configuration the README shows is accepted as written.
+#[test]
+fn the_documented_configuration_parses() {
+    let config = block_after("<!-- documented-config -->").join("\n");
+    assert!(
+        config.contains("[budgets]")
+            && config.contains("[pricing.")
+            && config.contains("[outcomes]")
+    );
+    let env = Env::new("http://127.0.0.1:9", "");
+    std::fs::write(env.home.path().join("config/config.toml"), config).unwrap();
+    let out = run_usage(&env, &["usage"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

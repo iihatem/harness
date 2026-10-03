@@ -17,8 +17,9 @@ A terminal-first, open-source coding agent written in Rust, built for **hybrid d
 - Model profiles: `[profiles."<glob>"]` sets a model's context window, output limit, temperature, reasoning effort and whether tool calls it writes as text are run. Built-in profiles cover common open-weight coding models (Qwen3-Coder, Devstral, gpt-oss and others) and the hosted families. Local servers are asked what context they really run a model with, and a window too small for agentic work is warned about with the fix (`OLLAMA_CONTEXT_LENGTH`, `llama-server -c`).
 - Local models: tool calls written as text (`<tool_call>` blocks, or a message that is only a call's JSON) run like native ones, and a reply cut off at the output limit never runs a partial tool call; the model is asked to continue in smaller steps.
 - Secrets: the API keys and sign-in tokens harness holds (in the environment, in `credentials.json`, or read from the keychain), each configured provider's key variable, the values of environment variables whose names end in `KEY`, `TOKEN`, `SECRET` or `PASSWORD` (or their plurals), `PASSPHRASE`, `CREDENTIALS`, `_PASS` or `_PWD`, and the password of any URL in the environment (`postgres://user:password@host`) are replaced by `[redacted]` in session files, tool-output files, `--json` output and everything harness prints, even when the model streams one in pieces. `harness ask --debug` writes the run's events and the warnings printed before it starts, redacted too, to `~/.local/state/harness/logs/`; harness does not delete old logs. Session files, tool-output files and logs are readable only by you.
+- Usage and cost: every model request is recorded in a local ledger, and `harness usage` and `/usage` report tokens and cost by model, provider, day or project, offline. The status line shows the session's billed cost and, on a ChatGPT plan, the most-used usage window (`5h 62%`). See "Usage, cost and privacy" below.
 - Approval modes: `plan`, `read-only`, `ask`, `auto`, `full-access`. Default is `auto` inside a git repository and `ask` elsewhere.
-- Exit codes for scripting: `0` success, `1` runtime error, `2` invalid usage or no model, `3` an action was blocked for lack of approval, `130` interrupted.
+- Exit codes for scripting: `0` success, `1` runtime error, `2` invalid usage or no model, `3` an action was blocked for lack of approval, `4` a money budget stopped the run, `130` interrupted.
 - Project instructions: `AGENTS.md` (or `CLAUDE.md` where a directory has no `AGENTS.md`) from `~/.config/harness/`, the repository root, and each directory down to the working directory, with `@path` import lines. They go into a system prompt that stays the same for the whole run, so model servers can reuse their prompt caches.
 - Slash commands in `harness ask`: Markdown commands from `.harness/commands`, `.claude/commands` or `.opencode/commands` in the project, and from `~/.config/harness/commands` and `~/.claude/commands`, so OpenSpec's `/opsx:*` commands work as they are. `$ARGUMENTS`, `$1`…`$9`, `@file` and `` !`command` `` are filled in; a shell command gets the arguments as its parameters (`"$1"`, `"$ARGUMENTS"`), never written into its text, and shell commands go through the same approvals and sandbox as the `bash` tool. `harness ask "/init"` drafts an `AGENTS.md`.
 - Sessions: every run is saved under `~/.local/share/harness/sessions/`. `harness -c` (or `harness -c ask "..."`) continues the project's most recent session, `harness --resume` opens the session picker (without a terminal, it lists the sessions), and `harness --resume <id>` continues one.
@@ -73,6 +74,57 @@ desktop = true  # OSC 9 when a long turn ends or an approval waits
 bell = true
 ```
 
+## Usage, cost and privacy
+
+harness keeps three local files about how you use models, and sends them nowhere. All are readable only by you, and none holds prompt text, model output, file paths or command lines.
+
+- **The usage ledger**, `~/.local/share/harness/usage/ledger-YYYY-MM.jsonl`: one line for every model request, failed ones and compaction summaries included: when, the session, a hash of the workspace root (never its path), the role, the model, how it was paid for (`api_key`, `subscription` or `local`), the tokens (uncached input, cache reads and writes, output, and the reasoning part of the output, which is not priced twice), the cost, how long it took and how it ended. `usage/index.sqlite` is a cache the reports are served from; delete it whenever you like and it is rebuilt from the ledger.
+- **The outcome log**, `~/.local/share/harness/outcomes/YYYY-MM.jsonl`: one line for every finished turn: the model, tokens, time to first token, duration, how many tool calls, invalid calls and retries, how the turn ended, and what you did next (`rewound`, `interrupted` or `continued`). It is meant for building a router from your own data later. It is on by default; `[outcomes] enabled = false` turns it off, and the ledger does not depend on it.
+- **Window snapshots**, `usage/windows-YYYY-MM.jsonl`: the ChatGPT usage windows a request saw.
+
+Nothing is fetched to make these reports. The one network call harness makes for prices is the one you ask for with `harness pricing update`, which downloads [models.dev](https://models.dev)'s data over HTTPS and keeps it in `~/.local/share/harness/pricing.json`.
+
+Cost is worked out from a price table: your `[pricing."<glob>"]` entries, over the table `harness pricing update` stored, over the snapshot built into harness (see `THIRD_PARTY`; `/usage` shows its date). A model in none of them shows "price unknown", never $0; a local model costs 0. Three figures are kept apart and never added: **billed** (API-key requests at the table price; ChatGPT plans and local models are 0), the **list-price estimate** (every hosted request at the table price, a ChatGPT model priced as its OpenAI API counterpart), and, only when you name `usage.baseline`, **avoided** (the baseline model's price for the tokens that ran on local or ChatGPT-plan models; plan and hardware fees are not counted). The tables ignore prices by context size and the like, so everything but billed API-key use is an estimate.
+
+<!-- documented-commands -->
+```sh
+harness usage                                    # tokens and cost by model, all time
+harness usage --by day --since 2026-10-01        # by day, from a UTC date
+harness usage --by project
+harness usage export --since 2026-10-01 --format csv > usage.csv
+harness usage export > usage.jsonl
+harness pricing update                           # the only fetch: models.dev, over HTTPS
+harness usage forget --before 2026-10-01         # delete ledger, windows and outcomes before a date
+harness usage forget --all
+```
+
+In the session, `/usage [model|provider|day|project] [--since DATE]` shows the session's tokens and cost lines, the usage windows with their reset times, and the ledger's report; `/budget` shows the money budgets and `/budget 2.00` raises the session's. Days and months are UTC.
+
+**ChatGPT windows.** On a ChatGPT plan, harness reads your usage windows from the response headers, the stream, and `GET /wham/usage` (asked when a session starts, by `/usage`, and before an automatic resume, never on a timer). OpenAI does not document these, so every field is optional: windows are named by their length (`5h`, `7d`), a window nobody has reported is "window unknown" (never 0%), and one observed more than 15 minutes ago is marked stale. A warning shows once as a window passes 80% and once at 95%; nothing is ever blocked because of a window. When a plan's limit ends a turn, the session offers once to resume at the reset (`usage.auto_resume = "never"` turns the offer off): a countdown that Esc cancels, the window read again at the reset, "Continue where you left off." sent only if it has capacity, and at most two more tries. `harness ask` never waits.
+
+**Budgets.** `[budgets]` sets `session_usd`, `daily_usd` and `monthly_usd` on billed cost (ChatGPT plans and local models are not spend). Before every request harness checks them: one warning at 80%, and at 100% the request is not sent and the turn ends (`harness ask` exits `4`). A project's `.harness/config.toml` may lower a budget but not raise it.
+
+<!-- documented-config -->
+```toml
+[usage]
+baseline = "openai/gpt-5"   # what "avoided" is measured against; none means no avoided figure
+auto_resume = "ask"         # or "never"
+
+[budgets]
+session_usd = 5.00
+daily_usd = 20.00
+monthly_usd = 200.00
+
+[outcomes]
+enabled = true              # false turns the per-turn outcome log off
+
+[pricing."openai/gpt-5*"]   # USD per million tokens; fields left out come from the tables
+input = 2.00
+output = 10.00
+```
+
+`[usage]`, `[budgets]` (as upper bounds), `[outcomes]` and `[pricing]` are read from the global config only.
+
 Project-level `.harness/config.toml` settings that widen what the agent may do (allow rules, `read_dirs`, model, providers, model profiles, sandbox settings, a `mode` wider than your global or default mode, a `max_steps` above your global limit) only apply after `harness trust`, and so does a `[compaction] threshold_percent` below 50. The same trust lets a project's command files choose their own `model`; a repository with command files and no project settings can be trusted too.
 
 ## Known limitations
@@ -100,6 +152,7 @@ Project-level `.harness/config.toml` settings that widen what the agent may do (
 - **Redaction** covers what harness writes, not what the model is sent: a key a command prints still reaches the model, which may repeat it in a file it writes. Secrets are matched only as whole values, as written or JSON-escaped: an encoded form (base64, as in Basic auth or a Kubernetes secret; a percent-encoded `/`, `+` or `=`), a fragment, or a few lines of a multi-line value such as a PEM key are not redacted, and neither are values shorter than eight characters. The exception is the edge of a reply: a reply that ends with the start of a secret, or starts with its end, eight characters or more of it, has that part redacted where it is recorded, so a reply cut off at the output limit inside a key, and the reply that continues it, show neither part. A key stored only in the keychain is known once a run reads it, so another provider's keychain key that a command prints is not redacted; every key in `credentials.json` is. The name rule has false positives, which only hide text: a path in `LESSKEY` or `GOOGLE_APPLICATION_CREDENTIALS`, or a placeholder such as `DB_PASSWORD=password`, which then hides every `password`. A continued session (`-c`, `--resume`) shows the model `[redacted]` where the first run showed the value, as does reading a saved tool-output file.
 - **Checkpoints** cover the working directory, not files over 10 MB, git-ignored files, `node_modules`, `target`, `.harness/` or a top-level `HEAD`, or what is inside nested repositories; a rewind leaves those alone, including a file that was ignored or too large when the checkpoint was taken. In a subdirectory of a repository, the repository's own ignore rules apply, unless they ignore that subdirectory itself (then only its own `.gitignore` files do); your global git excludes file does not. A checkpoint is restored only in the directory it was taken in, so a session continued from another directory can rewind its conversation but not those files. git stores only whether a file is executable: a restored file gets your umask's permissions, except files only you could read, which get theirs back. Checkpoints are off, with a warning, when harness's data directory is inside the workspace or a directory sandboxed commands can write to (a temp directory, or a `writable_roots` entry), and in a workspace whose first snapshot takes longer than 5 seconds. They need git 2.26 or later.
 - **Command files run with their own settings.** A command file's `allowed-tools` pre-approve the commands it names (never beyond deny rules, destructive-command confirmation or the sandbox). Its `model` answers its invocations if the file is your own (`~/.config/harness/commands`, `~/.claude/commands`); a project's command file chooses the model only once `harness trust` has trusted the directory the command files come from, the repository root (run it there, not in a subdirectory); otherwise a note says the session's model answers instead. In a command file's `` !`…` `` commands, the arguments are shell parameters set before the command runs: write `"$1"` or `"$ARGUMENTS"` in double quotes, as in any script (an unquoted `$1` is split and globbed, and `'$1'` is the text `$1`). A command that uses the arguments with a construct where bash may evaluate a value as code or arithmetic (`$((…))`, `$[…]`, `let`, `declare`, subscripts, `=(…)`, `eval`, `trap`, `read`, `printf -v`, `source`, `.`, `${!…}`, `${…@P}`, `compgen`, `complete`, `enable`, and a few more) is not run, with a warning. That list defends ordinary command bodies; one that deliberately hands an argument to something that runs it later, such as `PS4`, `PROMPT_COMMAND` or `BASH_ENV`, is the command author's responsibility, as in any script. Read command files from repositories you did not write before running them.
+- **Usage figures are local and approximate.** The ledger starts with this version: M1 sessions are not included. A request on a model with no price cannot be counted against a budget, and shows "price unknown". Prices by context size (the higher rates some models charge past 200k tokens) are not in the tables, so a cost can be low there. A manual `/compact` is a request that no budget stops. Subscription windows come from undocumented fields that can change; they degrade to "window unknown". Dates and times are UTC, since harness has no time-zone database.
 - **Instruction files and command files are read when a run starts**; changes apply to the next run.
 - **The interactive terminal is new.** Shift+Enter inserts a new line only in terminals that report it (those with the kitty keyboard protocol: kitty, WezTerm, Ghostty, foot, recent iTerm2); Alt+Enter, Ctrl+J, or a `\` before Enter work everywhere. Desktop notifications need a terminal that shows OSC 9 (iTerm2, WezTerm, kitty, Ghostty, Windows Terminal); inside tmux only the bell gets through unless passthrough is on. A long diff scrolls inside the approval prompt rather than in a full-screen view. A mode chosen with Shift+Tab during a turn applies when the turn ends; `/model`, `/mode`, `/rewind`, `/compact`, `/new`, `/resume` and `/login` wait for the turn (press Esc to stop it). A model chosen with `/model` lasts for the session; the default stays what `config.toml` says. API keys are added with `harness auth add` in a shell, not with `/login`. Code highlighting uses a dark theme. Input history is this session's (and a resumed session's) messages.
 
@@ -108,7 +161,7 @@ Project-level `.harness/config.toml` settings that widen what the agent may do (
 | Milestone | Scope |
 |---|---|
 | M1 Core agent | Phases P1 foundation, P2 safety, P3 memory (AGENTS.md, slash commands, sessions, checkpoints, compaction) and P4 providers (OpenAI, Anthropic, ChatGPT sign-in, credentials, model profiles) done, and P5, the terminal UI (inline rendering, approvals, plan mode, steering, the rewind list, model and session pickers) |
-| M2 Routing | Model roles, boundary-based switching, usage ledger and "$ saved", verification gates |
+| M2 Routing | Usage ledger, cost, budgets and the outcome log (M2a); verification gates, LSP diagnostics and edit formats (M2b); model roles, hand-off, fallback and escalation (M2c) |
 | M3 Agents | Subagents, delegation to Claude Code and Codex, parallel agents in worktrees |
 | M4 Ecosystem | Hooks, MCP, Agent Skills, ACP server |
 | M5 Distribution | Installers, native Windows |

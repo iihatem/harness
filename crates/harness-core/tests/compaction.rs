@@ -591,6 +591,8 @@ async fn a_turn_models_summary_request_keeps_the_defaults() {
             id: "mock/m2".into(),
             name: "m2".into(),
             local: false,
+            tools: None,
+            edit_section: None,
         }),
         ..TurnInput::from("d".repeat(1_500))
     };
@@ -771,6 +773,8 @@ async fn a_local_turn_models_requests_say_it_is_local() {
             id: "ollama/m2".into(),
             name: "m2".into(),
             local: true,
+            tools: None,
+            edit_section: None,
         }),
         ..TurnInput::from("d".repeat(1_500))
     };

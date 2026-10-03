@@ -150,11 +150,19 @@ pub fn turn_input(
     Expanded { input, messages }
 }
 
-/// The model a command asks for, as `resolved`: local when its profile (from `profiles`) says so.
-fn turn_model(resolved: Resolved, user: &BTreeMap<String, ProfileSettings>) -> TurnModel {
+/// The model for one turn on `resolved`, as a command's `model:` asks for it and as a role will:
+/// local when its profile (from `user`) says so, with the edit tool set and the prompt's edit
+/// section of the profile's `edit_format`, as the session has them after `/model`.
+pub(crate) fn turn_model(
+    resolved: Resolved,
+    user: &BTreeMap<String, ProfileSettings>,
+) -> TurnModel {
     let local = profiles::is_local(&resolved.id, &resolved.base_url);
+    let profile = profiles::resolve(&resolved.id, local, user);
     TurnModel {
-        local: profiles::resolve(&resolved.id, local, user).local,
+        local: profile.local,
+        tools: Some(harness_tools::builtin_for(profile.edit_format)),
+        edit_section: Some(crate::prompt::edit_section(profile.edit_format)),
         provider: resolved.provider,
         id: resolved.id,
         name: resolved.model,
@@ -205,6 +213,58 @@ mod tests {
         assert_eq!(
             (model.id.as_str(), model.name.as_str()),
             ("ollama/qwen3", "qwen3")
+        );
+    }
+
+    // Final review, M5: a turn on another model has that model's edit format: its tools and the
+    // prompt's edit section, whatever the session's model uses.
+    #[test]
+    fn a_turn_model_has_the_edit_format_of_its_profile() {
+        use std::collections::BTreeMap;
+
+        use harness_config::config::ProfileSettings;
+        use harness_core::edit_format::EditFormat;
+
+        let providers = BTreeMap::new();
+        let resolved = |id: &str| {
+            registry::resolve(id, &providers, |_: &str| Some("sk-test-key".to_string())).unwrap()
+        };
+        let profile = |format| ProfileSettings {
+            edit_format: Some(format),
+            ..ProfileSettings::default()
+        };
+        let user = BTreeMap::from([
+            (
+                "openrouter/patcher".to_string(),
+                profile(EditFormat::ApplyPatch),
+            ),
+            (
+                "openrouter/replacer".to_string(),
+                profile(EditFormat::StrReplace),
+            ),
+        ]);
+        let names = |m: &TurnModel| -> Vec<String> {
+            m.tools
+                .as_ref()
+                .unwrap()
+                .specs()
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        let patcher = turn_model(resolved("openrouter/patcher"), &user);
+        let replacer = turn_model(resolved("openrouter/replacer"), &user);
+        assert!(names(&patcher).contains(&"apply_patch".to_string()));
+        assert!(!names(&patcher).contains(&"edit".to_string()));
+        assert!(names(&replacer).contains(&"edit".to_string()));
+        assert!(!names(&replacer).contains(&"apply_patch".to_string()));
+        assert_eq!(
+            patcher.edit_section.as_deref(),
+            Some(crate::prompt::edit_section(EditFormat::ApplyPatch).as_str())
+        );
+        assert_eq!(
+            replacer.edit_section.as_deref(),
+            Some(crate::prompt::edit_section(EditFormat::StrReplace).as_str())
         );
     }
 

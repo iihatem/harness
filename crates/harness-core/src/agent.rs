@@ -1072,12 +1072,22 @@ impl Agent {
         self.config.context_window = model.context_window;
         self.config.request = model.request;
         self.config.text_tool_calls = model.text_tool_calls;
-        if let Some(tools) = model.tools {
+        self.use_edit_format(model.tools, model.edit_section);
+        self.reported_usage = None;
+        self.auto_compaction_paused = false;
+        self.model_chosen_by_user = true;
+    }
+
+    /// Offers `tools` (when given) and puts `section` (when given) in the system prompt's edit
+    /// section: the edit format of a model. The one place a model's edit format is applied, for a
+    /// `/model` switch and for a turn on another model. The prompt changes only where the section
+    /// is, and only when the format does: it stays byte for byte the same for as long as the
+    /// model does.
+    fn use_edit_format(&mut self, tools: Option<ToolRegistry>, section: Option<String>) {
+        if let Some(tools) = tools {
             self.set_tools(tools);
         }
-        // The prompt changes only where the section is, and only when the format does: it stays
-        // byte for byte the same for as long as the model does.
-        if let Some(section) = model.edit_section {
+        if let Some(section) = section {
             if let Some(old) = self.config.edit_section.take()
                 && old != section
             {
@@ -1085,9 +1095,6 @@ impl Agent {
             }
             self.config.edit_section = Some(section);
         }
-        self.reported_usage = None;
-        self.auto_compaction_paused = false;
-        self.model_chosen_by_user = true;
     }
 
     /// Switches the approval mode between turns, and with [`with_sandboxes`](Self::with_sandboxes)
@@ -1138,7 +1145,27 @@ impl Agent {
         if input.read_only_shell {
             self.ctx.access = FsAccess::ReadOnly;
         }
+        // A turn on another model uses that model's edit format; the session's comes back after.
+        let session_format = self.turn_model.as_ref().and_then(|m| {
+            (m.tools.is_some() || m.edit_section.is_some()).then(|| {
+                (
+                    self.tools.clone(),
+                    self.config.edit_section.clone(),
+                    self.config.system_prompt.clone(),
+                    m.tools.clone(),
+                    m.edit_section.clone(),
+                )
+            })
+        });
+        if let Some((_, _, _, tools, section)) = session_format.clone() {
+            self.use_edit_format(tools, section);
+        }
         let reason = self.turn(input, events, cancel).await;
+        if let Some((tools, section, prompt, _, _)) = session_format {
+            self.set_tools(tools);
+            self.config.edit_section = section;
+            self.config.system_prompt = prompt;
+        }
         self.ctx.access = access;
         self.policy.set_turn_rules(None);
         self.turn_model = None;

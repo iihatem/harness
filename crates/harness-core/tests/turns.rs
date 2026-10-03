@@ -161,6 +161,8 @@ async fn a_turn_model_answers_only_its_turn() {
             id: "mock/m2".into(),
             name: "m2".into(),
             local: false,
+            tools: None,
+            edit_section: None,
         }),
         ..TurnInput::from("one")
     };

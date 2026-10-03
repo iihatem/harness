@@ -212,3 +212,54 @@ async fn the_context_report_counts_the_new_tools() {
     ));
     assert!(agent.context_usage().tools > before);
 }
+
+// A per-turn model (a command's `model:`, a role) brings its own edit format for that turn: its
+// tool set and the prompt's edit section. The session's come back when the turn ends.
+#[tokio::test]
+async fn a_turn_model_uses_its_own_edit_format_and_the_sessions_comes_back() {
+    use harness_core::turn::{TurnInput, TurnModel};
+    let dir = tempfile::tempdir().unwrap();
+    let session = MockProvider::new(vec![Script::text("one"), Script::text("three")]);
+    let other = MockProvider::new(vec![
+        Script::tool_call("t1", "apply_patch", json!({"input": "p"})),
+        Script::text("two"),
+    ]);
+    let mut agent = agent(session.clone(), dir.path());
+    let input = TurnInput {
+        model: Some(TurnModel {
+            provider: other.clone(),
+            id: "mock/b".into(),
+            name: "b".into(),
+            local: false,
+            tools: Some(registry(&["read", "apply_patch", "bash"])),
+            edit_section: Some(SECTION_B.into()),
+        }),
+        ..TurnInput::from("patch it")
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_turn(input, &tx, tokio_util::sync::CancellationToken::new())
+        .await;
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    // Both requests of the turn offered the turn model's tools and prompt section.
+    for request in other.requests() {
+        let names: Vec<_> = request.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["read", "apply_patch", "bash"]);
+        assert!(request.system.contains(SECTION_B) && !request.system.contains(SECTION_A));
+    }
+    // Its edit tool ran, though the session's model has none of that name.
+    assert_eq!(
+        common::finished_outputs(&events)[0],
+        ("apply_patch ran".to_string(), false)
+    );
+    // The next turn is the session model's again, byte for byte as before.
+    run(&mut agent, "again").await;
+    assert_eq!(tool_names(&session, 0), ["read", "edit", "bash"]);
+    assert!(session.requests()[0].system.contains(SECTION_A));
+    assert!(!session.requests()[0].system.contains(SECTION_B));
+    assert_eq!(agent.tool_specs().len(), 3);
+    assert_eq!(tool_names(&session, 0), ["read", "edit", "bash"]);
+}

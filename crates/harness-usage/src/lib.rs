@@ -6,6 +6,7 @@ pub mod error;
 pub mod ledger;
 pub mod meter;
 pub mod paths;
+pub mod pricing;
 pub mod store;
 
 /// The version of the SQLite library built into harness, which the report cache runs on.

@@ -228,6 +228,46 @@ fn profiles_problem(profiles: &BTreeMap<String, ProfileSettings>) -> Option<Stri
         .find_map(|(key, profile)| profile.problem(key))
 }
 
+/// `[pricing."<glob>"]`: a model's prices in USD per million tokens, over the price tables', for
+/// the models whose ids match the glob. Fields left out come from the table below.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceSettings {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+    pub cache_write_1h: Option<f64>,
+}
+
+impl PriceSettings {
+    /// What is wrong with the prices under `key`, if anything.
+    fn problem(&self, key: &str) -> Option<String> {
+        if let Err(e) = globset::Glob::new(key) {
+            return Some(format!("pricing.{key:?} is not a valid glob: {e}"));
+        }
+        for (name, value) in [
+            ("input", self.input),
+            ("output", self.output),
+            ("cache_read", self.cache_read),
+            ("cache_write", self.cache_write),
+            ("cache_write_1h", self.cache_write_1h),
+        ] {
+            if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
+                return Some(format!(
+                    "pricing.{key:?}: {name} must be a price in USD per million tokens, not below 0"
+                ));
+            }
+        }
+        None
+    }
+}
+
+/// The first problem with any of `pricing`.
+fn pricing_problem(pricing: &BTreeMap<String, PriceSettings>) -> Option<String> {
+    pricing.iter().find_map(|(key, price)| price.problem(key))
+}
+
 /// `[notifications]`: what the interactive session does when a long turn ends or an approval
 /// waits. A project may set it without trust: it changes nothing the agent may do.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -284,6 +324,8 @@ pub struct ConfigFile {
     pub profiles: BTreeMap<String, ProfileSettings>,
     #[serde(default)]
     pub notifications: NotificationSettings,
+    #[serde(default)]
+    pub pricing: BTreeMap<String, PriceSettings>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -315,6 +357,9 @@ pub struct Config {
     /// Model profiles by model-id glob: the global config's, with a trusted project's over them.
     pub profiles: BTreeMap<String, ProfileSettings>,
     pub notifications: Notifications,
+    /// The user's prices by model-id glob (global config only: a project cannot make a model
+    /// look free).
+    pub pricing: BTreeMap<String, PriceSettings>,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -559,6 +604,7 @@ pub fn load(
         g.compaction
             .problem()
             .or_else(|| profiles_problem(&g.profiles))
+            .or_else(|| pricing_problem(&g.pricing))
     }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
@@ -580,6 +626,7 @@ pub fn load(
         cfg.allow_localhost = global.sandbox.allow_localhost.unwrap_or(false);
         cfg.linux_git_protection = global.sandbox.linux_git_protection.unwrap_or_default();
         cfg.profiles = global.profiles;
+        cfg.pricing = global.pricing;
         cfg.notifications = cfg.notifications.overlaid(&global.notifications);
     }
     let path = project_file(workspace);
@@ -595,6 +642,12 @@ pub fn load(
             return Err(ConfigError::Parse { path, message });
         }
         cfg.notifications = cfg.notifications.overlaid(&project.notifications);
+        if !project.pricing.is_empty() {
+            cfg.warnings.push(format!(
+                "{}: ignoring [pricing]: prices are read from the global config only, so a cloned repository cannot make a model look free",
+                path.display()
+            ));
+        }
         cfg.deny.extend(project.permissions.deny.iter().cloned());
         cfg.confirm
             .extend(project.permissions.confirm.iter().cloned());

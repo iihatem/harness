@@ -7,6 +7,7 @@ mod interactive;
 mod login;
 mod models;
 mod notices;
+mod pricing;
 mod prompt;
 mod sandbox;
 mod sessions;
@@ -106,6 +107,11 @@ enum Command {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+    /// Update the price table the cost figures use (the only time harness connects to models.dev)
+    Pricing {
+        #[command(subcommand)]
+        command: PricingCommand,
+    },
     /// Report model usage and cost from the local ledger, by model, provider, day or project
     Usage {
         /// What to group by: model, provider, day or project
@@ -137,6 +143,12 @@ enum AuthCommand {
         /// The account profile
         profile: String,
     },
+}
+
+#[derive(Subcommand)]
+enum PricingCommand {
+    /// Fetch the current prices from models.dev, validate them, and store them
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -195,6 +207,7 @@ fn command_line(command: &Command) -> &'static str {
         Command::Trust { .. } => "harness trust",
         Command::Sandbox { .. } => "harness sandbox doctor",
         Command::Usage { .. } => "harness usage",
+        Command::Pricing { .. } => "harness pricing update",
     }
 }
 
@@ -309,6 +322,9 @@ fn main() -> ExitCode {
                 command: SandboxCommand::Doctor,
             }) => doctor::run(),
             Some(Command::Usage { by, since, until }) => usage::report(&by, since, until),
+            Some(Command::Pricing {
+                command: PricingCommand::Update,
+            }) => pricing::update().await,
             None => {
                 let pick_session = matches!(cli.resume, Some(None));
                 interactive::run(cli.model, cli.mode, session, pick_session).await

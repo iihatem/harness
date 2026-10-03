@@ -1548,8 +1548,10 @@ name = "harness-usage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "globset",
  "harness-core",
  "hex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1557,6 +1559,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "wiremock",
 ]
 
 [[package]]

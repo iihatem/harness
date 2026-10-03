@@ -249,3 +249,110 @@ fn usage_is_listed_in_help() {
     let help = stdout(&run_usage(&env, &["--help"]));
     assert!(help.contains("usage"), "{help}");
 }
+
+// `harness pricing update` fetches the table once, validates it and stores it; a failed update
+// leaves the old table; and a session makes no connection to the pricing host.
+const MODELS_DEV: &str = r#"{"openai":{"models":{"gpt-5":{"cost":{"input":1.5,"output":9}},"o3":{"cost":{"input":2,"output":8}}}}}"#;
+
+async fn pricing_server(status: u16, body: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api.json"))
+        .respond_with(ResponseTemplate::new(status).set_body_string(body))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pricing_update_stores_the_table_and_prints_its_date_and_size() {
+    let models_dev = pricing_server(200, MODELS_DEV).await;
+    let env = Env::new("http://127.0.0.1:9", "");
+    let url = format!("{}/api.json", models_dev.uri());
+    let env = tokio::task::spawn_blocking(move || {
+        let out = env
+            .cmd()
+            .env("HARNESS_PRICING_URL", &url)
+            .args(["pricing", "update"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(text.contains("2 models"), "{text}");
+        assert!(text.contains("dated 20"), "{text}");
+        let file = env.home.path().join("data/pricing.json");
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("\"gpt-5\"")
+        );
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        env
+    })
+    .await
+    .unwrap();
+    assert_eq!(models_dev.received_requests().await.unwrap().len(), 1);
+    drop(env);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_pricing_update_exits_non_zero_and_keeps_the_old_table() {
+    let models_dev = pricing_server(200, "this is not pricing data").await;
+    let env = Env::new("http://127.0.0.1:9", "");
+    let file = env.home.path().join("data/pricing.json");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "old table").unwrap();
+    let url = format!("{}/api.json", models_dev.uri());
+    tokio::task::spawn_blocking(move || {
+        let out = env
+            .cmd()
+            .env("HARNESS_PRICING_URL", &url)
+            .args(["pricing", "update"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert!(!out.stderr.is_empty());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old table");
+    })
+    .await
+    .unwrap();
+}
+
+// A session runs without the user running `harness pricing update`: no connection to models.dev.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_never_fetches_prices() {
+    let models_dev = pricing_server(200, MODELS_DEV).await;
+    let server = MockServer::start().await;
+    two_requests(&server).await;
+    let env = Env::new(&server.uri(), "");
+    let url = format!("{}/api.json", models_dev.uri());
+    let env = tokio::task::spawn_blocking(move || {
+        let _ = env
+            .cmd()
+            .env("HARNESS_PRICING_URL", &url)
+            .args(["--model", "mock/test-model", "ask", "go"])
+            .assert();
+        let _ = env
+            .cmd()
+            .env("HARNESS_PRICING_URL", &url)
+            .arg("usage")
+            .output();
+        env
+    })
+    .await
+    .unwrap();
+    assert!(models_dev.received_requests().await.unwrap().is_empty());
+    drop(env);
+}
+
+#[test]
+fn pricing_is_listed_in_help() {
+    let env = Env::new("http://127.0.0.1:9", "");
+    let help = stdout(&run_usage(&env, &["--help"]));
+    assert!(help.contains("pricing"), "{help}");
+    let help = stdout(&run_usage(&env, &["pricing", "--help"]));
+    assert!(help.contains("update"), "{help}");
+}

@@ -69,3 +69,18 @@ fn the_snapshot_is_written_once_with_the_windows_and_no_more_than_that() {
         0o600
     );
 }
+
+// Final review, Minor 1: the same windows seen again a second later are the same snapshot.
+#[test]
+fn an_unchanged_snapshot_seen_later_is_written_once() {
+    let data = tempfile::tempdir().unwrap();
+    let meter = UsageMeter::open(data.path(), data.path()).with_clock(Arc::new(|| OCTOBER));
+    for later in 0..3 {
+        let mut seen = snapshot(42.0);
+        seen.observed_at += later;
+        meter.record_window(&seen);
+    }
+    let file = Dirs::under(data.path()).usage.join("windows-2026-10.jsonl");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(text.lines().count(), 1, "{text}");
+}

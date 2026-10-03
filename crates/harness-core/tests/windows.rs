@@ -70,5 +70,20 @@ fn a_snapshot_has_a_stable_id_that_follows_its_content() {
     assert_eq!(a.id(), b.id());
     b.windows[0].used_percent = Some(43.0);
     assert_ne!(a.id(), b.id());
-    assert!(a.id().starts_with("w1790000000-"), "{}", a.id());
+    assert!(a.id().starts_with('w'), "{}", a.id());
+}
+
+// Final review, Minor 1: the time it was seen is not part of what a snapshot is, so one that
+// repeats unchanged is the same snapshot and is written once.
+#[test]
+fn the_id_of_a_snapshot_does_not_depend_on_when_it_was_seen() {
+    let a = WindowSnapshot {
+        windows: vec![window(Some(300), Some(42.0))],
+        observed_at: 1_790_000_000,
+    };
+    let b = WindowSnapshot {
+        observed_at: 1_790_000_001,
+        ..a.clone()
+    };
+    assert_eq!(a.id(), b.id());
 }

@@ -130,12 +130,13 @@ impl WindowSnapshot {
             })
     }
 
-    /// A name for this snapshot that follows its content: the ledger refers to it by this.
+    /// A name for this snapshot that follows its windows, not when they were seen, so a snapshot
+    /// that repeats unchanged is written once: the ledger refers to it by this.
     pub fn id(&self) -> String {
         use sha2::{Digest, Sha256};
         let json = serde_json::to_string(&self.windows).unwrap_or_default();
         let digest = Sha256::digest(json.as_bytes());
-        format!("w{}-{}", self.observed_at, hex::encode(&digest[..4]))
+        format!("w{}", hex::encode(&digest[..8]))
     }
 }
 

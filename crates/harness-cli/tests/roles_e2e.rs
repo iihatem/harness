@@ -161,3 +161,37 @@ async fn a_cloned_repositorys_roles_are_ignored_until_trusted() {
     assert!(stderr.contains("roles.plan"), "{stderr}");
     assert!(bodies(&planner).await.is_empty());
 }
+
+// Spec "Headless output" and "Message attribution": `ask --json` prints the `ModelSwitched` event
+// of the plan role's turn, and its messages say which role they ran for.
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_json_prints_the_model_switch_and_the_attribution() {
+    let (main, planner) = (server("from main").await, server("the plan").await);
+    let env = Env::new(
+        &main,
+        &planner,
+        "model = \"main/m\"\n",
+        "[roles]\nplan = \"planner/p\"\n",
+    );
+    let (stdout, _) = run(env, &["--mode", "plan", "ask", "--json", "plan it"]).await;
+    let events: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let switched: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "model_switched")
+        .collect();
+    assert_eq!(switched.len(), 1, "{stdout}");
+    assert_eq!(switched[0]["from"], "main/m");
+    assert_eq!(switched[0]["to"], "planner/p");
+    assert_eq!(switched[0]["role"], "plan");
+    assert_eq!(switched[0]["reason"], "user");
+    let reply = events
+        .iter()
+        .find(|e| e["type"] == "assistant_message")
+        .unwrap();
+    assert_eq!(reply["model"], "planner/p");
+    assert_eq!(reply["role"], "plan");
+    assert!(reply.get("switch_reason").is_none(), "{reply}");
+}

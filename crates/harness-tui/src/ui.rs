@@ -263,7 +263,15 @@ where
                         })
                     }
                     Job::SetRole { role, id } => {
+                        let from = agent.role_model_id(role);
                         agent.set_role_model(role, &id);
+                        let _ = events_tx.send(AgentEvent::ModelSwitched {
+                            from,
+                            to: id.clone(),
+                            role,
+                            reason: harness_core::role::SwitchReason::User,
+                            detail: None,
+                        });
                         Some(Done::Role {
                             role,
                             id,
@@ -271,7 +279,7 @@ where
                         })
                     }
                     Job::SwitchModel { model, window_note } => {
-                        agent.switch_model(*model);
+                        let _ = events_tx.send(agent.switch_model(*model));
                         let view = ModelView {
                             id: agent.model_id().to_string(),
                             window_note,

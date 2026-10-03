@@ -554,6 +554,7 @@ pub mod tests {
             display: None,
             note: false,
             plan: None,
+            attribution: None,
         });
         let id = opened.session.id().to_string();
         drop(opened);
@@ -596,6 +597,7 @@ pub mod tests {
             display: None,
             note: false,
             plan: None,
+            attribution: None,
         });
         let id = opened.session.id().to_string();
         drop(opened);

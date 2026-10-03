@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     message::Usage,
     meter::{BudgetNotice, RequestCost, WindowSnapshot},
+    role::{Role, SwitchReason},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +89,22 @@ pub enum AgentEvent {
     AssistantMessage {
         content: String,
         model: String,
+        /// The role the message was written for.
+        role: Role,
+        /// Why its model is not the one its role is configured to use, when it is not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        switch_reason: Option<SwitchReason>,
+    },
+    /// The model changed: by a command or key, by a role's assignment, by a fallback chain, or by
+    /// an escalation. `detail` says more where there is more to say (what failed, and whether the
+    /// new model is billed).
+    ModelSwitched {
+        from: String,
+        to: String,
+        role: Role,
+        reason: SwitchReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     ToolCallRequested {
         id: String,

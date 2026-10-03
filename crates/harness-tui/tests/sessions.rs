@@ -97,6 +97,7 @@ fn saved(dir: &Path, workspace: &Path, exchanges: &[(&str, &str)]) -> String {
                 display: None,
                 note: false,
                 plan: None,
+                attribution: None,
             });
         }
     }

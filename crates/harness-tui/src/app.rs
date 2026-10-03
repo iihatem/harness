@@ -947,8 +947,7 @@ impl App {
                 let wanted = self.switching.take().unwrap_or_default();
                 match result {
                     Ok(view) => {
-                        self.transcript
-                            .push_note(&format!("switched to {}", view.id), width);
+                        // The `ModelSwitched` event is the line that says so.
                         // The countdown reads the windows of the provider it began with.
                         self.resume = None;
                         self.limit_reset = None;
@@ -966,13 +965,8 @@ impl App {
                     }
                 }
             }
-            Done::Role {
-                role,
-                id,
-                result: Ok(()),
-            } => self
-                .transcript
-                .push_note(&format!("{role} role: {id}, for this session"), width),
+            // The `ModelSwitched` event is its line.
+            Done::Role { result: Ok(()), .. } => {}
             Done::Role {
                 role,
                 id,

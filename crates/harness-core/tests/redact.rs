@@ -160,6 +160,7 @@ fn session_files_hold_no_secrets() {
         display: None,
         note: false,
         plan: None,
+        attribution: None,
     });
     let saved = std::fs::read_to_string(session.path().unwrap()).unwrap();
     assert!(!saved.contains(KEY), "{saved}");
@@ -321,6 +322,8 @@ fn events_show_streamed_secrets_whole_and_flush_before_other_events() {
         AgentEvent::AssistantMessage {
             content: format!("Your key is {KEY}. Done sk-"),
             model: "mock/m".into(),
+            role: harness_core::role::Role::Main,
+            switch_reason: None,
         },
         AgentEvent::TextDelta {
             text: "after sk-canary".into(),
@@ -370,6 +373,8 @@ fn events_show_streamed_secrets_whole_and_flush_before_other_events() {
         AgentEvent::AssistantMessage {
             content: format!("Your key is {REDACTED}. Done sk-"),
             model: "mock/m".into(),
+            role: harness_core::role::Role::Main,
+            switch_reason: None,
         }
     );
     assert_eq!(shown[0], AgentEvent::TurnStarted);
@@ -430,6 +435,7 @@ fn session_files_hold_no_password_from_a_tool_call() {
         display: None,
         note: false,
         plan: None,
+        attribution: None,
     });
     let saved = std::fs::read_to_string(session.path().unwrap()).unwrap();
     assert!(!holds_the_password(&saved), "{saved}");
@@ -495,6 +501,7 @@ fn a_secret_that_is_one_of_harnesss_own_words_breaks_no_record() {
         display: None,
         note: false,
         plan: None,
+        attribution: None,
     });
     let path = session.path().unwrap().to_path_buf();
     drop(session);
@@ -667,6 +674,8 @@ fn a_secret_split_across_a_cut_off_reply_and_its_continuation_is_written_nowhere
                 events.push(AgentEvent::AssistantMessage {
                     content: reply.clone(),
                     model: "mock/m".into(),
+                    role: harness_core::role::Role::Main,
+                    switch_reason: None,
                 });
                 events.push(AgentEvent::Warning {
                     message: "the model's reply was cut off at its output limit".into(),
@@ -727,6 +736,7 @@ fn a_session_holds_no_part_of_a_secret_split_across_two_replies() {
         display: None,
         note: false,
         plan: None,
+        attribution: None,
     };
     session.append(reply(format!("Your key is {head}")));
     session.append(EntryKind::Message {
@@ -737,6 +747,7 @@ fn a_session_holds_no_part_of_a_secret_split_across_two_replies() {
         display: None,
         note: true,
         plan: None,
+        attribution: None,
     });
     session.append(reply(format!("{tail} is the rest.")));
     let saved = std::fs::read_to_string(session.path().unwrap()).unwrap();

@@ -295,6 +295,17 @@ impl Transcript {
                     self.push_lines(lines(shown.trim_end(), dim), width);
                 }
             }
+            AgentEvent::ModelSwitched {
+                from,
+                to,
+                role,
+                reason,
+                detail,
+            } => {
+                let text =
+                    harness_core::role::switched_text(from, to, *role, *reason, detail.as_deref());
+                self.push_note(&text, width);
+            }
             AgentEvent::ApprovalNeeded { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::Metered { .. }

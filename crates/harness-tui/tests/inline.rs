@@ -425,6 +425,8 @@ fn a_tool_using_turn_becomes_lines_for_the_scrollback() {
         AgentEvent::AssistantMessage {
             content: "All **tests** pass.".into(),
             model: "mock/m".into(),
+            role: harness_core::role::Role::Main,
+            switch_reason: None,
         },
         AgentEvent::TurnFinished {
             reason: TurnEndReason::Completed,
@@ -679,6 +681,8 @@ fn a_streaming_reply_goes_into_the_scrollback_block_by_block() {
         &AgentEvent::AssistantMessage {
             content: REPLY.into(),
             model: "mock/m".into(),
+            role: harness_core::role::Role::Main,
+            switch_reason: None,
         },
         40,
     );

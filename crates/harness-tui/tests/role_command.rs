@@ -93,7 +93,11 @@ async fn wait_for(ui: &mut Ui, text: &str) {
 async fn a_role_is_set_for_the_session_and_roles_says_so() {
     let (_dir, mut ui, calls) = open(vec![], vec![]);
     send(&mut ui, "/model --role build ollama/qwen3-coder:30b");
-    wait_for(&mut ui, "build role: ollama/qwen3-coder:30b").await;
+    wait_for(
+        &mut ui,
+        "switched to ollama/qwen3-coder:30b (build role, from mock/m; you chose it)",
+    )
+    .await;
     settle(&mut ui).await;
     assert_eq!(*calls.checked.lock().unwrap(), ["ollama/qwen3-coder:30b"]);
     assert!(calls.switched.lock().unwrap().is_empty());

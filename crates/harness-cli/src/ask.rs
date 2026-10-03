@@ -497,6 +497,24 @@ impl Shown {
                     eprintln!("{}", terminal_safe_text(tail.trim_end()));
                 }
             }
+            AgentEvent::ModelSwitched {
+                from,
+                to,
+                role,
+                reason,
+                detail,
+            } if !json => {
+                eprintln!(
+                    "{}",
+                    terminal_safe(&harness_core::role::switched_text(
+                        from,
+                        to,
+                        *role,
+                        *reason,
+                        detail.as_deref()
+                    ))
+                );
+            }
             AgentEvent::Error { message, .. } if !json => {
                 eprintln!("error: {}", terminal_safe(message))
             }

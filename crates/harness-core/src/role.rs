@@ -52,6 +52,51 @@ impl FromStr for Role {
     }
 }
 
+/// Why a model switched, or why a message is on a model other than the one its role is configured
+/// to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchReason {
+    /// A configured fallback chain moved a failed request.
+    Fallback,
+    /// The user escalated (`/escalate`).
+    Escalation,
+    /// The user's command or key: `/model`, `/model --role`, Shift+Tab into `plan` mode, Build, or
+    /// a command file's `model:`.
+    User,
+}
+
+impl SwitchReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SwitchReason::Fallback => "fallback",
+            SwitchReason::Escalation => "escalation",
+            SwitchReason::User => "user",
+        }
+    }
+}
+
+/// The line that announces a model switch, for the terminal and for `harness ask`'s stderr.
+pub fn switched_text(
+    from: &str,
+    to: &str,
+    role: Role,
+    reason: SwitchReason,
+    detail: Option<&str>,
+) -> String {
+    let why = match reason {
+        SwitchReason::User => "you chose it",
+        SwitchReason::Fallback => "fallback",
+        SwitchReason::Escalation => "escalation",
+    };
+    let mut text = format!("switched to {to} ({role} role, from {from}; {why})");
+    if let Some(detail) = detail {
+        text.push_str(": ");
+        text.push_str(detail);
+    }
+    text
+}
+
 /// Where a role's model comes from, as `/roles` says it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

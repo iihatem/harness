@@ -79,7 +79,9 @@ async fn assistant_messages_are_attributed_to_the_model() {
     let (_, events) = run(&mut agent, "hi").await;
     assert!(events.contains(&AgentEvent::AssistantMessage {
         content: "hello".into(),
-        model: "mock/m1".into()
+        model: "mock/m1".into(),
+        role: harness_core::role::Role::Main,
+        switch_reason: None,
     }));
     assert!(matches!(&agent.history()[1], Message::Assistant { model, .. } if model == "mock/m1"));
 }

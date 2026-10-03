@@ -28,8 +28,8 @@ use crate::{
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
     redact::Redactor,
     retry::RetryPolicy,
-    role::{ModelResolver, Role, RoleConfig, RoleLine, RoleSource, RoleTable},
-    session::{Entry, EntryKind, RewindScope, Session},
+    role::{ModelResolver, Role, RoleConfig, RoleLine, RoleSource, RoleTable, SwitchReason},
+    session::{Attribution, Entry, EntryKind, RewindScope, Session},
     tokens::DEFAULT_CONTEXT_WINDOW,
     tool::{CommandSandbox, Tool, ToolContext, ToolOutput, ToolRegistry},
     turn::{InputPart, Steering, TurnInput, TurnModel},
@@ -425,8 +425,14 @@ pub struct Agent {
     roles: RoleTable,
     /// Makes the models of roles ready when a turn needs them.
     resolver: Option<Arc<dyn ModelResolver>>,
-    /// The role the current turn runs for.
+    /// The role the current turn runs for, and why its model is not the one that role is
+    /// configured to use, when it is not.
     turn_role: Role,
+    turn_reason: Option<SwitchReason>,
+    /// Why the session's own model is not the one it started on, when it is not.
+    main_reason: Option<SwitchReason>,
+    /// The model the last turn's role used, to announce a turn on another.
+    last_role_model: String,
 }
 
 impl Agent {
@@ -439,6 +445,7 @@ impl Agent {
         ctx: ToolContext,
     ) -> Self {
         let validators = validators_of(&tools);
+        let last_role_model = config.model_id.clone();
         Agent {
             provider,
             tools,
@@ -482,6 +489,9 @@ impl Agent {
             roles: RoleTable::default(),
             resolver: None,
             turn_role: Role::Main,
+            turn_reason: None,
+            main_reason: None,
+            last_role_model,
         }
     }
 
@@ -501,6 +511,13 @@ impl Agent {
     /// `background`. `false` for `main`, which `switch_model` changes.
     pub fn set_role_model(&mut self, role: Role, id: &str) -> bool {
         self.roles.set(role, id)
+    }
+
+    /// The model `role` runs on now: its own, or the session's.
+    pub fn role_model_id(&self, role: Role) -> String {
+        self.roles
+            .get(role)
+            .map_or_else(|| self.config.model_id.clone(), |(id, _)| id.clone())
     }
 
     /// Each role's model and where it came from, `main` first, for `/roles`. A role that is not
@@ -1100,7 +1117,7 @@ impl Agent {
     /// Adds `message` to the history and saves it in the session. If the session file cannot be
     /// written, the conversation continues in memory and a warning says so once.
     fn record(&mut self, message: Message, display: Option<String>, note: bool) {
-        self.record_entry(message, display, note, None);
+        self.record_entry(message, display, note, None, None);
     }
 
     /// [`record`](Self::record), with the plan the message asks to build.
@@ -1110,12 +1127,14 @@ impl Agent {
         display: Option<String>,
         note: bool,
         plan: Option<String>,
+        attribution: Option<Attribution>,
     ) -> String {
         let id = self.session.append(EntryKind::Message {
             message: message.clone(),
             display,
             note,
             plan,
+            attribution,
         });
         self.history.push(message);
         self.history_ids.push(id.clone());
@@ -1150,9 +1169,13 @@ impl Agent {
     /// conversation stays as it is: it is kept in a form every provider takes, and each adapter
     /// leaves out what its provider cannot accept. The next request's size is estimated afresh,
     /// since the new model counts tokens its own way, and it is compacted against the new window.
-    pub fn switch_model(&mut self, model: SessionModel) {
+    pub fn switch_model(&mut self, model: SessionModel) -> AgentEvent {
+        let from = std::mem::replace(&mut self.config.model_id, model.id.clone());
+        // A turn on the model the last one used needs no announcement of its own.
+        if self.last_role_model == from {
+            self.last_role_model = model.id.clone();
+        }
         self.provider = model.provider;
-        self.config.model_id = model.id;
         self.config.model_name = model.name;
         self.config.context_window = model.context_window;
         self.config.request = model.request;
@@ -1161,6 +1184,14 @@ impl Agent {
         self.reported_usage = None;
         self.auto_compaction_paused = false;
         self.model_chosen_by_user = true;
+        self.main_reason = Some(SwitchReason::User);
+        AgentEvent::ModelSwitched {
+            from,
+            to: self.config.model_id.clone(),
+            role: Role::Main,
+            reason: SwitchReason::User,
+            detail: None,
+        }
     }
 
     /// Offers `tools` (when given) and puts `section` (when given) in the system prompt's edit
@@ -1252,6 +1283,30 @@ impl Agent {
                 return reason;
             }
         };
+        // Why the model is not the role's own, when it is not; and the announcement of a turn on
+        // another role's model than the last turn's.
+        self.turn_reason = match (&input.model, self.roles.get(role)) {
+            (Some(_), _) => Some(SwitchReason::User),
+            (None, Some((id, source))) if *id != self.config.model_id => {
+                (*source == RoleSource::Session).then_some(SwitchReason::User)
+            }
+            _ => self.main_reason,
+        };
+        if input.model.is_none() {
+            let to = role_model
+                .as_ref()
+                .map_or_else(|| self.config.model_id.clone(), |m| m.id.clone());
+            if to != self.last_role_model {
+                let from = std::mem::replace(&mut self.last_role_model, to.clone());
+                let _ = events.send(AgentEvent::ModelSwitched {
+                    from,
+                    to,
+                    role,
+                    reason: SwitchReason::User,
+                    detail: None,
+                });
+            }
+        }
         // Settings that apply to this turn only.
         self.turn_model = input.model.clone().or(role_model);
         self.policy.set_turn_rules(Some(input.rules.clone()));
@@ -1295,8 +1350,13 @@ impl Agent {
         let _ = events.send(AgentEvent::TurnStarted);
         self.message_recorded = false;
         let content = self.user_message(input.parts, events).await;
-        self.turn_entry =
-            self.record_entry(Message::User { content }, input.display, false, input.plan);
+        self.turn_entry = self.record_entry(
+            Message::User { content },
+            input.display,
+            false,
+            input.plan,
+            None,
+        );
         self.message_recorded = true;
         for kind in std::mem::take(&mut self.held_entries) {
             self.append_turn_entry(kind);
@@ -2030,13 +2090,19 @@ impl Agent {
         let _ = events.send(AgentEvent::AssistantMessage {
             content: text.clone(),
             model: model.clone(),
+            role: self.turn_role,
+            switch_reason: self.turn_reason,
         });
         let message = Message::Assistant {
             content: text,
             tool_calls,
             model,
         };
-        self.record(message, None, false);
+        let attribution = Attribution {
+            role: self.turn_role,
+            switch_reason: self.turn_reason,
+        };
+        self.record_entry(message, None, false, None, Some(attribution));
     }
 
     /// Adds what a model call took to the turn's stats, and reports its usage once: a server

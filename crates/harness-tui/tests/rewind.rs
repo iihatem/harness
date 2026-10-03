@@ -292,3 +292,54 @@ fn the_limits_are_those_the_spec_states() {
         assert!(REWIND_LIMITS.contains(effect), "{effect}");
     }
 }
+
+// Review A minor 4: the rewind cannot be stopped, so its banner does not say Esc stops it.
+#[tokio::test]
+async fn the_rewinding_banner_does_not_offer_to_stop_it() {
+    let (dir, data) = dirs();
+    let dir = canonical(&dir);
+    let provider = MockProvider::new(vec![Script::text("Answer one.")]);
+    let (mut ui, _log) = open(provider, &dir, data.path(), false);
+    send(&mut ui, "first question");
+    settle(&mut ui).await;
+    send(&mut ui, "/rewind");
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Enter);
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Down);
+    press(&mut ui, KeyCode::Enter);
+    let shown = screen(&ui);
+    assert!(shown.iter().any(|r| r.contains("rewinding…")), "{shown:#?}");
+    assert!(
+        !shown.iter().any(|r| r.contains("Esc to stop")),
+        "{shown:#?}"
+    );
+    settle(&mut ui).await;
+    ui.finish().await.unwrap();
+}
+
+// Review A minor 6: what the user typed while the rewind ran is not replaced by the message it
+// gives back: both are kept, the message in the history.
+#[tokio::test]
+async fn what_was_typed_during_a_rewind_is_kept_beside_the_message_it_gives_back() {
+    let (dir, data) = dirs();
+    let dir = canonical(&dir);
+    let provider = MockProvider::new(vec![Script::text("Answer one.")]);
+    let (mut ui, _log) = open(provider, &dir, data.path(), false);
+    send(&mut ui, "first question");
+    settle(&mut ui).await;
+    send(&mut ui, "/rewind");
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Enter);
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Down);
+    press(&mut ui, KeyCode::Enter);
+    type_text(&mut ui, "typed meanwhile");
+    settle(&mut ui).await;
+    assert_eq!(ui.app().editor().text(), "typed meanwhile");
+    assert!(shows(&ui, "first question"));
+    ctrl(&mut ui, 'u');
+    press(&mut ui, KeyCode::Up);
+    assert_eq!(ui.app().editor().text(), "first question");
+    ui.finish().await.unwrap();
+}

@@ -335,6 +335,8 @@ pub struct App {
     picker: Option<(Pick, Picker)>,
     /// What the agent is doing for a command, shown until it is done.
     working: Option<String>,
+    /// Whether Esc stops what `working` says (a rewind runs to its end).
+    working_stoppable: bool,
     /// The user messages the conversation can be rewound to, oldest first, and whether the last
     /// rewind can be undone, as the agent last said.
     rewind_points: Vec<RewindPoint>,
@@ -391,6 +393,7 @@ impl App {
             ran_tools: false,
             picker: None,
             working: None,
+            working_stoppable: true,
             rewind_points: Vec::new(),
             can_undo_rewind: false,
             rewinding: None,
@@ -438,6 +441,13 @@ impl App {
         self.picker.as_ref().map(|(_, picker)| picker)
     }
 
+    /// Says what the session is busy with, until [`on_done`](Self::on_done); `stoppable` says
+    /// whether Esc stops it.
+    fn work(&mut self, what: &str, stoppable: bool) {
+        self.working = Some(what.to_string());
+        self.working_stoppable = stoppable;
+    }
+
     /// Work the agent did for a command ended.
     pub fn on_done(&mut self, done: Done) {
         self.working = None;
@@ -463,8 +473,18 @@ impl App {
                             width,
                         );
                         // The message comes back, to send again as it is or changed.
-                        if scope != RewindScope::Code && self.editor.is_empty() {
-                            self.editor.set_text(&text);
+                        // What the user typed meanwhile is not replaced: the message is kept in
+                        // the history instead, for Up.
+                        if scope != RewindScope::Code {
+                            if self.editor.is_empty() {
+                                self.editor.set_text(&text);
+                            } else {
+                                self.editor.remember(&text);
+                                self.transcript.push_note(
+                                    "the message is in your history (Up), as you had typed another",
+                                    width,
+                                );
+                            }
                         }
                     }
                     Err(why) => self
@@ -1194,7 +1214,7 @@ impl App {
                         }
                     }
                 }
-                self.working = Some("signing in".into());
+                self.work("signing in", true);
                 return Some(Action::Login {
                     provider: provider.unwrap_or_else(|| "chatgpt".into()),
                     device,
@@ -1214,7 +1234,7 @@ impl App {
             "new" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
-                self.working = Some("starting a new session".into());
+                self.work("starting a new session", true);
                 return Some(Action::OpenSession(None));
             }
             "resume" => {
@@ -1235,7 +1255,7 @@ impl App {
             "compact" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
-                self.working = Some("compacting the conversation".into());
+                self.work("compacting the conversation", true);
                 let focus = (!args.is_empty()).then(|| args.to_string());
                 return Some(Action::Compact(focus));
             }
@@ -1318,7 +1338,7 @@ impl App {
             }
             Pick::Rewind(points) => match points.into_iter().nth(index)? {
                 None => {
-                    self.working = Some("undoing the last rewind".into());
+                    self.work("undoing the last rewind", false);
                     Some(Action::UndoRewind)
                 }
                 Some(point) => {
@@ -1341,12 +1361,12 @@ impl App {
             }
             Pick::Session(ids) => {
                 let id = ids.into_iter().nth(index)?;
-                self.working = Some("resuming the session".into());
+                self.work("loading the session", true);
                 Some(Action::OpenSession(Some(id)))
             }
             Pick::RewindScope(point) => {
                 let scope = SCOPES.get(index)?.0;
-                self.working = Some("rewinding".into());
+                self.work("rewinding", false);
                 self.rewinding = Some((point.text, scope));
                 Some(Action::Rewind {
                     entry: point.entry,
@@ -1363,7 +1383,7 @@ impl App {
                 .push_note(&format!("already on {id}"), self.width);
             return None;
         }
-        self.working = Some(format!("switching to {id}"));
+        self.work(&format!("switching to {id}"), true);
         self.switching = Some(id.to_string());
         Some(Action::SwitchModel(id.to_string()))
     }
@@ -1382,7 +1402,7 @@ impl App {
             return None;
         }
         if !id.is_empty() {
-            self.working = Some("resuming the session".into());
+            self.work("loading the session", true);
             return Some(Action::OpenSession(Some(id.to_string())));
         }
         let sessions: Vec<SessionSummary> = self
@@ -1573,7 +1593,14 @@ impl App {
                 0,
                 Line::from(vec![
                     Span::styled("● ", theme.accent()),
-                    Span::styled(format!("{what}… (Esc to stop)"), theme.dim()),
+                    Span::styled(
+                        if self.working_stoppable {
+                            format!("{what}… (Esc to stop)")
+                        } else {
+                            format!("{what}…")
+                        },
+                        theme.dim(),
+                    ),
                 ]),
             );
         }

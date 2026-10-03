@@ -9,7 +9,7 @@ use std::{
 
 use futures::{FutureExt, Stream, StreamExt};
 use harness_core::{
-    agent::{Agent, ContextUsage, RewindPoint, SessionModel},
+    agent::{Agent, ContextUsage, RewindError, RewindPoint, SessionModel},
     checkpoint::Checkpoints,
     event::AgentEvent,
     redact::{EventRedactor, Redactor},
@@ -202,11 +202,11 @@ where
                     }
                     Job::Rewind { entry, scope } => {
                         let result = agent.rewind(&entry, scope).await;
-                        Some(Done::Rewound(result.map_err(|e| e.to_string())))
+                        Some(Done::Rewound(result.map_err(|e| rewind_error(&e))))
                     }
                     Job::UndoRewind => {
                         let result = agent.undo_rewind().await;
-                        Some(Done::UndidRewind(result.map_err(|e| e.to_string())))
+                        Some(Done::UndidRewind(result.map_err(|e| rewind_error(&e))))
                     }
                     Job::StartSession {
                         session,
@@ -936,5 +936,37 @@ fn why_stopped(error: tokio::task::JoinError) -> String {
     {
         Some(message) => format!("it panicked: {message}"),
         None => "it panicked".into(),
+    }
+}
+
+/// What a failed rewind says. One that failed partway through restoring files has changed some,
+/// and offers to undo, which puts them back as they were.
+fn rewind_error(error: &RewindError) -> String {
+    match error {
+        RewindError::Restore(_) => format!(
+            "{error}; some files may be restored and others not: \"undo the last rewind\" is now offered in /rewind, to put them back"
+        ),
+        _ => error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use harness_core::checkpoint::CheckpointError;
+
+    use super::*;
+
+    // Review A minor 5.
+    #[test]
+    fn a_rewind_that_failed_partway_says_undo_is_offered() {
+        let half = RewindError::Restore(CheckpointError::Restore {
+            before: "abc123".into(),
+            source: Box::new(CheckpointError::TooSlow),
+        });
+        let said = rewind_error(&half);
+        assert!(said.contains("snapshot abc123"), "{said}");
+        assert!(said.contains("undo the last rewind"), "{said}");
+        let refused = rewind_error(&RewindError::NoCheckpoints);
+        assert_eq!(refused, RewindError::NoCheckpoints.to_string());
     }
 }

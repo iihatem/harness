@@ -24,18 +24,29 @@ fn on_path(program: &str) -> bool {
 pub fn passes(task: &Task, tree: &Tree) -> Result<bool, String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     write_tree(dir.path(), tree)?;
+    passes_in(
+        dir.path(),
+        &task.test,
+        &std::env::temp_dir().join("harness-eval-target"),
+    )
+    .map_err(|e| format!("{}: {e}", task.id))
+}
+
+/// Runs `test` in `dir`, building into `target` if it is a Rust project; whether it exited 0.
+pub fn passes_in(
+    dir: &std::path::Path,
+    test: &str,
+    target: &std::path::Path,
+) -> Result<bool, String> {
     let status = Command::new("sh")
         .arg("-c")
-        .arg(&task.test)
-        .current_dir(dir.path())
-        .env(
-            "CARGO_TARGET_DIR",
-            std::env::temp_dir().join("harness-eval-target"),
-        )
+        .arg(test)
+        .current_dir(dir)
+        .env("CARGO_TARGET_DIR", target)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map_err(|e| format!("{}: cannot run `{}`: {e}", task.id, task.test))?;
+        .map_err(|e| format!("cannot run `{test}`: {e}"))?;
     Ok(status.success())
 }
 

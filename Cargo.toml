@@ -21,6 +21,7 @@ harness-shell = { path = "crates/harness-shell" }
 harness-tools = { path = "crates/harness-tools" }
 harness-tui = { path = "crates/harness-tui" }
 harness-usage = { path = "crates/harness-usage" }
+xtask = { path = "crates/xtask" }
 async-stream = "0.3"
 base64 = "0.23.1"
 async-trait = "0.1.92"

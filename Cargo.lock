@@ -1422,6 +1422,7 @@ dependencies = [
  "tokio-util",
  "unicode-width",
  "wiremock",
+ "xtask",
 ]
 
 [[package]]

@@ -21,7 +21,7 @@ use harness_core::{
     meter::WindowSnapshot,
     permission::Mode,
     redact::Redactor,
-    role::{Role, SwitchReason},
+    role::{Role, RoleSource, SwitchReason},
     session::{RewindScope, Session, SessionSummary},
     turn::{Steering, TurnInput},
 };
@@ -971,6 +971,17 @@ impl App {
             }
             // The `ModelSwitched` event is its line.
             Done::Role { result: Ok(()), .. } => {}
+            // Esc while the model was checked.
+            Done::Role {
+                role,
+                id,
+                result: Err(why),
+            } if why == "stopped" => {
+                let text = self.redacted(&format!(
+                    "stopped checking {id}; the {role} role is unchanged"
+                ));
+                self.transcript.push_note(&text, width);
+            }
             Done::Role {
                 role,
                 id,
@@ -1851,8 +1862,20 @@ impl App {
             "model" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
-                if let Some(rest) = args.strip_prefix("--role") {
+                if let Some(rest) = args.strip_prefix("--role")
+                    && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+                {
                     return self.set_role(rest);
+                }
+                if args.starts_with("--") {
+                    let option = args.split_whitespace().next().unwrap_or(args);
+                    self.transcript.push_error(
+                        &format!(
+                            "unknown option `{option}`: /model takes a model, or --role <role> <model>"
+                        ),
+                        width,
+                    );
+                    return None;
                 }
                 if !args.is_empty() {
                     return self.switch_to(args);
@@ -2045,6 +2068,17 @@ impl App {
         };
         if role == Role::Main {
             return self.switch_to(id);
+        }
+        // Chosen already, in the configuration or in this session; one that only inherits `main`
+        // is still pinned by choosing it.
+        if self
+            .roles
+            .iter()
+            .any(|r| r.role == role && r.model == id && r.source != RoleSource::Inherited)
+        {
+            self.transcript
+                .push_note(&format!("{role} already runs on {id}"), width);
+            return None;
         }
         self.work(&format!("checking {id}"), true);
         Some(Action::SetRole {

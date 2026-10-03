@@ -187,3 +187,60 @@ async fn setting_a_role_waits_for_the_turn() {
     );
     assert!(calls.checked.lock().unwrap().is_empty());
 }
+
+// Review B minor 2: only `--role` is the option; `--roles` is not it with an `s` left over.
+#[tokio::test]
+async fn an_option_that_only_starts_like_role_is_not_role() {
+    let (_dir, mut ui, calls) = open(vec![], vec![]);
+    send(&mut ui, "/model --roles build ollama/llama3");
+    assert!(
+        shows(&ui, "unknown option `--roles`"),
+        "{:#?}",
+        everything(&ui)
+    );
+    assert!(!shows(&ui, "unknown role"), "{:#?}", everything(&ui));
+    assert!(calls.checked.lock().unwrap().is_empty());
+    assert!(calls.switched.lock().unwrap().is_empty());
+}
+
+// Review B minor 3: a role already on the model says so, as `/model` does, and announces no
+// switch from a model to itself.
+#[tokio::test]
+async fn a_role_already_on_the_model_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Calls::default());
+    let (mut ui, _) = start(
+        agent(MockProvider::new(vec![]), dir.path(), Mode::Auto).with_roles(
+            harness_core::role::RoleConfig {
+                build: Some("ollama/llama3".into()),
+                ..Default::default()
+            },
+        ),
+        Box::new(Models {
+            calls: calls.clone(),
+            refused: vec![],
+        }),
+        options(dir.path(), Mode::Auto),
+    );
+    send(&mut ui, "/model --role build ollama/llama3");
+    assert!(
+        shows(&ui, "build already runs on ollama/llama3"),
+        "{:#?}",
+        everything(&ui)
+    );
+    assert!(!shows(&ui, "switched to"), "{:#?}", everything(&ui));
+    assert!(calls.checked.lock().unwrap().is_empty());
+}
+
+// Review B minor 4: Esc while the model is checked is a stop, shown as a note, not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_the_check_of_a_role_model_is_a_note_not_an_error() {
+    let (_dir, mut ui, _calls) = open(vec![], vec![("ollama/llama3", "stopped")]);
+    send(&mut ui, "/model --role build ollama/llama3");
+    wait_for(
+        &mut ui,
+        "stopped checking ollama/llama3; the build role is unchanged",
+    )
+    .await;
+    assert!(!shows(&ui, "could not set"), "{:#?}", everything(&ui));
+}

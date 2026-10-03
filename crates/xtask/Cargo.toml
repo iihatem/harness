@@ -11,6 +11,7 @@ globset.workspace = true
 clap.workspace = true
 harness-core.workspace = true
 harness-tools.workspace = true
+nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

@@ -52,6 +52,10 @@ pub fn calls(format: EditFormat, before: &Tree, after: &Tree) -> Vec<Call> {
                 patch.extend(new.lines().map(|l| format!("+{l}\n")));
             }
             (None, _) => edits.push(call("write", json!({"path": path, "content": new}))),
+            // An empty file has no text to replace and no line to address: it is written.
+            (Some(old), EditFormat::StrReplace | EditFormat::Hashline) if old.is_empty() => {
+                edits.push(call("write", json!({"path": path, "content": new})))
+            }
             (Some(old), EditFormat::StrReplace) => edits.push(str_replace(path, old, new)),
             (Some(old), EditFormat::ApplyPatch) => {
                 patch.push_str(&format!("*** Update File: {path}\n{}", hunk(old, new)))

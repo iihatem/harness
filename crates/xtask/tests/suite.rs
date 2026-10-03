@@ -2,7 +2,7 @@
 
 use harness_core::edit_format::EditFormat;
 use xtask::{
-    record::{recorded, regenerate},
+    record::{path_of, recorded, regenerate},
     replay::{check, check_all},
     task::{Task, load_all},
 };
@@ -77,6 +77,39 @@ fn a_missing_recording_fails_the_check() {
     task.dir = task.dir.join("no-such-dir");
     let error = check(&task, EditFormat::ApplyPatch).unwrap_err();
     assert!(error.contains("apply_patch"), "{error}");
+}
+
+// The check run in CI also finds a recording that applies but is not what the recorder makes
+// today.
+#[test]
+fn a_stale_recording_fails_the_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut task = suite().remove(0);
+    let copy = dir.path().join(&task.id);
+    std::fs::create_dir_all(copy.join("replay")).unwrap();
+    for format in EditFormat::ALL {
+        std::fs::copy(
+            path_of(&task, format),
+            copy.join("replay").join(format!("{format}.json")),
+        )
+        .unwrap();
+    }
+    task.dir = copy.clone();
+    assert!(check(&task, EditFormat::WholeFile).is_ok());
+    // The same edit, with a read that the recorder would not make.
+    let mut calls = recorded(&task, EditFormat::WholeFile).unwrap();
+    calls.insert(0, calls[0].clone());
+    let file = serde_json::json!({"calls": calls});
+    std::fs::write(
+        copy.join("replay/whole_file.json"),
+        serde_json::to_string_pretty(&file).unwrap(),
+    )
+    .unwrap();
+    let error = check(&task, EditFormat::WholeFile).unwrap_err();
+    assert!(
+        error.contains("stale") && error.contains("eval record"),
+        "{error}"
+    );
 }
 
 #[test]

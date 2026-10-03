@@ -41,6 +41,14 @@ pub fn check(task: &Task, format: EditFormat) -> Result<(), String> {
     let result =
         apply(format, &task.before, &calls).map_err(|e| format!("{} {format}: {e}", task.id))?;
     if result == task.after {
+        // A recording that still works but is not what the recorder makes today is stale: the
+        // task, or the recorder, changed after it was made.
+        if calls != crate::record::regenerate(task, format) {
+            return Err(format!(
+                "{} {format}: the recording is stale; run `cargo xtask eval record`",
+                task.id
+            ));
+        }
         return Ok(());
     }
     let mut differing: Vec<&str> = result

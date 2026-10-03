@@ -206,8 +206,14 @@ pub fn run(tasks: &[Task], options: &Options) -> Result<Report, String> {
         None => None,
     };
     let config = home_config(user.as_deref(), &options.model, options.format)?;
-    // One build directory for the Rust tasks, so each run does not compile from nothing.
-    let target = std::env::temp_dir().join("harness-eval-target");
+    // One build directory for the Rust tasks, so each run does not compile from nothing. It is
+    // made fresh, with a name nobody can guess (a fixed one in the world-writable temp directory
+    // could be planted), and removed at the end.
+    let build = tempfile::Builder::new()
+        .prefix("harness-eval-target-")
+        .tempdir()
+        .map_err(|e| format!("cannot make the build directory: {e}"))?;
+    let target = build.path().to_path_buf();
     let mut runs = Vec::new();
     for task in tasks {
         for number in 1..=options.runs {
@@ -253,6 +259,9 @@ fn attempt(
     std::fs::create_dir_all(home.path().join("config")).map_err(|e| e.to_string())?;
     std::fs::write(home.path().join("config/config.toml"), config).map_err(|e| e.to_string())?;
     let mut command = Command::new(&options.harness);
+    // In a group of its own, so that a run that has to be stopped takes what it started with it
+    // (shell commands, language servers).
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     command
         .args(["--mode", "auto", "ask", "--json", &task.prompt])
         .current_dir(workspace.path())
@@ -280,6 +289,10 @@ fn attempt(
         match child.try_wait() {
             Ok(Some(_)) => break false,
             Ok(None) if Instant::now() >= deadline => {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(child.id() as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
                 let _ = child.kill();
                 let _ = child.wait();
                 break true;

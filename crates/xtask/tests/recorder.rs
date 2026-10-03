@@ -207,3 +207,9 @@ fn a_call_to_a_tool_the_format_does_not_offer_fails_the_replay() {
         "{error}"
     );
 }
+
+// An empty file has no line to address: recording an edit of it must not panic in any format.
+#[test]
+fn an_empty_file_gets_content() {
+    check(&[("f.txt", "")], &[("f.txt", "new\n")]);
+}

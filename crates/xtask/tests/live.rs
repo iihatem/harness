@@ -185,3 +185,58 @@ fn a_result_file_is_named_by_date_model_and_format() {
         "2026-10-02-ollama-qwen3-coder-30b-apply_patch.json"
     );
 }
+
+// A run that is stopped for taking too long takes what it started with it.
+#[test]
+fn a_run_that_times_out_is_stopped_with_everything_it_started() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("child.pid");
+    let script = dir.path().join("harness");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nsleep 300 &\necho $! > \"$PID_FILE\"\nsleep 300\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let task = xtask::task::Task {
+        id: "t".into(),
+        dir: dir.path().to_path_buf(),
+        language: "python".into(),
+        title: "t".into(),
+        prompt: "do it".into(),
+        test: "false".into(),
+        before: Default::default(),
+        after: Default::default(),
+    };
+    let options = xtask::live::Options {
+        model: "p/m".into(),
+        format: EditFormat::StrReplace,
+        runs: 1,
+        harness: script,
+        user_config: None,
+        timeout: std::time::Duration::from_secs(1),
+        env: vec![("PID_FILE".into(), pid_file.display().to_string())],
+    };
+    let report = xtask::live::run(&[task], &options).unwrap();
+    assert!(
+        report.runs[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("timed out")
+    );
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let alive = |pid| nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
+    for _ in 0..100 {
+        if !alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("the background process {pid} is still running");
+}

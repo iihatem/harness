@@ -412,3 +412,26 @@ async fn esc_ctrl_c_or_the_end_of_input_choose_nothing() {
         assert!(!term.in_full_screen());
     }
 }
+
+// Review B I1: the item for a model says whether it is the current one or one a ChatGPT plan
+// includes, in the model picker and the first-run list alike.
+#[test]
+fn model_items_mark_the_current_model_and_chatgpt_ones() {
+    use harness_tui::picker::{Item, model_item};
+    assert_eq!(
+        model_item("ollama/llama3", false),
+        Item::new("ollama/llama3", "")
+    );
+    assert_eq!(
+        model_item("ollama/llama3", true),
+        Item::new("ollama/llama3", "(current)")
+    );
+    assert_eq!(
+        model_item("chatgpt/gpt-5", false),
+        Item::new("chatgpt/gpt-5", "ChatGPT plan")
+    );
+    assert_eq!(
+        model_item("chatgpt/gpt-5", true),
+        Item::new("chatgpt/gpt-5", "(current) ChatGPT plan")
+    );
+}

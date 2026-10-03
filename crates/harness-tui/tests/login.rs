@@ -87,7 +87,10 @@ async fn login_signs_in_to_chatgpt_and_shows_what_it_says() {
         &ui,
         "Signed in to ChatGPT as dev@example.com (profile default)."
     ));
-    assert!(shows(&ui, "/model chatgpt/<model> uses it"));
+    // What it says is true: the picker offers ChatGPT's models once signed in (the host lists
+    // them), and any other is named.
+    assert!(shows(&ui, "/model offers ChatGPT's models"));
+    assert!(shows(&ui, "/model chatgpt/<model> uses any other"));
     assert!(!ui.app().busy());
     send(&mut ui, "/login chatgpt --device");
     settle(&mut ui).await;

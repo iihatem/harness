@@ -20,6 +20,44 @@ pub async fn available(setup: &Setup) -> Vec<DiscoveredModel> {
     found
 }
 
+/// The ids of the models to choose from: those found (see [`available`]), then ChatGPT's own
+/// when an account is signed in (ChatGPT has no listing to ask, so the built-in list is
+/// offered).
+pub async fn choices(setup: &Setup) -> Vec<String> {
+    let mut ids: Vec<String> = available(setup)
+        .await
+        .into_iter()
+        .map(|model| model.id())
+        .collect();
+    if signed_in_to_chatgpt(setup).await {
+        ids.extend(
+            registry::CHATGPT_MODELS
+                .iter()
+                .map(|model| format!("{}/{model}", registry::CHATGPT)),
+        );
+    }
+    ids
+}
+
+/// Whether a ChatGPT account is signed in. The credential store may wait on the keychain, which
+/// is not done on the runtime's threads.
+#[cfg(feature = "chatgpt-login")]
+async fn signed_in_to_chatgpt(setup: &Setup) -> bool {
+    let credentials = setup.credentials.clone();
+    tokio::task::spawn_blocking(move || {
+        credentials
+            .active(registry::CHATGPT)
+            .is_ok_and(|stored| stored.is_some())
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[cfg(not(feature = "chatgpt-login"))]
+async fn signed_in_to_chatgpt(_setup: &Setup) -> bool {
+    false
+}
+
 pub async fn run() -> u8 {
     let setup = match setup::load() {
         Ok(setup) => setup,

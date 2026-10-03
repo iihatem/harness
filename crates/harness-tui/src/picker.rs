@@ -44,6 +44,19 @@ impl Item {
     }
 }
 
+/// The item for the model `id` in a list of models: marked when it is the `current` one, and
+/// when it is one a ChatGPT plan includes (a `chatgpt/` model).
+pub fn model_item(id: &str, current: bool) -> Item {
+    let marks: Vec<&str> = [
+        current.then_some("(current)"),
+        id.starts_with("chatgpt/").then_some("ChatGPT plan"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    Item::new(id, &marks.join(" "))
+}
+
 /// What a key did to the picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Picked {

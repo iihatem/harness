@@ -17,7 +17,7 @@ use harness_tui::{
     inline::InlineTerminal,
     input::{Startup, TerminalInput, Unanswered, ask_at_startup},
     notify::TerminalNotifier,
-    picker::{Item, Picker, choose},
+    picker::{Picker, choose, model_item},
     plan::ExternalEditor,
     style::Theme,
     terminal::{CrosstermRawMode, Modes},
@@ -62,7 +62,7 @@ pub fn unfit_terminal(term: Option<&str>, size: Option<(u16, u16)>) -> Option<&'
 /// What the first run says when no model can be found.
 fn no_models(global: &Path) -> String {
     format!(
-        "no model is configured, and harness found none to choose from. Start Ollama, LM Studio or llama.cpp; add an API key with `harness auth add openai` (or anthropic, openrouter); or sign in to ChatGPT with `harness login chatgpt`. Then run harness again, or set `model = \"<provider>/<model>\"` in {}.",
+        "no model is configured, and harness found none to choose from. Start Ollama, LM Studio or llama.cpp; add an API key with `harness auth add openai` (or anthropic, openrouter); or sign in to ChatGPT with `harness login chatgpt`, which offers its models. Then run harness again, or pass `--model chatgpt/<model>`, or set `model = \"<provider>/<model>\"` in {}.",
         global.display()
     )
 }
@@ -86,7 +86,7 @@ where
     if found.is_empty() {
         return Err(no_models(global));
     }
-    let items = found.iter().map(|id| Item::new(id, "")).collect();
+    let items = found.iter().map(|id| model_item(id, false)).collect();
     let picker = Picker::new("Choose a model to start with", items).with_footer(vec![format!(
         "It is saved as your default model in {}; /model switches in a session.",
         global.display()
@@ -117,11 +117,7 @@ enum FirstModel {
 /// the session's reader, as in the session, and a signal or a hangup ends it cleanly, a picker
 /// open or not.
 async fn first_model(setup: &Setup, notices: &mut Notices) -> Result<FirstModel, String> {
-    let found: Vec<String> = crate::models::available(setup)
-        .await
-        .into_iter()
-        .map(|model| model.id())
-        .collect();
+    let found = crate::models::choices(setup).await;
     for warning in setup.credentials.take_warnings() {
         notices.warn(&warning);
     }
@@ -623,6 +619,36 @@ mod tests {
         }
         assert!(!term.in_full_screen());
         assert!(!global.exists());
+    }
+
+    // Review B I1: ChatGPT's models, offered once signed in, are marked in the first-run list.
+    #[tokio::test]
+    async fn the_first_run_marks_chatgpt_models() {
+        let home = tempfile::tempdir().unwrap();
+        let global = home.path().join("config.toml");
+        let found = vec!["ollama/llama3".to_string(), "chatgpt/gpt-5-codex".into()];
+        let mut term = terminal();
+        let chosen = choose_first_model(
+            &global,
+            found,
+            &mut term,
+            keys(&[KeyCode::Down, KeyCode::Enter]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(chosen, "chatgpt/gpt-5-codex");
+        assert_eq!(
+            std::fs::read_to_string(&global).unwrap(),
+            "model = \"chatgpt/gpt-5-codex\"\n"
+        );
+    }
+
+    #[test]
+    fn the_no_models_advice_says_how_to_use_a_chatgpt_plan() {
+        let advice = no_models(Path::new("/home/me/config.toml"));
+        for hint in ["harness login chatgpt", "--model chatgpt/<model>"] {
+            assert!(advice.contains(hint), "{hint}: {advice}");
+        }
     }
 
     // Review A's M8: Emacs's shell mode and other terminals that cannot move the cursor set

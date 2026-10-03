@@ -36,7 +36,7 @@ use crate::{
     complete::{self, Completer, Offer},
     editor::{Edit, Editor},
     notify::{self, Notify},
-    picker::{Item, Picked, Picker},
+    picker::{Item, Picked, Picker, model_item},
     plan::{Choice, PlanChoice, TextEditor},
     status::{self, Totals},
     style::Theme,
@@ -51,7 +51,7 @@ pub const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TYPED_PAST: &str = "your typing went to your message; the prompt takes keys once you pause";
 
 /// What the model picker says when no model is found.
-const NO_MODELS: &str = "no models found: start Ollama, LM Studio or llama.cpp, add a provider's API key with `harness auth add <provider>`, or sign in to ChatGPT with `harness login chatgpt`";
+const NO_MODELS: &str = "no models found: start Ollama, LM Studio or llama.cpp, add a provider's API key with `harness auth add <provider>`, or sign in to ChatGPT with `/login` (then /model offers its models), or name one with `/model chatgpt/<model>`";
 
 /// Esc twice on empty input within this long opens the rewind list.
 pub const REWIND_WINDOW: Duration = Duration::from_secs(1);
@@ -409,10 +409,7 @@ impl App {
         };
         let items = ids
             .iter()
-            .map(|id| {
-                let current = if *id == self.model { "(current)" } else { "" };
-                Item::new(id, current)
-            })
+            .map(|id| model_item(id, *id == self.model))
             .collect();
         picker.set_items(items);
         if let Some(current) = ids.iter().position(|id| *id == self.model) {
@@ -479,7 +476,7 @@ impl App {
             Done::LoggedIn(Ok(done)) => {
                 self.transcript.push_note(&done, width);
                 self.transcript.push_note(
-                    "/model chatgpt/<model> uses it; /model lists the models your plan includes",
+                    "/model offers ChatGPT's models; /model chatgpt/<model> uses any other",
                     width,
                 );
             }

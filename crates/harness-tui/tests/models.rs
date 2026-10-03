@@ -231,8 +231,36 @@ async fn the_picker_says_how_to_get_models_when_there_are_none() {
         "{:#?}",
         screen(&ui)
     );
+    // Review B I1: and how to use a ChatGPT plan: sign in, or name its model.
+    let advice = screen(&ui).join(" ");
+    let advice = advice.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(advice.contains("/login"), "{advice}");
+    assert!(advice.contains("/model chatgpt/<model>"), "{advice}");
     until_armed(&ui).await;
     press(&mut ui, KeyCode::Esc);
     assert!(ui.app().picker().is_none());
+    ui.finish().await.unwrap();
+}
+
+// Review B I1: a model of a ChatGPT plan is marked as one in the picker, with the current one.
+#[tokio::test]
+async fn chatgpt_models_are_marked_as_such_in_the_picker() {
+    let first = MockProvider::new(Vec::new());
+    let big = MockProvider::new(Vec::new());
+    let mut host = Models::default();
+    host.models.insert("mock/m".into(), (first.clone(), 32_768));
+    host.models
+        .insert("chatgpt/gpt-5-codex".into(), (big, 272_000));
+    let (mut ui, _log, _dir) = open(first, host);
+    send(&mut ui, "/model");
+    until(&mut ui, |app| {
+        app.picker().is_some_and(|p| p.items().len() == 2)
+    })
+    .await;
+    let items = ui.app().picker().unwrap().items().to_vec();
+    let chatgpt = items.iter().find(|i| i.label == "chatgpt/gpt-5-codex");
+    assert_eq!(chatgpt.map(|i| i.detail.as_str()), Some("ChatGPT plan"));
+    let current = items.iter().find(|i| i.label == "mock/m");
+    assert_eq!(current.map(|i| i.detail.as_str()), Some("(current)"));
     ui.finish().await.unwrap();
 }

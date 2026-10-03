@@ -80,13 +80,7 @@ impl Host for CliHost {
 
     fn models(&self) -> BoxFuture<'static, Vec<String>> {
         let setup = self.setup.clone();
-        Box::pin(async move {
-            crate::models::available(&setup)
-                .await
-                .into_iter()
-                .map(|model| model.id())
-                .collect()
-        })
+        Box::pin(async move { crate::models::choices(&setup).await })
     }
 
     fn login(
@@ -233,6 +227,39 @@ pub mod tests {
             panic!("an unknown session opened");
         };
         assert!(why.contains("there is no session nope"), "{why}");
+    }
+
+    // Review B I1: with ChatGPT signed in, the model list (the picker's) has ChatGPT's models,
+    // from the built-in list; without it, none.
+    #[cfg(feature = "chatgpt-login")]
+    #[tokio::test]
+    async fn a_signed_in_chatgpt_account_offers_its_models() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let host = host(home.path(), &workspace);
+        let before = host.models().await;
+        assert!(
+            !before.iter().any(|id| id.starts_with("chatgpt/")),
+            "{before:?}"
+        );
+        let profile = host.setup.credentials.active_profile("chatgpt").unwrap();
+        host.setup
+            .credentials
+            .set("chatgpt", &profile, "{}")
+            .unwrap();
+        let after = host.models().await;
+        let chatgpt: Vec<&String> = after
+            .iter()
+            .filter(|id| id.starts_with("chatgpt/"))
+            .collect();
+        assert!(!chatgpt.is_empty(), "{after:?}");
+        for model in registry::CHATGPT_MODELS {
+            assert!(
+                after.contains(&format!("chatgpt/{model}")),
+                "{model}: {after:?}"
+            );
+        }
     }
 
     /// A Chat Completions stream of `chunks`.

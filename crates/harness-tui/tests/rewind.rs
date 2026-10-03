@@ -343,3 +343,29 @@ async fn what_was_typed_during_a_rewind_is_kept_beside_the_message_it_gives_back
     assert_eq!(ui.app().editor().text(), "first question");
     ui.finish().await.unwrap();
 }
+
+// Final review minor 2: input queued behind a rewind was written for the conversation as it was,
+// so the rewind drops it; the draft stays.
+#[tokio::test]
+async fn a_rewind_drops_input_queued_behind_it_and_keeps_the_draft() {
+    let (dir, data) = dirs();
+    let dir = canonical(&dir);
+    let provider = MockProvider::new(vec![Script::text("Answer one.")]);
+    let (mut ui, _log) = open(provider.clone(), &dir, data.path(), false);
+    send(&mut ui, "first question");
+    settle(&mut ui).await;
+    send(&mut ui, "/rewind");
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Enter);
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Down);
+    press(&mut ui, KeyCode::Enter);
+    send(&mut ui, "queued meanwhile");
+    assert!(shows(&ui, "queued: queued meanwhile"), "{:#?}", screen(&ui));
+    type_text(&mut ui, "a draft");
+    settle(&mut ui).await;
+    assert!(!shows(&ui, "queued: queued meanwhile"));
+    assert_eq!(provider.requests().len(), 1, "the queued input was sent");
+    assert_eq!(ui.app().editor().text(), "a draft");
+    ui.finish().await.unwrap();
+}

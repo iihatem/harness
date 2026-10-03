@@ -483,6 +483,7 @@ impl App {
                         // What the user typed meanwhile is not replaced: the message is kept in
                         // the history instead, for Up.
                         if scope != RewindScope::Code {
+                            self.drop_pending_input();
                             if self.editor.is_empty() {
                                 self.editor.set_text(&text);
                             } else {
@@ -788,6 +789,15 @@ impl App {
         Some(Action::Run(input))
     }
 
+    /// The plan choice, input queued behind it or a turn, and a mode change waiting for the turn
+    /// to end belong to the conversation they came from: a new or resumed session, or a rewind
+    /// of the conversation, drops them. The draft in the editor stays.
+    fn drop_pending_input(&mut self) {
+        self.plan_choice = None;
+        self.queued.clear();
+        self.pending_mode = None;
+    }
+
     /// The agent continues in another session now, or could not.
     fn session_started(&mut self, resumed: bool, result: Result<SessionView, String>) {
         let width = self.width;
@@ -806,6 +816,7 @@ impl App {
         };
         self.session_id = view.id.clone();
         self.last_reply.clear();
+        self.drop_pending_input();
         // Up recalls this session's messages.
         let inputs = self.rewind_points.iter().map(|p| p.text.clone()).collect();
         self.editor.set_history(inputs);

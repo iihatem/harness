@@ -602,12 +602,7 @@ impl Agent {
             turn: self.turn_entry.clone(),
             role: self.turn_role.as_str().to_string(),
             model: self.model_id().to_string(),
-            selected_by: if self.model_chosen_by_user {
-                "user"
-            } else {
-                "config"
-            }
-            .to_string(),
+            selected_by: self.selected_by().to_string(),
             input_tokens: stats.usage.input_tokens,
             output_tokens: stats.usage.output_tokens,
             first_token_ms: stats.time_to_first_token.map(|d| d.as_millis() as u64),
@@ -619,7 +614,25 @@ impl Agent {
             started_at,
             ended_at: crate::time::now_unix(),
             gates: self.gate_counts,
+            handoff: self.turn_handoff.map(|h| crate::meter::HandoffRecord {
+                kind: h.kind.as_str().to_string(),
+                forced: h.forced,
+            }),
         });
+    }
+
+    /// How the current turn's model was chosen, for its outcome record: `fallback` when a chain
+    /// moved it, `escalation` after `/escalate`, `user` when a command, a key or a session setting
+    /// chose it, and `config` otherwise (`--model` included).
+    fn selected_by(&self) -> &'static str {
+        if self.fell_back {
+            return "fallback";
+        }
+        match self.turn_reason {
+            Some(SwitchReason::Escalation) => "escalation",
+            Some(SwitchReason::User) => "user",
+            _ => "config",
+        }
     }
 
     /// Asks the meter whether the budgets allow the next request: says each 80% warning, and
@@ -2118,7 +2131,6 @@ impl Agent {
             self.history_ids = ids;
             self.reported_usage = None;
         }
-        self.turn_handoff = None;
     }
 
     /// Moves the rest of the turn to the first usable model of the failed model's chain: on the

@@ -58,11 +58,12 @@ fn env(first: &MockServer, second: &MockServer, chain: &str) -> (TempDir, TempDi
     (home, ws)
 }
 
-async fn run_json(home: TempDir, ws: TempDir) -> (Option<i32>, Vec<Value>) {
+async fn run_json(home: &TempDir, ws: &TempDir) -> (Option<i32>, Vec<Value>) {
+    let (home_path, ws_path) = (home.path().to_path_buf(), ws.path().to_path_buf());
     let output = tokio::task::spawn_blocking(move || {
         Command::new(BIN)
-            .current_dir(ws.path())
-            .env("HARNESS_HOME", home.path())
+            .current_dir(&ws_path)
+            .env("HARNESS_HOME", &home_path)
             .isolate()
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME")
@@ -90,7 +91,7 @@ async fn a_limit_falls_back_to_the_next_model_and_json_says_so() {
         &second,
         "[fallback]\n\"first/*\" = [\"second/x\"]\n",
     );
-    let (code, events) = run_json(home, ws).await;
+    let (code, events) = run_json(&home, &ws).await;
     assert_eq!(code, Some(0), "{events:?}");
     let switched: Vec<&Value> = events
         .iter()
@@ -121,9 +122,40 @@ async fn a_limit_falls_back_to_the_next_model_and_json_says_so() {
 async fn without_a_chain_the_run_stops_with_the_limit_reported() {
     let (first, second) = (limited().await, healthy("never").await);
     let (home, ws) = env(&first, &second, "");
-    let (code, events) = run_json(home, ws).await;
+    let (code, events) = run_json(&home, &ws).await;
     assert_eq!(code, Some(1));
     assert!(events.iter().any(|e| e["type"] == "limit_reached"));
     assert!(!events.iter().any(|e| e["type"] == "model_switched"));
     assert!(second.received_requests().await.unwrap().is_empty());
+}
+
+// Spec "Selected by a fallback", tasks.md 3.7: the outcome record of the turn names the model that
+// finished it and says a fallback moved it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_outcome_record_says_a_fallback_moved_the_turn() {
+    let (first, second) = (limited().await, healthy("from the second").await);
+    let (home, ws) = env(
+        &first,
+        &second,
+        "[fallback]\n\"first/*\" = [\"second/x\"]\n",
+    );
+    let (code, _) = run_json(&home, &ws).await;
+    assert_eq!(code, Some(0));
+    let file = std::fs::read_dir(home.path().join("data/outcomes"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .unwrap();
+    let line: Value = serde_json::from_str(
+        std::fs::read_to_string(file)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(line["selected_by"], "fallback");
+    assert_eq!(line["model"], "second/x");
+    assert_eq!(line["finish_reason"], "completed");
 }

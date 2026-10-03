@@ -277,6 +277,15 @@ pub struct GateCounts {
 
 /// One finished turn: how it went, as counts and ids; never the prompt, the reply, paths or
 /// commands.
+/// How a Build turn got the conversation, for its outcome record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffRecord {
+    /// `same_model`, `history` or `plan_only`.
+    pub kind: String,
+    /// `[roles.handoff] mode` chose it.
+    pub forced: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnRecord {
     pub session: String,
@@ -303,6 +312,8 @@ pub struct TurnRecord {
     pub started_at: u64,
     pub ended_at: u64,
     pub gates: GateCounts,
+    /// For a Build turn, how it got the conversation; `None` for any other turn.
+    pub handoff: Option<HandoffRecord>,
 }
 
 /// Where the runtime reports what each model request took. Implemented by `harness-usage`.

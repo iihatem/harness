@@ -49,7 +49,8 @@ pub struct OutcomeRecord {
     pub retries: u32,
     pub finish_reason: String,
     pub gates: GateCounts,
-    /// The kind and result of a Build turn's hand-off: filled by the model roles.
+    /// The kind, whether it was forced, and the result (from its gates) of a Build turn's
+    /// hand-off; null for any other turn.
     pub handoff: Option<Value>,
     /// `rewound`, `interrupted` or `continued`, from what the user did next.
     pub user_signal: String,
@@ -82,7 +83,13 @@ impl OutcomeRecord {
             retries: turn.retries,
             finish_reason: turn.finish_reason.clone(),
             gates: turn.gates,
-            handoff: None,
+            handoff: turn.handoff.as_ref().map(|h| {
+                serde_json::json!({
+                    "kind": h.kind,
+                    "forced": h.forced,
+                    "result": build_result(&turn.gates),
+                })
+            }),
             user_signal: if turn.finish_reason == "interrupted" {
                 "interrupted"
             } else {
@@ -90,6 +97,18 @@ impl OutcomeRecord {
             }
             .to_string(),
         }
+    }
+}
+
+/// How a Build turn went, from its gates: `failed` when one failed, `passed` when some ran and
+/// none failed, `none` when no gate ran.
+fn build_result(gates: &GateCounts) -> &'static str {
+    if gates.failed > 0 {
+        "failed"
+    } else if gates.passed > 0 {
+        "passed"
+    } else {
+        "none"
     }
 }
 

@@ -119,15 +119,22 @@ impl Completer {
             insert: format!("/{name}"),
             detail: description.clone(),
         };
+        // A name typed in full is first: Enter on `/mode` runs it, not `/model`.
+        let exact = self.commands.iter().filter(|(name, _)| name == typed);
         let prefix = self
             .commands
             .iter()
-            .filter(|(name, _)| name.starts_with(typed));
+            .filter(|(name, _)| name != typed && name.starts_with(typed));
         let inside = self
             .commands
             .iter()
             .filter(|(name, _)| !name.starts_with(typed) && name.contains(typed));
-        prefix.chain(inside).map(item).take(MAX_ITEMS).collect()
+        exact
+            .chain(prefix)
+            .chain(inside)
+            .map(item)
+            .take(MAX_ITEMS)
+            .collect()
     }
 
     fn file_items(&mut self, query: &str) -> Vec<Item> {

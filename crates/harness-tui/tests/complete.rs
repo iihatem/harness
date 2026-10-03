@@ -168,3 +168,21 @@ fn a_completed_word_is_replaced_and_collapsed_pastes_stay_collapsed() {
     );
     assert_eq!(editor.expanded(), format!("{long} see @src/main.rs please"));
 }
+
+// Review A I2: a command typed in full comes first, ahead of longer names that start with it
+// (`/mode` is not completed to `/model`).
+#[test]
+fn a_command_typed_in_full_comes_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut completer = Completer::new(
+        vec![
+            ("model".into(), "Switch the model".into()),
+            ("mode".into(), "Switch the approval mode".into()),
+            ("compact".into(), "Compact".into()),
+        ],
+        dir.path(),
+    );
+    assert_eq!(inserts(&completer.offer("/mode", 5)), ["/mode", "/model"]);
+    assert_eq!(inserts(&completer.offer("/mod", 4)), ["/model", "/mode"]);
+    assert_eq!(inserts(&completer.offer("/model", 6)), ["/model"]);
+}

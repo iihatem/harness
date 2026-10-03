@@ -22,7 +22,7 @@ use harness_providers::{
     registry::{self, Resolved},
 };
 
-use crate::{context::home, notices::Notices, setup::Setup, term::terminal_safe};
+use crate::{context::home, notices::Notices, setup::Setup};
 
 /// The project's custom commands when `prompt` is a slash command, printing a warning for each
 /// command file that was ignored. `None` for ordinary prompts.
@@ -62,6 +62,29 @@ pub fn check(prompt: &str, commands: Option<&Commands>) -> Result<(), String> {
     }
 }
 
+/// Something to tell the user about expanding a command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    Warning(String),
+    Note(String),
+}
+
+/// A turn's input, and what to tell the user about how it was expanded, in order.
+pub struct Expanded {
+    pub input: TurnInput,
+    pub messages: Vec<Message>,
+}
+
+/// Prints `messages` to stderr, escaped and redacted, and keeps them in `notices`.
+pub fn print_messages(messages: &[Message], notices: &mut Notices) {
+    for message in messages {
+        match message {
+            Message::Warning(text) => notices.warn(text),
+            Message::Note(text) => notices.note(text),
+        }
+    }
+}
+
 /// The turn for `prompt` followed by `piped` (the piped-stdin text appended to it, possibly
 /// empty). `/init` and custom commands are expanded and `piped` added after them; anything else is
 /// sent as it is.
@@ -71,9 +94,11 @@ pub fn turn_input(
     commands: Option<&Commands>,
     setup: &Setup,
     policy: &dyn PermissionPolicy,
-    notices: &mut Notices,
-) -> TurnInput {
-    let whole = || TurnInput::from(format!("{prompt}{piped}"));
+) -> Expanded {
+    let whole = || Expanded {
+        input: TurnInput::from(format!("{prompt}{piped}")),
+        messages: Vec::new(),
+    };
     let (Some(invocation), Some(commands)) = (parse_invocation(prompt), commands) else {
         return whole();
     };
@@ -82,7 +107,10 @@ pub fn turn_input(
         if !piped.is_empty() {
             input.parts.push(InputPart::Text(piped.to_string()));
         }
-        return input;
+        return Expanded {
+            input,
+            messages: Vec::new(),
+        };
     }
     let Some(command) = commands.get(invocation.name) else {
         return whole();
@@ -95,12 +123,13 @@ pub fn turn_input(
         trusted: config::is_trusted(&setup.paths.global_config_file(), &root, &setup.trust),
     };
     let expansion = expand(command, invocation.args, &setup.workspace, policy, trust);
-    for warning in &expansion.warnings {
-        notices.warn(warning);
-    }
-    for note in &expansion.notes {
-        notices.note(note);
-    }
+    let mut messages: Vec<Message> = expansion
+        .warnings
+        .iter()
+        .cloned()
+        .map(Message::Warning)
+        .collect();
+    messages.extend(expansion.notes.iter().cloned().map(Message::Note));
     let mut input = expansion.input;
     if !piped.is_empty() {
         input.parts.push(InputPart::Text(piped.to_string()));
@@ -108,13 +137,17 @@ pub fn turn_input(
     if let Some(model) = expansion.model {
         match registry::resolve(&model, &setup.config.providers, setup.keys()) {
             Ok(resolved) => {
-                notices.note(&runs_on(&command.name, &resolved.id));
+                messages.push(Message::Note(runs_on(&command.name, &resolved.id)));
                 input.model = Some(turn_model(resolved, &setup.config.profiles));
             }
-            Err(e) => notices.warn(&cannot_use(&command.name, &model, &e.to_string())),
+            Err(e) => messages.push(Message::Warning(cannot_use(
+                &command.name,
+                &model,
+                &e.to_string(),
+            ))),
         }
     }
-    input
+    Expanded { input, messages }
 }
 
 /// The model a command asks for, as `resolved`: local when its profile (from `profiles`) says so.
@@ -130,26 +163,20 @@ fn turn_model(resolved: Resolved, user: &BTreeMap<String, ProfileSettings>) -> T
 
 /// The note that command `name` runs on `model`.
 fn runs_on(name: &str, model: &str) -> String {
-    format!(
-        "/{} runs on {}, as its command file asks",
-        terminal_safe(name),
-        terminal_safe(model)
-    )
+    format!("/{name} runs on {model}, as its command file asks")
 }
 
 /// The warning that command `name` asks for `model`, which `error` keeps from being used.
 fn cannot_use(name: &str, model: &str, error: &str) -> String {
     format!(
-        "/{} asks for model {}, which cannot be used ({}); using the session's model",
-        terminal_safe(name),
-        terminal_safe(model),
-        terminal_safe(error)
+        "/{name} asks for model {model}, which cannot be used ({error}); using the session's model"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::term::terminal_safe;
 
     // Final review, I-1: a command's model on a local server gets a local server's wait, and its
     // rule that a reply that never starts is not asked for again; a profile may say otherwise.
@@ -181,16 +208,19 @@ mod tests {
         );
     }
 
-    // Review C, minor 7: a command's name is printed like any other text from a file.
+    // Review C, minor 7: a command's name is printed like any other text from a file: the
+    // messages carry it as it is, and are escaped where they are printed.
     #[test]
-    fn model_messages_print_the_command_name_safely() {
+    fn model_messages_name_the_command_and_are_printed_safely() {
         let name = "x\u{1b}[2J";
         for message in [
             runs_on(name, "mock/m"),
             cannot_use(name, "mock/m", "unknown provider"),
         ] {
-            assert!(!message.contains('\u{1b}'), "{message:?}");
-            assert!(message.contains("/x\\u{1b}[2J"), "{message:?}");
+            assert!(message.contains("/x\u{1b}[2J"), "{message:?}");
+            let printed = terminal_safe(&message);
+            assert!(!printed.contains('\u{1b}'), "{printed:?}");
+            assert!(printed.contains("/x\\u{1b}[2J"), "{printed:?}");
         }
     }
 }

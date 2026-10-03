@@ -49,6 +49,10 @@ pub enum EntryKind {
         /// A note from harness, such as a mode change, rather than something the user typed.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         note: bool,
+        /// The plan the user approved, on the message that asks the model to build it. A harness
+        /// that does not know the field ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
     },
     /// A summary that replaces the conversation before `first_kept` (all of it when `None`) on
     /// this branch. The summarized entries stay in the file.
@@ -568,6 +572,7 @@ fn summary(path: &Path) -> Option<SessionSummary> {
                     message: Message::User { content },
                     display,
                     note: false,
+                    ..
                 } => Some(display.unwrap_or(content)),
                 _ => None,
             }

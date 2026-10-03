@@ -4,12 +4,13 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::{sync::mpsc::UnboundedSender, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -24,8 +25,8 @@ use crate::{
     retry::RetryPolicy,
     session::{Entry, EntryKind, RewindScope, Session},
     tokens::DEFAULT_CONTEXT_WINDOW,
-    tool::{Tool, ToolContext, ToolOutput, ToolRegistry},
-    turn::{InputPart, TurnInput, TurnModel},
+    tool::{CommandSandbox, Tool, ToolContext, ToolOutput, ToolRegistry},
+    turn::{InputPart, Steering, TurnInput, TurnModel},
 };
 
 /// Model calls allowed per turn unless configured otherwise.
@@ -114,12 +115,50 @@ impl AgentConfig {
     }
 }
 
+/// The OS sandbox shell commands get in each mode, for a session whose mode can change: one for
+/// read-only access (`plan`, `read-only`) and one for workspace-write access (`ask`, `auto`).
+/// Either may be missing: a workspace too broad to make writable has no workspace-write sandbox,
+/// and neither has a system without one. `full-access` never uses one.
+#[derive(Debug, Clone, Default)]
+pub struct Sandboxes {
+    pub read_only: Option<Arc<dyn CommandSandbox>>,
+    pub workspace_write: Option<Arc<dyn CommandSandbox>>,
+}
+
+impl Sandboxes {
+    /// The sandbox for `mode`.
+    pub fn for_mode(&self, mode: Mode) -> Option<Arc<dyn CommandSandbox>> {
+        match mode {
+            Mode::Plan | Mode::ReadOnly => self.read_only.clone(),
+            Mode::Ask | Mode::Auto => self.workspace_write.clone(),
+            Mode::FullAccess => None,
+        }
+    }
+}
+
+/// What an approval decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalKind {
+    /// Whether the action may run: once, for the rest of the session, or not.
+    Action,
+    /// Whether a command may run without the sandbox: once, or not. It is never approved for
+    /// the session.
+    RunUnsandboxed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub call_id: String,
     pub tool: String,
+    /// The call's arguments as the model sent them, before any redaction: what an approver shows
+    /// of the change must be worked out from them, and only what it shows redacted.
+    pub arguments: Value,
     pub action: Action,
     pub reason: String,
+    pub kind: ApprovalKind,
+    /// Whether approving it for the session would be kept. When it would not (destructive
+    /// commands, and others the policy always asks about), such an approval applies once.
+    pub kept_for_session: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +188,32 @@ impl Approver for NonInteractive {
     }
 }
 
+/// Where the next request's tokens go, estimated, and the model's context window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextUsage {
+    /// The context window, in tokens.
+    pub window: u64,
+    /// The system prompt, instruction files and environment included.
+    pub system: u64,
+    /// The tool definitions.
+    pub tools: u64,
+    /// The conversation.
+    pub messages: u64,
+    /// The whole next request: from the input tokens the provider reported for the last one
+    /// where it did, else the sum of the estimates above.
+    pub total: u64,
+}
+
+/// What a turn's model calls took, for its [`AgentEvent::TurnStats`].
+#[derive(Debug, Default)]
+struct Stats {
+    /// The model that answered last; `None` until one was asked.
+    model: Option<String>,
+    time_to_first_token: Option<Duration>,
+    generation: Duration,
+    usage: Usage,
+}
+
 /// What one model call produced so far. Kept outside the stream future so partial output survives.
 #[derive(Debug, Default)]
 struct ModelReply {
@@ -159,6 +224,10 @@ struct ModelReply {
     emitted: bool,
     /// The token counts the provider reported for this call.
     usage: Option<Usage>,
+    /// When the request was sent, when the first output arrived, and when the stream ended.
+    started: Option<Instant>,
+    first_output: Option<Instant>,
+    ended: Option<Instant>,
     /// How much of `text` was sent as text deltas. With text tool calls on, text that may still
     /// turn out to be calls is held back, and shown once it cannot (see [`Self::show`]).
     shown: usize,
@@ -257,6 +326,12 @@ pub struct Agent {
     auto_compaction_paused: bool,
     /// Keeps secrets out of the session file and tool-output files.
     redactor: Option<Arc<Redactor>>,
+    /// The current turn's model calls, for its stats.
+    stats: Stats,
+    /// The sandbox for each mode, when switching modes also switches the sandbox.
+    sandboxes: Option<Sandboxes>,
+    /// Input the user sends while a turn runs.
+    steering: Option<Steering>,
 }
 
 impl Agent {
@@ -300,6 +375,9 @@ impl Agent {
             turn_model: None,
             auto_compaction_paused: false,
             redactor: None,
+            stats: Stats::default(),
+            sandboxes: None,
+            steering: None,
         }
     }
 
@@ -390,6 +468,21 @@ impl Agent {
         }
     }
 
+    /// Gives shell commands the sandbox for the mode whenever the mode changes
+    /// ([`set_mode`](Self::set_mode)). Without it, a mode change keeps the sandbox the agent
+    /// started with.
+    pub fn with_sandboxes(mut self, sandboxes: Sandboxes) -> Self {
+        self.sandboxes = Some(sandboxes);
+        self
+    }
+
+    /// Gives the model what the user sends through `steering` while a turn runs, with the
+    /// results of the next tool calls.
+    pub fn with_steering(mut self, steering: Steering) -> Self {
+        self.steering = Some(steering);
+        self
+    }
+
     /// Snapshots the workspace before each turn's first change, so it can be rewound.
     pub fn with_checkpoints(mut self, checkpoints: Option<Arc<Checkpoints>>) -> Self {
         self.checkpoints = checkpoints;
@@ -411,6 +504,7 @@ impl Agent {
                     message: Message::User { content },
                     display,
                     note: false,
+                    ..
                 } => Some(RewindPoint {
                     entry: entry.id.clone(),
                     text: display.clone().unwrap_or_else(|| content.clone()),
@@ -418,6 +512,20 @@ impl Agent {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The plan the user last approved on the active branch, if any.
+    pub fn approved_plan(&self) -> Option<String> {
+        self.session
+            .branch()
+            .into_iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::Message {
+                    plan: Some(plan), ..
+                } => Some(plan.clone()),
+                _ => None,
+            })
     }
 
     /// Whether the rewind list offers "undo last rewind": nothing has happened since the last
@@ -648,10 +756,22 @@ impl Agent {
     /// Adds `message` to the history and saves it in the session. If the session file cannot be
     /// written, the conversation continues in memory and a warning says so once.
     fn record(&mut self, message: Message, display: Option<String>, note: bool) {
+        self.record_entry(message, display, note, None);
+    }
+
+    /// [`record`](Self::record), with the plan the message asks to build.
+    fn record_entry(
+        &mut self,
+        message: Message,
+        display: Option<String>,
+        note: bool,
+        plan: Option<String>,
+    ) {
         let id = self.session.append(EntryKind::Message {
             message: message.clone(),
             display,
             note,
+            plan,
         });
         self.history.push(message);
         self.history_ids.push(id);
@@ -662,14 +782,34 @@ impl Agent {
         &mut self.config
     }
 
+    /// Where the next request's tokens would go.
+    pub fn context_usage(&self) -> ContextUsage {
+        let system = crate::tokens::estimate(&self.config.system_prompt);
+        let tools = compaction::request_tokens("", &self.tools.specs(), &[]);
+        let messages = self.history.iter().map(compaction::message_tokens).sum();
+        ContextUsage {
+            window: self.config.context_window,
+            system,
+            tools,
+            messages,
+            total: self.estimated_tokens(),
+        }
+    }
+
     /// Invalid tool calls (unknown tool, bad JSON, schema violations) in the current or last turn.
     pub fn invalid_calls_this_turn(&self) -> u32 {
         self.invalid_calls
     }
 
-    /// Switches the approval mode between turns. The system prompt stays as it is, so providers
-    /// keep reusing their prompt caches; the change is appended to the conversation as a note.
+    /// Switches the approval mode between turns, and with [`with_sandboxes`](Self::with_sandboxes)
+    /// the sandbox with it. The system prompt stays as it is, so providers keep reusing their
+    /// prompt caches; the change is appended to the conversation as a note.
     pub fn set_mode(&mut self, mode: Mode) {
+        if let Some(sandboxes) = &self.sandboxes {
+            self.ctx.sandbox = sandboxes.for_mode(mode);
+            self.policy
+                .set_sandbox_available(self.ctx.sandbox.is_some());
+        }
         self.policy.set_mode(mode);
         self.ctx.access = mode.fs_access();
         self.record(
@@ -692,6 +832,7 @@ impl Agent {
         let input = input.into();
         self.ctx.cancel = cancel.clone();
         self.invalid_calls = 0;
+        self.stats = Stats::default();
         self.turn_checkpointed = false;
         // Settings that apply to this turn only.
         self.turn_model = input.model.clone();
@@ -716,7 +857,7 @@ impl Agent {
         let _ = events.send(AgentEvent::TurnStarted);
         self.message_recorded = false;
         let content = self.user_message(input.parts, events).await;
-        self.record(Message::User { content }, input.display, false);
+        self.record_entry(Message::User { content }, input.display, false, input.plan);
         self.message_recorded = true;
         for kind in std::mem::take(&mut self.held_entries) {
             self.append_turn_entry(kind);
@@ -730,7 +871,13 @@ impl Agent {
             if !auto_compaction_failed {
                 auto_compaction_failed = !self.compact_automatically(events, &cancel).await;
             }
-            let reply = match self.call_model_compacting(events, &cancel).await {
+            let outcome = self.call_model_compacting(events, &cancel).await;
+            match &outcome {
+                ModelOutcome::Reply(reply)
+                | ModelOutcome::Failed(_, reply)
+                | ModelOutcome::Interrupted(reply) => self.tally(reply, events),
+            }
+            let reply = match outcome {
                 ModelOutcome::Reply(mut reply) => {
                     self.dedupe_call_ids(&mut reply.tool_calls);
                     // The reported input covers the request; the reply is estimated like any
@@ -781,7 +928,7 @@ impl Agent {
                     for skipped in &calls[index..] {
                         let message = Message::Tool {
                             call_id: skipped.id.clone(),
-                            content: "interrupted by the user before this tool ran".into(),
+                            content: STOPPED_BEFORE_RUNNING.into(),
                             is_error: true,
                         };
                         self.record(message, None, false);
@@ -799,6 +946,7 @@ impl Agent {
             if cancel.is_cancelled() {
                 return self.finish(TurnEndReason::Interrupted, events);
             }
+            self.deliver_steering(events);
         }
         self.finish(TurnEndReason::StepLimit, events)
     }
@@ -829,6 +977,23 @@ impl Agent {
         let _ = events.send(AgentEvent::Warning {
             message: message.into(),
         });
+    }
+
+    /// Adds what the user sent during the turn to the conversation, after the tool results.
+    fn deliver_steering(&mut self, events: &UnboundedSender<AgentEvent>) {
+        let Some(steering) = &self.steering else {
+            return;
+        };
+        for text in steering.take() {
+            self.record(
+                Message::User {
+                    content: text.clone(),
+                },
+                None,
+                false,
+            );
+            let _ = events.send(AgentEvent::Steered { text });
+        }
     }
 
     /// The turn's user message: text parts as they are, and each shell part replaced by the output
@@ -1071,33 +1236,49 @@ impl Agent {
             let collect = async {
                 let mut text = String::new();
                 let mut finish = None;
+                let mut usage = None;
                 let mut stream = provider.stream(request.clone());
                 while let Some(item) = stream.next().await {
                     match item? {
                         ProviderEvent::TextDelta(delta) => text.push_str(&delta),
                         ProviderEvent::Finished(reason) => finish = Some(reason),
+                        // Last one wins, as for any other reply: some servers report it
+                        // cumulatively, in every chunk.
+                        ProviderEvent::Usage(reported) => usage = Some(reported),
                         _ => {}
                     }
                 }
-                Ok::<(String, Option<FinishReason>), ProviderError>((text, finish))
+                Ok::<(String, Option<FinishReason>, Option<Usage>), ProviderError>((
+                    text, finish, usage,
+                ))
             };
             let result = tokio::select! {
                 result = collect => result,
                 _ = cancel.cancelled() => return Err(CompactError::Interrupted),
             };
             match result {
-                Ok((text, _)) if text.trim().is_empty() => {
+                Ok((text, _, _)) if text.trim().is_empty() => {
                     return Err(CompactError::Failed(
                         "the model returned an empty summary".into(),
                     ));
                 }
                 // The end of a summary says what remains to be done: a cut-off one is no use.
-                Ok((_, Some(FinishReason::Length))) => {
+                Ok((_, Some(FinishReason::Length), _)) => {
                     return Err(CompactError::Failed(
                         "the summary was cut off at the model's output limit".into(),
                     ));
                 }
-                Ok((text, _)) => return Ok(text.trim().to_string()),
+                Ok((text, _, usage)) => {
+                    // A compaction request is a paid call like any other, and often the turn's
+                    // largest, so it must count towards `/usage` and the status line's totals.
+                    if let Some(usage) = usage {
+                        let _ = events.send(AgentEvent::Usage {
+                            model: self.model_id().to_string(),
+                            usage,
+                        });
+                    }
+                    return Ok(text.trim().to_string());
+                }
                 Err(error) if self.config.retry.retries(&error, attempt) => {
                     let delay = self.config.retry.delay(attempt, error.retry_after());
                     let _ = events.send(AgentEvent::Retrying {
@@ -1217,6 +1398,29 @@ impl Agent {
         self.record(message, None, false);
     }
 
+    /// Adds what a model call took to the turn's stats, and reports its usage once: a server
+    /// that reports usage cumulatively, in every chunk (redact.rs knows such servers exist), must
+    /// not be counted once per chunk, only once per reply, with the last chunk's number.
+    fn tally(&mut self, reply: &ModelReply, events: &UnboundedSender<AgentEvent>) {
+        self.stats.model = Some(self.model_id().to_string());
+        if let (Some(started), Some(first)) = (reply.started, reply.first_output) {
+            if self.stats.time_to_first_token.is_none() {
+                self.stats.time_to_first_token = Some(first - started);
+            }
+            let ended = reply.ended.unwrap_or_else(Instant::now);
+            self.stats.generation += ended.saturating_duration_since(first);
+        }
+        if let Some(usage) = reply.usage {
+            self.stats.usage.input_tokens += usage.input_tokens;
+            self.stats.usage.output_tokens += usage.output_tokens;
+            self.stats.usage.cached_tokens += usage.cached_tokens;
+            let _ = events.send(AgentEvent::Usage {
+                model: self.model_id().to_string(),
+                usage,
+            });
+        }
+    }
+
     fn finish(
         &mut self,
         reason: TurnEndReason,
@@ -1224,6 +1428,17 @@ impl Agent {
     ) -> TurnEndReason {
         for message in self.warnings.drain(..) {
             let _ = events.send(AgentEvent::Warning { message });
+        }
+        let stats = std::mem::take(&mut self.stats);
+        if let Some(model) = stats.model {
+            let _ = events.send(AgentEvent::TurnStats {
+                model,
+                time_to_first_token_ms: stats.time_to_first_token.map(|d| d.as_millis() as u64),
+                generation_ms: stats.generation.as_millis() as u64,
+                input_tokens: stats.usage.input_tokens,
+                output_tokens: stats.usage.output_tokens,
+                cached_tokens: stats.usage.cached_tokens,
+            });
         }
         let _ = events.send(AgentEvent::TurnFinished { reason });
         reason
@@ -1275,9 +1490,24 @@ impl Agent {
             options,
             output_room,
         };
+        reply.started = Some(Instant::now());
         let mut stream = provider.stream(request);
         while let Some(item) = stream.next().await {
-            match item? {
+            let item = item?;
+            // `OutputStarted` is a tool-call reply's only early signal: the call itself is
+            // buffered by the wire parser and arrives whole only once the stream ends. The other
+            // three are kept as a fallback for a provider that has none to emit.
+            if matches!(
+                item,
+                ProviderEvent::OutputStarted
+                    | ProviderEvent::TextDelta(_)
+                    | ProviderEvent::ReasoningDelta(_)
+                    | ProviderEvent::ToolCall(_)
+            ) && reply.first_output.is_none()
+            {
+                reply.first_output = Some(Instant::now());
+            }
+            match item {
                 ProviderEvent::TextDelta(text) => {
                     reply.text.push_str(&text);
                     // Tool calls written as text are not shown as text: what may still become
@@ -1294,16 +1524,15 @@ impl Agent {
                     let _ = events.send(AgentEvent::ReasoningDelta { text });
                 }
                 ProviderEvent::ToolCall(call) => reply.tool_calls.push(call),
-                ProviderEvent::Usage(usage) => {
-                    reply.usage = Some(usage);
-                    let _ = events.send(AgentEvent::Usage {
-                        model: self.model_id().to_string(),
-                        usage,
-                    });
-                }
+                ProviderEvent::OutputStarted => {}
+                // Kept, last one wins, for `tally` to report once the reply is whole: some
+                // servers send it cumulatively, in every chunk, and counting each would
+                // over-count both `/usage` and the status line's session totals.
+                ProviderEvent::Usage(usage) => reply.usage = Some(usage),
                 ProviderEvent::Finished(reason) => reply.finish = Some(reason),
             }
         }
+        reply.ended = Some(Instant::now());
         Ok(())
     }
 
@@ -1379,24 +1608,61 @@ impl Agent {
 
         let action = tool.action(&args, &self.ctx);
         let mutating = self.is_mutating(&action);
-        match self.policy.check(&action) {
+        let decision = self.policy.check(&action);
+        // A sandbox that can no longer run this command (Linux, git protection required, after a
+        // drop to the basic tier) leaves one way to run it: outside the sandbox, if approved.
+        if let (Decision::Allow | Decision::Ask(_), Action::Bash(command)) = (&decision, &action)
+            && !self.ctx.unsandboxed
+            && let Some(why) = self
+                .ctx
+                .sandbox
+                .as_ref()
+                .and_then(|sandbox| sandbox.cannot_run(self.ctx.access))
+        {
+            let command = command.clone();
+            let asked_anyway = match &decision {
+                Decision::Ask(reason) => Some(reason.clone()),
+                _ => None,
+            };
+            return self
+                .run_outside_sandbox(
+                    call,
+                    &tool,
+                    args,
+                    &command,
+                    &why,
+                    asked_anyway.as_deref(),
+                    mutating,
+                    events,
+                )
+                .await;
+        }
+        match decision {
             Decision::Allow => {}
             Decision::Deny(reason) => return ToolOutput::error(format!("denied: {reason}")),
             Decision::Ask(reason) => {
-                let _ = events.send(AgentEvent::ApprovalNeeded {
-                    id: call.id.clone(),
-                    reason: reason.clone(),
-                });
                 let request = ApprovalRequest {
                     call_id: call.id.clone(),
                     tool: call.name.clone(),
+                    arguments: args.clone(),
+                    kept_for_session: self.policy.can_remember(&action),
                     action,
                     reason: reason.clone(),
+                    kind: ApprovalKind::Action,
                 };
-                match self.approver.decide(&request).await {
+                let Some(decision) = self.ask(&request, events).await else {
+                    return ToolOutput::error(STOPPED_BEFORE_RUNNING);
+                };
+                match decision {
                     ApprovalDecision::Approve => {}
                     ApprovalDecision::ApproveForSession => {
-                        self.policy.remember(&request.action);
+                        if !self.policy.remember(&request.action) {
+                            let _ = events.send(AgentEvent::Warning {
+                                message: format!(
+                                    "approved once: {reason} cannot be approved for the rest of the session, so harness will ask again next time"
+                                ),
+                            });
+                        }
                     }
                     ApprovalDecision::Deny {
                         feedback: Some(note),
@@ -1447,6 +1713,100 @@ impl Agent {
         output
     }
 
+    /// Asks the user about `request`, unless the turn was stopped: then nothing is asked, and a
+    /// turn stopped while the user has not answered stops waiting for the answer. `None` when
+    /// stopped, and the action must not run.
+    async fn ask(
+        &self,
+        request: &ApprovalRequest,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> Option<ApprovalDecision> {
+        let cancel = self.ctx.cancel.clone();
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let _ = events.send(AgentEvent::ApprovalNeeded {
+            id: request.call_id.clone(),
+            reason: request.reason.clone(),
+        });
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            decision = self.approver.decide(request) => Some(decision),
+        }
+    }
+
+    /// The sandbox cannot run `command` now, for the reason `why`: asks whether to run it outside
+    /// the sandbox, once. Nobody to ask blocks it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "what executing the call knows, passed on"
+    )]
+    async fn run_outside_sandbox(
+        &mut self,
+        call: &ToolCall,
+        tool: &Arc<dyn Tool>,
+        args: Value,
+        command: &str,
+        why: &str,
+        asked_anyway: Option<&str>,
+        mutating: bool,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> ToolOutput {
+        // What the policy would have asked about anyway (a destructive command, a `confirm`
+        // rule) stays in the question.
+        let reason = match asked_anyway {
+            Some(reason) => format!("{reason}, and {why}: run it without the sandbox?"),
+            None => {
+                let mut shown: String = command.chars().take(80).collect();
+                if shown.len() < command.len() {
+                    shown.push('…');
+                }
+                format!("{why}; run `{shown}` without the sandbox?")
+            }
+        };
+        let request = ApprovalRequest {
+            call_id: call.id.clone(),
+            tool: call.name.clone(),
+            arguments: args.clone(),
+            action: Action::Bash(command.to_string()),
+            reason,
+            kind: ApprovalKind::RunUnsandboxed,
+            kept_for_session: false,
+        };
+        let Some(decision) = self.ask(&request, events).await else {
+            return ToolOutput::error(STOPPED_BEFORE_RUNNING);
+        };
+        match decision {
+            ApprovalDecision::Approve | ApprovalDecision::ApproveForSession => {
+                if mutating {
+                    self.checkpoint(events).await;
+                }
+                let mut ctx = self.ctx.clone();
+                ctx.unsandboxed = true;
+                tool.run(args, &ctx).await
+            }
+            ApprovalDecision::Deny {
+                feedback: Some(note),
+            } => ToolOutput::error(format!(
+                "the user declined to run it without the sandbox: {note}"
+            )),
+            ApprovalDecision::Deny { feedback: None } => {
+                ToolOutput::error("the user declined to run it without the sandbox")
+            }
+            ApprovalDecision::Unavailable => {
+                let blocked = format!(
+                    "{why}, and no user is available to approve running the command without the sandbox"
+                );
+                let _ = events.send(AgentEvent::ActionBlocked {
+                    id: call.id.clone(),
+                    reason: blocked.clone(),
+                });
+                ToolOutput::error(format!("blocked: {blocked}"))
+            }
+        }
+    }
+
     /// A command failed inside the sandbox in a way that looks like a denial: ask whether to run
     /// it once without the sandbox. Denials are recognised heuristically, so the wording hedges.
     async fn offer_unsandboxed_rerun(
@@ -1459,17 +1819,25 @@ impl Agent {
     ) -> ToolOutput {
         let reason = "the sandbox may have blocked this command; run it again without the sandbox?"
             .to_string();
-        let _ = events.send(AgentEvent::ApprovalNeeded {
-            id: call.id.clone(),
-            reason: reason.clone(),
-        });
         let request = ApprovalRequest {
             call_id: call.id.clone(),
             tool: call.name.clone(),
+            arguments: args.clone(),
             action: tool.action(&args, &self.ctx),
             reason,
+            kind: ApprovalKind::RunUnsandboxed,
+            kept_for_session: false,
         };
-        let note = match self.approver.decide(&request).await {
+        let Some(decision) = self.ask(&request, events).await else {
+            return ToolOutput {
+                content: format!(
+                    "{}\n[not run again without the sandbox: the user stopped the turn]",
+                    first.content
+                ),
+                ..first
+            };
+        };
+        let note = match decision {
             ApprovalDecision::Approve | ApprovalDecision::ApproveForSession => {
                 let mut ctx = self.ctx.clone();
                 ctx.unsandboxed = true;
@@ -1511,6 +1879,10 @@ fn shell_part_text(command: &str, output: &ToolOutput) -> String {
     }
 }
 
+/// The result of a tool call the user stopped the turn before, while harness waited to ask or
+/// for the answer.
+const STOPPED_BEFORE_RUNNING: &str = "interrupted by the user before this tool ran";
+
 /// The result given to a tool call that a stopped run left without one.
 fn stopped_result(call_id: String) -> Message {
     Message::Tool {
@@ -1525,10 +1897,16 @@ fn stopped_result(call_id: String) -> Message {
 /// prompt does.
 fn mode_note(mode: Mode, sandboxed: bool) -> String {
     let rules = match mode {
-        Mode::Plan | Mode::ReadOnly if sandboxed => {
+        Mode::Plan if sandboxed => {
+            "file edits are refused, and shell commands run in a read-only sandbox. Investigate the task, then end your reply with a step-by-step implementation plan; the user will build it, edit it, or keep planning"
+        }
+        Mode::Plan => {
+            "file edits and shell commands are refused, since no OS sandbox is active; use the read, grep and glob tools. Investigate the task, then end your reply with a step-by-step implementation plan; the user will build it, edit it, or keep planning"
+        }
+        Mode::ReadOnly if sandboxed => {
             "file edits are refused, and shell commands run in a read-only sandbox"
         }
-        Mode::Plan | Mode::ReadOnly => {
+        Mode::ReadOnly => {
             "file edits and shell commands are refused, since no OS sandbox is active; use the read, grep and glob tools"
         }
         Mode::Ask if sandboxed => {

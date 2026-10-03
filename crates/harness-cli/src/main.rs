@@ -2,6 +2,7 @@ mod ask;
 mod auth;
 mod context;
 mod doctor;
+mod interactive;
 mod login;
 mod models;
 mod notices;
@@ -10,6 +11,7 @@ mod sandbox;
 mod sessions;
 mod setup;
 mod slash;
+mod start;
 mod term;
 mod trust;
 
@@ -198,8 +200,8 @@ fn main() -> ExitCode {
         }
         Err(e) => e.exit(),
     };
-    // Only `ask` continues a session and has a run to log: with another subcommand `-c`,
-    // `--resume` and `--debug` would do nothing.
+    // Only `ask` and the interactive session continue a session, and only `ask` has a run to
+    // log: with another subcommand `-c`, `--resume` and `--debug` would do nothing.
     if let Some(command) = cli
         .command
         .as_ref()
@@ -212,7 +214,7 @@ fn main() -> ExitCode {
         };
         if let Some(flag) = flag {
             eprintln!(
-                "error: {flag} continues a session, which only `harness ask` does; run `{}` without it",
+                "error: {flag} continues a session, which only `harness ask` and `harness` alone do; run `{}` without it",
                 command_line(command)
             );
             return ExitCode::from(2);
@@ -225,6 +227,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    // The interactive session (no subcommand) has no run to log either: unlike `ask`, it ignored
+    // the flag silently rather than refusing it.
+    if cli.command.is_none() && cli.debug {
+        eprintln!("error: --debug logs a run of `harness ask`; run `harness` without it");
+        return ExitCode::from(2);
+    }
     let session = match (&cli.resume, cli.continue_session) {
         // Listing is what `--resume` alone does; with a subcommand, the id was forgotten.
         (Some(None), _) if cli.command.is_some() => {
@@ -236,6 +244,12 @@ fn main() -> ExitCode {
         (None, true) => sessions::Choice::Continue,
         (None, false) => sessions::Choice::New,
     };
+    // Before the runtime starts its threads: see `interactive::prepare`.
+    if cli.command.is_none()
+        && let Some(code) = interactive::prepare()
+    {
+        return ExitCode::from(code);
+    }
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the tokio runtime");
     let code = runtime.block_on(async move {
         match cli.command {
@@ -269,11 +283,11 @@ fn main() -> ExitCode {
             Some(Command::Sandbox {
                 command: SandboxCommand::Doctor,
             }) => doctor::run(),
-            None => {
-                eprintln!("Interactive mode is not available yet; use `harness ask \"...\"`.");
-                2
-            }
+            None => interactive::run(cli.model, cli.mode, session).await,
         }
     });
+    // A blocking task given up on (a file read for an approval's diff that never returned) must
+    // not hold up the exit: dropping the runtime would wait for it.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     ExitCode::from(code)
 }

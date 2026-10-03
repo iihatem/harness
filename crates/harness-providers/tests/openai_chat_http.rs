@@ -42,6 +42,7 @@ async fn streams_events_from_the_server_with_the_api_key() {
     assert_eq!(
         events,
         vec![
+            Ok(ProviderEvent::OutputStarted),
             Ok(ProviderEvent::TextDelta("hi".into())),
             Ok(ProviderEvent::Finished(FinishReason::Stop))
         ]

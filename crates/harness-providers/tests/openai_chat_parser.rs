@@ -24,6 +24,7 @@ fn text_usage_and_finish() {
     assert_eq!(
         events,
         vec![
+            ProviderEvent::OutputStarted,
             ProviderEvent::TextDelta("Hel".into()),
             ProviderEvent::TextDelta("lo".into()),
             ProviderEvent::Usage(Usage {
@@ -48,6 +49,7 @@ fn tool_call_fragments_are_assembled() {
     assert_eq!(
         events,
         vec![
+            ProviderEvent::OutputStarted,
             ProviderEvent::ToolCall(ToolCall {
                 id: "call_a".into(),
                 name: "read".into(),
@@ -55,6 +57,29 @@ fn tool_call_fragments_are_assembled() {
             }),
             ProviderEvent::Finished(FinishReason::ToolCalls),
         ]
+    );
+}
+
+// Review C, Important 2: a tool call's own event only arrives whole in `finish()`, once the
+// stream ends, so `OutputStarted` is the only signal of when the reply actually began. It fires
+// on the very first fragment of the first call, not once per fragment or once per call.
+#[test]
+fn a_tool_calls_first_fragment_reports_output_started_before_it_is_assembled() {
+    let mut parser = ChatStreamParser::default();
+    let first = parser
+        .push(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":""}}]}}]}"#)
+        .unwrap();
+    assert_eq!(first, vec![ProviderEvent::OutputStarted]);
+    let second = parser
+        .push(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#)
+        .unwrap();
+    assert!(second.is_empty(), "{second:?}");
+    let third = parser
+        .push(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"glob","arguments":""}}]}}]}"#)
+        .unwrap();
+    assert!(
+        third.is_empty(),
+        "a second call does not repeat it: {third:?}"
     );
 }
 
@@ -69,6 +94,7 @@ fn missing_ids_and_indexes_still_yield_distinct_calls() {
     assert_eq!(
         events,
         vec![
+            ProviderEvent::OutputStarted,
             ProviderEvent::ToolCall(ToolCall {
                 id: "call_0".into(),
                 name: "read".into(),
@@ -90,7 +116,7 @@ fn empty_arguments_become_an_empty_object() {
         r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"glob"}}]},"finish_reason":"tool_calls"}]}"#,
     ]);
     assert_eq!(
-        events[0],
+        events[1],
         ProviderEvent::ToolCall(ToolCall {
             id: "c".into(),
             name: "glob".into(),
@@ -112,6 +138,7 @@ fn empty_string_id_falls_back_and_does_not_start_a_new_call() {
     assert_eq!(
         events,
         vec![
+            ProviderEvent::OutputStarted,
             ProviderEvent::ToolCall(ToolCall {
                 id: "call_0".into(),
                 name: "read".into(),
@@ -131,6 +158,7 @@ fn reasoning_fields_become_reasoning_deltas() {
     assert_eq!(
         events,
         vec![
+            ProviderEvent::OutputStarted,
             ProviderEvent::ReasoningDelta("think".into()),
             ProviderEvent::ReasoningDelta("more".into()),
             ProviderEvent::Finished(FinishReason::Length),

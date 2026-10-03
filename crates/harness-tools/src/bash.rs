@@ -164,6 +164,9 @@ async fn run_command(
         guard.started(pid);
     }
     let pgid = child.id().map(|id| id as i32);
+    // Dropped with this future while the command runs (a panic unwinding, the runtime shutting
+    // down), it kills the command's whole group; `kill_on_drop` kills only the shell.
+    let mut group = GroupGuard(pgid);
     let mut stdout = child.stdout.take().expect("stdout is piped");
 
     // Read stdout on a separate task into a buffer that outlives the `select!` below: if a
@@ -198,6 +201,8 @@ async fn run_command(
 
     tokio::select! {
         status = finished => {
+            // It ended by itself: what it left running in the background is left alone.
+            group.disarm();
             let text = partial_text(&output);
             match status {
                 Ok(status) => {
@@ -218,6 +223,7 @@ async fn run_command(
         }
         _ = tokio::time::sleep(Duration::from_secs(secs)) => {
             kill_group(pgid);
+            group.disarm();
             reap(&mut child, pgid).await;
             reader.abort();
             let text = partial_text(&output);
@@ -225,11 +231,28 @@ async fn run_command(
         }
         _ = ctx.cancel.cancelled() => {
             kill_group(pgid);
+            group.disarm();
             reap(&mut child, pgid).await;
             reader.abort();
             let text = partial_text(&output);
             ToolOutput::error(format!("command interrupted by the user\n{text}"))
         }
+    }
+}
+
+/// Kills a command's process group when dropped, unless disarmed first: the command ended, or
+/// was killed already.
+struct GroupGuard(Option<i32>);
+
+impl GroupGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        kill_group(self.0);
     }
 }
 
@@ -319,6 +342,41 @@ mod tests {
             .wait()
             .expect("reap took the exit status of a group member it does not wait for");
         assert!(status.success());
+    }
+
+    // Final review M3: a command dropped while it runs (the agent's task panicked and unwound, or
+    // was dropped as harness exits) killed only its shell; what the shell started in its group
+    // ran on. The whole group is killed.
+    #[tokio::test]
+    async fn a_command_dropped_while_it_runs_takes_its_process_group_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path());
+        let running = tokio::spawn(async move {
+            BashTool
+                .run(json!({"command": "sleep 30 & echo $! > child; wait"}), &ctx)
+                .await
+        });
+        let file = dir.path().join("child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let child = loop {
+            if let Ok(pid) = std::fs::read_to_string(&file)
+                && pid.ends_with('\n')
+            {
+                break nix::unistd::Pid::from_raw(pid.trim().parse().unwrap());
+            }
+            assert!(std::time::Instant::now() < deadline, "never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while nix::sys::signal::kill(child, None).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "what the command started still runs"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[test]

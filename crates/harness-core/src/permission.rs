@@ -176,12 +176,21 @@ pub trait PermissionPolicy: Send + Sync {
         false
     }
 
+    /// Whether [`remember`](Self::remember) would remember `action` now, without remembering it.
+    fn can_remember(&self, _action: &Action) -> bool {
+        false
+    }
+
     /// Switches the approval mode for later checks. Policies without modes ignore it.
     ///
     /// Internal to the agent: frontends call `Agent::set_mode`, which also gives shell commands
     /// the new mode's sandbox access and records the change in the conversation. Calling this
     /// directly would leave commands running with the old mode's access.
     fn set_mode(&self, _mode: Mode) {}
+
+    /// Whether shell commands run in an OS sandbox from now on. Internal to the agent, like
+    /// [`set_mode`](Self::set_mode), which it goes with.
+    fn set_sandbox_available(&self, _available: bool) {}
 
     /// Adds rules for the current turn only, or with `None` removes them. They never override
     /// deny rules, destructive-command confirmation or the sandbox.

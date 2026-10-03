@@ -215,6 +215,14 @@ pub trait CommandSandbox: Send + Sync + std::fmt::Debug {
     fn git_protection(&self) -> GitProtection {
         GitProtection::Full
     }
+    /// Why this sandbox would refuse, now, a command with `access`, if it would: on Linux, once a
+    /// session that requires full git-metadata protection dropped to the basic tier, a command
+    /// that may write. The agent then asks whether to run the command outside the sandbox, as a
+    /// session without one asks for every command. The default is `None`.
+    fn cannot_run(&self, access: FsAccess) -> Option<String> {
+        let _ = access;
+        None
+    }
 }
 
 /// Tools in a fixed order, so tool definitions are byte-identical across requests.

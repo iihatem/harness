@@ -1,7 +1,7 @@
 //! What a user turn sends: text, shell commands whose output is filled in before the message is
 //! sent, and settings that apply to that turn only (a slash command's model and allowed tools).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::{engine::RuleSet, message::RequestOptions, provider::Provider};
 
@@ -59,6 +59,8 @@ pub struct TurnInput {
     pub rules: RuleSet,
     /// Run this turn's shell commands in a read-only sandbox.
     pub read_only_shell: bool,
+    /// The plan the user approved, which this turn implements; saved with its user message.
+    pub plan: Option<String>,
 }
 
 impl From<String> for TurnInput {
@@ -73,5 +75,30 @@ impl From<String> for TurnInput {
 impl From<&str> for TurnInput {
     fn from(text: &str) -> Self {
         TurnInput::from(text.to_string())
+    }
+}
+
+/// Input the user sends while a turn runs, for the model to get at the next tool-result
+/// boundary of that turn ("send now"). The frontend keeps a clone and sends; the agent takes.
+#[derive(Debug, Clone, Default)]
+pub struct Steering(Arc<Mutex<Vec<String>>>);
+
+impl Steering {
+    pub fn new() -> Steering {
+        Steering::default()
+    }
+
+    /// Adds `text` for the model to get with the next tool results.
+    pub fn send(&self, text: impl Into<String>) {
+        self.0.lock().expect("steering lock").push(text.into());
+    }
+
+    /// Takes everything sent and not yet delivered, oldest first.
+    pub fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().expect("steering lock"))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().expect("steering lock").is_empty()
     }
 }

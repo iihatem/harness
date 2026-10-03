@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use harness_core::{
+    agent::Sandboxes,
     permission::FsAccess,
     tool::{CommandSandbox, GitProtection},
 };
@@ -54,6 +55,30 @@ pub fn choose(
             "user namespaces are unavailable ({reason}), so the sandbox can only check git hooks and config after each command; run `harness sandbox doctor` to see how to enable them"
         )),
     }
+}
+
+/// The sandbox for each mode from the detected one, and the warning for the modes that write:
+/// read-only access keeps it (in the Linux basic tier too, since a read-only sandbox protects git
+/// metadata completely), and workspace-write access gets none in a workspace too broad to make
+/// writable (`too_broad`), or as [`choose`] says.
+pub fn for_modes(
+    detected: Option<Arc<dyn CommandSandbox>>,
+    too_broad: bool,
+    required: bool,
+) -> (Sandboxes, Option<String>) {
+    let write = if too_broad {
+        Choice {
+            sandbox: None,
+            warning: None,
+        }
+    } else {
+        choose(detected.clone(), FsAccess::WorkspaceWrite, required)
+    };
+    let sandboxes = Sandboxes {
+        read_only: choose(detected, FsAccess::ReadOnly, required).sandbox,
+        workspace_write: write.sandbox,
+    };
+    (sandboxes, write.warning)
 }
 
 #[cfg(test)]
@@ -135,5 +160,25 @@ mod tests {
     fn no_detected_sandbox_stays_none_without_a_warning_of_its_own() {
         let choice = choose(None, FsAccess::WorkspaceWrite, true);
         assert!(choice.sandbox.is_none() && choice.warning.is_none());
+    }
+
+    #[test]
+    fn each_access_gets_the_sandbox_it_can_use() {
+        let full: Option<Arc<dyn CommandSandbox>> = Some(Arc::new(Fake(GitProtection::Full)));
+        let (both, warning) = for_modes(full.clone(), false, true);
+        assert!(both.read_only.is_some() && both.workspace_write.is_some() && warning.is_none());
+        // Too broad to make writable: read-only only, and the startup warning is its own.
+        let (broad, warning) = for_modes(full, true, false);
+        assert!(broad.read_only.is_some() && broad.workspace_write.is_none() && warning.is_none());
+        // The basic tier with `required`: read-only only, with the warning.
+        let (basic, warning) = for_modes(basic(), false, true);
+        assert!(basic.read_only.is_some() && basic.workspace_write.is_none());
+        assert!(
+            warning
+                .unwrap()
+                .contains("every shell command will need approval")
+        );
+        let (none, warning) = for_modes(None, false, false);
+        assert!(none.read_only.is_none() && none.workspace_write.is_none() && warning.is_none());
     }
 }

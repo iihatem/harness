@@ -17,13 +17,16 @@ chatgpt-login = ["harness-providers/chatgpt-login"]
 
 [dependencies]
 clap.workspace = true
+crossterm.workspace = true
 harness-config.workspace = true
 harness-context.workspace = true
 harness-core.workspace = true
 harness-providers.workspace = true
 harness-sandbox.workspace = true
 harness-tools.workspace = true
+harness-tui.workspace = true
 nix = { workspace = true, features = ["term"] }
+ratatui.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -37,4 +40,5 @@ predicates.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+unicode-width.workspace = true
 wiremock.workspace = true

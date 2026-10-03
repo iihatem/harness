@@ -207,6 +207,23 @@ pub(crate) enum End {
     Panicked,
 }
 
+impl End {
+    /// What the next report says of a watcher that ended so: the guard then checks git metadata
+    /// only before and after each command, until one starts again. `None` for an ordinary end.
+    /// Said there rather than on stderr, which is the terminal the session draws in raw mode.
+    pub(crate) fn note(self) -> Option<String> {
+        let why = match self {
+            End::Failed => "waiting for changes failed",
+            End::Panicked => "a check panicked",
+            End::Stopped | End::NoneLeft | End::Inert => return None,
+        };
+        Some(format!(
+            "[harness stopped watching git metadata as it changes ({why}), so for now it checks \
+             it only before and after each command.]\n"
+        ))
+    }
+}
+
 /// A watcher: what it watches, and when it checks.
 pub(crate) struct Watch<S, T> {
     source: S,
@@ -1028,6 +1045,29 @@ mod tests {
         assert_eq!(run(&w, Lifetime::Command), End::Failed);
     }
 
+    // Final review M5: a watcher that stops on its own says so in the next report, as one that
+    // cannot start does; its ordinary ends say nothing.
+    #[test]
+    fn only_a_watcher_that_failed_or_panicked_has_something_to_say() {
+        for end in [End::Failed, End::Panicked] {
+            let note = end.note().expect("a note");
+            assert!(
+                note.contains("harness stopped watching git metadata as it changes"),
+                "{note}"
+            );
+        }
+        assert!(
+            End::Failed
+                .note()
+                .unwrap()
+                .contains("waiting for changes failed")
+        );
+        assert!(End::Panicked.note().unwrap().contains("a check panicked"));
+        for end in [End::Stopped, End::NoneLeft, End::Inert] {
+            assert_eq!(end.note(), None);
+        }
+    }
+
     #[test]
     fn a_stop_ends_the_watcher() {
         let w = world(&DIRS);
@@ -1056,7 +1096,7 @@ mod tests {
         std::fs::write(ws.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
         std::fs::write(ws.join(".git/hooks/pre-commit"), "exit 0\n").unwrap();
         let session = crate::guard::GuardSession::new(&base.join("quarantine"));
-        let guard = session.begin(&ws, true, |_| {});
+        let guard = session.begin(&ws, |_| {});
         let w = world(&[]);
         let watcher = Watch::new(
             Fake(Arc::clone(&w), Instant::now()),

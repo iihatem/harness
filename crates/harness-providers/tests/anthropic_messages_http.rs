@@ -45,7 +45,8 @@ async fn streams_a_reply_with_the_api_key_and_version() {
         Some("sk-ant-api03-test".into()),
     );
     let events: Vec<_> = provider.stream(request()).collect().await;
-    assert_eq!(events[0], Ok(ProviderEvent::TextDelta("Hello".into())));
+    assert_eq!(events[0], Ok(ProviderEvent::OutputStarted));
+    assert_eq!(events[1], Ok(ProviderEvent::TextDelta("Hello".into())));
     assert_eq!(
         events.last(),
         Some(&Ok(ProviderEvent::Finished(FinishReason::Stop)))

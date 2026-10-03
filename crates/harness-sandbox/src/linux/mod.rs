@@ -116,7 +116,7 @@ use tokio::process::Command;
 
 use crate::guard::{GitGuard, GuardSession};
 use crate::procs::{self, Registration};
-use crate::watch::{Lifetime, Target};
+use crate::watch::{End, Lifetime, Target};
 use crate::{FsAccess, SandboxPolicy, SandboxSettings};
 use inotify::Watcher;
 use mountns::MountPlan;
@@ -368,16 +368,15 @@ impl CommandSandbox for LinuxSandbox {
         // `begin` asks the probe only when an earlier command left something
         // to check, so orphans are reaped here as well.
         procs::look_and_reap();
-        // Every protected file is saved in the full tier too: a rename or an
-        // unlink from outside the command's namespace detaches its bind
+        // The guard saves every protected file in the full tier too: a rename
+        // or an unlink from outside the command's namespace detaches its bind
         // there, and a process an earlier command left keeps its own
-        // namespace, where what appeared since has no mount.
-        let save_all = true;
-        // The plan is made from the guard's index, after the scan and before
-        // the guard records which protected names exist, so the guard takes
-        // the `hooks/` placeholders for existing ones.
+        // namespace, where what appeared since has no mount. The plan is made
+        // from the guard's index, after the scan and before the guard records
+        // which protected names exist, so the guard takes the `hooks/`
+        // placeholders for existing ones.
         let mut planned = None;
-        let guard = self.guards.begin(&workspace, save_all, |index| {
+        let guard = self.guards.begin(&workspace, |index| {
             if full {
                 planned = mountplan::plan(&workspace, index);
             }
@@ -390,7 +389,7 @@ impl CommandSandbox for LinuxSandbox {
             // this) is not lost, exactly as the `mounted_command` error path
             // below does for a setup failure.
             let message = format!(
-                "git metadata protection is required (sandbox.linux_git_protection = \"required\"), but the full tier is unavailable: {reason}; restart harness to have every command ask first"
+                "git metadata protection is required (sandbox.linux_git_protection = \"required\"), but the full tier is unavailable: {reason}; the command did not run"
             );
             let report = self.after(workspace).finished(guard.finish());
             return Err(match report {
@@ -437,6 +436,21 @@ impl CommandSandbox for LinuxSandbox {
 
     fn git_protection(&self) -> GitProtection {
         lock(&self.tier).clone()
+    }
+
+    /// A command that may write, once the session dropped to the basic tier while full git
+    /// protection is required: the agent asks to run it outside the sandbox instead, as
+    /// `prepare` would refuse it.
+    fn cannot_run(&self, access: FsAccess) -> Option<String> {
+        if access != FsAccess::WorkspaceWrite || !self.settings.require_full_git_protection {
+            return None;
+        }
+        match self.git_protection() {
+            GitProtection::Basic { reason } => Some(format!(
+                "git metadata protection is required (sandbox.linux_git_protection = \"required\"), but the sandbox dropped to the basic tier ({reason})"
+            )),
+            GitProtection::Full => None,
+        }
     }
 
     /// As harness exits: stops the watchers between commands, ends the
@@ -550,11 +564,23 @@ impl Watching {
         lock(&self.0.note).unsaid.take()
     }
 
+    /// Stops `watcher`, and has the next report say so if it had stopped on
+    /// its own (its wait failed, or a check panicked).
+    fn stop(&self, watcher: Watcher) {
+        if let Some(said) = watcher.stop().and_then(End::note) {
+            let mut note = lock(&self.0.note);
+            let unsaid = note.unsaid.get_or_insert_with(String::new);
+            if !unsaid.contains(&said) {
+                unsaid.push_str(&said);
+            }
+        }
+    }
+
     /// Stops every watcher between commands, and waits for them.
     fn stop_all_between(&self) {
         let watchers = std::mem::take(&mut *lock(&self.0.between));
         for watcher in watchers.into_values() {
-            watcher.stop();
+            self.stop(watcher);
         }
     }
 
@@ -563,7 +589,7 @@ impl Watching {
     fn stop_between(&self, workspace: &Path) {
         let watcher = lock(&self.0.between).remove(workspace);
         if let Some(watcher) = watcher {
-            watcher.stop();
+            self.stop(watcher);
         }
     }
 
@@ -595,7 +621,9 @@ impl Watching {
             done
         };
         // Joined once the lock is released.
-        drop(done);
+        for watcher in done {
+            self.stop(watcher);
+        }
     }
 }
 
@@ -726,7 +754,7 @@ impl CommandGuard for LinuxGuard {
             after,
         } = *self;
         if let Some(watcher) = watcher {
-            watcher.stop();
+            after.watching.stop(watcher);
         }
         drop(registration);
         let note = setup
@@ -760,6 +788,29 @@ mod tests {
                 reason: "test".into(),
             },
         )
+    }
+
+    // 2.13 final review M1: after a drop to the basic tier with "required", the agent asks to
+    // run a writing command outside the sandbox, as a session that started so does.
+    #[test]
+    fn only_writing_commands_after_a_drop_with_required_protection_cannot_run() {
+        let required = crate::SandboxSettings {
+            require_full_git_protection: true,
+            ..crate::SandboxSettings::default()
+        };
+        let dropped = LinuxSandbox::with_git_protection(
+            required.clone(),
+            GitProtection::Basic {
+                reason: "the full tier's setup failed during the session: x".into(),
+            },
+        );
+        let why = dropped.cannot_run(FsAccess::WorkspaceWrite).unwrap();
+        assert!(why.contains("linux_git_protection = \"required\""), "{why}");
+        assert!(why.contains("setup failed during the session: x"), "{why}");
+        assert_eq!(dropped.cannot_run(FsAccess::ReadOnly), None);
+        let full = LinuxSandbox::with_git_protection(required, GitProtection::Full);
+        assert_eq!(full.cannot_run(FsAccess::WorkspaceWrite), None);
+        assert_eq!(sandbox().cannot_run(FsAccess::WorkspaceWrite), None);
     }
 
     #[test]
@@ -806,6 +857,42 @@ mod tests {
         assert!(finish(true).is_some(), "said again once one started");
     }
 
+    // Final review M5: a command's watcher that stops on its own is said in the next report, as
+    // one that cannot start is, rather than on stderr.
+    #[test]
+    fn a_watcher_that_stops_on_its_own_is_said_in_the_next_report() {
+        let _serial = procs::serial();
+        if !linux_sandbox_available() {
+            eprintln!("skipping: linux sandbox unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        let sandbox = LinuxSandbox::with_git_protection(
+            crate::SandboxSettings {
+                quarantine_dir: Some(dir.path().join("quarantine")),
+                ..crate::SandboxSettings::default()
+            },
+            GitProtection::Basic {
+                reason: "forced by the test".into(),
+            },
+        );
+        inotify::fail_next_wait();
+        let prepared = sandbox
+            .prepare(FsAccess::WorkspaceWrite, &ws, "/bin/true", &[])
+            .expect("prepare");
+        let report = prepared.guard.expect("a guard").finish().expect("a note");
+        assert!(!report.blocked, "{}", report.message);
+        assert!(
+            report.message.contains(
+                "harness stopped watching git metadata as it changes (waiting for changes failed)"
+            ),
+            "{}",
+            report.message
+        );
+    }
+
     #[test]
     fn cross_device_link_message_is_a_denial() {
         assert!(sandbox().is_denial(
@@ -847,7 +934,7 @@ mod tests {
             GitProtection::Full,
         );
         let workspace = ws.path().canonicalize().unwrap();
-        let guard = sandbox.guards.begin(&workspace, false, |_| {});
+        let guard = sandbox.guards.begin(&workspace, |_| {});
         let guard = Box::new(LinuxGuard {
             guard,
             registration: Registration::new(),

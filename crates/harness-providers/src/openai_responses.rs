@@ -118,9 +118,22 @@ pub struct ResponsesStreamParser {
     calls: BTreeMap<u64, PartialCall>,
     finish: Option<FinishReason>,
     done: bool,
+    /// Whether `OutputStarted` has already been emitted for this reply.
+    started: bool,
 }
 
 impl ResponsesStreamParser {
+    /// Emits `OutputStarted` the first time this reply produces any content: a text, refusal or
+    /// reasoning delta, or a function call starting or streaming its first argument fragment. A
+    /// function call itself is buffered and arrives whole only once its output item is done, so
+    /// this is the only early signal such a reply gives.
+    fn mark_started(&mut self, out: &mut Vec<ProviderEvent>) {
+        if !self.started {
+            self.started = true;
+            out.push(ProviderEvent::OutputStarted);
+        }
+    }
+
     pub fn push(&mut self, data: &str) -> Result<Vec<ProviderEvent>, ProviderError> {
         let event: Value = serde_json::from_str(data)
             .map_err(|e| ProviderError::Protocol(format!("{e} in event: {data}")))?;
@@ -130,23 +143,27 @@ impl ResponsesStreamParser {
             // A refusal is the model's answer, and is shown as one.
             "response.output_text.delta" | "response.refusal.delta" => {
                 if let Some(text) = delta() {
+                    self.mark_started(&mut out);
                     out.push(ProviderEvent::TextDelta(text.to_string()));
                 }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 if let Some(text) = delta() {
+                    self.mark_started(&mut out);
                     out.push(ProviderEvent::ReasoningDelta(text.to_string()));
                 }
             }
             // Each part of a summary after the first starts a new paragraph.
             "response.reasoning_summary_part.added" => {
                 if event["summary_index"].as_u64().is_some_and(|i| i > 0) {
+                    self.mark_started(&mut out);
                     out.push(ProviderEvent::ReasoningDelta("\n\n".into()));
                 }
             }
             "response.output_item.added" | "response.output_item.done"
                 if event["item"]["type"] == "function_call" =>
             {
+                self.mark_started(&mut out);
                 let item = &event["item"];
                 let call = self.call(&event);
                 if let Some(id) = item["call_id"].as_str() {
@@ -162,6 +179,9 @@ impl ResponsesStreamParser {
             }
             "response.function_call_arguments.delta" => {
                 if let Some(fragment) = event["delta"].as_str() {
+                    if !fragment.is_empty() {
+                        self.mark_started(&mut out);
+                    }
                     self.call(&event).arguments.push_str(fragment);
                 }
             }

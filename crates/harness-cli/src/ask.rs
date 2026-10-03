@@ -38,7 +38,7 @@ pub async fn run(
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("failed to install a SIGINT handler");
     let setup = match setup::load() {
-        Ok(setup) => setup,
+        Ok(setup) => Arc::new(setup),
         Err(message) => {
             eprintln!("error: {}", terminal_safe(&message));
             return 2;

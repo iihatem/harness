@@ -25,7 +25,7 @@ use crate::{notices::Notices, prompt, sandbox, setup::Setup, term::terminal_safe
 
 /// What a frontend asks for.
 pub struct Request<'a> {
-    pub setup: &'a Setup,
+    pub setup: &'a Arc<Setup>,
     pub mode: Mode,
     pub model: Resolved,
     pub session: Session,
@@ -55,6 +55,8 @@ pub struct Started {
     pub meter: Arc<harness_usage::meter::UsageMeter>,
     /// The language servers, for the session to stop when it ends.
     pub diagnostics: Arc<harness_lsp::LspDiagnostics>,
+    /// Makes the models of roles ready: the agent's, and the host's for `/model --role`.
+    pub resolver: Arc<crate::routes::CliResolver>,
 }
 
 /// The model a session starts on when it is not chosen another way: the `--model` flag, then
@@ -245,6 +247,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
             }),
     );
     let diagnostics = crate::lsp::diagnostics(setup, interactive.then(|| approver.clone()));
+    let resolver = crate::routes::CliResolver::new(setup.clone());
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin_for(model.edit_format),
@@ -259,7 +262,8 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     .with_meter(meter.clone())
     .with_gates(setup.config.gates.clone())
     .with_diagnostics(diagnostics.clone())
-    .with_roles(setup.config.roles.clone());
+    .with_roles(setup.config.roles.clone())
+    .with_resolver(resolver.clone());
     if interactive {
         agent = agent.with_sandboxes(sandboxes);
     }
@@ -272,6 +276,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         writable: writable_roots,
         meter,
         diagnostics,
+        resolver,
     })
 }
 
@@ -374,16 +379,7 @@ pub async fn model_setup(
 ) -> Option<ModelSetup> {
     let local = profiles::is_local(&resolved.id, &resolved.base_url);
     let profile = profiles::resolve(&resolved.id, local, &setup.config.profiles);
-    // The window the server really runs the model with, when it is a local server that says.
-    let provider = resolved.id.split('/').next().unwrap_or_default();
-    let server = window::Server::of(provider, &setup.config.providers);
-    let running = match server {
-        Some(server) => tokio::select! {
-            tokens = window::running_context(server, &resolved.base_url, &resolved.model, PROBE_TIMEOUT, LOAD_TIMEOUT) => tokens,
-            _ = cancel.cancelled() => return None,
-        },
-        None => window::Running::Unknown,
-    };
+    let (running, server) = running_window(setup, resolved, cancel).await?;
     let window_note = window_note(running.tokens(), profile.context_window);
     let window = window::effective_window(&resolved.id, &profile, running, server);
     Some(ModelSetup {
@@ -394,6 +390,25 @@ pub async fn model_setup(
         text_tool_calls: profile.text_tool_calls,
         warnings: window.warnings,
     })
+}
+
+/// The window the server really runs `resolved` with, when it is a local server that says (and
+/// that server). `None` when `cancel` stops the wait for its answer.
+pub async fn running_window(
+    setup: &Setup,
+    resolved: &Resolved,
+    cancel: &CancellationToken,
+) -> Option<(window::Running, Option<window::Server>)> {
+    let provider = resolved.id.split('/').next().unwrap_or_default();
+    let server = window::Server::of(provider, &setup.config.providers);
+    let running = match server {
+        Some(server) => tokio::select! {
+            tokens = window::running_context(server, &resolved.base_url, &resolved.model, PROBE_TIMEOUT, LOAD_TIMEOUT) => tokens,
+            _ = cancel.cancelled() => return None,
+        },
+        None => window::Running::Unknown,
+    };
+    Some((running, server))
 }
 
 /// Where the window comes from: the smaller of what the server runs the model with (`running`)

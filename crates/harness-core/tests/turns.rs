@@ -163,6 +163,9 @@ async fn a_turn_model_answers_only_its_turn() {
             local: false,
             tools: None,
             edit_section: None,
+            context_window: None,
+            request: None,
+            text_tool_calls: false,
         }),
         ..TurnInput::from("one")
     };

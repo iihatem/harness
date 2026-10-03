@@ -4,7 +4,11 @@
 
 use std::{fmt, str::FromStr};
 
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+
+use crate::turn::TurnModel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,4 +167,17 @@ impl RoleTable {
             None => false,
         }
     }
+}
+
+/// Makes a model id ready for use: its provider, with the credentials it needs, and its whole
+/// profile. The frontend's side of roles: the agent asks for a role's model when a turn needs it,
+/// and a failure is told to the user, whose turn then does not run.
+pub trait ModelResolver: Send + Sync {
+    /// The model `id` (`<provider>/<model>`). The error says why it cannot be used. `cancel`
+    /// stops the wait, say for a local server that is loading the model.
+    fn resolve(
+        &self,
+        id: &str,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<TurnModel, String>>;
 }

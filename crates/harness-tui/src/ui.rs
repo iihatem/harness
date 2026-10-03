@@ -15,6 +15,7 @@ use harness_core::{
     meter::WindowSnapshot,
     provider::Provider,
     redact::{EventRedactor, Redactor},
+    role::Role,
     session::{RewindScope, Session},
     turn::TurnInput,
 };
@@ -106,6 +107,10 @@ enum Job {
         model: Box<SessionModel>,
         window_note: String,
     },
+    SetRole {
+        role: Role,
+        id: String,
+    },
 }
 
 /// What work the session started in the background, apart from the agent, comes back with.
@@ -114,6 +119,12 @@ enum Background {
     Models(Vec<String>),
     /// The model to switch to, made ready, or why it could not be.
     Switch(Result<ModelSwitch, String>),
+    /// Whether the model asked for a role can be used.
+    RoleChecked {
+        role: Role,
+        id: String,
+        result: Result<(), String>,
+    },
     /// The session to continue in, opened, or why it could not be.
     Session {
         resumed: bool,
@@ -249,6 +260,14 @@ where
                         Some(Done::Session {
                             resumed,
                             result: Ok(view),
+                        })
+                    }
+                    Job::SetRole { role, id } => {
+                        agent.set_role_model(role, &id);
+                        Some(Done::Role {
+                            role,
+                            id,
+                            result: Ok(()),
                         })
                     }
                     Job::SwitchModel { model, window_note } => {
@@ -473,6 +492,17 @@ where
                 let tx = self.background_tx.clone();
                 tokio::spawn(async move {
                     let _ = tx.send(Background::Switch(switch.await));
+                });
+                Flow::Continue
+            }
+            Action::SetRole { role, id } => {
+                let cancel = CancellationToken::new();
+                self.cancel = Some(cancel.clone());
+                let check = self.app.host().check_model(&id, cancel);
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let result = check.await;
+                    let _ = tx.send(Background::RoleChecked { role, id, result });
                 });
                 Flow::Continue
             }
@@ -799,6 +829,23 @@ where
                     model: Box::new(switch.model),
                     window_note: switch.window_note,
                 });
+            }
+            Background::RoleChecked {
+                role,
+                id,
+                result: Ok(()),
+            } => self.send_job(Job::SetRole { role, id }),
+            Background::RoleChecked {
+                role,
+                id,
+                result: Err(why),
+            } => {
+                self.app.on_done(Done::Role {
+                    role,
+                    id,
+                    result: Err(why),
+                });
+                self.next_actions()?;
             }
             Background::Switch(Err(why)) => {
                 self.app.on_done(Done::Model(Err(why)));

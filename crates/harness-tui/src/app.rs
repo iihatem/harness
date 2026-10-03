@@ -21,6 +21,7 @@ use harness_core::{
     meter::WindowSnapshot,
     permission::Mode,
     redact::Redactor,
+    role::Role,
     session::{RewindScope, Session, SessionSummary},
     turn::{Steering, TurnInput},
 };
@@ -143,6 +144,13 @@ pub enum Done {
     },
     /// `/model`: the model the session continues on, or why it could not switch.
     Model(Result<ModelView, String>),
+    /// `/model --role`: the role now runs on the model `id` for the session, or why it does
+    /// not.
+    Role {
+        role: Role,
+        id: String,
+        result: Result<(), String>,
+    },
     /// `/login`: what to tell the user, or why it did not sign in.
     LoggedIn(Result<String, String>),
 }
@@ -238,6 +246,15 @@ pub trait Host: Send {
         _cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<ModelSwitch, String>> {
         Box::pin(async { Err("the model cannot change".into()) })
+    }
+    /// Whether model `id` can be used for a role: its provider and credentials are ready. Errors
+    /// say why not. `cancel` stops it while a local server is asked for its window.
+    fn check_model(
+        &self,
+        _id: &str,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Err("roles cannot be set here".into()) })
     }
     /// The settings `/usage` shows beside what the session knows.
     fn usage_context(&self) -> UsageContext {
@@ -357,6 +374,8 @@ pub enum Action {
     ListModels,
     /// Continue on the model with this id.
     SwitchModel(String),
+    /// Run `role` on the model `id` for the session, once the host has checked it can be used.
+    SetRole { role: Role, id: String },
     /// Sign in to a provider, with a device code when `device` is set.
     Login { provider: String, device: bool },
     /// Stop the running turn.
@@ -946,6 +965,21 @@ impl App {
                         self.transcript.push_error(&text, width);
                     }
                 }
+            }
+            Done::Role {
+                role,
+                id,
+                result: Ok(()),
+            } => self
+                .transcript
+                .push_note(&format!("{role} role: {id}, for this session"), width),
+            Done::Role {
+                role,
+                id,
+                result: Err(why),
+            } => {
+                let text = self.redacted(&format!("could not set the {role} role to {id}: {why}"));
+                self.transcript.push_error(&text, width);
             }
             Done::UndidRewind(Ok(())) => self.transcript.push_note("undid the last rewind", width),
             Done::UndidRewind(Err(why)) => self
@@ -1803,6 +1837,9 @@ impl App {
             "model" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
+                if let Some(rest) = args.strip_prefix("--role") {
+                    return self.set_role(rest);
+                }
                 if !args.is_empty() {
                     return self.switch_to(args);
                 }
@@ -1972,6 +2009,34 @@ impl App {
                 })
             }
         }
+    }
+
+    /// `/model --role <role> <id>`, with `rest` after `--role`.
+    fn set_role(&mut self, rest: &str) -> Option<Action> {
+        let width = self.width;
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let [role, id] = words[..] else {
+            self.transcript.push_error(
+                "/model --role takes a role and a model, such as /model --role build ollama/qwen3-coder",
+                width,
+            );
+            return None;
+        };
+        let role = match role.parse::<Role>() {
+            Ok(role) => role,
+            Err(why) => {
+                self.transcript.push_error(&why, width);
+                return None;
+            }
+        };
+        if role == Role::Main {
+            return self.switch_to(id);
+        }
+        self.work(&format!("checking {id}"), true);
+        Some(Action::SetRole {
+            role,
+            id: id.to_string(),
+        })
     }
 
     /// Switches the session to model `id`, unless it is on it already.

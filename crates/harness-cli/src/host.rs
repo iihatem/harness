@@ -38,6 +38,8 @@ pub struct CliHost {
     pub unsaved_default: std::sync::Mutex<Option<String>>,
     /// Keeps the budgets, which `/budget` shows and raises.
     pub meter: Arc<harness_usage::meter::UsageMeter>,
+    /// Makes the models of roles ready, as the agent does.
+    pub resolver: Arc<crate::routes::CliResolver>,
 }
 
 impl Host for CliHost {
@@ -208,6 +210,16 @@ impl Host for CliHost {
         })
     }
 
+    fn check_model(
+        &self,
+        id: &str,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<(), String>> {
+        use harness_core::role::ModelResolver;
+        let resolving = self.resolver.resolve(id, cancel);
+        Box::pin(async move { resolving.await.map(|_| ()) })
+    }
+
     fn switch_model(
         &self,
         id: &str,
@@ -316,8 +328,10 @@ pub mod tests {
             sandbox_available: false,
             writes_need_approval: false,
         }));
+        let setup = setup_in(home, workspace);
         CliHost {
-            setup: setup_in(home, workspace),
+            resolver: crate::routes::CliResolver::new(setup.clone()),
+            setup,
             commands: Commands::default(),
             policy,
             writable: Vec::new(),
@@ -497,6 +511,11 @@ pub mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let mut host = host(&home, &workspace.canonicalize().unwrap());
         let (release, wait) = std::sync::mpsc::channel();
+        // The resolver keeps a handle on the setup too; this switch does not use it.
+        host.resolver = crate::routes::CliResolver::new(setup_in(
+            &home.join("other"),
+            &workspace.canonicalize().unwrap(),
+        ));
         let mut setup = Arc::try_unwrap(host.setup).ok().expect("the only owner");
         setup.credentials = Arc::new(harness_providers::credentials::Credentials::with_keychain(
             &setup.paths.data_dir,
@@ -815,6 +834,7 @@ pub mod tests {
             writable,
             unsaved_default: Default::default(),
             meter: meter.clone(),
+            resolver: crate::routes::CliResolver::new(setup.clone()),
         };
         let options = Options {
             theme: Theme::monochrome(),
@@ -933,6 +953,7 @@ pub mod tests {
             writable,
             unsaved_default: Default::default(),
             meter: meter.clone(),
+            resolver: crate::routes::CliResolver::new(setup.clone()),
         };
         let options = Options {
             theme: Theme::monochrome(),
@@ -1082,6 +1103,7 @@ pub mod tests {
             writable,
             meter,
             unsaved_default: Default::default(),
+            resolver: crate::routes::CliResolver::new(setup.clone()),
         };
         let options = Options {
             theme: Theme::monochrome(),
@@ -1284,6 +1306,7 @@ pub mod tests {
             writable,
             unsaved_default: Default::default(),
             meter: meter.clone(),
+            resolver: crate::routes::CliResolver::new(setup.clone()),
         };
         let options = Options {
             theme: Theme::monochrome(),

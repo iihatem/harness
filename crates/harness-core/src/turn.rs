@@ -3,7 +3,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::{engine::RuleSet, message::RequestOptions, provider::Provider, tool::ToolRegistry};
+use crate::{
+    engine::RuleSet, message::RequestOptions, provider::Provider, role::Role, tool::ToolRegistry,
+};
 
 /// One piece of a turn's user message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,14 +31,26 @@ pub struct TurnModel {
     pub tools: Option<ToolRegistry>,
     /// What the system prompt's edit section becomes for the turn.
     pub edit_section: Option<String>,
+    /// The model's effective context window, when known: what the turn's compaction, its room for
+    /// output and its hand-off are measured against. `None` keeps the session's.
+    pub context_window: Option<u64>,
+    /// What its profile gives each request. `None` leaves the provider's defaults, but for
+    /// whether it is local.
+    pub request: Option<RequestOptions>,
+    /// Whether tool calls the model writes as text are run, as its profile says.
+    pub text_tool_calls: bool,
 }
 
 impl TurnModel {
-    /// What its requests carry: the provider's defaults, and whether it is local.
+    /// What its requests carry: its profile's options, or the provider's defaults and whether it
+    /// is local.
     pub fn options(&self) -> RequestOptions {
-        RequestOptions {
-            local: self.local,
-            ..RequestOptions::default()
+        match &self.request {
+            Some(options) => options.clone(),
+            None => RequestOptions {
+                local: self.local,
+                ..RequestOptions::default()
+            },
         }
     }
 }
@@ -65,6 +79,9 @@ pub struct TurnInput {
     pub read_only_shell: bool,
     /// The plan the user approved, which this turn implements; saved with its user message.
     pub plan: Option<String>,
+    /// The role the turn runs for. `None` is `plan` in `plan` mode and `main` otherwise; Build
+    /// asks for `build`.
+    pub role: Option<Role>,
 }
 
 impl From<String> for TurnInput {

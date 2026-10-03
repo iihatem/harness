@@ -598,6 +598,9 @@ async fn the_room_left_in_the_window_reaches_the_provider() {
             local: false,
             tools: None,
             edit_section: None,
+            context_window: None,
+            request: None,
+            text_tool_calls: false,
         }),
         ..TurnInput::from("again")
     };

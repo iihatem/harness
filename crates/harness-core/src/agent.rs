@@ -22,13 +22,13 @@ use crate::{
     event::{AgentEvent, ErrorKind, TurnEndReason},
     gate::Gates,
     message::{ChatRequest, Message, RequestOptions, ToolCall, Usage},
-    meter::{AccountKind, GateCounts, MAIN_ROLE, Meter, RequestRecord, TurnRecord},
+    meter::{AccountKind, BudgetNotice, GateCounts, Meter, RequestRecord, TurnRecord},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
     permission::{Action, Decision, FsAccess, Mode, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
     redact::Redactor,
     retry::RetryPolicy,
-    role::{Role, RoleConfig, RoleLine, RoleSource, RoleTable},
+    role::{ModelResolver, Role, RoleConfig, RoleLine, RoleSource, RoleTable},
     session::{Entry, EntryKind, RewindScope, Session},
     tokens::DEFAULT_CONTEXT_WINDOW,
     tool::{CommandSandbox, Tool, ToolContext, ToolOutput, ToolRegistry},
@@ -329,6 +329,24 @@ enum ModelOutcome {
     Interrupted(ModelReply),
 }
 
+/// Who a model request is for: the role it runs for and the model that answers, for the meter.
+#[derive(Debug, Clone)]
+struct Answering {
+    role: Role,
+    model: String,
+    local: bool,
+}
+
+/// The model that writes a compaction's summary.
+struct Summarizer {
+    provider: Arc<dyn Provider>,
+    who: Answering,
+    /// The model name sent to the provider.
+    name: String,
+    options: RequestOptions,
+    window: u64,
+}
+
 pub struct Agent {
     provider: Arc<dyn Provider>,
     tools: ToolRegistry,
@@ -405,6 +423,10 @@ pub struct Agent {
     diagnostics: Option<Arc<dyn Diagnostics>>,
     /// The models of the roles other than `main`.
     roles: RoleTable,
+    /// Makes the models of roles ready when a turn needs them.
+    resolver: Option<Arc<dyn ModelResolver>>,
+    /// The role the current turn runs for.
+    turn_role: Role,
 }
 
 impl Agent {
@@ -458,7 +480,15 @@ impl Agent {
             gate_skip_said: false,
             diagnostics: None,
             roles: RoleTable::default(),
+            resolver: None,
+            turn_role: Role::Main,
         }
+    }
+
+    /// Makes the models of roles ready with `resolver`.
+    pub fn with_resolver(mut self, resolver: Arc<dyn ModelResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     /// Sets the models of the roles from the configuration.
@@ -515,7 +545,7 @@ impl Agent {
         meter.record_turn(&TurnRecord {
             session: self.session.id().to_string(),
             turn: self.turn_entry.clone(),
-            role: MAIN_ROLE.to_string(),
+            role: self.turn_role.as_str().to_string(),
             model: self.model_id().to_string(),
             selected_by: if self.model_chosen_by_user {
                 "user"
@@ -540,14 +570,26 @@ impl Agent {
     /// Asks the meter whether the budgets allow the next request: says each 80% warning, and
     /// whether one is reached (said as an event too).
     fn budget_reached(&self, events: &UnboundedSender<AgentEvent>, said_paused: &mut bool) -> bool {
-        let Some(meter) = &self.meter else {
-            return false;
-        };
-        let local = match &self.turn_model {
-            Some(turn) => turn.options().local,
-            None => self.config.request.local,
-        };
-        let account = AccountKind::of(self.model_id(), local);
+        let who = self.answering();
+        let account = AccountKind::of(&who.model, who.local);
+        match self.budget_check(account, events, said_paused) {
+            Some(notice) => {
+                let _ = events.send(AgentEvent::BudgetReached { notice });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The budget that stops a request on `account`, if one does, after saying what the meter has
+    /// to warn about.
+    fn budget_check(
+        &self,
+        account: AccountKind,
+        events: &UnboundedSender<AgentEvent>,
+        said_paused: &mut bool,
+    ) -> Option<BudgetNotice> {
+        let meter = self.meter.as_ref()?;
         let status = meter.check_budget(self.session.id(), account);
         for notice in status.warnings {
             let _ = events.send(AgentEvent::BudgetWarning { notice });
@@ -562,20 +604,27 @@ impl Agent {
                 message: notice.paused_message(),
             });
         }
-        match status.stop {
-            Some(notice) => {
-                let _ = events.send(AgentEvent::BudgetReached { notice });
-                true
-            }
-            None => false,
+        status.stop
+    }
+
+    /// Who the current turn's requests are for.
+    fn answering(&self) -> Answering {
+        Answering {
+            role: self.turn_role,
+            model: self.model_id().to_string(),
+            local: match &self.turn_model {
+                Some(turn) => turn.options().local,
+                None => self.config.request.local,
+            },
         }
     }
 
-    /// Tells the meter, if there is one, that a model request ended as `outcome` (`ok`, or
-    /// `error:<kind>`) with `usage`, `started` being when it was sent. What the meter could not
-    /// keep is shown as warnings.
+    /// Tells the meter, if there is one, that a model request for `who` ended as `outcome` (`ok`,
+    /// or `error:<kind>`) with `usage`, `started` being when it was sent. What the meter could
+    /// not keep is shown as warnings.
     fn meter_request(
         &self,
+        who: &Answering,
         outcome: String,
         usage: Usage,
         started: Instant,
@@ -584,21 +633,17 @@ impl Agent {
         let Some(meter) = &self.meter else {
             return;
         };
-        let local = match &self.turn_model {
-            Some(turn) => turn.options().local,
-            None => self.config.request.local,
-        };
         let cost = meter.record_request(&RequestRecord {
             session: self.session.id().to_string(),
-            role: MAIN_ROLE.to_string(),
-            model: self.model_id().to_string(),
-            local,
+            role: who.role.as_str().to_string(),
+            model: who.model.clone(),
+            local: who.local,
             usage,
             duration: started.elapsed(),
             outcome,
         });
         let _ = events.send(AgentEvent::Metered {
-            model: self.model_id().to_string(),
+            model: who.model.clone(),
             cost,
         });
         for message in meter.take_warnings() {
@@ -1088,7 +1133,7 @@ impl Agent {
         let tools = compaction::request_tokens("", &self.tools.specs(), &[]);
         let messages = self.history.iter().map(compaction::message_tokens).sum();
         ContextUsage {
-            window: self.config.context_window,
+            window: self.window(),
             system,
             tools,
             messages,
@@ -1178,8 +1223,37 @@ impl Agent {
         self.turn_changed = false;
         self.gate_counts = GateCounts::default();
         self.gate_turn = gates::GateTurn::default();
+        // The model the turn runs on: a slash command's own, else its role's, made ready here.
+        let role = input.role.unwrap_or(match self.policy.mode() {
+            Some(Mode::Plan) => Role::Plan,
+            _ => Role::Main,
+        });
+        self.turn_role = role;
+        self.turn_model = None;
+        let role_model = match &input.model {
+            Some(_) => Ok(None),
+            None => self.role_model(role, &cancel).await,
+        };
+        let role_model = match role_model {
+            Ok(model) => model,
+            Err(message) => {
+                // No request was made, and nothing of the turn is saved.
+                let _ = events.send(AgentEvent::TurnStarted);
+                let reason = if cancel.is_cancelled() {
+                    TurnEndReason::Interrupted
+                } else {
+                    let _ = events.send(AgentEvent::Error {
+                        kind: ErrorKind::Internal,
+                        message,
+                    });
+                    TurnEndReason::Error
+                };
+                let _ = events.send(AgentEvent::TurnFinished { reason });
+                return reason;
+            }
+        };
         // Settings that apply to this turn only.
-        self.turn_model = input.model.clone();
+        self.turn_model = input.model.clone().or(role_model);
         self.policy.set_turn_rules(Some(input.rules.clone()));
         let access = self.ctx.access;
         if input.read_only_shell {
@@ -1271,7 +1345,7 @@ impl Agent {
             // A cut-off text call lacks its end, so it is not looked for.
             if reply.tool_calls.is_empty()
                 && !cut_off
-                && self.config.text_tool_calls
+                && self.text_calls()
                 && let Some(mut calls) = crate::textcalls::recover(&reply.text, &self.tools)
             {
                 self.dedupe_call_ids(&mut calls);
@@ -1488,7 +1562,7 @@ impl Agent {
 
     /// The compaction threshold, in tokens.
     fn threshold_tokens(&self) -> f64 {
-        self.config.context_window as f64 * self.config.compaction.threshold
+        self.window() as f64 * self.config.compaction.threshold
     }
 
     /// Where the current turn starts: its user message (or the summary standing for it).
@@ -1540,7 +1614,9 @@ impl Agent {
         events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<(), CompactError> {
-        let window = self.config.context_window;
+        // The part kept is sized by the window of the model that answers the turn, which is sent
+        // the conversation next.
+        let window = self.window();
         let budget = (window as f64 * self.config.compaction.keep_recent) as u64;
         let fits = compaction::cut(&self.history, budget);
         let cut = match trigger {
@@ -1557,33 +1633,39 @@ impl Agent {
             return Err(CompactError::NothingToCompact);
         }
         let before = self.estimated_tokens();
-        let model = self
-            .turn_model
-            .as_ref()
-            .map_or(self.config.model_name.clone(), |m| m.name.clone());
+        // The model of the `background` role writes it, `main` when that is not set, and no
+        // other model: not the model answering this turn, whatever that is.
+        let summarizer = self
+            .summarizer(cancel)
+            .await
+            .map_err(CompactError::Failed)?;
+        // A summary is a request like any other: a billed model is not asked once a budget is
+        // reached, whatever the turn's own model costs. A manual `/compact` is not checked.
+        if trigger != Trigger::Manual {
+            let account = AccountKind::of(&summarizer.who.model, summarizer.who.local);
+            if let Some(notice) = self.budget_check(account, events, &mut false) {
+                return Err(CompactError::Failed(notice.reached_message()));
+            }
+        }
         // The transcript is sized from an estimate, so the request can still be too long for the
         // model: then it is tried once more with half as much.
-        let mut max_tokens = window / 2;
+        let mut max_tokens = summarizer.window / 2;
         let summary = loop {
-            let mut request =
-                compaction::summary_request(&model, &self.history[..cut], focus, max_tokens);
-            // The session's model writes it under its profile's options, as it answers turns; a
-            // slash command's model gets the provider's defaults, but for whether it is local, as
-            // for its turn.
-            match &self.turn_model {
-                None => {
-                    request.options = self.config.request.clone();
-                    let input = compaction::request_tokens(
-                        &request.system,
-                        &request.tools,
-                        &request.messages,
-                    );
-                    request.output_room = Some(window.saturating_sub(input));
+            let mut request = compaction::summary_request(
+                &summarizer.name,
+                &self.history[..cut],
+                focus,
+                max_tokens,
+            );
+            // Under the options of its profile, within the room its window leaves.
+            request.options = summarizer.options.clone();
+            let input =
+                compaction::request_tokens(&request.system, &request.tools, &request.messages);
+            request.output_room = Some(summarizer.window.saturating_sub(input));
+            match self.summarize(&summarizer, request, events, cancel).await {
+                Err(CompactError::Overflow(_)) if max_tokens == summarizer.window / 2 => {
+                    max_tokens /= 2
                 }
-                Some(turn) => request.options = turn.options(),
-            }
-            match self.summarize(request, events, cancel).await {
-                Err(CompactError::Overflow(_)) if max_tokens == window / 2 => max_tokens /= 2,
                 result => break result?,
             }
         };
@@ -1605,15 +1687,13 @@ impl Agent {
     /// errors like any model call.
     async fn summarize(
         &self,
+        summarizer: &Summarizer,
         request: ChatRequest,
         events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<String, CompactError> {
-        let provider = self
-            .turn_model
-            .as_ref()
-            .map_or(&self.provider, |m| &m.provider)
-            .clone();
+        let provider = summarizer.provider.clone();
+        let who = &summarizer.who;
         let mut attempt = 1;
         let started = Instant::now();
         loop {
@@ -1639,6 +1719,7 @@ impl Agent {
                 _ = cancel.cancelled() => {
                     // What was reported before the stop is billed.
                     self.meter_request(
+                        who,
                         "error:interrupted".into(),
                         usage.unwrap_or_default(),
                         started,
@@ -1652,20 +1733,20 @@ impl Agent {
             // becomes of its result.
             match result {
                 Ok(()) if text.trim().is_empty() => {
-                    self.meter_summary("error:incomplete", usage, started, events);
+                    self.meter_summary(who, "error:incomplete", usage, started, events);
                     return Err(CompactError::Failed(
                         "the model returned an empty summary".into(),
                     ));
                 }
                 // The end of a summary says what remains to be done: a cut-off one is no use.
                 Ok(()) if finish == Some(FinishReason::Length) => {
-                    self.meter_summary("error:incomplete", usage, started, events);
+                    self.meter_summary(who, "error:incomplete", usage, started, events);
                     return Err(CompactError::Failed(
                         "the summary was cut off at the model's output limit".into(),
                     ));
                 }
                 Ok(()) => {
-                    self.meter_summary("ok", usage, started, events);
+                    self.meter_summary(who, "ok", usage, started, events);
                     return Ok(text.trim().to_string());
                 }
                 Err(error) if self.config.retry.retries(&error, attempt) => {
@@ -1673,6 +1754,7 @@ impl Agent {
                     if usage.is_some() {
                         let outcome = format!("error:{}", error.kind());
                         self.meter_request(
+                            who,
                             outcome,
                             usage.unwrap_or_default(),
                             attempt_started,
@@ -1689,6 +1771,7 @@ impl Agent {
                         _ = tokio::time::sleep(delay) => {}
                         _ = cancel.cancelled() => {
                             self.meter_request(
+                                who,
                                 "error:interrupted".into(),
                                 Usage::default(),
                                 started,
@@ -1701,7 +1784,7 @@ impl Agent {
                 }
                 Err(error) => {
                     let outcome = format!("error:{}", error.kind());
-                    self.meter_request(outcome, usage.unwrap_or_default(), started, events);
+                    self.meter_request(who, outcome, usage.unwrap_or_default(), started, events);
                     return Err(if error.is_context_overflow() {
                         CompactError::Overflow(describe(&error))
                     } else {
@@ -1716,18 +1799,111 @@ impl Agent {
     /// no use) and reports its usage.
     fn meter_summary(
         &self,
+        who: &Answering,
         outcome: &str,
         usage: Option<Usage>,
         started: Instant,
         events: &UnboundedSender<AgentEvent>,
     ) {
-        self.meter_request(outcome.into(), usage.unwrap_or_default(), started, events);
+        self.meter_request(
+            who,
+            outcome.into(),
+            usage.unwrap_or_default(),
+            started,
+            events,
+        );
         if let Some(usage) = usage {
             let _ = events.send(AgentEvent::Usage {
-                model: self.model_id().to_string(),
+                model: who.model.clone(),
                 usage,
             });
         }
+    }
+
+    /// The model that writes summaries: the `background` role's, made ready, or the session's own
+    /// when the role is not set (or is the session's model).
+    async fn summarizer(&self, cancel: &CancellationToken) -> Result<Summarizer, String> {
+        if let Some((id, _)) = self.roles.get(Role::Background)
+            && *id != self.config.model_id
+        {
+            let model = self.make_ready(Role::Background, id, cancel).await?;
+            let options = model.options();
+            return Ok(Summarizer {
+                provider: model.provider,
+                who: Answering {
+                    role: Role::Background,
+                    model: model.id,
+                    local: options.local,
+                },
+                name: model.name,
+                window: model.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+                options,
+            });
+        }
+        Ok(Summarizer {
+            provider: self.provider.clone(),
+            who: Answering {
+                role: Role::Background,
+                model: self.config.model_id.clone(),
+                local: self.config.request.local,
+            },
+            name: self.config.model_name.clone(),
+            options: self.config.request.clone(),
+            window: self.config.context_window,
+        })
+    }
+
+    /// Makes the model `id` of `role` ready, with the session's resolver.
+    async fn make_ready(
+        &self,
+        role: Role,
+        id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<TurnModel, String> {
+        let Some(resolver) = &self.resolver else {
+            return Err(format!(
+                "the {role} role is set to {id}, and nothing here can make it ready"
+            ));
+        };
+        resolver
+            .resolve(id, cancel.clone())
+            .await
+            .map_err(|why| {
+                format!(
+                    "the {role} role's model {id} cannot be used: {why}; set another with /model --role {role} <id>"
+                )
+            })
+    }
+
+    /// The model the turn for `role` runs on, when it is not the session's: `None` for `main`,
+    /// for a role that is not set, and for one set to the session's own model.
+    async fn role_model(
+        &self,
+        role: Role,
+        cancel: &CancellationToken,
+    ) -> Result<Option<TurnModel>, String> {
+        let Some((id, _)) = self.roles.get(role) else {
+            return Ok(None);
+        };
+        if *id == self.config.model_id {
+            return Ok(None);
+        }
+        self.make_ready(role, id, cancel).await.map(Some)
+    }
+
+    /// The context window of the model answering the current turn.
+    fn window(&self) -> u64 {
+        self.turn_model
+            .as_ref()
+            .and_then(|m| m.context_window)
+            .unwrap_or(self.config.context_window)
+    }
+
+    /// Whether tool calls written as text are run for the model answering the current turn.
+    fn text_calls(&self) -> bool {
+        self.turn_model
+            .as_ref()
+            .map_or(self.config.text_tool_calls, |m| m.text_tool_calls)
     }
 
     /// [`call_model`](Self::call_model); when the provider rejects the request as longer than its
@@ -1779,6 +1955,7 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> ModelOutcome {
         let started = Instant::now();
+        let who = self.answering();
         let outcome = self.call_model_with_retries(events, cancel).await;
         let (result, usage) = match &outcome {
             ModelOutcome::Reply(reply) => ("ok".to_string(), reply.usage),
@@ -1788,7 +1965,7 @@ impl Agent {
             }
             ModelOutcome::Interrupted(partial) => ("error:interrupted".to_string(), partial.usage),
         };
-        self.meter_request(result, usage.unwrap_or_default(), started, events);
+        self.meter_request(&who, result, usage.unwrap_or_default(), started, events);
         outcome
     }
 
@@ -1797,6 +1974,7 @@ impl Agent {
         events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> ModelOutcome {
+        let who = self.answering();
         let mut attempt = 1;
         loop {
             let attempt_started = Instant::now();
@@ -1818,7 +1996,7 @@ impl Agent {
                     // What the attempt reported before it failed is billed, as a record of its own.
                     if let Some(usage) = reply.usage {
                         let outcome = format!("error:{}", error.kind());
-                        self.meter_request(outcome, usage, attempt_started, events);
+                        self.meter_request(&who, outcome, usage, attempt_started, events);
                     }
                     let delay = self.config.retry.delay(attempt, error.retry_after());
                     self.retry_count
@@ -1939,10 +2117,15 @@ impl Agent {
         reply: &mut ModelReply,
         events: &UnboundedSender<AgentEvent>,
     ) -> Result<(), ProviderError> {
-        // A slash command's model gets the provider's defaults, but for whether it is local: the
-        // options, and the window, are the session model's.
+        // A turn on another model has that model's options and window.
         let (provider, model, options, output_room) = match &self.turn_model {
-            Some(turn) => (&turn.provider, turn.name.clone(), turn.options(), None),
+            Some(turn) => (
+                &turn.provider,
+                turn.name.clone(),
+                turn.options(),
+                turn.context_window
+                    .map(|window| window.saturating_sub(self.estimated_tokens())),
+            ),
             None => (
                 &self.provider,
                 self.config.model_name.clone(),
@@ -1984,7 +2167,7 @@ impl Agent {
                     reply.text.push_str(&text);
                     // Tool calls written as text are not shown as text: what may still become
                     // them waits for the reply's end, or until it cannot.
-                    let held = self.config.text_tool_calls
+                    let held = self.text_calls()
                         && reply.shown == 0
                         && reply.watch.may_be_calls(&reply.text);
                     if !held {

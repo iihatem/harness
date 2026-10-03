@@ -574,17 +574,19 @@ async fn the_summary_request_carries_the_configured_request_options() {
     assert_eq!(request.output_room, Some(2_000 - input));
 }
 
-// A slash command's model keeps the provider's defaults when it writes the summary, as it does
-// for its turn: the options are the session model's.
+// Spec "Compaction on the background role": a slash command's model answers its turn, but the
+// summary is written by the model of the `background` role, which is `main` when unset: no other
+// model sees the older conversation for it.
 #[tokio::test]
-async fn a_turn_models_summary_request_keeps_the_defaults() {
+async fn a_turn_models_turn_does_not_write_the_summary() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut agent, session_model) = after_three_turns(dir.path(), vec![]).await;
+    let (mut agent, session_model) =
+        after_three_turns(dir.path(), vec![Script::text("summary")]).await;
     agent.config_mut().request = RequestOptions {
         max_output_tokens: Some(1000),
         ..RequestOptions::default()
     };
-    let command_model = MockProvider::new(vec![Script::text("summary"), Script::text("answer")]);
+    let command_model = MockProvider::new(vec![Script::text("answer")]);
     let input = TurnInput {
         model: Some(TurnModel {
             provider: command_model.clone(),
@@ -593,6 +595,9 @@ async fn a_turn_models_summary_request_keeps_the_defaults() {
             local: false,
             tools: None,
             edit_section: None,
+            context_window: None,
+            request: None,
+            text_tool_calls: false,
         }),
         ..TurnInput::from("d".repeat(1_500))
     };
@@ -606,10 +611,14 @@ async fn a_turn_models_summary_request_keeps_the_defaults() {
     assert_eq!(reason, TurnEndReason::Completed);
     assert_eq!(compacted(&events).len(), 1, "{events:?}");
     let requests = command_model.requests();
-    assert!(is_summary_request(&requests[0]));
+    assert_eq!(requests.len(), 1, "only the turn itself");
+    assert!(!is_summary_request(&requests[0]));
     assert_eq!(requests[0].options, RequestOptions::default());
-    assert_eq!(requests[0].output_room, None);
-    assert_eq!(session_model.requests().len(), 3);
+    // Main wrote the summary, with its own options.
+    let main = session_model.requests();
+    assert_eq!(main.len(), 4);
+    assert!(is_summary_request(&main[3]));
+    assert_eq!(main[3].options.max_output_tokens, Some(1000));
 }
 
 // Review F I3: output tokens, reasoning included, are not sent back to the model, so only the
@@ -760,13 +769,13 @@ async fn a_summary_request_retries_first_data_timeouts_as_a_turn_does() {
     assert_eq!(summaries(&provider), 2);
 }
 
-// Final review, I-1: a slash command's model on a local server gets a local server's wait, for
-// its turn and for a summary it writes.
+// Final review, I-1: a slash command's model on a local server gets a local server's wait for
+// its turn; the summary is main's to write (see above), and carries main's options.
 #[tokio::test]
 async fn a_local_turn_models_requests_say_it_is_local() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut agent, _) = after_three_turns(dir.path(), vec![]).await;
-    let command_model = MockProvider::new(vec![Script::text("summary"), Script::text("answer")]);
+    let (mut agent, main) = after_three_turns(dir.path(), vec![Script::text("summary")]).await;
+    let command_model = MockProvider::new(vec![Script::text("answer")]);
     let input = TurnInput {
         model: Some(TurnModel {
             provider: command_model.clone(),
@@ -775,6 +784,9 @@ async fn a_local_turn_models_requests_say_it_is_local() {
             local: true,
             tools: None,
             edit_section: None,
+            context_window: None,
+            request: None,
+            text_tool_calls: false,
         }),
         ..TurnInput::from("d".repeat(1_500))
     };
@@ -782,15 +794,15 @@ async fn a_local_turn_models_requests_say_it_is_local() {
     let reason = agent.run_turn(input, &tx, CancellationToken::new()).await;
     assert_eq!(reason, TurnEndReason::Completed);
     let requests = command_model.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(is_summary_request(&requests[0]));
-    for request in &requests {
-        assert_eq!(
-            request.options,
-            RequestOptions {
-                local: true,
-                ..RequestOptions::default()
-            }
-        );
-    }
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].options,
+        RequestOptions {
+            local: true,
+            ..RequestOptions::default()
+        }
+    );
+    let summary = main.requests().pop().unwrap();
+    assert!(is_summary_request(&summary));
+    assert!(!summary.options.local);
 }

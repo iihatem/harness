@@ -9,6 +9,7 @@ use std::{
 };
 
 use common::*;
+use futures::future::BoxFuture;
 use harness_core::{
     message::Message,
     permission::Mode,
@@ -20,11 +21,15 @@ use harness_tui::{
     ui::Ui,
 };
 use ratatui::{backend::TestBackend, crossterm::event::KeyCode};
+use tokio_util::sync::CancellationToken;
 
 /// The project's sessions, saved in `dir`.
 struct Sessions {
     dir: PathBuf,
     workspace: PathBuf,
+    /// Opening a session waits for this (or for the user to stop it), as a slow disk or a slow
+    /// `git` would make it.
+    gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Host for Sessions {
@@ -37,24 +42,38 @@ impl Host for Sessions {
     fn sessions(&self) -> Vec<SessionSummary> {
         session::list(&self.dir)
     }
-    fn open_session(&self, id: Option<&str>) -> Result<OpenedSession, String> {
-        let session = match id {
-            None => Session::create(&self.dir, &self.workspace),
-            Some(id) => {
-                let path = self.dir.join(format!("{id}.jsonl"));
-                if !path.exists() {
-                    return Err(format!("there is no session {id} in this project"));
+    fn open_session(
+        &self,
+        id: Option<&str>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<OpenedSession, String>> {
+        let (dir, workspace, gate) = (self.dir.clone(), self.workspace.clone(), self.gate.clone());
+        let id = id.map(str::to_string);
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                tokio::select! {
+                    () = gate.notified() => {}
+                    () = cancel.cancelled() => return Err("stopped".to_string()),
                 }
-                Session::open(&path).map_err(|e| e.to_string())?.0
             }
-        };
-        Ok(OpenedSession {
-            session,
-            checkpoints: None,
-            warnings: vec![
-                "a warning about the file".into(),
-                "note: a note about the file".into(),
-            ],
+            let session = match id {
+                None => Session::create(&dir, &workspace),
+                Some(id) => {
+                    let path = dir.join(format!("{id}.jsonl"));
+                    if !path.exists() {
+                        return Err(format!("there is no session {id} in this project"));
+                    }
+                    Session::open(&path).map_err(|e| e.to_string())?.0
+                }
+            };
+            Ok(OpenedSession {
+                session,
+                checkpoints: None,
+                warnings: vec![
+                    "a warning about the file".into(),
+                    "note: a note about the file".into(),
+                ],
+            })
         })
     }
 }
@@ -85,11 +104,21 @@ fn saved(dir: &Path, workspace: &Path, exchanges: &[(&str, &str)]) -> String {
 }
 
 fn open(provider: Arc<MockProvider>, sessions: &Path, workspace: &Path) -> (Ui<TestBackend>, Log) {
+    open_with(provider, sessions, workspace, None)
+}
+
+fn open_with(
+    provider: Arc<MockProvider>,
+    sessions: &Path,
+    workspace: &Path,
+    gate: Option<Arc<tokio::sync::Notify>>,
+) -> (Ui<TestBackend>, Log) {
     let agent =
         agent(provider, workspace, Mode::Auto).with_session(Session::create(sessions, workspace));
     let host = Sessions {
         dir: sessions.to_path_buf(),
         workspace: workspace.to_path_buf(),
+        gate,
     };
     start(agent, Box::new(host), options(workspace, Mode::Auto))
 }
@@ -309,5 +338,68 @@ async fn the_session_picker_can_open_as_the_session_starts() {
     send(&mut ui, "go on");
     settle(&mut ui).await;
     assert_eq!(user_messages(&provider)[0], "old question");
+    ui.finish().await.unwrap();
+}
+
+// Review B M4: opening a session (reading its file, opening its checkpoints) is not done on the
+// UI's loop: the session shows it is loading, and Esc stops it.
+#[tokio::test]
+async fn a_session_that_is_slow_to_open_shows_loading_and_esc_stops_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let old = saved(&sessions, dir.path(), &[("old question", "old answer")]);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let provider = MockProvider::new(vec![Script::text("One."), Script::text("Two.")]);
+    let (mut ui, _log) = open_with(provider.clone(), &sessions, dir.path(), Some(gate));
+    send(&mut ui, "the current session");
+    settle(&mut ui).await;
+    send(&mut ui, &format!("/resume {old}"));
+    assert!(ui.app().busy());
+    assert!(
+        screen(&ui)
+            .iter()
+            .any(|r| r.contains("loading the session… (Esc to stop)")),
+        "{:#?}",
+        screen(&ui)
+    );
+    press(&mut ui, KeyCode::Esc);
+    settle(&mut ui).await;
+    assert!(
+        shows_wrapped(&ui, "error: could not resume the session: stopped"),
+        "{:#?}",
+        everything(&ui)
+    );
+    assert!(!ui.app().busy());
+    // The session in use goes on.
+    send(&mut ui, "still here");
+    settle(&mut ui).await;
+    assert_eq!(
+        user_messages(&provider),
+        ["the current session", "still here"]
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_session_that_opens_later_is_continued_when_it_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let old = saved(&sessions, dir.path(), &[("old question", "old answer")]);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let provider = MockProvider::new(vec![Script::text("Resumed.")]);
+    let (mut ui, _log) = open_with(provider.clone(), &sessions, dir.path(), Some(gate.clone()));
+    send(&mut ui, &format!("/resume {old}"));
+    assert!(ui.app().busy());
+    gate.notify_one();
+    settle(&mut ui).await;
+    assert!(shows(&ui, "resumed session"));
+    assert!(shows(&ui, "a note about the file"));
+    send(&mut ui, "carry on");
+    settle(&mut ui).await;
+    // The first message after the switch carries the mode note.
+    let sent = user_messages(&provider);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0], "old question");
+    assert!(sent[1].ends_with("carry on"), "{sent:?}");
     ui.finish().await.unwrap();
 }

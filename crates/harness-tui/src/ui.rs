@@ -21,7 +21,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    app::{Action, App, Done, Host, ModelSwitch, ModelView, Options, SessionView},
+    app::{Action, App, Done, Host, ModelSwitch, ModelView, OpenedSession, Options, SessionView},
     approval::{Reply, Requests},
     inline::{CursorReport, InlineTerminal},
     input::{CursorQuery, Timed},
@@ -109,6 +109,11 @@ enum Background {
     Models(Vec<String>),
     /// The model to switch to, made ready, or why it could not be.
     Switch(Result<ModelSwitch, String>),
+    /// The session to continue in, opened, or why it could not be.
+    Session {
+        resumed: bool,
+        result: Result<OpenedSession, String>,
+    },
     /// Something a sign-in says while it waits.
     Note(String),
     /// How a sign-in ended.
@@ -423,23 +428,21 @@ where
                 Flow::Continue
             }
             Action::OpenSession(id) => {
+                // Reading the session and opening its checkpoints are the host's to do in the
+                // background, so the screen stays alive and Esc can stop them.
                 let resumed = id.is_some();
-                match self.app.host().open_session(id.as_deref()) {
-                    Ok(opened) => {
-                        for message in opened.warnings {
-                            self.show_notice(message);
-                        }
-                        self.send_job(Job::StartSession {
-                            session: Box::new(opened.session),
-                            checkpoints: opened.checkpoints,
-                            resumed,
-                        });
-                    }
-                    Err(why) => self.app.on_done(Done::Session {
-                        resumed,
-                        result: Err(why),
-                    }),
-                }
+                let cancel = CancellationToken::new();
+                self.cancel = Some(cancel.clone());
+                let opening = self.app.host().open_session(id.as_deref(), cancel.clone());
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => Err("stopped".to_string()),
+                        opened = opening => opened,
+                    };
+                    let _ = tx.send(Background::Session { resumed, result });
+                });
                 Flow::Continue
             }
             Action::Compact(focus) => {
@@ -699,6 +702,29 @@ where
             }
             Background::Switch(Err(why)) => {
                 self.app.on_done(Done::Model(Err(why)));
+                self.next_actions()?;
+            }
+            Background::Session {
+                resumed,
+                result: Ok(opened),
+            } => {
+                for message in opened.warnings {
+                    self.show_notice(message);
+                }
+                self.send_job(Job::StartSession {
+                    session: Box::new(opened.session),
+                    checkpoints: opened.checkpoints,
+                    resumed,
+                });
+            }
+            Background::Session {
+                resumed,
+                result: Err(why),
+            } => {
+                self.app.on_done(Done::Session {
+                    resumed,
+                    result: Err(why),
+                });
                 self.next_actions()?;
             }
             Background::Note(note) => self.app.push_note(&note),

@@ -186,8 +186,15 @@ pub trait Host: Send {
     }
     /// Opens a new session (`None`), or this project's session `id`, for the agent to continue
     /// in. Errors say why it cannot be.
-    fn open_session(&self, _id: Option<&str>) -> Result<OpenedSession, String> {
-        Err("this session cannot change".into())
+    ///
+    /// Reading a session and opening its checkpoints take time, which does not block the
+    /// session's loop: the future runs in the background. `cancel` stops it (Esc).
+    fn open_session(
+        &self,
+        _id: Option<&str>,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<OpenedSession, String>> {
+        Box::pin(async { Err("this session cannot change".to_string()) })
     }
     /// The ids of the models harness finds: local servers', and those of providers with a key
     /// or a sign-in.

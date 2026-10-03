@@ -61,21 +61,37 @@ impl Host for CliHost {
         session::list(&sessions::dir(&self.setup))
     }
 
-    fn open_session(&self, id: Option<&str>) -> Result<OpenedSession, String> {
+    fn open_session(
+        &self,
+        id: Option<&str>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<OpenedSession, String>> {
         let choice = match id {
             None => Choice::New,
             Some(id) => Choice::Resume(id.to_string()),
         };
-        // Nothing may print while the terminal UI runs: the UI shows the warnings.
-        let mut notices = Notices::quiet(self.setup.redactor.clone());
-        let session =
-            sessions::open_listing(&self.setup, &choice, &mut notices, "`/resume` lists them")?;
-        let checkpoints =
-            sessions::checkpoints(&self.setup, &session, &self.writable, &mut notices);
-        Ok(OpenedSession {
-            session,
-            checkpoints,
-            warnings: notices.into_messages(),
+        let setup = self.setup.clone();
+        let writable = self.writable.clone();
+        // Reading the file and opening the checkpoints (which runs `git`) block, so they run on
+        // a thread meant for that.
+        let opening = tokio::task::spawn_blocking(move || {
+            // Nothing may print while the terminal UI runs: the UI shows the warnings.
+            let mut notices = Notices::quiet(setup.redactor.clone());
+            let session =
+                sessions::open_listing(&setup, &choice, &mut notices, "`/resume` lists them")?;
+            let checkpoints = sessions::checkpoints(&setup, &session, &writable, &mut notices);
+            Ok(OpenedSession {
+                session,
+                checkpoints,
+                warnings: notices.into_messages(),
+            })
+        });
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err("stopped".to_string()),
+                opened = opening => opened.unwrap_or_else(|e| Err(format!("opening it failed: {e}"))),
+            }
         })
     }
 
@@ -199,13 +215,18 @@ pub mod tests {
         }
     }
 
-    #[test]
-    fn the_host_opens_a_new_session_and_this_projects_others() {
+    /// What the host opens, waited for.
+    fn open(host: &CliHost, id: Option<&str>) -> Result<OpenedSession, String> {
+        futures::executor::block_on(host.open_session(id, CancellationToken::new()))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_host_opens_a_new_session_and_this_projects_others() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let workspace = workspace.path().canonicalize().unwrap();
         let host = host(home.path(), &workspace);
-        let mut opened = host.open_session(None).unwrap();
+        let mut opened = open(&host, None).unwrap();
         // The file is made with the first message.
         assert!(host.sessions().is_empty());
         opened.session.append(EntryKind::Message {
@@ -221,10 +242,10 @@ pub mod tests {
         let listed = host.sessions();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].first_message.as_deref(), Some("hello"));
-        let resumed = host.open_session(Some(&id)).unwrap();
+        let resumed = open(&host, Some(&id)).unwrap();
         assert_eq!(resumed.session.id(), id);
         assert_eq!(resumed.session.messages().len(), 1);
-        let Err(why) = host.open_session(Some("nope")) else {
+        let Err(why) = open(&host, Some("nope")) else {
             panic!("an unknown session opened");
         };
         assert!(why.contains("there is no session nope"), "{why}");

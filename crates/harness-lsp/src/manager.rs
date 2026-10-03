@@ -135,6 +135,9 @@ pub enum Report {
     Pending,
     /// What the server published for the file, all severities.
     Checked(Vec<Diagnostic>),
+    /// The server published nothing new for this edit; this is the set it last published for the
+    /// file.
+    Unchanged(Vec<Diagnostic>),
 }
 
 /// Asks the user whether language servers may start in the workspace: they run the project's
@@ -148,6 +151,10 @@ pub trait ServerConsent: Send + Sync {
 
 /// What the note says when there is no sandbox to run a server in.
 pub const NO_SANDBOX_NOTE: &str = "diagnostics are off: language servers run only inside the sandbox, and none is available in this mode";
+
+/// What the note says when rust-analyzer is left out because the workspace is read-only.
+pub const READ_ONLY_NOTE: &str =
+    "diagnostics for Rust are off in read-only mode: rust-analyzer's cargo check writes to target/";
 
 /// Crashes in a session after which a server is not started again.
 const MAX_CRASHES: u32 = 2;
@@ -214,6 +221,7 @@ pub struct Manager {
     workspace: PathBuf,
     slots: Mutex<HashMap<Language, Arc<tokio::sync::Mutex<Slot>>>>,
     noted_sandbox: AtomicBool,
+    noted_read_only: AtomicBool,
     /// The answer to the question, as stored or as given in this session.
     answer: Mutex<Option<bool>>,
     consent: Option<Arc<dyn ServerConsent>>,
@@ -229,6 +237,7 @@ impl Manager {
             workspace,
             slots: Mutex::default(),
             noted_sandbox: AtomicBool::new(false),
+            noted_read_only: AtomicBool::new(false),
             consent: None,
             asking: tokio::sync::Mutex::new(()),
         }
@@ -342,6 +351,10 @@ impl Manager {
         let Some((program, args)) = self.command(found.language) else {
             return Report::NoServer;
         };
+        // rust-analyzer's `cargo check` writes `target/`, which read-only access forbids.
+        if found.language == Language::Rust && launch.access == FsAccess::ReadOnly {
+            return once(&self.noted_read_only, READ_ONLY_NOTE);
+        }
         if let Some(report) = self.may_start(launch).await {
             return report;
         }
@@ -353,24 +366,19 @@ impl Manager {
         if slot.crashes >= MAX_CRASHES {
             return Report::NoServer;
         }
+        let name = found.name();
         if slot.client.is_none() {
             let command = match self.launch(&program, &args, launch) {
                 Ok(Some(command)) => command,
                 Ok(None) => return once(&self.noted_sandbox, NO_SANDBOX_NOTE),
-                Err(_) => {
-                    slot.crashes += 1;
-                    return Report::NoServer;
-                }
+                Err(_) => return failed(&mut slot, name),
             };
             match Client::start(command, &self.workspace, self.settings.init_timeout).await {
                 Ok(client) => {
                     slot.client = Some(client);
                     slot.asked = false;
                 }
-                Err(_) => {
-                    slot.crashes += 1;
-                    return Report::NoServer;
-                }
+                Err(_) => return failed(&mut slot, name),
             }
         }
         let wait = if slot.asked {
@@ -382,11 +390,11 @@ impl Manager {
         let client = slot.client.as_ref().expect("a client was started");
         match client.check(file, found.language_id(), &text, wait).await {
             Ok(Check::Published(diagnostics)) => Report::Checked(diagnostics),
+            Ok(Check::Unchanged(diagnostics)) => Report::Unchanged(diagnostics),
             Ok(Check::Pending) => Report::Pending,
             Ok(Check::Exited) | Err(LspError::Exited) => {
                 slot.client = None;
-                slot.crashes += 1;
-                Report::NoServer
+                failed(&mut slot, name)
             }
             Err(_) => Report::Pending,
         }
@@ -446,6 +454,20 @@ impl Manager {
                 client.shutdown().await;
             }
         }
+    }
+}
+
+/// A server that crashed, or could not be started. The second time is the last: it is said once
+/// that there will be no diagnostics for the language until a new session, so that the silence is
+/// not taken for a clean file.
+fn failed(slot: &mut Slot, language: &str) -> Report {
+    slot.crashes += 1;
+    if slot.crashes == MAX_CRASHES {
+        Report::Note(format!(
+            "the {language} language server stopped; no diagnostics for {language} files until /new"
+        ))
+    } else {
+        Report::NoServer
     }
 }
 

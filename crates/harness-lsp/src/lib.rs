@@ -11,6 +11,6 @@ pub use client::{Check, Client, LspError, uri_of};
 pub use diagnostics::{LspDiagnostics, MAX_ERRORS};
 pub use lsp_types::{Diagnostic, DiagnosticSeverity};
 pub use manager::{
-    AskThroughApprover, Found, Language, Launch, Manager, NO_SANDBOX_NOTE, Report,
+    AskThroughApprover, Found, Language, Launch, Manager, NO_SANDBOX_NOTE, READ_ONLY_NOTE, Report,
     SERVERS_QUESTION, ServerConsent, ServerSetting, Settings, language_of,
 };

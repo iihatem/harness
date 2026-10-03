@@ -212,3 +212,42 @@ async fn a_message_is_one_clean_line() {
     assert!(!said.contains('\u{1b}'), "{said:?}");
     d.shutdown().await;
 }
+
+// Format characters (a bidi override, a zero-width space, a line separator) are dropped as well.
+#[tokio::test]
+async fn invisible_and_reordering_characters_in_a_message_are_dropped() {
+    let f = Fixture::new();
+    let d = f.diagnostics(Duration::from_secs(5), true);
+    let said = after_edit(
+        &d,
+        &[f.file("a.ts", "x \u{202e}gnirts\u{200b}\u{2028}y // ERROR\n")],
+    )
+    .await
+    .unwrap();
+    for c in ['\u{202e}', '\u{200b}', '\u{2028}'] {
+        assert!(!said.contains(c), "{said:?}");
+    }
+    d.shutdown().await;
+}
+
+// A server that does not republish an unchanged set: the known errors still reach the model, and
+// are marked as not new, never "pending".
+#[tokio::test]
+async fn a_set_the_server_does_not_republish_is_given_again_marked_unchanged() {
+    let f = Fixture::new();
+    let d = f.diagnostics(Duration::from_millis(400), true);
+    let first = after_edit(&d, &[f.file("a.ts", "NOREPEAT\nx // ERROR\n")])
+        .await
+        .unwrap();
+    assert!(first.contains("[diagnostics: 1 error]"), "{first}");
+    let second = after_edit(&d, &[f.file("a.ts", "NOREPEAT\nx // ERROR\n\n")])
+        .await
+        .unwrap();
+    assert!(
+        second.contains("[diagnostics: 1 error, unchanged since the last edit]"),
+        "{second}"
+    );
+    assert!(second.contains("a.ts:2:"), "{second}");
+    assert!(!second.contains("pending"), "{second}");
+    d.shutdown().await;
+}

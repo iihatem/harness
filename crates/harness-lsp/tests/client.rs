@@ -218,6 +218,222 @@ async fn a_server_that_never_answers_initialize_times_out() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
+// rust-analyzer's way: an empty set at once, while it is still indexing, and the real one later.
+// The empty set is not the answer.
+#[tokio::test]
+async fn an_empty_publish_while_the_server_reports_progress_is_not_the_answer() {
+    let f = fixture();
+    let client = f.start().await;
+    let started = std::time::Instant::now();
+    let result = check(&client, &f, "RALIKE\nx // ERROR\n", WAIT).await;
+    assert_eq!(result.errors().len(), 1, "{result:?}");
+    assert!(started.elapsed() >= Duration::from_millis(1100));
+    // The next edit, with no progress, is answered at once.
+    let started = std::time::Instant::now();
+    let clean = check(&client, &f, "fine\n", WAIT).await;
+    assert_eq!(clean, Check::Published(Vec::new()));
+    assert!(started.elapsed() < Duration::from_millis(900));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_server_status_that_is_not_quiescent_holds_the_answer_too() {
+    let f = fixture();
+    let client = f.start().await;
+    let started = std::time::Instant::now();
+    let result = check(&client, &f, "STATUS\nx // ERROR\n", WAIT).await;
+    assert_eq!(result.errors().len(), 1, "{result:?}");
+    assert!(started.elapsed() >= Duration::from_millis(1100));
+    client.shutdown().await;
+}
+
+// rust-analyzer says it is idle, and only then starts `cargo check`: the first request waits that
+// long, once.
+#[tokio::test]
+async fn the_first_check_waits_for_work_that_starts_just_after_the_server_is_idle() {
+    let f = fixture();
+    let client = f.start().await;
+    let result = check(&client, &f, "FLYCHECK\nx // ERROR\n", WAIT).await;
+    assert_eq!(result.errors().len(), 1, "{result:?}");
+    // Afterwards a clean file is not held up for it.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        check(&client, &f, "fine\n", WAIT).await,
+        Check::Published(Vec::new())
+    );
+    assert!(started.elapsed() < Duration::from_millis(900));
+    client.shutdown().await;
+}
+
+// A server whose progress never ends degrades to the latest publish at the end of the wait.
+#[tokio::test]
+async fn progress_that_never_ends_gives_the_latest_publish_at_the_end_of_the_wait() {
+    let f = fixture();
+    let client = f.start().await;
+    let started = std::time::Instant::now();
+    let result = check(
+        &client,
+        &f,
+        "STUCK\nx // ERROR\n",
+        Duration::from_millis(700),
+    )
+    .await;
+    assert_eq!(result.errors().len(), 1, "{result:?}");
+    assert!(started.elapsed() >= Duration::from_millis(600));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    client.shutdown().await;
+}
+
+// rust-analyzer starts `cargo check` on a save.
+#[tokio::test]
+async fn every_check_saves_the_file_after_telling_the_server_its_text() {
+    let f = fixture();
+    let client = f.start().await;
+    check(&client, &f, "a\n", WAIT).await;
+    check(&client, &f, "b\n", WAIT).await;
+    let log = f.log();
+    let tail: Vec<&str> = log
+        .iter()
+        .map(String::as_str)
+        .filter(|m| m.starts_with("textDocument/"))
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            "textDocument/didOpen",
+            "textDocument/didSave",
+            "textDocument/didChange",
+            "textDocument/didSave"
+        ]
+    );
+    client.shutdown().await;
+}
+
+// A publish under an older version of the file is not the answer for this edit.
+#[tokio::test]
+async fn a_publish_for_an_older_version_is_not_taken_as_fresh() {
+    let f = fixture();
+    let client = f.start().await;
+    assert_eq!(
+        check(&client, &f, "a\n", WAIT).await,
+        Check::Published(Vec::new())
+    );
+    let result = check(
+        &client,
+        &f,
+        "STALE\nold // ERROR\n",
+        Duration::from_millis(500),
+    )
+    .await;
+    assert!(matches!(result, Check::Unchanged(_)), "{result:?}");
+    // A publish with no version keeps the rule that it came after the change.
+    let result = check(&client, &f, "NOVERSION\nnew // ERROR\n", WAIT).await;
+    assert!(matches!(result, Check::Published(_)), "{result:?}");
+    client.shutdown().await;
+}
+
+// A server that does not republish an unchanged set: the known set comes back, marked.
+#[tokio::test]
+async fn an_unchanged_set_that_is_not_republished_comes_back_marked_unchanged() {
+    let f = fixture();
+    let client = f.start().await;
+    let first = check(&client, &f, "NOREPEAT\nx // ERROR\n", WAIT).await;
+    assert_eq!(first.errors().len(), 1, "{first:?}");
+    let started = std::time::Instant::now();
+    let second = check(
+        &client,
+        &f,
+        "NOREPEAT\nx // ERROR\n\n",
+        Duration::from_millis(400),
+    )
+    .await;
+    let Check::Unchanged(set) = &second else {
+        panic!("{second:?}")
+    };
+    assert_eq!(set.len(), 1);
+    assert_eq!(second.errors().len(), 1);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    client.shutdown().await;
+}
+
+// A server may write the percent-encoding in another case.
+#[tokio::test]
+async fn a_uri_the_server_encodes_differently_still_matches_the_file() {
+    let f = fixture();
+    let client = f.start().await;
+    let path = f.dir.path().join("é.rs");
+    let result = client
+        .check(&path, "rust", "LOWERHEX\nx // ERROR\n", WAIT)
+        .await
+        .unwrap();
+    assert_eq!(result.errors().len(), 1, "{result:?}");
+    client.shutdown().await;
+}
+
+fn alive(pid: i32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+async fn child_of(file: &std::path::Path) -> i32 {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(file)
+            && let Ok(pid) = text.trim().parse()
+        {
+            return pid;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the server wrote no child pid");
+}
+
+async fn dies(pid: i32) -> bool {
+    for _ in 0..100 {
+        if !alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+// Servers run in a process group of their own, as the manager starts them; what they started
+// (cargo check, tsserver) goes with them when they are ended without a goodbye.
+#[tokio::test]
+async fn a_descendant_of_a_dropped_server_dies_with_it() {
+    let f = fixture();
+    let child = f.dir.path().join("child.pid");
+    let mut command = Command::new(SERVER);
+    command
+        .env("FAKE_LSP_LOG", &f.log)
+        .env("FAKE_LSP_CHILD", &child)
+        .arg("--stdio")
+        .process_group(0);
+    let client = Client::start(command, f.dir.path(), Duration::from_secs(10))
+        .await
+        .unwrap();
+    let pid = child_of(&child).await;
+    assert!(alive(pid));
+    drop(client);
+    assert!(dies(pid).await, "the descendant {pid} is still running");
+}
+
+#[tokio::test]
+async fn a_descendant_of_a_server_that_never_initializes_dies_with_it() {
+    let f = fixture();
+    let child = f.dir.path().join("child.pid");
+    let mut command = Command::new(SERVER);
+    command
+        .env("FAKE_LSP_LOG", &f.log)
+        .env("FAKE_LSP_CHILD", &child)
+        .env("FAKE_LSP_HANG_INIT", "1")
+        .arg("--stdio")
+        .process_group(0);
+    let result = Client::start(command, f.dir.path(), Duration::from_secs(2)).await;
+    assert!(matches!(result, Err(LspError::InitializeTimeout)));
+    let pid = child_of(&child).await;
+    assert!(dies(pid).await, "the descendant {pid} is still running");
+}
+
 #[test]
 fn a_path_becomes_a_percent_encoded_file_uri() {
     assert_eq!(uri_of(Path::new("/a/b.rs")), "file:///a/b.rs");

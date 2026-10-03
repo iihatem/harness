@@ -1480,6 +1480,7 @@ dependencies = [
  "harness-tools",
  "harness-tui",
  "lsp-types",
+ "nix",
  "ratatui",
  "serde",
  "serde_json",

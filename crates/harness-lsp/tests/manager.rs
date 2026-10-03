@@ -536,7 +536,12 @@ async fn a_server_that_crashes_twice_is_not_started_again() {
     let manager = f.manager(f.settings());
     let crash = f.file("a.go", "CRASH\n");
     assert_eq!(manager.check(&crash, &direct()).await, Report::NoServer);
-    assert_eq!(manager.check(&crash, &direct()).await, Report::NoServer);
+    // The second crash is the last: the user is told once, so that the silence is not mistaken
+    // for a clean file.
+    let Report::Note(note) = manager.check(&crash, &direct()).await else {
+        panic!("a note was expected")
+    };
+    assert!(note.contains("go") && note.contains("/new"), "{note}");
     assert_eq!(f.count("initialize"), 2);
     // A clean file now gets nothing, and the server is not started a third time.
     let clean = f.file("b.go", "package b\n");
@@ -572,7 +577,11 @@ async fn the_first_request_is_given_longer_than_the_later_ones() {
     let manager = f.manager(settings);
     let slow = f.file("a.go", "SLOW:1200\nx // ERROR\n");
     assert_eq!(errors(&manager.check(&slow, &direct()).await), 1);
-    assert_eq!(manager.check(&slow, &direct()).await, Report::Pending);
+    // Too late for the second: the set known from the first is given back, marked, not "pending".
+    assert!(matches!(
+        manager.check(&slow, &direct()).await,
+        Report::Unchanged(_)
+    ));
     manager.shutdown().await;
 }
 
@@ -631,4 +640,31 @@ async fn a_file_that_cannot_be_read_gets_nothing() {
     std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
     assert_eq!(manager.check(&binary, &direct()).await, Report::NoServer);
     assert!(f.log().is_empty());
+}
+
+// rust-analyzer's `cargo check` writes `target/`, which a read-only workspace does not allow.
+#[tokio::test]
+async fn rust_analyzer_is_not_started_in_read_only_access_and_the_user_is_told_once() {
+    let f = Fixture::new();
+    f.install("rust-analyzer");
+    f.install("gopls");
+    let manager = f.manager(f.settings());
+    let read_only = Launch {
+        sandbox: None,
+        access: FsAccess::ReadOnly,
+        unsandboxed_ok: true,
+    };
+    let file = f.file("a.rs", "x // ERROR\n");
+    let Report::Note(note) = manager.check(&file, &read_only).await else {
+        panic!("a note was expected")
+    };
+    assert!(note.contains("read-only"), "{note}");
+    assert_eq!(manager.check(&file, &read_only).await, Report::NoServer);
+    assert_eq!(f.count("initialize"), 0);
+    // Other servers do not write to the workspace.
+    let report = manager
+        .check(&f.file("a.go", "x // ERROR\n"), &read_only)
+        .await;
+    assert_eq!(errors(&report), 1);
+    manager.shutdown().await;
 }

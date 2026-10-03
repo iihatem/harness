@@ -55,18 +55,33 @@ async fn rust_analyzer_reports_a_type_error_after_an_edit() {
         ),
         root.clone(),
     );
-    std::fs::write(&lib, "pub fn one() -> i32 { \"one\" }\n").unwrap();
-    let said = d
-        .after_edit(&EditedFiles {
-            paths: &[lib],
-            workspace: &root,
-            sandbox: None,
-            access: FsAccess::WorkspaceWrite,
-            unsandboxed_ok: true,
-        })
-        .await
-        .unwrap_or_default();
+    let edit = |text: &'static str| {
+        let (d, lib, root) = (&d, lib.clone(), root.clone());
+        async move {
+            std::fs::write(&lib, text).unwrap();
+            d.after_edit(&EditedFiles {
+                paths: &[lib],
+                workspace: &root,
+                sandbox: None,
+                access: FsAccess::WorkspaceWrite,
+                unsandboxed_ok: true,
+            })
+            .await
+            .unwrap_or_default()
+        }
+    };
+    let said = edit("pub fn one() -> i32 { \"one\" }\n").await;
+    // The same error again, and then the fix: what a second and a third edit tell the model.
+    let again = edit("pub fn one() -> i32 { \"two\" }\n").await;
+    let fixed = edit("pub fn one() -> i32 { 3 }\n").await;
     d.shutdown().await;
     assert!(said.contains("src/lib.rs:1:"), "{said}");
-    assert!(said.contains("mismatched types"), "{said}");
+    assert!(again.contains("[diagnostics: 1 error"), "{again}");
+    assert!(!fixed.contains("[diagnostics: 1 error"), "{fixed}");
+    // rust-analyzer's own check says "expected i32, found &str", cargo check "mismatched types";
+    // which comes first depends on timing.
+    assert!(
+        said.contains("mismatched types") || said.contains("expected i32"),
+        "{said}"
+    );
 }

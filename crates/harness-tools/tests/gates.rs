@@ -126,7 +126,13 @@ async fn a_lint_that_runs_too_long_is_stopped_and_reported() {
 /// A turn that reads and edits `app.py` and ends twice, as a model does that is told its tests
 /// fail and answers without changing anything; the user messages of the last request.
 async fn test_turn(gates: Gates) -> (harness_core::event::TurnEndReason, Vec<AgentEvent>, String) {
-    let dir = tempfile::tempdir().unwrap();
+    test_turn_in(&tempfile::tempdir().unwrap(), gates).await
+}
+
+async fn test_turn_in(
+    dir: &tempfile::TempDir,
+    gates: Gates,
+) -> (harness_core::event::TurnEndReason, Vec<AgentEvent>, String) {
     std::fs::write(dir.path().join("app.py"), "print(1)\n").unwrap();
     let provider = MockProvider::new(vec![
         Script::tool_call("r1", "read", json!({"path": "app.py"})),
@@ -214,4 +220,39 @@ async fn a_passing_real_test_command_finishes_the_turn() {
             ..
         }
     )));
+}
+
+// A failing test that prints one 3 MB line: the model gets a bounded tail, in the request and in
+// the event, and the whole output is saved.
+#[tokio::test]
+async fn a_test_that_prints_one_enormous_line_gives_the_model_a_bounded_tail() {
+    let command = "head -c 3000000 /dev/zero | tr '\\0' x; echo; exit 1";
+    let dir = tempfile::tempdir().unwrap();
+    let (_, events, seen) = test_turn_in(
+        &dir,
+        Gates {
+            test: Some(command.into()),
+            ..Gates::default()
+        },
+    )
+    .await;
+    assert!(seen.len() < 20_000, "{} bytes", seen.len());
+    assert!(seen.contains("test gate failed"), "{}", &seen[..200]);
+    assert!(seen.contains("long lines cut"));
+    let tail = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::GateResult { tail, .. } => tail.clone(),
+            _ => None,
+        })
+        .expect("a gate result with a tail");
+    assert!(tail.len() <= 16 * 1024, "{} bytes", tail.len());
+    // The whole output is saved where the model is told.
+    let saved = seen
+        .split("full output saved to ")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("the path of the saved output");
+    let whole = std::fs::read_to_string(saved).expect("the saved output");
+    assert!(whole.len() >= 3_000_000, "{} bytes", whole.len());
 }

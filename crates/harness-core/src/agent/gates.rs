@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use super::Agent;
 use crate::{
     event::{AgentEvent, ChangeSource, GateKind, GateStatus, TurnEndReason},
-    gate::{Outcome, outcome, tail},
+    gate::{Outcome, Tail, outcome, tail},
     message::{Message, ToolCall},
     output::spill,
     permission::{Action, Decision, Mode},
@@ -22,10 +22,13 @@ pub(super) struct GateRun {
     pub(super) kind: GateKind,
     pub(super) command: String,
     pub(super) outcome: Outcome,
-    /// The last lines of the command's output, redacted, and how many lines came before them.
+    /// The last lines of the command's output, redacted, bounded in lines and bytes, and how many
+    /// lines came before them.
     pub(super) tail: String,
     pub(super) omitted: usize,
-    /// Where the whole output was saved, when more than the tail was.
+    /// A long line of the tail was cut.
+    pub(super) shortened: bool,
+    /// Where the whole output was saved: every failure's is.
     pub(super) saved: Option<std::path::PathBuf>,
 }
 
@@ -55,16 +58,20 @@ impl GateRun {
         };
         let mut text = head;
         text.push('\n');
-        if self.omitted > 0 {
+        if self.omitted > 0 || self.shortened {
+            let mut what = Vec::new();
+            if self.omitted > 0 {
+                what.push(format!("{} earlier lines omitted", self.omitted));
+            }
+            if self.shortened {
+                what.push("long lines cut".to_string());
+            }
             let saved = self
                 .saved
                 .as_ref()
                 .map(|path| format!("; full output saved to {}", path.display()))
                 .unwrap_or_default();
-            text.push_str(&format!(
-                "[... {} earlier lines omitted{saved}]\n",
-                self.omitted
-            ));
+            text.push_str(&format!("[... {}{saved}]\n", what.join(", ")));
         }
         text.push_str(&self.tail);
         text
@@ -72,12 +79,11 @@ impl GateRun {
 }
 
 impl Agent {
-    /// Whether the approval mode (`plan`, `read-only`) forbids running any gate.
+    /// Whether no gate may run: the approval mode is `plan` or `read-only`, or this turn's shell is
+    /// read-only (`/init`), where a test would fail for writing.
     pub(super) fn gates_skipped(&self) -> bool {
-        match self.policy.mode() {
-            Some(mode) => matches!(mode, Mode::Plan | Mode::ReadOnly),
-            None => self.ctx.access == crate::permission::FsAccess::ReadOnly,
-        }
+        matches!(self.policy.mode(), Some(Mode::Plan | Mode::ReadOnly))
+            || self.ctx.access == crate::permission::FsAccess::ReadOnly
     }
 
     /// After a successful call of an edit tool: notes that the turn changed files, and runs the
@@ -159,8 +165,14 @@ impl Agent {
             Some(redactor) => redactor.redact(&outcome.output),
             None => outcome.output.clone(),
         };
-        let (tail, omitted) = tail(&redacted, self.gates.output_tail_lines);
-        let saved = (omitted > 0)
+        let Tail {
+            text: tail,
+            omitted,
+            shortened,
+        } = tail(&redacted, self.gates.output_tail_lines);
+        // A failure's whole output is saved, whether or not the model got all of it.
+        let failed = matches!(outcome.status, GateStatus::Failed | GateStatus::TimedOut);
+        let saved = (failed && !outcome.output.is_empty())
             .then(|| {
                 spill(
                     &outcome.output,
@@ -171,19 +183,24 @@ impl Agent {
                 .ok()
             })
             .flatten();
-        let _ = events.send(AgentEvent::GateResult {
-            gate: kind,
-            command: Some(command.to_string()),
-            status: outcome.status,
-            exit_code: outcome.exit_code,
-            tail: (outcome.status != GateStatus::Passed && !tail.is_empty()).then(|| tail.clone()),
-        });
+        // A run the user stopped did not fail: nothing is said of it.
+        if !(outcome.interrupted || self.ctx.cancel.is_cancelled()) {
+            let _ = events.send(AgentEvent::GateResult {
+                gate: kind,
+                command: Some(command.to_string()),
+                status: outcome.status,
+                exit_code: outcome.exit_code,
+                tail: (outcome.status != GateStatus::Passed && !tail.is_empty())
+                    .then(|| tail.clone()),
+            });
+        }
         Some(GateRun {
             kind,
             command: command.to_string(),
             outcome,
             tail,
             omitted,
+            shortened,
             saved,
         })
     }
@@ -220,16 +237,27 @@ impl Agent {
             return done;
         };
         if self.gates_skipped() {
-            let _ = events.send(AgentEvent::GateResult {
-                gate: GateKind::Test,
-                command: Some(command),
-                status: GateStatus::Skipped,
-                exit_code: None,
-                tail: None,
-            });
+            // Said once while the mode stays: one line after every reply is noise.
+            if !std::mem::replace(&mut self.gate_skip_said, true) {
+                let _ = events.send(AgentEvent::GateResult {
+                    gate: GateKind::Test,
+                    command: Some(command),
+                    status: GateStatus::Skipped,
+                    exit_code: None,
+                    tail: None,
+                });
+            }
             return done;
         }
-        if self.gate_turn.blocked || !self.turn_changed_files(events).await {
+        self.gate_skip_said = false;
+        if self.gate_turn.blocked {
+            return done;
+        }
+        let changed = self.turn_changed_files(events, cancel).await;
+        if cancel.is_cancelled() {
+            return EndOfTurn::Finish(TurnEndReason::Interrupted);
+        }
+        if !changed {
             return done;
         }
         let Some(run) = self.run_gate(GateKind::Test, &command, events).await else {
@@ -242,7 +270,7 @@ impl Agent {
             GateStatus::Passed => {
                 // Changes the tests have passed on need no second run.
                 self.turn_changed = false;
-                self.remember_tested_tree().await;
+                self.remember_tested_tree(cancel).await;
                 self.gate_turn.last_failure = None;
                 if self.deliver_steering(events) {
                     return EndOfTurn::Continue;
@@ -279,7 +307,11 @@ impl Agent {
     /// passed: by comparing the workspace with it, so a change `bash` made counts. Where there is
     /// no checkpoint, or it cannot be compared, the edit tools' changed paths decide. Says which
     /// on `events`.
-    async fn turn_changed_files(&mut self, events: &UnboundedSender<AgentEvent>) -> bool {
+    async fn turn_changed_files(
+        &mut self,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> bool {
         let reference = self
             .tested_tree
             .clone()
@@ -287,7 +319,7 @@ impl Agent {
         let compared = match (self.checkpoints.clone(), reference) {
             (Some(checkpoints), Some(reference)) => {
                 let tested = self.tested_tree.is_some();
-                tokio::task::spawn_blocking(move || {
+                let compare = tokio::task::spawn_blocking(move || {
                     let now = checkpoints.tree_now()?;
                     let then = if tested {
                         reference
@@ -295,10 +327,12 @@ impl Agent {
                         checkpoints.tree_of(&reference)?
                     };
                     Ok::<_, crate::checkpoint::CheckpointError>(now != then)
-                })
-                .await
-                .ok()
-                .and_then(Result::ok)
+                });
+                // Esc does not wait for a snapshot of a very large workspace.
+                tokio::select! {
+                    done = compare => done.ok().and_then(Result::ok),
+                    () = cancel.cancelled() => None,
+                }
             }
             _ => None,
         };
@@ -311,14 +345,15 @@ impl Agent {
     }
 
     /// The tests passed: changes are measured from the workspace as it is now.
-    async fn remember_tested_tree(&mut self) {
+    async fn remember_tested_tree(&mut self, cancel: &CancellationToken) {
         let Some(checkpoints) = self.checkpoints.clone() else {
             return;
         };
-        self.tested_tree = tokio::task::spawn_blocking(move || checkpoints.tree_now())
-            .await
-            .ok()
-            .and_then(Result::ok);
+        let now = tokio::task::spawn_blocking(move || checkpoints.tree_now());
+        self.tested_tree = tokio::select! {
+            now = now => now.ok().and_then(Result::ok),
+            () = cancel.cancelled() => None,
+        };
     }
 
     /// Adds what the gate found to the conversation, for the model to read.

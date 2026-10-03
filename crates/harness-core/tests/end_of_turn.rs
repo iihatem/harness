@@ -326,6 +326,51 @@ async fn plan_and_read_only_skip_the_test_and_say_so() {
     }
 }
 
+// `/init` runs its turn with a read-only shell: the test would run in a read-only sandbox and
+// fail, so it is skipped like in a read-only mode.
+#[tokio::test]
+async fn a_turn_with_a_read_only_shell_skips_the_test() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bash, ran) = ScriptedBash::new(vec![]);
+    let provider = MockProvider::new(vec![edit("e1"), Script::text("written")]);
+    let mut agent = agent(provider, dir.path(), bash, setup(3));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let input = harness_core::turn::TurnInput {
+        read_only_shell: true,
+        ..harness_core::turn::TurnInput::from("init")
+    };
+    let reason = agent.run_turn(input, &tx, CancellationToken::new()).await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert!(ran.commands().is_empty());
+    assert_eq!(test_results(&events), [(GateStatus::Skipped, None)]);
+}
+
+// One dim line per turn is noise: the skip is said once while the mode stays.
+#[tokio::test]
+async fn the_skip_is_said_once_not_after_every_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bash, _) = ScriptedBash::new(vec![]);
+    let provider = MockProvider::new(vec![Script::text("one"), Script::text("two")]);
+    let mut agent = agent(
+        provider,
+        dir.path(),
+        bash,
+        Setup {
+            mode: Mode::Plan,
+            ..setup(3)
+        },
+    );
+    let (_, first) = run(&mut agent, "a question").await;
+    let (_, second) = run(&mut agent, "another").await;
+    assert_eq!(test_results(&first), [(GateStatus::Skipped, None)]);
+    assert!(test_results(&second).is_empty());
+}
+
 // Spec "Send-now input during the test run": the model receives the gate result and that
 // message together.
 #[tokio::test]
@@ -379,9 +424,15 @@ async fn stopping_the_turn_during_the_test_run_interrupts_it() {
     let bash = bash.during(TEST, move || stop.cancel());
     let provider = MockProvider::new(vec![edit("e1"), Script::text("a"), Script::text("b")]);
     let mut agent = agent(provider.clone(), dir.path(), bash, setup(3));
-    let (reason, _) = run_with(&mut agent, "change it", cancel).await;
+    let (reason, events) = run_with(&mut agent, "change it", cancel).await;
     assert_eq!(reason, TurnEndReason::Interrupted);
     assert_eq!(provider.requests().len(), 2);
+    // A stopped run is not a failed one: no "tests failed" line.
+    assert!(
+        test_results(&events).is_empty(),
+        "{:?}",
+        test_results(&events)
+    );
 }
 
 // The test runs only at the end of a turn, once per end, however many edits came before it.

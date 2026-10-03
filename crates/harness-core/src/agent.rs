@@ -396,6 +396,8 @@ pub struct Agent {
     gate_calls: u64,
     /// What the end-of-turn test gate has done in the current turn.
     gate_turn: gates::GateTurn,
+    /// The test gate's skip was said, and the mode has not changed since.
+    gate_skip_said: bool,
     /// Language-server diagnostics for edited files.
     diagnostics: Option<Arc<dyn Diagnostics>>,
 }
@@ -447,6 +449,7 @@ impl Agent {
             turn_changed: false,
             gate_calls: 0,
             gate_turn: gates::GateTurn::default(),
+            gate_skip_said: false,
             diagnostics: None,
         }
     }

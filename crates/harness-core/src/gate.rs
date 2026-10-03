@@ -114,15 +114,57 @@ fn npm_scripts(text: &str) -> Option<Proposal> {
     })
 }
 
-/// The last `lines` lines of `output`, and how many earlier lines were left out.
-pub fn tail(output: &str, lines: usize) -> (String, usize) {
+/// The most bytes of a failing command's output the model is given.
+pub const MAX_TAIL_BYTES: usize = 16 * 1024;
+
+/// The longest a line is kept, in characters: a minified bundle or a JSON dump on one line would
+/// otherwise be the whole tail.
+pub const MAX_LINE_CHARS: usize = 1000;
+
+/// The part of a command's output the model is given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tail {
+    pub text: String,
+    /// How many lines came before the ones kept (cut by the line limit or by the byte limit).
+    pub omitted: usize,
+    /// A line of what is kept was cut to [`MAX_LINE_CHARS`].
+    pub shortened: bool,
+}
+
+/// The last `lines` lines of `output`, each at most [`MAX_LINE_CHARS`] long, and at most
+/// [`MAX_TAIL_BYTES`] in all (earlier lines go first).
+pub fn tail(output: &str, lines: usize) -> Tail {
     let all: Vec<&str> = output.lines().collect();
-    let omitted = all.len().saturating_sub(lines);
-    let mut kept = all[omitted..].join("\n");
-    if !kept.is_empty() {
-        kept.push('\n');
+    let mut omitted = all.len().saturating_sub(lines);
+    let mut shortened = false;
+    let mut kept: Vec<String> = all[omitted..]
+        .iter()
+        .map(|line| match line.char_indices().nth(MAX_LINE_CHARS) {
+            Some((end, _)) => {
+                shortened = true;
+                let more = line[end..].chars().count();
+                format!("{} [... {more} more characters]", &line[..end])
+            }
+            None => (*line).to_string(),
+        })
+        .collect();
+    let mut bytes: usize = kept.iter().map(|line| line.len() + 1).sum();
+    let mut dropped = 0;
+    while bytes > MAX_TAIL_BYTES && dropped + 1 < kept.len() {
+        bytes -= kept[dropped].len() + 1;
+        dropped += 1;
     }
-    (kept, omitted)
+    kept.drain(..dropped);
+    omitted += dropped;
+    let mut text = kept.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    Tail {
+        text,
+        omitted,
+        shortened,
+    }
 }
 
 /// How a gate command ended, read from what the bash tool reported.

@@ -134,15 +134,27 @@ fn a_project_may_turn_servers_off_or_shorten_the_wait_without_trust() {
     );
 }
 
-// A project cannot turn on what the user turned off.
+// Turning a server on again is a widening: ignored with a warning until the project is trusted,
+// and then it applies.
 #[test]
-fn a_project_cannot_turn_back_on_what_the_global_config_turned_off() {
-    let f = fixture(
+fn a_project_turns_back_on_what_the_global_config_turned_off_only_once_trusted() {
+    let mut f = fixture(
         "[lsp]\nenabled = false\n[lsp.servers.go]\nenabled = false\n",
         "[lsp]\nenabled = true\n[lsp.servers.go]\nenabled = true\n",
     );
     let cfg = f.load().unwrap();
     assert!(!cfg.lsp.enabled && !cfg.lsp.servers["go"].enabled);
+    assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
+    assert!(
+        cfg.warnings[0].contains("lsp.enabled")
+            && cfg.warnings[0].contains("lsp.servers.go.enabled"),
+        "{:?}",
+        cfg.warnings
+    );
+    f.trust_now();
+    let cfg = f.load().unwrap();
+    assert!(cfg.lsp.enabled && cfg.lsp.servers["go"].enabled);
+    assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
 }
 
 #[test]

@@ -286,6 +286,17 @@ pub fn first_use(
     Ok(FirstUse::Trusted)
 }
 
+/// What `harness trust --revoke` says it did.
+fn revoked_message(workspace: &str, revoked: harness_config::trust::Revoked) -> String {
+    match (revoked.trusted, revoked.servers_answer) {
+        (true, _) => format!("Revoked trust for {workspace}."),
+        (false, true) => format!(
+            "{workspace} was not trusted; the answer stored about language servers was cleared."
+        ),
+        (false, false) => format!("{workspace} was not trusted."),
+    }
+}
+
 pub fn run(yes: bool, revoke: bool) -> u8 {
     let workspace = match std::env::current_dir().and_then(|d| d.canonicalize()) {
         Ok(dir) => dir,
@@ -313,17 +324,10 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
     };
     if revoke {
         return match store.revoke(&workspace) {
-            Ok(true) => {
+            Ok(revoked) => {
                 println!(
-                    "Revoked trust for {}.",
-                    terminal_safe(&workspace.display().to_string())
-                );
-                0
-            }
-            Ok(false) => {
-                println!(
-                    "{} was not trusted.",
-                    terminal_safe(&workspace.display().to_string())
+                    "{}",
+                    revoked_message(&terminal_safe(&workspace.display().to_string()), revoked)
                 );
                 0
             }
@@ -403,6 +407,23 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revoking_says_what_was_forgotten() {
+        use harness_config::trust::Revoked;
+        let said = |trusted, servers_answer| {
+            revoked_message(
+                "/w",
+                Revoked {
+                    trusted,
+                    servers_answer,
+                },
+            )
+        };
+        assert_eq!(said(true, true), "Revoked trust for /w.");
+        assert_eq!(said(false, false), "/w was not trusted.");
+        assert!(said(false, true).contains("answer stored about language servers was cleared"));
+    }
 
     struct Workspace {
         _dir: tempfile::TempDir,

@@ -23,8 +23,8 @@ fn trust_round_trips_through_disk_and_can_be_revoked() {
     assert_eq!(mode & 0o777, 0o600);
 
     let mut store = reloaded;
-    assert!(store.revoke(&ws).unwrap());
-    assert!(!store.revoke(&ws).unwrap());
+    assert!(store.revoke(&ws).unwrap().trusted);
+    assert!(!store.revoke(&ws).unwrap().trusted);
     assert!(!TrustStore::load(&data).unwrap().is_trusted(&ws, "abc"));
 }
 
@@ -103,7 +103,7 @@ fn a_gate_answer_round_trips_through_disk_by_canonical_path() {
     // Trust and the answer are separate: revoking trust keeps the answer, and the other way round.
     let mut again = again;
     again.trust(&ws, "fingerprint").unwrap();
-    assert!(again.revoke(&ws).unwrap());
+    assert!(again.revoke(&ws).unwrap().trusted);
     assert_eq!(again.gate_answer(&ws), Some(&answer));
 }
 
@@ -151,12 +151,13 @@ fn the_language_server_answer_is_stored_with_the_trust_record() {
     );
     // Revoking trust takes the permission to run project code with it.
     again.trust(&ws, "fingerprint").unwrap();
-    assert!(again.revoke(&ws).unwrap());
+    assert!(again.revoke(&ws).unwrap().trusted);
     assert_eq!(TrustStore::load(&data).unwrap().servers_answer(&ws), None);
     // A workspace that was never trusted but answered: revoking says it was not trusted, and
     // still forgets the answer.
     again.set_servers_answer(&ws, true).unwrap();
-    assert!(!again.revoke(&ws).unwrap());
+    let revoked = again.revoke(&ws).unwrap();
+    assert!(!revoked.trusted && revoked.servers_answer);
     assert_eq!(TrustStore::load(&data).unwrap().servers_answer(&ws), None);
 }
 

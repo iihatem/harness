@@ -483,7 +483,7 @@ pub const LSP_WAIT_MS: std::ops::RangeInclusive<u64> = 100..=60_000;
 
 /// `[lsp]`: language servers that report the errors in edited files. Turning them off, or
 /// shortening the wait, narrows what harness does and applies from a project without trust; a
-/// command to run does not.
+/// command to run, or turning them on again, does not.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LspSettings {
@@ -530,17 +530,22 @@ impl LspSettings {
         None
     }
 
-    /// The commands a project sets, as `lsp.servers.<language>.command = <command>`.
+    /// What a project sets that needs trust: `lsp.servers.<language>.command = <command>` (it runs
+    /// project code), and turning servers on (`enabled = true`, which the user may have turned off).
     fn items(&self) -> Vec<String> {
-        self.servers
-            .iter()
-            .filter_map(|(language, server)| {
-                server
-                    .command
-                    .as_ref()
-                    .map(|command| format!("lsp.servers.{language}.command = {command:?}"))
-            })
-            .collect()
+        let mut items = Vec::new();
+        if self.enabled == Some(true) {
+            items.push("lsp.enabled = true".to_string());
+        }
+        for (language, server) in &self.servers {
+            if server.enabled == Some(true) {
+                items.push(format!("lsp.servers.{language}.enabled = true"));
+            }
+            if let Some(command) = &server.command {
+                items.push(format!("lsp.servers.{language}.command = {command:?}"));
+            }
+        }
+        items
     }
 }
 
@@ -570,11 +575,15 @@ pub struct LspServer {
 }
 
 impl LspConfig {
-    /// These with `settings` over them. `trusted` lets commands in; a setting can only turn a
-    /// server off, not on again.
+    /// These with `settings` over them. `trusted` lets commands in, and turning servers on again;
+    /// without it a setting can only turn a server off.
     fn overlaid(&mut self, settings: &LspSettings, commands: bool) {
         if let Some(enabled) = settings.enabled {
-            self.enabled &= enabled;
+            self.enabled = if commands {
+                enabled
+            } else {
+                self.enabled & enabled
+            };
         }
         if let Some(ms) = settings.wait_ms {
             self.wait_ms = ms;
@@ -585,7 +594,11 @@ impl LspConfig {
                 enabled: true,
             });
             if let Some(enabled) = server.enabled {
-                entry.enabled &= enabled;
+                entry.enabled = if commands {
+                    enabled
+                } else {
+                    entry.enabled & enabled
+                };
             }
             if commands && let Some(command) = &server.command {
                 entry.command = Some(command.clone());

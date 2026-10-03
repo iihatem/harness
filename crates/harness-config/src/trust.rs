@@ -52,6 +52,15 @@ pub struct TrustStore {
     file: TrustFile,
 }
 
+/// What revoking a workspace's trust forgot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Revoked {
+    /// The workspace was trusted.
+    pub trusted: bool,
+    /// An answer about language servers was stored.
+    pub servers_answer: bool,
+}
+
 impl TrustStore {
     /// Loads `data_dir/trust.toml`; a missing file is an empty store.
     pub fn load(data_dir: &Path) -> Result<TrustStore, ConfigError> {
@@ -117,15 +126,18 @@ impl TrustStore {
         self.save()
     }
 
-    /// Returns whether the workspace was trusted before. The answer about language servers goes
-    /// with the trust.
-    pub fn revoke(&mut self, workspace: &Path) -> Result<bool, ConfigError> {
-        let removed = self.file.workspaces.remove(&Self::key(workspace)).is_some();
-        let answered = self.file.servers.remove(&Self::key(workspace)).is_some();
-        if removed || answered {
+    /// Forgets the workspace's trust, and the answer about language servers with it; says which
+    /// there were.
+    pub fn revoke(&mut self, workspace: &Path) -> Result<Revoked, ConfigError> {
+        let trusted = self.file.workspaces.remove(&Self::key(workspace)).is_some();
+        let servers_answer = self.file.servers.remove(&Self::key(workspace)).is_some();
+        if trusted || servers_answer {
             self.save()?;
         }
-        Ok(removed)
+        Ok(Revoked {
+            trusted,
+            servers_answer,
+        })
     }
 
     fn save(&self) -> Result<(), ConfigError> {

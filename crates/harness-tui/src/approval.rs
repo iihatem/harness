@@ -472,8 +472,11 @@ pub fn body(
             })
             .collect(),
         _ => match arguments {
-            Some(args) => lines(&args.to_string(), theme.dim()),
-            None => Vec::new(),
+            // A request with no arguments (the language-server question) has nothing to show.
+            Some(args) if !args.is_null() && args.as_object().is_none_or(|o| !o.is_empty()) => {
+                lines(&args.to_string(), theme.dim())
+            }
+            _ => Vec::new(),
         },
     }
 }

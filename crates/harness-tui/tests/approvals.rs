@@ -1066,6 +1066,8 @@ async fn the_language_server_question_is_shown_and_y_says_yes() {
     assert!(shown.contains(SERVERS_QUESTION), "{shown}");
     assert!(shown.contains("[y] yes"), "{shown}");
     assert!(!shown.contains("for this session"), "{shown}");
+    // It has no arguments to show: no `null` after the question.
+    assert!(!shown.contains("null"), "{shown}");
     press(&mut ui, KeyCode::Char('y'));
     assert_eq!(answer.try_recv(), Ok(ApprovalDecision::Approve));
     ui.finish().await.unwrap();

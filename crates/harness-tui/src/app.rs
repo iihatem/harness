@@ -9,12 +9,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::future::BoxFuture;
 use harness_context::commands::{is_builtin, parse_invocation};
 use harness_core::{
-    agent::{ApprovalDecision, ApprovalRequest, ContextUsage},
+    agent::{
+        ApprovalDecision, ApprovalRequest, ContextUsage, REWIND_LIMITS, RewindPoint, SessionModel,
+    },
+    checkpoint::Checkpoints,
     event::{AgentEvent, TurnEndReason},
+    message::Message,
     permission::Mode,
     redact::Redactor,
+    session::{RewindScope, Session, SessionSummary},
     turn::{Steering, TurnInput},
 };
 use ratatui::{
@@ -22,12 +28,15 @@ use ratatui::{
     layout::Position,
     text::{Line, Span},
 };
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     approval::{Answered, Arming, Prompt, Reply},
     complete::{self, Completer, Offer},
     editor::{Edit, Editor},
     notify::{self, Notify},
+    picker::{Item, Picked, Picker, model_item},
     plan::{Choice, PlanChoice, TextEditor},
     status::{self, Totals},
     style::Theme,
@@ -41,28 +50,115 @@ pub const QUIT_WINDOW: Duration = Duration::from_secs(2);
 /// Said under a prompt once keys typed while it waited went to the input instead.
 const TYPED_PAST: &str = "your typing went to your message; the prompt takes keys once you pause";
 
-/// Built-in commands that come with the rest of the terminal UI, and where.
-const LATER: [(&str, &str); 7] = [
+/// What the model picker says when no model is found.
+const NO_MODELS: &str = "no models found: start Ollama, LM Studio or llama.cpp, add a provider's API key with `harness auth add <provider>`, or sign in to ChatGPT with `/login` (then /model offers its models), or name one with `/model chatgpt/<model>`";
+
+/// Esc twice on empty input within this long opens the rewind list.
+pub const REWIND_WINDOW: Duration = Duration::from_secs(1);
+
+/// What the rewind's second list offers, in order.
+const SCOPES: [(RewindScope, &str, &str); 3] = [
     (
-        "model",
-        "with the model picker; for now, start harness with --model <provider>/<model>",
+        RewindScope::CodeAndConversation,
+        "code and conversation",
+        "the files and the conversation as they were",
     ),
     (
-        "login",
-        "with sign-in inside the session; for now, run `harness login <provider>` or `harness auth add <provider>` in a shell",
+        RewindScope::Conversation,
+        "conversation only",
+        "the files stay as they are now",
     ),
     (
-        "mode",
-        "with the full terminal UI; press Shift+Tab to cycle plan, ask and auto",
+        RewindScope::Code,
+        "code only",
+        "the conversation stays as it is now",
     ),
-    ("new", "with the session picker"),
-    (
-        "resume",
-        "with the session picker; start harness with -c or --resume <id>",
-    ),
-    ("rewind", "with the rewind picker"),
-    ("compact", "with the full terminal UI"),
 ];
+
+/// The modes `/mode` offers, and what each lets the agent do. `full-access` is chosen only when
+/// harness starts.
+const MODES: [(Mode, &str); 4] = [
+    (
+        Mode::Plan,
+        "read-only; ends with a plan to build, edit, or keep planning",
+    ),
+    (
+        Mode::ReadOnly,
+        "reads, and runs commands that change nothing",
+    ),
+    (Mode::Ask, "asks before edits, and commands no rule allows"),
+    (
+        Mode::Auto,
+        "edits the workspace and runs sandboxed commands",
+    ),
+];
+
+/// What a picker is choosing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pick {
+    Mode,
+    /// The message to rewind to, one per item: `None` undoes the last rewind.
+    Rewind(Vec<Option<RewindPoint>>),
+    /// The session to resume, one id per item.
+    Session(Vec<String>),
+    /// The model to switch to, one id per item.
+    Model(Vec<String>),
+    /// What to restore to before this message.
+    RewindScope(RewindPoint),
+}
+
+/// How work the agent did for a command ended.
+#[derive(Debug)]
+pub enum Done {
+    /// `/compact`: `Err` says why nothing was compacted.
+    Compacted(Result<(), String>),
+    /// A rewind: `Err` says why it failed.
+    Rewound(Result<(), String>),
+    /// Undoing the last rewind.
+    UndidRewind(Result<(), String>),
+    /// A new session (`/new`), or another one (`/resume`), that the agent continues in now.
+    Session {
+        resumed: bool,
+        result: Result<SessionView, String>,
+    },
+    /// `/model`: the model the session continues on, or why it could not switch.
+    Model(Result<ModelView, String>),
+    /// `/login`: what to tell the user, or why it did not sign in.
+    LoggedIn(Result<String, String>),
+}
+
+/// A session the agent is to continue in, as the host opened it.
+pub struct OpenedSession {
+    pub session: Session,
+    /// Its checkpoints; `None` when they cannot work here.
+    pub checkpoints: Option<Arc<Checkpoints>>,
+    /// What opening it had to warn about.
+    pub warnings: Vec<String>,
+}
+
+/// A session the agent continues in now, for the app to show.
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    pub id: String,
+    /// Its conversation, oldest first.
+    pub history: Vec<Message>,
+}
+
+/// A model made ready for the session by the host: the agent switches to it.
+pub struct ModelSwitch {
+    pub model: SessionModel,
+    /// Where its context window comes from, for `/context`.
+    pub window_note: String,
+    /// What to warn about, such as a window too small for agentic work.
+    pub warnings: Vec<String>,
+}
+
+/// The model the session continues on now, for the app to show.
+#[derive(Debug, Clone)]
+pub struct ModelView {
+    pub id: String,
+    pub window_note: String,
+}
 
 /// A slash command expanded for a turn.
 pub struct Prepared {
@@ -84,6 +180,89 @@ pub trait Host: Send {
     fn take_warnings(&self) -> Vec<String> {
         Vec::new()
     }
+    /// This project's sessions, the most recently used first.
+    fn sessions(&self) -> Vec<SessionSummary> {
+        Vec::new()
+    }
+    /// Opens a new session (`None`), or this project's session `id`, for the agent to continue
+    /// in. Errors say why it cannot be.
+    ///
+    /// Reading a session and opening its checkpoints take time, which does not block the
+    /// session's loop: the future runs in the background. `cancel` stops it (Esc).
+    fn open_session(
+        &self,
+        _id: Option<&str>,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<OpenedSession, String>> {
+        Box::pin(async { Err("this session cannot change".to_string()) })
+    }
+    /// The first run's model answered a request, so it can be kept as the default (what it
+    /// saved, or why it could not, is returned as notes to show).
+    fn model_answered(&self, _model: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// The ids of the models harness finds: local servers', and those of providers with a key
+    /// or a sign-in.
+    fn models(&self) -> BoxFuture<'static, Vec<String>> {
+        Box::pin(async { Vec::new() })
+    }
+    /// Makes model `id` ready for the session: its provider, and what its profile and window
+    /// say. Errors say why it cannot be used. `cancel` stops it while a local server is asked
+    /// for its window.
+    fn switch_model(
+        &self,
+        _id: &str,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<ModelSwitch, String>> {
+        Box::pin(async { Err("the model cannot change".into()) })
+    }
+    /// Signs in to `provider`, with a device code when `device` is set: what the user must do
+    /// (the address to open, the code) goes to `notes` as it comes, and `cancel` stops it. Ok:
+    /// what to tell the user; errors say why not.
+    fn login(
+        &self,
+        _provider: &str,
+        _device: bool,
+        _notes: mpsc::UnboundedSender<String>,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'static, Result<String, String>> {
+        Box::pin(async { Err("sign-in is not available here".into()) })
+    }
+}
+
+/// A model that has not answered yet: its id cannot be checked offline, so a wrong one shows up
+/// as a refused request.
+struct Unproven {
+    id: String,
+    /// The model before a `/model` switch, to offer the way back.
+    previous: Option<String>,
+    /// The first run's choice, kept as the default only once it has answered.
+    first_run: bool,
+}
+
+/// Whether `message`, of a failed request, says the model is the problem: it is not found, or the
+/// request is refused with a 4xx other than a key, a timeout or a rate limit.
+fn refuses_the_model(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    if lower.contains("not found")
+        || lower.contains("model_not_found")
+        || lower.contains("does not exist")
+    {
+        return true;
+    }
+    let Some(at) = message
+        .find("HTTP ")
+        .map(|i| i + 5)
+        .or_else(|| message.find("reported ").map(|i| i + 9))
+    else {
+        return false;
+    };
+    let status: String = message[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    matches!(status.parse::<u16>(), Ok(400..=499))
+        && !matches!(status.as_str(), "401" | "403" | "408" | "429")
 }
 
 /// Settings of the interactive session.
@@ -120,6 +299,20 @@ pub enum Action {
     RunIn(Mode, TurnInput),
     /// Open the plan in the user's editor.
     EditPlan(String),
+    /// Compact the conversation, with what to keep in particular.
+    Compact(Option<String>),
+    /// Rewind to just before the user message `entry`.
+    Rewind { entry: String, scope: RewindScope },
+    /// Undo the last rewind.
+    UndoRewind,
+    /// Continue in a new session (`None`), or in this project's session with this id.
+    OpenSession(Option<String>),
+    /// Look for the models, for the model picker.
+    ListModels,
+    /// Continue on the model with this id.
+    SwitchModel(String),
+    /// Sign in to a provider, with a device code when `device` is set.
+    Login { provider: String, device: bool },
     /// Stop the running turn.
     Interrupt,
     /// Leave harness.
@@ -172,6 +365,8 @@ pub struct App {
     plan_note_pending: bool,
     /// A plan waiting for the user's choice.
     plan_choice: Option<PlanChoice>,
+    /// The model the session uses, until it has answered once.
+    unproven: Option<Unproven>,
     /// When the running turn started.
     turn_started: Option<Instant>,
     /// Notifications to send.
@@ -185,6 +380,29 @@ pub struct App {
     /// Whether the running turn has requested any tool call: files it wrote or created should
     /// be offered by `@` completion once it ends.
     ran_tools: bool,
+    /// A picker the user is choosing in, drawn in a full-screen view, and what for.
+    picker: Option<(Pick, Picker)>,
+    /// What the agent is doing for a command, shown until it is done.
+    working: Option<String>,
+    /// Whether Esc stops what `working` says (a rewind runs to its end).
+    working_stoppable: bool,
+    /// The user messages the conversation can be rewound to, oldest first, and whether the last
+    /// rewind can be undone, as the agent last said.
+    rewind_points: Vec<RewindPoint>,
+    can_undo_rewind: bool,
+    /// The rewind asked for: to before which message, restoring what.
+    rewinding: Option<(String, RewindScope)>,
+    /// When Esc was last pressed on empty input.
+    last_esc: Option<Instant>,
+    /// The id of the session the agent continues in.
+    session_id: String,
+    /// The mode the session started in, which the system prompt describes.
+    start_mode: Mode,
+    /// The agent continues in another session, whose conversation may not say the mode: the
+    /// next turn tells the model.
+    mode_note_pending: bool,
+    /// The model being switched to.
+    switching: Option<String>,
 }
 
 impl App {
@@ -215,6 +433,7 @@ impl App {
             default_mode: options.default_mode,
             plan_note_pending: options.mode == Mode::Plan,
             plan_choice: None,
+            unproven: None,
             turn_started: None,
             notifications: Vec::new(),
             workspace: options.workspace,
@@ -222,6 +441,143 @@ impl App {
             redactor: None,
             write_mode_warning: None,
             ran_tools: false,
+            picker: None,
+            working: None,
+            working_stoppable: true,
+            rewind_points: Vec::new(),
+            can_undo_rewind: false,
+            rewinding: None,
+            last_esc: None,
+            session_id: String::new(),
+            start_mode: options.mode,
+            mode_note_pending: false,
+            switching: None,
+        }
+    }
+
+    /// The models the host found, for the model picker if it is open.
+    pub fn on_models(&mut self, ids: Vec<String>) {
+        let Some((Pick::Model(listed), picker)) = &mut self.picker else {
+            return;
+        };
+        let items = ids
+            .iter()
+            .map(|id| model_item(id, *id == self.model))
+            .collect();
+        picker.set_items(items);
+        if let Some(current) = ids.iter().position(|id| *id == self.model) {
+            picker.select(current);
+        }
+        *listed = ids;
+        // The list that arrived takes keys once the user has paused, as the picker did when it
+        // opened: a key typed as it appears never chooses in it.
+        self.arming = Arming::default();
+    }
+
+    /// The id of the session the agent continues in.
+    pub fn set_session_id(&mut self, id: &str) {
+        self.session_id = id.to_string();
+    }
+
+    /// What the conversation can be rewound to: `points`, oldest first, and whether the last
+    /// rewind can be undone.
+    pub fn set_rewind(&mut self, points: Vec<RewindPoint>, can_undo: bool) {
+        self.rewind_points = points;
+        self.can_undo_rewind = can_undo;
+    }
+
+    /// The picker the user is choosing in: the session draws it in a full-screen view.
+    pub fn picker(&self) -> Option<&Picker> {
+        self.picker.as_ref().map(|(_, picker)| picker)
+    }
+
+    /// Says what the session is busy with, until [`on_done`](Self::on_done); `stoppable` says
+    /// whether Esc stops it.
+    fn work(&mut self, what: &str, stoppable: bool) {
+        self.working = Some(what.to_string());
+        self.working_stoppable = stoppable;
+    }
+
+    /// Work the agent did for a command ended.
+    pub fn on_done(&mut self, done: Done) {
+        self.working = None;
+        let width = self.width;
+        match done {
+            Done::Compacted(Ok(())) => {}
+            Done::Compacted(Err(why)) => self
+                .transcript
+                .push_note(&format!("the conversation was not compacted: {why}"), width),
+            Done::Rewound(result) => {
+                let Some((text, scope)) = self.rewinding.take() else {
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        let what = match scope {
+                            RewindScope::CodeAndConversation => "the code and the conversation",
+                            RewindScope::Conversation => "the conversation",
+                            RewindScope::Code => "the code",
+                        };
+                        self.transcript.push_note(
+                            &format!("rewound {what} to before: {}", first_line(&text)),
+                            width,
+                        );
+                        // The message comes back, to send again as it is or changed.
+                        // What the user typed meanwhile is not replaced: the message is kept in
+                        // the history instead, for Up.
+                        if scope != RewindScope::Code {
+                            self.drop_pending_input();
+                            if self.editor.is_empty() {
+                                self.editor.set_text(&text);
+                            } else {
+                                self.editor.remember(&text);
+                                self.transcript.push_note(
+                                    "the message is in your history (Up), as you had typed another",
+                                    width,
+                                );
+                            }
+                        }
+                    }
+                    Err(why) => self
+                        .transcript
+                        .push_error(&format!("the rewind failed: {why}"), width),
+                }
+            }
+            Done::Session { resumed, result } => self.session_started(resumed, result),
+            Done::LoggedIn(Ok(done)) => {
+                self.transcript.push_note(&done, width);
+                self.transcript.push_note(
+                    "/model offers ChatGPT's models; /model chatgpt/<model> uses any other",
+                    width,
+                );
+            }
+            Done::LoggedIn(Err(why)) => self
+                .transcript
+                .push_error(&format!("could not sign in: {why}"), width),
+            Done::Model(result) => {
+                let wanted = self.switching.take().unwrap_or_default();
+                match result {
+                    Ok(view) => {
+                        self.transcript
+                            .push_note(&format!("switched to {}", view.id), width);
+                        let previous = std::mem::replace(&mut self.model, view.id.clone());
+                        self.unproven = Some(Unproven {
+                            id: view.id,
+                            previous: Some(previous),
+                            first_run: false,
+                        });
+                        self.window_note = Some(view.window_note);
+                    }
+                    Err(why) => {
+                        let text = self.redacted(&format!("could not switch to {wanted}: {why}"));
+                        self.transcript.push_error(&text, width);
+                    }
+                }
+            }
+            Done::UndidRewind(Ok(())) => self.transcript.push_note("undid the last rewind", width),
+            Done::UndidRewind(Err(why)) => self
+                .transcript
+                .push_error(&format!("could not undo the last rewind: {why}"), width),
         }
     }
 
@@ -231,9 +587,34 @@ impl App {
         self.write_mode_warning = warning;
     }
 
+    /// The session's model is the first run's choice, which the host keeps as the default once
+    /// the model has answered.
+    pub fn set_first_run_model(&mut self) {
+        self.unproven = Some(Unproven {
+            id: self.model.clone(),
+            previous: None,
+            first_run: true,
+        });
+    }
+
     /// Shows approvals with the secrets `redactor` knows replaced.
     pub fn set_redactor(&mut self, redactor: Arc<Redactor>) {
         self.redactor = Some(redactor);
+    }
+
+    /// Shows `text`, something the host says, as a note, with the secrets harness knows
+    /// replaced.
+    pub fn push_note(&mut self, text: &str) {
+        let text = self.redacted(text);
+        self.transcript.push_note(&text, self.width);
+    }
+
+    /// `text` with the secrets harness knows replaced.
+    fn redacted(&self, text: &str) -> String {
+        match &self.redactor {
+            Some(redactor) => redactor.redact(text),
+            None => text.to_string(),
+        }
     }
 
     /// What the CLI provides.
@@ -241,7 +622,7 @@ impl App {
         &*self.host
     }
 
-    fn theme(&self) -> Theme {
+    pub fn theme(&self) -> Theme {
         *self.transcript.theme()
     }
 
@@ -283,7 +664,7 @@ impl App {
     /// time takes keys once the user has paused for
     /// [`ARMING_DELAY`](crate::approval::ARMING_DELAY) since then.
     pub fn drawn(&mut self, now: Instant) {
-        if self.prompt.is_some() || self.plan_choice.is_some() {
+        if self.takes_keys_after_a_pause() {
             self.arming.drawn(now);
         }
     }
@@ -292,7 +673,21 @@ impl App {
     pub fn armed_at(&self) -> Option<Instant> {
         self.arming
             .armed_at()
-            .filter(|_| self.prompt.is_some() || self.plan_choice.is_some())
+            .filter(|_| self.takes_keys_after_a_pause())
+    }
+
+    /// Opens `picker`, drawn in a full-screen view. Every picker, one that follows another
+    /// included, takes keys only once the user has paused ([`Arming`]): keys typed ahead never
+    /// choose an item or confirm what the picker is for.
+    fn open_picker(&mut self, pick: Pick, picker: Picker) {
+        self.picker = Some((pick, picker));
+        self.arming = Arming::default();
+    }
+
+    /// Whether an approval, a plan choice or a picker waits for an answer: it takes keys only
+    /// once the user has paused ([`Arming`]), so keys typed ahead never answer it.
+    fn takes_keys_after_a_pause(&self) -> bool {
+        self.prompt.is_some() || self.plan_choice.is_some() || self.picker.is_some()
     }
 
     /// Denies the approval waiting, if any, as the session ends: the turn stops.
@@ -337,9 +732,9 @@ impl App {
         self.mode
     }
 
-    /// Whether a turn is running, or about to.
+    /// Whether a turn is running, or about to, or the agent works for a command.
     pub fn busy(&self) -> bool {
-        self.running
+        self.running || self.working.is_some()
     }
 
     /// Where send-now input goes: give it to the agent (`Agent::with_steering`).
@@ -360,8 +755,11 @@ impl App {
                 self.turn_started = Some(now);
                 self.ran_tools = false;
             }
-            AgentEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
-                self.last_reply = content.clone();
+            AgentEvent::AssistantMessage { content, .. } => {
+                if !content.trim().is_empty() {
+                    self.last_reply = content.clone();
+                }
+                self.model_proven();
             }
             AgentEvent::ToolCallRequested { .. } => self.ran_tools = true,
             AgentEvent::TurnFinished { reason } => self.turn_ended(*reason, now),
@@ -374,6 +772,47 @@ impl App {
             _ => {}
         }
         self.transcript.on_event(event, self.width);
+        if let AgentEvent::Error { message, .. } = event {
+            self.model_refused(message);
+        }
+    }
+
+    /// The model answered: the first run's choice is kept as the default.
+    fn model_proven(&mut self) {
+        let Some(proven) = self.unproven.take() else {
+            return;
+        };
+        if proven.first_run {
+            for note in self.host.model_answered(&proven.id) {
+                self.push_note(&note);
+            }
+        }
+    }
+
+    /// A request failed before the model had answered once: says so when the model is the
+    /// problem.
+    fn model_refused(&mut self, message: &str) {
+        if !refuses_the_model(message) {
+            return;
+        }
+        let Some(failed) = self.unproven.take() else {
+            return;
+        };
+        let note = match (&failed.previous, failed.first_run) {
+            (_, true) => format!(
+                "{} did not answer, so it is not saved as your default; /model picks another",
+                failed.id
+            ),
+            (Some(previous), false) => format!(
+                "{} did not accept the request; /model {previous} switches back",
+                failed.id
+            ),
+            (None, false) => format!(
+                "{} did not accept the request; /model picks another",
+                failed.id
+            ),
+        };
+        self.push_note(&note);
     }
 
     /// A turn ended. Send-now input it did not take is sent next, before queued input. After an
@@ -440,13 +879,92 @@ impl App {
         self.context = context;
     }
 
-    /// Asks for a turn. In a session that started in plan mode, the agent is told to plan first.
+    /// Asks for a turn. In a session that started in plan mode, the agent is told to plan first;
+    /// in a session continued after `/new` or `/resume`, it is told the mode when that may not be
+    /// what the conversation says.
     fn run(&mut self, input: TurnInput) -> Option<Action> {
         self.running = true;
-        if std::mem::take(&mut self.plan_note_pending) && self.mode == Mode::Plan {
-            return Some(Action::RunIn(Mode::Plan, input));
+        let plan_note = std::mem::take(&mut self.plan_note_pending) && self.mode == Mode::Plan;
+        if std::mem::take(&mut self.mode_note_pending) || plan_note {
+            return Some(Action::RunIn(self.mode, input));
         }
         Some(Action::Run(input))
+    }
+
+    /// The plan choice, input queued behind it or a turn, and a mode change waiting for the turn
+    /// to end belong to the conversation they came from: a new or resumed session, or a rewind
+    /// of the conversation, drops them. The draft in the editor stays.
+    fn drop_pending_input(&mut self) {
+        self.plan_choice = None;
+        self.queued.clear();
+        self.pending_mode = None;
+    }
+
+    /// The agent continues in another session now, or could not.
+    fn session_started(&mut self, resumed: bool, result: Result<SessionView, String>) {
+        let width = self.width;
+        let view = match result {
+            Ok(view) => view,
+            Err(why) => {
+                let what = if resumed {
+                    "resume the session"
+                } else {
+                    "start a new session"
+                };
+                self.transcript
+                    .push_error(&format!("could not {what}: {why}"), width);
+                return;
+            }
+        };
+        self.session_id = view.id.clone();
+        self.last_reply.clear();
+        self.drop_pending_input();
+        // Up recalls this session's messages.
+        let inputs = self.rewind_points.iter().map(|p| p.text.clone()).collect();
+        self.editor.set_history(inputs);
+        if !resumed {
+            self.transcript
+                .push_note("started a new session; /resume goes back to another", width);
+            self.mode_note_pending = self.mode != self.start_mode;
+            self.plan_note_pending = self.mode == Mode::Plan;
+            return;
+        }
+        self.transcript
+            .push_note(&format!("resumed session {}", view.id), width);
+        self.recap(&view.history);
+        self.mode_note_pending = true;
+    }
+
+    /// What a resumed conversation ended with: the last message the user typed and the replies
+    /// to it.
+    fn recap(&mut self, history: &[Message]) {
+        let width = self.width;
+        let typed = |m: &Message| matches!(m, Message::User { content } if !content.starts_with("[harness]"));
+        let Some(last) = history.iter().rposition(typed) else {
+            return;
+        };
+        let earlier = history[..last].iter().filter(|m| typed(m)).count();
+        if earlier > 0 {
+            self.transcript.push_note(
+                &format!(
+                    "… {earlier} earlier message{} in this session",
+                    if earlier == 1 { "" } else { "s" }
+                ),
+                width,
+            );
+        }
+        let theme = self.theme();
+        for message in &history[last..] {
+            match message {
+                Message::User { content } if typed(message) => {
+                    self.transcript.push_user(content, width)
+                }
+                Message::Assistant { content, .. } if !content.trim().is_empty() => self
+                    .transcript
+                    .push_lines(crate::markdown::render(content, width, &theme), width),
+                _ => {}
+            }
+        }
     }
 
     /// The plan waiting for the user's choice.
@@ -518,7 +1036,7 @@ impl App {
         {
             return;
         }
-        if (self.prompt.is_some() || self.plan_choice.is_some()) && !self.arming.armed(now) {
+        if self.takes_keys_after_a_pause() && !self.arming.armed(now) {
             self.arming.typed(now);
         }
         if !self.editor.paste(text) {
@@ -550,7 +1068,10 @@ impl App {
         }
         self.ctrl_c = None;
         self.hint = None;
-        if self.prompt.is_some() || self.plan_choice.is_some() {
+        if key.code != KeyCode::Esc {
+            self.last_esc = None;
+        }
+        if self.takes_keys_after_a_pause() {
             if self.arming.armed(now) {
                 return self.prompt_key(key);
             }
@@ -559,26 +1080,36 @@ impl App {
                 self.answer(Answered::Interrupt);
                 return Some(Action::Interrupt);
             }
-            // Until the prompt takes keys, they were typed for the input, and the prompt waits
-            // for the user to pause.
+            // Until the prompt or the picker takes keys, they were typed for the input, and it
+            // waits for the user to pause.
             self.arming.typed(now);
         }
+        // While a picker is open (not yet taking keys, or it would have had this one), what is
+        // typed goes to the draft and nothing else happens: the draft is not sent, no command
+        // runs, the mode does not change, and neither Esc nor Ctrl+D leaves or opens anything. It
+        // waits for the picker to close.
+        let under_picker = self.picker.is_some();
+        if under_picker && (key.code == KeyCode::BackTab || key.code == KeyCode::Esc) {
+            return None;
+        }
         if ctrl && key.code == KeyCode::Char('d') && self.editor.is_empty() {
-            return self.quit();
+            return if under_picker { None } else { self.quit() };
         }
         if ctrl && key.code == KeyCode::Char('s') {
-            return self.send_now();
+            return if under_picker { None } else { self.send_now() };
         }
         if let Some(action) = self.completion_key(key) {
             return action;
         }
         match key.code {
             KeyCode::Esc if self.busy() => return Some(Action::Interrupt),
+            KeyCode::Esc if self.editor.is_empty() => return self.esc_on_empty_input(now),
             KeyCode::Esc => return None,
             KeyCode::BackTab => return self.cycle_mode(),
             _ => {}
         }
         match self.editor.key(key) {
+            Edit::Submit if under_picker => {}
             Edit::Submit => return self.submit(),
             Edit::Handled => self.update_completion(),
             Edit::Ignored => {}
@@ -595,6 +1126,14 @@ impl App {
                 "choose b, e or k first: nothing is sent while the plan waits".into()
             });
             return None;
+        }
+        if let Some((_, picker)) = &mut self.picker {
+            let picked = picker.key(key)?;
+            let (pick, _) = self.picker.take()?;
+            return match picked {
+                Picked::Chosen(index) => self.picked(pick, index),
+                Picked::Cancelled => None,
+            };
         }
         if let Some(prompt) = &mut self.prompt {
             let answered = prompt.key(key)?;
@@ -666,6 +1205,9 @@ impl App {
         }
         self.ctrl_c = Some(now);
         self.hint = Some("press Ctrl+C again to exit".into());
+        if self.picker.take().is_some() {
+            return None;
+        }
         if self.prompt.is_some() {
             self.answer(Answered::Interrupt);
         }
@@ -722,7 +1264,8 @@ impl App {
             && !self.starts_a_turn(invocation.name)
         {
             let name = invocation.name.to_string();
-            return self.builtin(&name, &full);
+            let args = invocation.args.trim().to_string();
+            return self.builtin(&name, &args, &full);
         }
         let (shown, full) = self.editor.submit();
         // Input typed ahead of a plan choice waits for it, as input typed during a turn does.
@@ -758,11 +1301,90 @@ impl App {
         name == "init" || (!is_builtin(name) && self.host.is_command(name))
     }
 
-    /// A built-in command that runs here, without a turn, or an unknown one.
-    fn builtin(&mut self, name: &str, full: &str) -> Option<Action> {
+    /// Whether a command that changes the session can run now: not during a turn, when a hint
+    /// says so and the input stays for later.
+    fn between_turns(&mut self, name: &str) -> bool {
+        if self.busy() {
+            self.hint = Some(format!(
+                "/{name} works between turns: press Esc to stop this one first"
+            ));
+            return false;
+        }
+        true
+    }
+
+    /// A built-in command that runs here, without a turn, or an unknown one. `args` follow its
+    /// name.
+    fn builtin(&mut self, name: &str, args: &str, full: &str) -> Option<Action> {
         let width = self.width;
         match name {
             "quit" => return self.quit(),
+            "mode" | "compact" | "rewind" | "new" | "resume" | "model" | "login"
+                if !self.between_turns(name) => {}
+            "login" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                let mut words = args.split_whitespace();
+                let mut provider = None;
+                let mut device = false;
+                for word in words.by_ref() {
+                    match word {
+                        "--device" => device = true,
+                        _ if provider.is_none() => provider = Some(word.to_string()),
+                        other => {
+                            self.transcript.push_error(
+                                &format!("/login takes a provider and --device, not `{other}`"),
+                                width,
+                            );
+                            return None;
+                        }
+                    }
+                }
+                self.work("signing in", true);
+                return Some(Action::Login {
+                    provider: provider.unwrap_or_else(|| "chatgpt".into()),
+                    device,
+                });
+            }
+            "model" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                if !args.is_empty() {
+                    return self.switch_to(args);
+                }
+                let picker =
+                    Picker::loading("Choose a model", "looking for models…").with_empty(NO_MODELS);
+                self.open_picker(Pick::Model(Vec::new()), picker);
+                return Some(Action::ListModels);
+            }
+            "new" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                self.work("starting a new session", true);
+                return Some(Action::OpenSession(None));
+            }
+            "resume" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return self.resume(args);
+            }
+            "rewind" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                self.open_rewind();
+            }
+            "mode" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return self.mode_command(args);
+            }
+            "compact" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                self.work("compacting the conversation", true);
+                let focus = (!args.is_empty()).then(|| args.to_string());
+                return Some(Action::Compact(focus));
+            }
             "help" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
@@ -785,24 +1407,192 @@ impl App {
                 self.transcript.push_lines(lines, width);
             }
             _ => {
-                if let Some((_, when)) = LATER.iter().find(|(n, _)| *n == name) {
-                    self.editor.submit();
-                    self.transcript.push_user(full, width);
-                    self.transcript.push_note(
-                        &format!("/{name} is not available yet: it comes {when}."),
-                        width,
-                    );
-                } else {
-                    self.transcript.push_error(
-                        &format!(
-                            "unknown command /{name}; custom commands are Markdown files in .harness/commands, .claude/commands or .opencode/commands; to send text that starts with /, put a word before it"
-                        ),
-                        width,
-                    );
-                }
+                self.transcript.push_error(
+                    &format!(
+                        "unknown command /{name}; custom commands are Markdown files in .harness/commands, .claude/commands or .opencode/commands; to send text that starts with /, put a word before it"
+                    ),
+                    width,
+                );
             }
         }
         None
+    }
+
+    /// `/mode`: with a mode's name, switches to it; alone, opens the mode picker.
+    fn mode_command(&mut self, args: &str) -> Option<Action> {
+        let width = self.width;
+        if args.is_empty() {
+            let items = MODES
+                .iter()
+                .map(|(mode, what)| {
+                    let current = if *mode == self.mode { "(current) " } else { "" };
+                    Item::new(&mode.to_string(), &format!("{current}{what}"))
+                })
+                .collect();
+            let current = MODES.iter().position(|(m, _)| *m == self.mode).unwrap_or(0);
+            let picker = Picker::new("Choose the approval mode", items)
+                .with_selected(current)
+                .with_footer(vec![
+                    "full-access is chosen only when harness starts (--mode full-access).".into(),
+                ]);
+            self.open_picker(Pick::Mode, picker);
+            return None;
+        }
+        match args.parse::<Mode>() {
+            Ok(Mode::FullAccess) => self.transcript.push_error(
+                "full-access is chosen only when harness starts (--mode full-access)",
+                width,
+            ),
+            Ok(mode) if mode == self.mode => self
+                .transcript
+                .push_note(&format!("already in {mode} mode"), width),
+            Ok(mode) => return self.switch_mode(mode),
+            Err(why) => self.transcript.push_error(&why, width),
+        }
+        None
+    }
+
+    /// The user chose item `index` of the picker for `pick`.
+    fn picked(&mut self, pick: Pick, index: usize) -> Option<Action> {
+        match pick {
+            Pick::Mode => {
+                let mode = MODES.get(index)?.0;
+                if mode == self.mode {
+                    return None;
+                }
+                self.switch_mode(mode)
+            }
+            Pick::Rewind(points) => match points.into_iter().nth(index)? {
+                None => {
+                    self.work("undoing the last rewind", false);
+                    Some(Action::UndoRewind)
+                }
+                Some(point) => {
+                    let items = SCOPES
+                        .iter()
+                        .map(|(_, name, what)| Item::new(name, what))
+                        .collect();
+                    let picker = Picker::new("Restore what, to before this message?", items)
+                        .with_footer(vec![
+                            format!("› {}", first_line(&point.text)),
+                            REWIND_LIMITS.into(),
+                        ]);
+                    self.open_picker(Pick::RewindScope(point), picker);
+                    None
+                }
+            },
+            Pick::Model(ids) => {
+                let id = ids.into_iter().nth(index)?;
+                self.switch_to(&id)
+            }
+            Pick::Session(ids) => {
+                let id = ids.into_iter().nth(index)?;
+                self.work("loading the session", true);
+                Some(Action::OpenSession(Some(id)))
+            }
+            Pick::RewindScope(point) => {
+                let scope = SCOPES.get(index)?.0;
+                self.work("rewinding", false);
+                self.rewinding = Some((point.text, scope));
+                Some(Action::Rewind {
+                    entry: point.entry,
+                    scope,
+                })
+            }
+        }
+    }
+
+    /// Switches the session to model `id`, unless it is on it already.
+    fn switch_to(&mut self, id: &str) -> Option<Action> {
+        if id == self.model {
+            self.transcript
+                .push_note(&format!("already on {id}"), self.width);
+            return None;
+        }
+        self.work(&format!("switching to {id}"), true);
+        self.switching = Some(id.to_string());
+        Some(Action::SwitchModel(id.to_string()))
+    }
+
+    /// Opens the session picker, as `harness --resume` does when the session starts.
+    pub fn open_session_picker(&mut self) {
+        self.resume("");
+    }
+
+    /// `/resume`: with an id, continues that session; alone, opens the session picker.
+    fn resume(&mut self, id: &str) -> Option<Action> {
+        let width = self.width;
+        if id == self.session_id {
+            self.transcript
+                .push_note(&format!("already in session {id}"), width);
+            return None;
+        }
+        if !id.is_empty() {
+            self.work("loading the session", true);
+            return Some(Action::OpenSession(Some(id.to_string())));
+        }
+        let sessions: Vec<SessionSummary> = self
+            .host
+            .sessions()
+            .into_iter()
+            .filter(|s| s.id != self.session_id)
+            .collect();
+        if sessions.is_empty() {
+            self.transcript
+                .push_note("there is no other session in this project yet", width);
+            return None;
+        }
+        let items = sessions
+            .iter()
+            .map(|s| {
+                let first = s.first_message.as_deref().map(first_line);
+                Item::new(
+                    first.as_deref().unwrap_or("(no message)"),
+                    &format!("{} · {}", s.started_at, s.id),
+                )
+            })
+            .collect();
+        let ids = sessions.into_iter().map(|s| s.id).collect();
+        self.open_picker(
+            Pick::Session(ids),
+            Picker::new("Resume which session?", items),
+        );
+        None
+    }
+
+    /// Esc on empty input: pressed twice within [`REWIND_WINDOW`], opens the rewind list.
+    fn esc_on_empty_input(&mut self, now: Instant) -> Option<Action> {
+        match self.last_esc.take() {
+            Some(at) if now.duration_since(at) <= REWIND_WINDOW => self.open_rewind(),
+            _ => self.last_esc = Some(now),
+        }
+        None
+    }
+
+    /// The rewind list: "undo the last rewind" when it can be, then the user's messages, the
+    /// latest first, with what a rewind cannot undo under them.
+    fn open_rewind(&mut self) {
+        let mut points: Vec<Option<RewindPoint>> = Vec::new();
+        let mut items = Vec::new();
+        if self.can_undo_rewind {
+            points.push(None);
+            items.push(Item::new(
+                "undo the last rewind",
+                "the files and the conversation as they were before it",
+            ));
+        }
+        for point in self.rewind_points.iter().rev() {
+            items.push(Item::new(&first_line(&point.text), ""));
+            points.push(Some(point.clone()));
+        }
+        if items.is_empty() {
+            self.transcript
+                .push_note("there is nothing to rewind yet", self.width);
+            return;
+        }
+        let picker = Picker::new("Rewind to before which message?", items)
+            .with_footer(vec![REWIND_LIMITS.into()]);
+        self.open_picker(Pick::Rewind(points), picker);
     }
 
     /// Sends input typed as `shown`, `full` with pastes expanded: a custom command or `/init`
@@ -847,6 +1637,7 @@ impl App {
             ("Ctrl+S during a turn", "send it with the next tool results"),
             ("Shift+Tab", "switch between plan, ask and auto mode"),
             ("Esc", "interrupt the running turn"),
+            ("Esc twice", "rewind to before an earlier message"),
             ("Ctrl+C twice", "exit"),
         ] {
             lines.push(Line::from(vec![
@@ -923,6 +1714,22 @@ impl App {
         for (shown, _) in &self.queued {
             waiting.push(pending_line("queued: ", shown, &theme));
         }
+        if let Some(what) = &self.working {
+            waiting.insert(
+                0,
+                Line::from(vec![
+                    Span::styled("● ", theme.accent()),
+                    Span::styled(
+                        if self.working_stoppable {
+                            format!("{what}… (Esc to stop)")
+                        } else {
+                            format!("{what}…")
+                        },
+                        theme.dim(),
+                    ),
+                ]),
+            );
+        }
         cursor.y += waiting.len() as u16;
         waiting.append(&mut editor);
         let editor = waiting;
@@ -962,6 +1769,17 @@ pub fn next_mode(mode: Mode) -> Mode {
         Mode::Plan | Mode::ReadOnly => Mode::Ask,
         Mode::Ask => Mode::Auto,
         Mode::Auto | Mode::FullAccess => Mode::Plan,
+    }
+}
+
+/// The first line of `text`, with `…` when there is more.
+fn first_line(text: &str) -> String {
+    let mut lines = text.trim().lines();
+    let first = lines.next().unwrap_or_default();
+    if lines.next().is_some() {
+        format!("{first} …")
+    } else {
+        first.to_string()
     }
 }
 

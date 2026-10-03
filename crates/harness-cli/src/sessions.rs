@@ -71,6 +71,22 @@ pub fn checkpoints(
 /// Opens the session to run in, printing any warnings about its file. Errors are user-facing
 /// messages (exit code 2).
 pub fn open(setup: &Setup, choice: &Choice, notices: &mut Notices) -> Result<Session, String> {
+    open_listing(
+        setup,
+        choice,
+        notices,
+        "run `harness --resume` to list them",
+    )
+}
+
+/// [`open`], where `listing` says how to list the project's sessions to someone who named one
+/// that is not there.
+pub fn open_listing(
+    setup: &Setup,
+    choice: &Choice,
+    notices: &mut Notices,
+    listing: &str,
+) -> Result<Session, String> {
     let dir = dir(setup);
     let path = match choice {
         Choice::New => return Ok(Session::create(&dir, &setup.workspace)),
@@ -85,7 +101,7 @@ pub fn open(setup: &Setup, choice: &Choice, notices: &mut Notices) -> Result<Ses
             let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
             if !session::is_valid_id(id) || !regular {
                 return Err(format!(
-                    "there is no session {id} in this project; run `harness --resume` to list them"
+                    "there is no session {id} in this project; {listing}"
                 ));
             }
             path
@@ -98,8 +114,9 @@ pub fn open(setup: &Setup, choice: &Choice, notices: &mut Notices) -> Result<Ses
     Ok(session)
 }
 
-/// `harness --resume` without an id: prints each session of this project, most recent first,
-/// with its id, start time and first message.
+/// `harness --resume` without an id and without a terminal: prints each session of this
+/// project, most recent first, with its id, start time and first message. On a terminal the
+/// interactive session opens with the session picker instead.
 pub fn print_list() -> u8 {
     let setup = match setup::load() {
         Ok(setup) => setup,
@@ -130,6 +147,6 @@ pub fn print_list() -> u8 {
             terminal_safe(&first)
         );
     }
-    println!("Continue one with: harness --resume <id> ask \"...\"");
+    println!("Continue one with: harness --resume <id>, or harness --resume <id> ask \"...\"");
     0
 }

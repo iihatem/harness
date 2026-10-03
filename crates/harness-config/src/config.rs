@@ -710,6 +710,92 @@ fn expand(path: &str, base: &Path, home: Option<&Path>) -> PathBuf {
     }
 }
 
+/// Saves `id` as the default model in the global config file `global`, as the first-run model
+/// choice does: `model = "<id>"` goes first in the file, where a top-level key must be, and the
+/// rest stays as written, comments included. The file is created when missing, and replaced
+/// through a temporary file, keeping its permissions; a new file is private (0600), and so is a
+/// directory made for it (0700). A file that is a link is written through: the file it names is
+/// the one replaced, beside it. A file that is not valid TOML, or that sets a model already, is
+/// left alone.
+pub fn save_default_model(global: &Path, id: &str) -> std::io::Result<()> {
+    use std::{
+        io::Write,
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    };
+    let global = &through_links(global)?;
+    let existing = match std::fs::read_to_string(global) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let text = existing.clone().unwrap_or_default();
+    let table: toml::Table = text.parse().map_err(|e| {
+        std::io::Error::other(format!("{} is not valid TOML: {e}", global.display()))
+    })?;
+    if table.contains_key("model") {
+        return Err(std::io::Error::other(format!(
+            "{} already sets model",
+            global.display()
+        )));
+    }
+    let line = format!("model = {}\n", toml::Value::String(id.to_string()));
+    if let Some(dir) = global.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    let tmp = global.with_file_name(format!(
+        "{}.tmp-{}",
+        global
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        if existing.is_some() {
+            let mode = std::fs::metadata(global)?.permissions().mode();
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        file.write_all(line.as_bytes())?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, global)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// `path`, or, when it is a link, where the links lead (which need not exist yet).
+fn through_links(path: &Path) -> std::io::Result<PathBuf> {
+    let mut path = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path)?;
+                path = match path.parent() {
+                    Some(dir) => dir.join(target),
+                    None => target,
+                };
+            }
+            _ => return Ok(path),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "too many links to follow from {}",
+        path.display()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

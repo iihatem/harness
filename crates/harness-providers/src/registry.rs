@@ -94,6 +94,19 @@ pub const BUILTIN_PROVIDERS: [Builtin; 7] = [
 /// The built-in provider a ChatGPT account answers for.
 pub const CHATGPT: &str = "chatgpt";
 
+/// The models a ChatGPT plan includes, as Codex lists them, for the model lists to offer when
+/// one is signed in (without the `chatgpt/` the ids carry). ChatGPT has no listing to ask, and
+/// the plan decides which of these it takes; `--model chatgpt/<model>` and `/model
+/// chatgpt/<model>` use any other. The `chatgpt/*` profile gives them their window.
+pub const CHATGPT_MODELS: &[&str] = &[
+    "gpt-5-codex",
+    "gpt-5",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1",
+];
+
 /// The local model servers harness finds on its own.
 pub const LOCAL_PROVIDERS: [&str; 3] = ["ollama", "lmstudio", "llamacpp"];
 
@@ -594,6 +607,19 @@ fn listed_key(name: &str, key_env: Option<&str>, secrets: &impl Secrets) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The models offered to a ChatGPT account are ones the built-in profiles know the window of.
+    #[test]
+    fn every_chatgpt_model_offered_has_a_profile_window() {
+        for model in CHATGPT_MODELS {
+            let profile = crate::profiles::resolve(
+                &format!("chatgpt/{model}"),
+                false,
+                &std::collections::BTreeMap::new(),
+            );
+            assert_eq!(profile.context_window, Some(272_000), "{model}");
+        }
+    }
 
     // Re-review A, N1: summaries are asked for by default only from OpenAI's own API (ChatGPT's
     // backend always asks); a server the user configured, whatever its name, gets them only when

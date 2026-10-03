@@ -2,7 +2,8 @@
 //! what harness has drawn, and scroll off into the terminal's own scrollback, where the terminal's
 //! scrolling, search and copy work as usual. Only the live region is redrawn, and only the cells
 //! in it that changed. Unlike ratatui's inline viewport, the live region's height changes with
-//! what it shows.
+//! what it shows. A full-screen view (a picker) is drawn on the terminal's alternate screen, and
+//! closing it gives the inline screen back as it was.
 
 use std::io;
 
@@ -30,6 +31,7 @@ pub enum CursorReport {
     /// come. Nothing is held against it.
     Unasked,
 }
+use crate::terminal::AltScreen;
 
 /// A terminal whose bottom rows, from `top` down, are a live region that is redrawn; everything
 /// above it is written once.
@@ -47,6 +49,12 @@ pub struct InlineTerminal<B: Backend> {
     reports_cursor: bool,
     /// How many times in a row it did not say by the time it was waited for.
     cursor_misses: u8,
+    /// Where full-screen views are drawn.
+    alt: Option<Box<dyn AltScreen<B> + Send>>,
+    /// What the full-screen view shows, while one is open.
+    full: Option<Buffer>,
+    /// The screen changed size while a full-screen view was open.
+    resized_in_full: bool,
 }
 
 fn io_error<E: std::error::Error + Send + Sync + 'static>(error: E) -> io::Error {
@@ -74,6 +82,9 @@ where
             cursor_row: top.min(screen.height.saturating_sub(1)),
             reports_cursor: true,
             cursor_misses: 0,
+            alt: None,
+            full: None,
+            resized_in_full: false,
         })
     }
 
@@ -82,6 +93,17 @@ where
     pub fn without_cursor_reports(mut self) -> Self {
         self.reports_cursor = false;
         self
+    }
+
+    /// Draws full-screen views on `alt`, the terminal's alternate screen.
+    pub fn with_alt_screen(mut self, alt: Box<dyn AltScreen<B> + Send>) -> Self {
+        self.alt = Some(alt);
+        self
+    }
+
+    /// Whether a full-screen view is open.
+    pub fn in_full_screen(&self) -> bool {
+        self.full.is_some()
     }
 
     pub fn backend(&self) -> &B {
@@ -243,7 +265,9 @@ where
     /// [`resized_to`](Self::resized_to) says. For a backend that answers itself; the session asks
     /// its terminal through the thread that reads it.
     pub fn resized(&mut self) -> io::Result<()> {
-        let cursor = if self.reports_cursor {
+        // Not asked while a full-screen view is open: the view's own screen has no say in where the
+        // live region's cursor is.
+        let cursor = if self.reports_cursor && self.full.is_none() {
             match self.backend.get_cursor_position() {
                 Ok(position) => CursorReport::At(position),
                 Err(_) => CursorReport::Missed,
@@ -263,6 +287,19 @@ where
     /// that did not say [`CURSOR_MISSES`] times in a row is not asked again.
     pub fn resized_to(&mut self, cursor: CursorReport) -> io::Result<()> {
         self.screen = self.backend.size().map_err(io_error)?;
+        let full_screen = self.full.is_some();
+        if full_screen {
+            // The live region waits, kept on screen, for the view to close.
+            let height = self.height.min(self.screen.height);
+            self.top = self
+                .top
+                .min(self.screen.height.saturating_sub(height.max(1)));
+            self.height = height;
+            self.cursor_row = self.cursor_row.min(self.screen.height.saturating_sub(1));
+            self.full = Some(Buffer::empty(self.whole_screen()));
+            self.resized_in_full = true;
+            return self.backend.clear().map_err(io_error);
+        }
         let bottom = self.screen.height.saturating_sub(1);
         let below_top = i32::from(self.cursor_row) - i32::from(self.top);
         let row = match cursor {
@@ -284,5 +321,67 @@ where
         self.top = top as u16;
         self.height = 0;
         self.clear_live()
+    }
+
+    fn whole_screen(&self) -> Rect {
+        Rect::new(0, 0, self.screen.width, self.screen.height)
+    }
+
+    /// Draws a full-screen view with `render`, which returns where the cursor goes (hidden for
+    /// `None`). The first draw switches to the alternate screen, or, without one, clears the
+    /// screen; after that only cells that changed are written. Draw nothing inline meanwhile.
+    pub fn draw_full(
+        &mut self,
+        render: impl FnOnce(Rect, &mut Buffer) -> Option<Position>,
+    ) -> io::Result<()> {
+        let area = self.whole_screen();
+        let shown = match self.full.take() {
+            Some(shown) => shown,
+            None => {
+                match &mut self.alt {
+                    Some(alt) => alt.enter(&mut self.backend)?,
+                    None => self.backend.clear().map_err(io_error)?,
+                }
+                Buffer::empty(area)
+            }
+        };
+        let mut next = Buffer::empty(area);
+        let cursor = render(area, &mut next);
+        let updates = shown.diff(&next);
+        self.backend.draw(updates.into_iter()).map_err(io_error)?;
+        match cursor {
+            Some(position) => {
+                self.backend
+                    .set_cursor_position(position)
+                    .map_err(io_error)?;
+                self.backend.show_cursor().map_err(io_error)?;
+            }
+            None => self.backend.hide_cursor().map_err(io_error)?,
+        }
+        self.full = Some(next);
+        self.backend.flush().map_err(io_error)
+    }
+
+    /// Closes the full-screen view: the normal screen comes back as it was, with the live region
+    /// where it was, to be drawn again. Without an alternate screen the view was drawn over the
+    /// screen, which is cleared, and the live region starts again at the top.
+    pub fn leave_full(&mut self) -> io::Result<()> {
+        if self.full.take().is_none() {
+            return Ok(());
+        }
+        match &mut self.alt {
+            Some(alt) => {
+                alt.leave(&mut self.backend)?;
+                if std::mem::take(&mut self.resized_in_full) {
+                    self.clear_live()?;
+                }
+            }
+            None => {
+                self.resized_in_full = false;
+                self.top = 0;
+                self.clear_live()?;
+            }
+        }
+        self.backend.flush().map_err(io_error)
     }
 }

@@ -657,3 +657,34 @@ fn the_editor_edits_the_plan_with_the_terminal_given_back_meanwhile() {
         .count();
     assert_eq!(left, 0);
 }
+
+// Final review minor 2: a plan choice and queued input belong to the conversation they came from;
+// a new session drops them, and the draft stays.
+#[tokio::test]
+async fn a_new_session_drops_the_plan_choice_and_queued_input_but_keeps_the_draft() {
+    use harness_tui::app::{Done, SessionView};
+    let dir = tempfile::tempdir().unwrap();
+    let provider = planning_script(vec![]);
+    let mut ui = start(provider.clone(), dir.path(), Mode::Plan, Mode::Auto);
+    plan(&mut ui).await;
+    send(&mut ui, "hello");
+    for c in "draft".chars() {
+        press(&mut ui, KeyCode::Char(c));
+    }
+    assert!(ui.app().plan_choice().is_some());
+    ui.app_mut().on_done(Done::Session {
+        resumed: false,
+        result: Ok(SessionView {
+            id: "new".into(),
+            history: Vec::new(),
+        }),
+    });
+    assert!(ui.app().plan_choice().is_none());
+    assert!(
+        !everything(&ui).iter().any(|r| r.starts_with("queued:")),
+        "{:#?}",
+        everything(&ui)
+    );
+    assert_eq!(ui.app().editor().text(), "draft");
+    ui.finish().await.unwrap();
+}

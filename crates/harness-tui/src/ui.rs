@@ -9,9 +9,11 @@ use std::{
 
 use futures::{FutureExt, Stream, StreamExt};
 use harness_core::{
-    agent::{Agent, ContextUsage},
+    agent::{Agent, ContextUsage, RewindError, RewindPoint, SessionModel},
+    checkpoint::Checkpoints,
     event::AgentEvent,
     redact::{EventRedactor, Redactor},
+    session::{RewindScope, Session},
     turn::TurnInput,
 };
 use ratatui::{backend::Backend, crossterm::event::Event};
@@ -19,7 +21,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    app::{Action, App, Host, Options},
+    app::{Action, App, Done, Host, ModelSwitch, ModelView, OpenedSession, Options, SessionView},
     approval::{Reply, Requests},
     inline::{CursorReport, InlineTerminal},
     input::{CursorQuery, Timed},
@@ -81,6 +83,52 @@ enum Job {
         cancel: CancellationToken,
     },
     SetMode(harness_core::permission::Mode),
+    Compact {
+        focus: Option<String>,
+        cancel: CancellationToken,
+    },
+    Rewind {
+        entry: String,
+        scope: RewindScope,
+    },
+    UndoRewind,
+    StartSession {
+        session: Box<Session>,
+        checkpoints: Option<Arc<Checkpoints>>,
+        resumed: bool,
+    },
+    SwitchModel {
+        model: Box<SessionModel>,
+        window_note: String,
+    },
+}
+
+/// What work the session started in the background, apart from the agent, comes back with.
+enum Background {
+    /// The models the host found.
+    Models(Vec<String>),
+    /// The model to switch to, made ready, or why it could not be.
+    Switch(Result<ModelSwitch, String>),
+    /// The session to continue in, opened, or why it could not be.
+    Session {
+        resumed: bool,
+        result: Result<OpenedSession, String>,
+    },
+    /// Something a sign-in says while it waits.
+    Note(String),
+    /// How a sign-in ended.
+    Login(Result<String, String>),
+}
+
+/// What the task that owns the agent says after each job: where the context goes now, and how
+/// the job ended when that has something to tell.
+struct Update {
+    context: ContextUsage,
+    /// What the conversation can be rewound to, and whether the last rewind can be undone.
+    rewind: (Vec<RewindPoint>, bool),
+    /// The session the agent continues in.
+    session: String,
+    done: Option<Done>,
 }
 
 /// The interactive session on a terminal.
@@ -89,8 +137,8 @@ pub struct Ui<B: Backend> {
     term: InlineTerminal<B>,
     jobs: Option<mpsc::UnboundedSender<Job>>,
     events: mpsc::UnboundedReceiver<AgentEvent>,
-    /// Where the context goes, sent by the runner after each job.
-    contexts: mpsc::UnboundedReceiver<ContextUsage>,
+    /// What the runner says after each job.
+    updates: mpsc::UnboundedReceiver<Update>,
     /// A job was sent whose context update has not come yet.
     awaiting_context: bool,
     approvals: Requests,
@@ -110,6 +158,9 @@ pub struct Ui<B: Backend> {
     /// Asks the terminal where its cursor is after a resize, through the thread that reads it;
     /// without it, the backend is asked.
     cursor_query: Option<CursorQuery>,
+    /// What work in the background comes back with.
+    background_tx: mpsc::UnboundedSender<Background>,
+    background: mpsc::UnboundedReceiver<Background>,
 }
 
 impl<B> Ui<B>
@@ -130,21 +181,68 @@ where
         let notifier = options.notifier.take();
         let (jobs, mut queue) = mpsc::unbounded_channel::<Job>();
         let (events_tx, events) = mpsc::unbounded_channel();
-        let (contexts_tx, contexts) = mpsc::unbounded_channel();
+        let (updates_tx, updates) = mpsc::unbounded_channel();
+        let (background_tx, background) = mpsc::unbounded_channel();
         let width = term.width() as usize;
         let mut app = App::new(options, host, width);
         let agent = agent.with_steering(app.steering());
         app.set_context(agent.context_usage());
+        app.set_rewind(agent.rewind_points(), agent.can_undo_rewind());
+        app.set_session_id(agent.session().id());
         let runner = tokio::spawn(async move {
             let mut agent = agent;
             while let Some(job) = queue.recv().await {
-                match job {
+                let done = match job {
                     Job::Turn { input, cancel } => {
                         agent.run_turn(*input, &events_tx, cancel).await;
+                        None
                     }
-                    Job::SetMode(mode) => agent.set_mode(mode),
-                }
-                let _ = contexts_tx.send(agent.context_usage());
+                    Job::SetMode(mode) => {
+                        agent.set_mode(mode);
+                        None
+                    }
+                    Job::Compact { focus, cancel } => {
+                        let result = agent.compact(focus.as_deref(), &events_tx, cancel).await;
+                        Some(Done::Compacted(result))
+                    }
+                    Job::Rewind { entry, scope } => {
+                        let result = agent.rewind(&entry, scope).await;
+                        Some(Done::Rewound(result.map_err(|e| rewind_error(&e))))
+                    }
+                    Job::UndoRewind => {
+                        let result = agent.undo_rewind().await;
+                        Some(Done::UndidRewind(result.map_err(|e| rewind_error(&e))))
+                    }
+                    Job::StartSession {
+                        session,
+                        checkpoints,
+                        resumed,
+                    } => {
+                        agent.start_session(*session, checkpoints);
+                        let view = SessionView {
+                            id: agent.session().id().to_string(),
+                            history: agent.history().to_vec(),
+                        };
+                        Some(Done::Session {
+                            resumed,
+                            result: Ok(view),
+                        })
+                    }
+                    Job::SwitchModel { model, window_note } => {
+                        agent.switch_model(*model);
+                        let view = ModelView {
+                            id: agent.model_id().to_string(),
+                            window_note,
+                        };
+                        Some(Done::Model(Ok(view)))
+                    }
+                };
+                let _ = updates_tx.send(Update {
+                    context: agent.context_usage(),
+                    rewind: (agent.rewind_points(), agent.can_undo_rewind()),
+                    session: agent.session().id().to_string(),
+                    done,
+                });
             }
         });
         Ui {
@@ -152,7 +250,7 @@ where
             term,
             jobs: Some(jobs),
             events,
-            contexts,
+            updates,
             awaiting_context: false,
             approvals,
             runner: Some(runner),
@@ -164,6 +262,8 @@ where
             drawn_at: None,
             redraw: false,
             cursor_query: None,
+            background_tx,
+            background,
         }
     }
 
@@ -181,6 +281,12 @@ where
         self.redactor = Some(EventRedactor::new(redactor.clone()));
         self.app.set_redactor(redactor);
         self
+    }
+
+    /// Opens the session picker, as `harness --resume` does when the session starts.
+    pub fn open_session_picker(&mut self) -> io::Result<()> {
+        self.app.open_session_picker();
+        self.draw()
     }
 
     pub fn app(&self) -> &App {
@@ -208,11 +314,24 @@ where
         }
     }
 
-    /// Writes the finished lines into the scrollback and redraws the live region.
+    /// Writes the finished lines into the scrollback and redraws the live region, or draws the
+    /// picker the user is choosing in, in a full-screen view.
     pub fn draw(&mut self) -> io::Result<()> {
         self.drawn_at = Some(tokio::time::Instant::now());
         self.redraw = false;
         self.notify();
+        if let Some(picker) = self.app.picker() {
+            // Finished lines wait for the inline screen.
+            let theme = self.app.theme();
+            self.term
+                .draw_full(|area, buf| picker.render(area, buf, &theme))?;
+            // The picker takes keys once the user has paused, as an approval does.
+            self.app.drawn(Instant::now());
+            return Ok(());
+        }
+        if self.term.in_full_screen() {
+            self.term.leave_full()?;
+        }
         let finished = self.app.transcript.take_finished();
         self.term.insert(&finished)?;
         let rows = self.term.height() as usize;
@@ -258,6 +377,83 @@ where
                 }
                 Flow::Continue
             }
+            Action::Rewind { entry, scope } => {
+                self.send_job(Job::Rewind { entry, scope });
+                Flow::Continue
+            }
+            Action::UndoRewind => {
+                self.send_job(Job::UndoRewind);
+                Flow::Continue
+            }
+            Action::ListModels => {
+                let models = self.app.host().models();
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(Background::Models(models.await));
+                });
+                Flow::Continue
+            }
+            Action::SwitchModel(id) => {
+                let cancel = CancellationToken::new();
+                self.cancel = Some(cancel.clone());
+                let switch = self.app.host().switch_model(&id, cancel);
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(Background::Switch(switch.await));
+                });
+                Flow::Continue
+            }
+            Action::Login { provider, device } => {
+                let cancel = CancellationToken::new();
+                self.cancel = Some(cancel.clone());
+                let (notes_tx, mut notes) = mpsc::unbounded_channel();
+                let login = self.app.host().login(&provider, device, notes_tx, cancel);
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let mut login = login;
+                    let result = loop {
+                        tokio::select! {
+                            result = &mut login => break result,
+                            Some(note) = notes.recv() => {
+                                let _ = tx.send(Background::Note(note));
+                            }
+                        }
+                    };
+                    // What it said before it ended comes first.
+                    while let Ok(note) = notes.try_recv() {
+                        let _ = tx.send(Background::Note(note));
+                    }
+                    let _ = tx.send(Background::Login(result));
+                });
+                Flow::Continue
+            }
+            Action::OpenSession(id) => {
+                // Reading the session and opening its checkpoints are the host's to do in the
+                // background, so the screen stays alive and Esc can stop them.
+                let resumed = id.is_some();
+                let cancel = CancellationToken::new();
+                self.cancel = Some(cancel.clone());
+                let opening = self.app.host().open_session(id.as_deref(), cancel.clone());
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => Err("stopped".to_string()),
+                        opened = opening => opened,
+                    };
+                    let _ = tx.send(Background::Session { resumed, result });
+                });
+                Flow::Continue
+            }
+            Action::Compact(focus) => {
+                let cancel = CancellationToken::new();
+                self.cancel = Some(cancel.clone());
+                if let Some(jobs) = &self.jobs {
+                    let _ = jobs.send(Job::Compact { focus, cancel });
+                    self.awaiting_context = true;
+                }
+                Flow::Continue
+            }
             Action::Interrupt => {
                 if let Some(cancel) = &self.cancel {
                     cancel.cancel();
@@ -266,6 +462,14 @@ where
             }
             Action::Quit => Flow::Quit,
         })
+    }
+
+    /// Gives `job` to the task that owns the agent.
+    fn send_job(&mut self, job: Job) {
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send(job);
+            self.awaiting_context = true;
+        }
     }
 
     /// Opens the plan in the user's editor, when they asked to edit it, and takes in the edited
@@ -382,6 +586,14 @@ where
         }
     }
 
+    /// Shows a message the host kept: a note when it starts `note: `, else a warning.
+    fn show_notice(&mut self, message: String) {
+        match message.strip_prefix("note: ") {
+            Some(note) => self.app.push_note(note),
+            None => self.show(AgentEvent::Warning { message }),
+        }
+    }
+
     /// Shows what the host has had to warn about; whether there was anything.
     fn host_warnings(&mut self) -> bool {
         let warnings = self.app.host().take_warnings();
@@ -408,14 +620,20 @@ where
             self.take_in(event);
         }
         self.host_warnings();
+        self.next_actions()?;
+        self.draw_soon()?;
+        Ok(Flow::Continue)
+    }
+
+    /// Once nothing runs: switches to the mode chosen during the turn, then sends queued input.
+    fn next_actions(&mut self) -> io::Result<()> {
         if let Some(action) = self.app.take_pending_mode() {
             self.dispatch(action)?;
         }
         if let Some(action) = self.app.next_queued() {
             self.dispatch(action)?;
         }
-        self.draw_soon()?;
-        Ok(Flow::Continue)
+        Ok(())
     }
 
     /// Shows an approval request, after the events that came before it.
@@ -441,11 +659,22 @@ where
         Ok(Flow::Continue)
     }
 
-    /// Takes in where the context goes after a job, and redraws the status line.
-    fn context(&mut self, context: ContextUsage) -> io::Result<Flow> {
+    /// Takes in what the runner says after a job, and redraws; queued input goes next.
+    fn update(&mut self, update: Update) -> io::Result<Flow> {
         self.awaiting_context = false;
-        self.app.set_context(context);
+        // Events the job sent come first.
+        while let Ok(event) = self.events.try_recv() {
+            self.show(event);
+        }
+        self.app.set_context(update.context);
+        let (points, can_undo) = update.rewind;
+        self.app.set_rewind(points, can_undo);
+        self.app.set_session_id(&update.session);
+        if let Some(done) = update.done {
+            self.app.on_done(done);
+        }
         self.host_warnings();
+        self.next_actions()?;
         self.draw()?;
         Ok(Flow::Continue)
     }
@@ -458,6 +687,57 @@ where
         Ok(Flow::Continue)
     }
 
+    /// Takes in what work in the background came back with.
+    fn background(&mut self, done: Background) -> io::Result<Flow> {
+        match done {
+            Background::Models(ids) => self.app.on_models(ids),
+            Background::Switch(Ok(switch)) => {
+                for message in switch.warnings {
+                    self.show(AgentEvent::Warning { message });
+                }
+                self.send_job(Job::SwitchModel {
+                    model: Box::new(switch.model),
+                    window_note: switch.window_note,
+                });
+            }
+            Background::Switch(Err(why)) => {
+                self.app.on_done(Done::Model(Err(why)));
+                self.next_actions()?;
+            }
+            Background::Session {
+                resumed,
+                result: Ok(opened),
+            } => {
+                for message in opened.warnings {
+                    self.show_notice(message);
+                }
+                self.send_job(Job::StartSession {
+                    session: Box::new(opened.session),
+                    checkpoints: opened.checkpoints,
+                    resumed,
+                });
+            }
+            Background::Session {
+                resumed,
+                result: Err(why),
+            } => {
+                self.app.on_done(Done::Session {
+                    resumed,
+                    result: Err(why),
+                });
+                self.next_actions()?;
+            }
+            Background::Note(note) => self.app.push_note(&note),
+            Background::Login(result) => {
+                self.app.on_done(Done::LoggedIn(result));
+                self.next_actions()?;
+            }
+        }
+        self.host_warnings();
+        self.draw()?;
+        Ok(Flow::Continue)
+    }
+
     /// Waits for the agent's next event, the runner's next message, or
     /// [`HOST_WARNINGS_EVERY`], and takes it in.
     pub async fn next(&mut self) -> io::Result<Flow> {
@@ -467,7 +747,8 @@ where
                 Some(event) => self.agent_event(event),
                 None => Ok(Flow::Quit),
             },
-            Some(context) = self.contexts.recv() => self.context(context),
+            Some(update) = self.updates.recv() => self.update(update),
+            Some(done) = self.background.recv() => self.background(done),
             Some((request, reply)) = self.approvals.recv() => self.approval(request, reply).await,
             _ = tokio::time::sleep_until(redraw_at), if redraw => {
                 self.draw().map(|()| Flow::Continue)
@@ -610,7 +891,8 @@ where
                     },
                     None => Flow::Quit,
                 },
-                Some(context) = self.contexts.recv() => self.context(context)?,
+                Some(update) = self.updates.recv() => self.update(update)?,
+                Some(done) = self.background.recv() => self.background(done)?,
                 // A request left unshown when the session ends is denied when its reply drops.
                 Some((request, reply)) = self.approvals.recv() => match self.keys(None, input).await? {
                     None => self.approval(request, reply).await?,
@@ -680,5 +962,37 @@ fn why_stopped(error: tokio::task::JoinError) -> String {
     {
         Some(message) => format!("it panicked: {message}"),
         None => "it panicked".into(),
+    }
+}
+
+/// What a failed rewind says. One that failed partway through restoring files has changed some,
+/// and offers to undo, which puts them back as they were.
+fn rewind_error(error: &RewindError) -> String {
+    match error {
+        RewindError::Restore(_) => format!(
+            "{error}; some files may be restored and others not: \"undo the last rewind\" is now offered in /rewind, to put them back"
+        ),
+        _ => error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use harness_core::checkpoint::CheckpointError;
+
+    use super::*;
+
+    // Review A minor 5.
+    #[test]
+    fn a_rewind_that_failed_partway_says_undo_is_offered() {
+        let half = RewindError::Restore(CheckpointError::Restore {
+            before: "abc123".into(),
+            source: Box::new(CheckpointError::TooSlow),
+        });
+        let said = rewind_error(&half);
+        assert!(said.contains("snapshot abc123"), "{said}");
+        assert!(said.contains("undo the last rewind"), "{said}");
+        let refused = rewind_error(&RewindError::NoCheckpoints);
+        assert_eq!(refused, RewindError::NoCheckpoints.to_string());
     }
 }

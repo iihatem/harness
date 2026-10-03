@@ -11,6 +11,9 @@ use harness_providers::{
     registry::Secrets,
 };
 
+/// Where environment variables are read: the process's own, or a test's.
+pub type Env = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 /// Everything a command needs about where it runs.
 pub struct Setup {
     pub paths: Paths,
@@ -23,6 +26,8 @@ pub struct Setup {
     /// The secrets nothing harness writes may hold: those in the environment from the start, and
     /// each key or token a provider is given.
     pub redactor: Arc<Redactor>,
+    /// Where API keys and the test hooks are read from the environment.
+    pub env: Env,
 }
 
 impl Setup {
@@ -39,6 +44,7 @@ impl Setup {
         Keys {
             credentials: &self.credentials,
             redactor: &self.redactor,
+            env: &self.env,
         }
     }
 }
@@ -48,11 +54,12 @@ impl Setup {
 pub struct Keys<'a> {
     credentials: &'a Arc<Credentials>,
     redactor: &'a Arc<Redactor>,
+    env: &'a Env,
 }
 
 impl Secrets for Keys<'_> {
     fn env(&self, var: &str) -> Option<String> {
-        env(var)
+        (self.env)(var)
     }
 
     fn profile(&self, provider: &str) -> Result<String, CredentialError> {
@@ -83,7 +90,16 @@ pub fn load() -> Result<Setup, String> {
         .and_then(|dir| dir.canonicalize())
         .map_err(|e| format!("cannot determine the working directory: {e}"))?;
     let paths = Paths::from_process_env().map_err(|e| e.to_string())?;
-    let credentials = Arc::new(Credentials::open(&paths.data_dir, env));
+    load_in(workspace, paths, Arc::new(env))
+}
+
+/// Loads the configuration for `workspace`, with `paths`, reading API keys, the credential
+/// store's settings (`HARNESS_CREDENTIAL_STORE`) and the test hooks from `env`.
+pub fn load_in(workspace: PathBuf, paths: Paths, env: Env) -> Result<Setup, String> {
+    let store_env = env.clone();
+    let credentials = Arc::new(Credentials::open(&paths.data_dir, move |var| {
+        store_env(var)
+    }));
     let redactor = Arc::new(known_secrets(&credentials));
     let redacted = |message: String| redactor.redact(&message);
     let trust = TrustStore::load(&paths.data_dir).map_err(|e| redacted(e.to_string()))?;
@@ -103,6 +119,7 @@ pub fn load() -> Result<Setup, String> {
         trust,
         credentials,
         redactor,
+        env,
     })
 }
 

@@ -18,6 +18,7 @@ chatgpt-login = ["harness-providers/chatgpt-login"]
 [dependencies]
 clap.workspace = true
 crossterm.workspace = true
+futures.workspace = true
 harness-config.workspace = true
 harness-context.workspace = true
 harness-core.workspace = true

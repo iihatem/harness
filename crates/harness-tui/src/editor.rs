@@ -64,6 +64,14 @@ impl Editor {
     /// An empty editor that recalls `history` (oldest first) with the Up key: its latest
     /// [`HISTORY_MAX`] entries, as far as they fit in 16 MiB, leaving out any too large to paste.
     pub fn new(history: Vec<String>) -> Editor {
+        Editor {
+            history: Self::recalled(history),
+            ..Editor::default()
+        }
+    }
+
+    /// What of `history` (oldest first) the editor recalls: as for [`new`](Self::new).
+    fn recalled(history: Vec<String>) -> Vec<String> {
         let mut kept = Vec::new();
         let mut bytes = 0;
         for entry in history.into_iter().rev() {
@@ -77,10 +85,7 @@ impl Editor {
             kept.push(entry);
         }
         kept.reverse();
-        Editor {
-            history: kept,
-            ..Editor::default()
-        }
+        kept
     }
 
     /// The text as shown, placeholders included.
@@ -141,6 +146,13 @@ impl Editor {
         self.remember(&full);
         self.clear();
         (shown, full)
+    }
+
+    /// Recalls `history` (oldest first) from now on, instead of the inputs so far: another
+    /// session's.
+    pub fn set_history(&mut self, history: Vec<String>) {
+        self.history = Self::recalled(history);
+        self.recall = None;
     }
 
     /// Adds `text` to the history without sending it (input sent some other way). As for the

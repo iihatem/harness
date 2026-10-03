@@ -175,6 +175,15 @@ impl TerminalInput {
         })
     }
 
+    /// Ends the session's reading, and waits until the reader no longer reads the terminal (a
+    /// read in the middle of a sequence finishes first), so that what reads the terminal next
+    /// (another [`TerminalInput`], or the questions asked at startup) is the only one.
+    pub fn stop(self) {
+        let paused = InputPause(self.control.clone()).pause();
+        drop(self);
+        drop(paused);
+    }
+
     /// Stops the reader while another program reads the terminal.
     pub fn pauser(&self) -> InputPause {
         InputPause(self.control.clone())

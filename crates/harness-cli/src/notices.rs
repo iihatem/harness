@@ -12,6 +12,8 @@ pub struct Notices {
     redactor: Arc<Redactor>,
     /// What was printed, redacted, as the messages of warning events.
     kept: Vec<String>,
+    /// Keep without printing: the terminal UI shows them itself.
+    quiet: bool,
 }
 
 impl Notices {
@@ -19,21 +21,40 @@ impl Notices {
         Notices {
             redactor,
             kept: Vec::new(),
+            quiet: false,
+        }
+    }
+
+    /// Notices that are kept, redacted, but not printed: for the terminal UI, while nothing
+    /// else may write to the terminal.
+    pub fn quiet(redactor: Arc<Redactor>) -> Notices {
+        Notices {
+            quiet: true,
+            ..Notices::new(redactor)
         }
     }
 
     /// Prints `warning: <message>`, and keeps it.
     pub fn warn(&mut self, message: &str) {
         let message = self.redactor.redact(message);
-        eprintln!("warning: {}", terminal_safe(&message));
+        if !self.quiet {
+            eprintln!("warning: {}", terminal_safe(&message));
+        }
         self.kept.push(message);
     }
 
     /// Prints `note: <message>`, and keeps it.
     pub fn note(&mut self, message: &str) {
         let message = self.redactor.redact(message);
-        eprintln!("note: {}", terminal_safe(&message));
+        if !self.quiet {
+            eprintln!("note: {}", terminal_safe(&message));
+        }
         self.kept.push(format!("note: {message}"));
+    }
+
+    /// What was kept, as warnings' messages; a note's starts `note: `.
+    pub fn into_messages(self) -> Vec<String> {
+        self.kept
     }
 
     /// Keeps `message`, a warning that was printed already.
@@ -53,6 +74,19 @@ impl Notices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_notices_are_kept_for_the_terminal_ui() {
+        let redactor = Arc::new(Redactor::default());
+        redactor.add("sk-canary-0123456789");
+        let mut notices = Notices::quiet(redactor);
+        notices.warn("the key sk-canary-0123456789 is odd");
+        notices.note("a note");
+        assert_eq!(
+            notices.into_messages(),
+            ["the key [redacted] is odd", "note: a note"]
+        );
+    }
 
     #[test]
     fn notices_are_kept_redacted() {

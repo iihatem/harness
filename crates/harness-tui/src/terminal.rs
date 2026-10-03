@@ -2,7 +2,8 @@
 //! included, since raw mode also turns off XON/XOFF flow control), bracketed paste (a paste
 //! arrives as one event), and, where the terminal supports it, disambiguated keys (so
 //! Shift+Enter differs from Enter). They are undone in reverse order when harness leaves, or
-//! hands the terminal to an editor.
+//! hands the terminal to an editor. Full-screen views (the pickers) use the terminal's
+//! alternate screen, which gives the inline screen back as it was when they close.
 
 use std::{
     io::{self, Write},
@@ -12,12 +13,16 @@ use std::{
     },
 };
 
-use ratatui::crossterm::{
-    event::{
-        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+use ratatui::{
+    backend::CrosstermBackend,
+    crossterm::{
+        event::{
+            DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+            PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        },
+        queue,
+        terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     },
-    queue, terminal,
 };
 
 /// Turns the terminal's raw mode on and off.
@@ -49,6 +54,10 @@ pub struct Modes<W: Write, R: RawMode> {
     /// The modes are set; shared with the panic hook [`leave_on_panic`](Self::leave_on_panic)
     /// sets.
     active: Arc<AtomicBool>,
+    /// A full-screen view is open on the alternate screen ([`CrosstermAltScreen`]); leaving the
+    /// modes leaves it first, so a panic, a signal or the end of the session while a picker is
+    /// open gives back the normal screen.
+    alt: Arc<AtomicBool>,
 }
 
 impl<W: Write, R: RawMode> Modes<W, R> {
@@ -60,6 +69,7 @@ impl<W: Write, R: RawMode> Modes<W, R> {
             raw,
             keyboard,
             active: Arc::default(),
+            alt: Arc::default(),
         };
         modes.resume()?;
         Ok(modes)
@@ -81,7 +91,14 @@ impl<W: Write, R: RawMode> Modes<W, R> {
         if !self.active.swap(false, Ordering::SeqCst) {
             return Ok(());
         }
-        leave(&mut self.out, &mut self.raw, self.keyboard)
+        leave(&mut self.out, &mut self.raw, self.keyboard, &self.alt)
+    }
+
+    /// The alternate screen for full-screen views, which these modes leave if one is open.
+    pub fn alt_screen(&self) -> CrosstermAltScreen {
+        CrosstermAltScreen {
+            open: self.alt.clone(),
+        }
     }
 
     pub fn out(&self) -> &W {
@@ -102,12 +119,13 @@ impl<W: Write, R: RawMode> Modes<W, R> {
     {
         let active = self.active.clone();
         let keyboard = self.keyboard;
+        let alt = self.alt.clone();
         let raw = Mutex::new(raw);
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let mut raw = raw.lock().unwrap_or_else(PoisonError::into_inner);
-            let left =
-                active.load(Ordering::SeqCst) && leave(&mut out(), &mut *raw, keyboard).is_ok();
+            let left = active.load(Ordering::SeqCst)
+                && leave(&mut out(), &mut *raw, keyboard, &alt).is_ok();
             previous(info);
             if left && raw.enable().is_ok() {
                 let _ = enter(&mut out(), keyboard);
@@ -131,7 +149,15 @@ fn enter(out: &mut impl Write, keyboard: bool) -> io::Result<()> {
 
 /// Undoes the modes in reverse order: disambiguated keys when `keyboard`, bracketed paste, then
 /// raw mode.
-fn leave(out: &mut impl Write, raw: &mut impl RawMode, keyboard: bool) -> io::Result<()> {
+fn leave(
+    out: &mut impl Write,
+    raw: &mut impl RawMode,
+    keyboard: bool,
+    alt: &AtomicBool,
+) -> io::Result<()> {
+    if alt.swap(false, Ordering::SeqCst) {
+        queue!(out, LeaveAlternateScreen)?;
+    }
     if keyboard {
         queue!(out, PopKeyboardEnhancementFlags)?;
     }
@@ -143,5 +169,35 @@ fn leave(out: &mut impl Write, raw: &mut impl RawMode, keyboard: bool) -> io::Re
 impl<W: Write, R: RawMode> Drop for Modes<W, R> {
     fn drop(&mut self) {
         let _ = self.suspend();
+    }
+}
+
+/// A terminal's alternate screen, for full-screen views on `B`: a blank screen of its own,
+/// which gives the normal screen back as it was, cursor included, when left. What harness wrote
+/// to the normal screen, and the scrollback, are untouched meanwhile.
+pub trait AltScreen<B> {
+    fn enter(&mut self, backend: &mut B) -> io::Result<()>;
+    fn leave(&mut self, backend: &mut B) -> io::Result<()>;
+}
+
+/// The real terminal's alternate screen (`ESC [ ? 1049 h`, and `l` to leave), through
+/// crossterm.
+#[derive(Default)]
+pub struct CrosstermAltScreen {
+    /// Whether the screen is open, for [`Modes`] to leave it should the session end meanwhile.
+    open: Arc<AtomicBool>,
+}
+
+impl<W: Write> AltScreen<CrosstermBackend<W>> for CrosstermAltScreen {
+    fn enter(&mut self, backend: &mut CrosstermBackend<W>) -> io::Result<()> {
+        queue!(backend, EnterAlternateScreen)?;
+        self.open.store(true, Ordering::SeqCst);
+        backend.flush()
+    }
+
+    fn leave(&mut self, backend: &mut CrosstermBackend<W>) -> io::Result<()> {
+        queue!(backend, LeaveAlternateScreen)?;
+        self.open.store(false, Ordering::SeqCst);
+        backend.flush()
     }
 }

@@ -9,19 +9,20 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use common::*;
+use common::{roles::switches, *};
 use futures::future::BoxFuture;
 use harness_core::{
     agent::{Agent, NonInteractive},
     compaction::SUMMARY_SYSTEM,
     event::{AgentEvent, TurnEndReason},
-    message::{ChatRequest, RequestOptions},
+    message::{ChatRequest, RequestOptions, Usage},
     meter::{
         AccountKind, Avoided, BudgetKind, BudgetNotice, BudgetStatus, Meter, RequestCost,
         RequestRecord,
     },
     permission::Mode,
-    role::{ModelResolver, Role, RoleConfig},
+    provider::{FinishReason, ProviderEvent},
+    role::{ModelResolver, Role, RoleConfig, SwitchReason},
     session::Session,
     testing::{MockProvider, Script},
     turn::{TurnInput, TurnModel},
@@ -161,7 +162,9 @@ async fn a_role_whose_model_cannot_be_used_ends_the_turn_without_a_request() {
     assert!(
         message.contains("plan role")
             && message.contains("plan/big has no credentials")
-            && message.contains("/model --role plan"),
+            && message.contains("/model --role plan")
+            // `harness ask` has no slash commands: the configuration is the other way.
+            && message.contains("[roles].plan in config.toml"),
         "{message}"
     );
     assert!(matches!(
@@ -187,6 +190,46 @@ async fn a_commands_model_goes_over_the_role() {
     agent.run_turn(input, &tx, CancellationToken::new()).await;
     assert_eq!(command.requests().len(), 1);
     assert!(plan.requests().is_empty() && main.requests().is_empty());
+}
+
+// A command file's `model:` is a switch of the user's own: it is announced with the reason
+// `user`, for `ask --json` and any other frontend, and the way back to main is announced too.
+#[tokio::test]
+async fn a_commands_model_is_announced_as_a_user_switch() {
+    let main = MockProvider::new(vec![Script::text("main again")]);
+    let command = MockProvider::new(vec![Script::text("from the command")]);
+    let mut agent = planning(&main, RoleConfig::default(), vec![]);
+    let input = TurnInput {
+        model: Some(model("cmd/x", &command, 50_000)),
+        ..TurnInput::from("go")
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.run_turn(input, &tx, CancellationToken::new()).await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    assert_eq!(
+        switches(&events),
+        [(
+            "mock/m1".to_string(),
+            "cmd/x".to_string(),
+            Role::Plan,
+            SwitchReason::User
+        )]
+    );
+    // The next turn, on main again, is announced as the way back.
+    let (_, events) = run(&mut agent, "and now").await;
+    assert_eq!(
+        switches(&events),
+        [(
+            "cmd/x".to_string(),
+            "mock/m1".to_string(),
+            Role::Plan,
+            SwitchReason::User
+        )]
+    );
 }
 
 // `/model --role plan <id>`: the session's own setting is used from the next turn.
@@ -437,4 +480,86 @@ async fn a_background_window_smaller_than_the_part_to_summarize_fails_with_a_war
     assert!(background.requests().is_empty());
     // The conversation is as it was, plus the new turn.
     assert_eq!(&agent.history()[..before.len()], &before[..]);
+}
+
+// The tokens the last request reported are counted by the model that answered it: a turn on
+// another model estimates its input afresh instead of trusting them.
+#[tokio::test]
+async fn a_turn_on_another_model_does_not_trust_the_last_models_token_counts() {
+    let main = MockProvider::new(vec![
+        Script::Reply(vec![
+            Ok(ProviderEvent::TextDelta("noted".into())),
+            Ok(ProviderEvent::Usage(Usage {
+                input_tokens: 50_000,
+                ..Default::default()
+            })),
+            Ok(ProviderEvent::Finished(FinishReason::Stop)),
+        ]),
+        Script::text("never asked"),
+    ]);
+    let plan = MockProvider::new(vec![Script::text("a plan")]);
+    let mut agent = planning(&main, plan_role(), vec![model("plan/big", &plan, 60_000)]);
+    agent.set_mode(Mode::Auto);
+    run(&mut agent, "hello").await;
+    agent.set_mode(Mode::Plan);
+    let (reason, events) = run(&mut agent, "plan it").await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compacted { .. } | AgentEvent::Warning { .. })),
+        "{events:?}"
+    );
+    assert_eq!(plan.requests().len(), 1);
+    assert_eq!(main.requests().len(), 1);
+}
+
+/// A meter that always says a budget is paused, which stops nothing.
+struct Paused;
+
+impl Meter for Paused {
+    fn record_request(&self, _request: &RequestRecord) -> RequestCost {
+        RequestCost {
+            account: AccountKind::ApiKey,
+            billed_usd: Some(0.0),
+            list_usd: Some(0.0),
+            avoided: Avoided::NotApplicable,
+        }
+    }
+
+    fn check_budget(&self, _session: &str, _account: AccountKind) -> BudgetStatus {
+        BudgetStatus {
+            paused: Some(BudgetNotice {
+                budget: BudgetKind::Daily,
+                spent_usd: 5.0,
+                limit_usd: 5.0,
+            }),
+            ..BudgetStatus::default()
+        }
+    }
+}
+
+// A paused budget is said once per turn, however many times it is checked: before the request,
+// and again for a compaction.
+#[tokio::test]
+async fn a_paused_budget_is_said_once_in_a_turn_that_also_compacts() {
+    let main = MockProvider::new(vec![
+        Script::text("noted"),
+        Script::text("summary"),
+        Script::text("answer"),
+    ]);
+    let mut agent = after_a_long_turn(&main, RoleConfig::default(), vec![], None).await;
+    agent = agent.with_meter(Arc::new(Paused));
+    let (_, events) = run(&mut agent, "short question").await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compacted { .. })),
+        "{events:?}"
+    );
+    let said = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Warning { message } if message.contains("paused")))
+        .count();
+    assert_eq!(said, 1, "{events:?}");
 }

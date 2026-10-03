@@ -179,9 +179,6 @@ impl ProviderError {
         .any(|phrase| text.contains(phrase))
     }
 
-    /// What kind of failure this is, in the word the usage ledger records after `error:`:
-    /// `unavailable` (a 5xx, or a network error), `rate_limited`, `quota`, `spend_cap`, `auth`,
-    /// `context_overflow`, `rejected` (another 4xx) or `protocol`.
     /// Whether a configured fallback chain may answer this failure: a rate limit, an exhausted
     /// quota or window, an overload, or an unavailable provider (the retries are over by the time
     /// this is asked). Never an authentication error, another 4xx, a context overflow or a spend
@@ -195,6 +192,9 @@ impl ProviderError {
         }
     }
 
+    /// What kind of failure this is, in the word the usage ledger records after `error:`:
+    /// `unavailable` (a 5xx, or a network error), `rate_limited`, `quota`, `spend_cap`, `auth`,
+    /// `context_overflow`, `rejected` (another 4xx) or `protocol`.
     pub fn kind(&self) -> &'static str {
         if self.is_spend_cap() {
             return "spend_cap";

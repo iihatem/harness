@@ -43,6 +43,17 @@ impl ModelResolver for CliResolver {
         .unwrap_or_default()
     }
 
+    fn runs_locally(&self, id: &str) -> Option<bool> {
+        let provider = id.split('/').next().unwrap_or_default();
+        let base_url = self
+            .setup
+            .config
+            .providers
+            .get(provider)
+            .map_or("", |p| p.base_url.as_str());
+        Some(harness_providers::profiles::is_local(id, base_url))
+    }
+
     fn resolve(
         &self,
         id: &str,
@@ -185,6 +196,15 @@ mod tests {
         );
         assert_eq!(resolver.chain("ChatGPT/o3"), ["openai/a"]);
         assert!(resolver.chain("openai/gpt-5").is_empty());
+    }
+
+    // Which side a model is on is known without making it ready.
+    #[test]
+    fn the_side_of_a_model_is_known_without_making_it_ready() {
+        let (_dir, resolver) = resolver(LOCAL, &[]);
+        assert_eq!(resolver.runs_locally("mine/x"), Some(true));
+        assert_eq!(resolver.runs_locally("ollama/llama3"), Some(true));
+        assert_eq!(resolver.runs_locally("openai/gpt-5"), Some(false));
     }
 
     #[tokio::test]

@@ -300,4 +300,11 @@ pub trait ModelResolver: Send + Sync {
     fn chain(&self, _model_id: &str) -> Vec<String> {
         Vec::new()
     }
+
+    /// Whether `id` runs on a server of the user's own, when that is known without making the
+    /// model ready (which can load it into memory). A fallback skips a candidate on the other
+    /// side of local and hosted before it is made ready.
+    fn runs_locally(&self, _id: &str) -> Option<bool> {
+        None
+    }
 }

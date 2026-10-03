@@ -275,8 +275,6 @@ pub struct GateCounts {
     pub skipped: u32,
 }
 
-/// One finished turn: how it went, as counts and ids; never the prompt, the reply, paths or
-/// commands.
 /// How a Build turn got the conversation, for its outcome record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandoffRecord {
@@ -286,6 +284,8 @@ pub struct HandoffRecord {
     pub forced: bool,
 }
 
+/// One finished turn: how it went, as counts and ids; never the prompt, the reply, paths or
+/// commands.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnRecord {
     pub session: String,

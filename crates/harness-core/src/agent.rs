@@ -390,6 +390,8 @@ pub struct Agent {
     /// Input tokens the provider reported for the last request, and how many messages it had;
     /// `None` until a provider reports usage, and after the history changes.
     reported_usage: Option<(u64, usize)>,
+    /// Whether this turn already said a budget is paused: once per turn, wherever it is checked.
+    said_paused: std::sync::atomic::AtomicBool,
     validators: HashMap<String, jsonschema::Validator>,
     invalid_calls: u32,
     /// Tool-call ids already used in this session, so a missing or repeated id (from a model or
@@ -489,6 +491,7 @@ impl Agent {
             message_recorded: true,
             held_entries: Vec::new(),
             reported_usage: None,
+            said_paused: std::sync::atomic::AtomicBool::new(false),
             validators,
             invalid_calls: 0,
             used_call_ids: HashSet::new(),
@@ -637,10 +640,10 @@ impl Agent {
 
     /// Asks the meter whether the budgets allow the next request: says each 80% warning, and
     /// whether one is reached (said as an event too).
-    fn budget_reached(&self, events: &UnboundedSender<AgentEvent>, said_paused: &mut bool) -> bool {
+    fn budget_reached(&self, events: &UnboundedSender<AgentEvent>) -> bool {
         let who = self.answering();
         let account = AccountKind::of(&who.model, who.local);
-        match self.budget_check(account, events, said_paused) {
+        match self.budget_check(account, events) {
             Some(notice) => {
                 let _ = events.send(AgentEvent::BudgetReached { notice });
                 true
@@ -655,7 +658,6 @@ impl Agent {
         &self,
         account: AccountKind,
         events: &UnboundedSender<AgentEvent>,
-        said_paused: &mut bool,
     ) -> Option<BudgetNotice> {
         let meter = self.meter.as_ref()?;
         let status = meter.check_budget(self.session.id(), account);
@@ -666,7 +668,9 @@ impl Agent {
             let _ = events.send(AgentEvent::Warning { message });
         }
         if let Some(notice) = status.paused
-            && !std::mem::replace(said_paused, true)
+            && !self
+                .said_paused
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             let _ = events.send(AgentEvent::Warning {
                 message: notice.paused_message(),
@@ -1318,6 +1322,11 @@ impl Agent {
             _ => Role::Main,
         });
         self.turn_role = role;
+        // The model that answered the last request counted its tokens its own way: after a
+        // fallback it was not the one this turn starts on.
+        if self.fell_back {
+            self.reported_usage = None;
+        }
         self.fell_back = false;
         self.escalation = EscalationState::default();
         self.turn_model = None;
@@ -1352,20 +1361,21 @@ impl Agent {
             }
             _ => self.main_reason,
         };
-        if input.model.is_none() {
-            let to = role_model
-                .as_ref()
-                .map_or_else(|| self.config.model_id.clone(), |m| m.id.clone());
-            if to != self.last_role_model {
-                let from = std::mem::replace(&mut self.last_role_model, to.clone());
-                let _ = events.send(AgentEvent::ModelSwitched {
-                    from,
-                    to,
-                    role,
-                    reason: SwitchReason::User,
-                    detail: None,
-                });
-            }
+        // A command file's model is the user's own choice, announced like the other switches.
+        let to = match (&input.model, &role_model) {
+            (Some(m), _) | (None, Some(m)) => m.id.clone(),
+            (None, None) => self.config.model_id.clone(),
+        };
+        if to != self.last_role_model {
+            self.reported_usage = None;
+            let from = std::mem::replace(&mut self.last_role_model, to.clone());
+            let _ = events.send(AgentEvent::ModelSwitched {
+                from,
+                to,
+                role,
+                reason: SwitchReason::User,
+                detail: None,
+            });
         }
         // Where the plan goes, and what went before it.
         let target = role_model
@@ -1446,14 +1456,18 @@ impl Agent {
         }
 
         let mut auto_compaction_failed = false;
-        let mut said_paused = false;
+        self.said_paused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         for _ in 0..self.config.max_steps {
             // Before each request, not each turn: a turn with many tool calls can overrun.
-            if self.budget_reached(events, &mut said_paused) {
+            if self.budget_reached(events) {
                 return self.finish(TurnEndReason::Budget, events);
             }
             if !auto_compaction_failed {
                 auto_compaction_failed = !self.compact_automatically(events, &cancel).await;
+                if cancel.is_cancelled() {
+                    return self.finish(TurnEndReason::Interrupted, events);
+                }
             }
             let mut outcome = self.call_model_compacting(events, &cancel).await;
             // A request that failed in a way a chain can answer is sent again on its next usable
@@ -1462,9 +1476,16 @@ impl Agent {
                 && !partial.emitted
                 && error.is_fallback_trigger()
                 && !cancel.is_cancelled()
-                && self.fall_back(error, events, &cancel).await
             {
-                outcome = self.call_model_compacting(events, &cancel).await;
+                let failed = self.model_id().to_string();
+                if self.fall_back(error, events, &cancel).await {
+                    // What the failed attempt reported is billed under the model that failed,
+                    // and counts in the turn's totals as in the ledger.
+                    self.tally_for(&failed, partial, events);
+                    outcome = self.call_model_compacting(events, &cancel).await;
+                } else if cancel.is_cancelled() {
+                    outcome = ModelOutcome::Interrupted(ModelReply::default());
+                }
             }
             match &outcome {
                 ModelOutcome::Reply(reply)
@@ -1801,15 +1822,17 @@ impl Agent {
         let before = self.estimated_tokens();
         // The model of the `background` role writes it, `main` when that is not set, and no
         // other model: not the model answering this turn, whatever that is.
-        let summarizer = self
-            .summarizer(cancel)
-            .await
-            .map_err(CompactError::Failed)?;
+        let summarizer = match self.summarizer(cancel).await {
+            Ok(summarizer) => summarizer,
+            // Esc while the model is made ready is a stop, not a failure.
+            Err(_) if cancel.is_cancelled() => return Err(CompactError::Interrupted),
+            Err(why) => return Err(CompactError::Failed(why)),
+        };
         // A summary is a request like any other: a billed model is not asked once a budget is
         // reached, whatever the turn's own model costs. A manual `/compact` is not checked.
         if trigger != Trigger::Manual {
             let account = AccountKind::of(&summarizer.who.model, summarizer.who.local);
-            if let Some(notice) = self.budget_check(account, events, &mut false) {
+            if let Some(notice) = self.budget_check(account, events) {
                 return Err(CompactError::Failed(notice.reached_message()));
             }
         }
@@ -2042,7 +2065,7 @@ impl Agent {
             .await
             .map_err(|why| {
                 format!(
-                    "the {role} role's model {id} cannot be used: {why}; set another with /model --role {role} <id>"
+                    "the {role} role's model {id} cannot be used: {why}; set another with /model --role {role} <id>, or change [roles].{role} in config.toml"
                 )
             })
     }
@@ -2178,8 +2201,18 @@ impl Agent {
         let mut skipped = Vec::new();
         let mut chosen = None;
         for id in chain.into_iter().filter(|id| *id != failed) {
+            // The other side of local and hosted: skipped before it is made ready, which can
+            // load a model into memory, and silently.
+            if resolver
+                .runs_locally(&id)
+                .is_some_and(|local| local != failed_local)
+            {
+                continue;
+            }
             let model = match resolver.resolve(&id, cancel.clone()).await {
                 Ok(model) => model,
+                // Esc while a candidate is made ready is a stop, not a candidate to list.
+                Err(_) if cancel.is_cancelled() => return false,
                 Err(why) => {
                     skipped.push(format!("{id} ({why})"));
                     continue;
@@ -2192,7 +2225,7 @@ impl Agent {
                 continue;
             }
             let account = AccountKind::of(&model.id, options.local);
-            if let Some(notice) = self.budget_check(account, events, &mut false) {
+            if let Some(notice) = self.budget_check(account, events) {
                 skipped.push(format!("{id} ({})", notice.reached_message()));
                 continue;
             }
@@ -2226,6 +2259,7 @@ impl Agent {
             detail: Some(format!("{failed} {failure}; {} {billing}", model.id)),
         });
         self.fell_back = true;
+        self.reported_usage = None;
         self.turn_reason = Some(SwitchReason::Fallback);
         self.turn_model = Some(model);
         true
@@ -2458,7 +2492,13 @@ impl Agent {
     /// that reports usage cumulatively, in every chunk (redact.rs knows such servers exist), must
     /// not be counted once per chunk, only once per reply, with the last chunk's number.
     fn tally(&mut self, reply: &ModelReply, events: &UnboundedSender<AgentEvent>) {
-        self.stats.model = Some(self.model_id().to_string());
+        let model = self.model_id().to_string();
+        self.tally_for(&model, reply, events);
+    }
+
+    /// [`tally`](Self::tally) for a request `model` answered.
+    fn tally_for(&mut self, model: &str, reply: &ModelReply, events: &UnboundedSender<AgentEvent>) {
+        self.stats.model = Some(model.to_string());
         if let (Some(started), Some(first)) = (reply.started, reply.first_output) {
             if self.stats.time_to_first_token.is_none() {
                 self.stats.time_to_first_token = Some(first - started);
@@ -2474,7 +2514,7 @@ impl Agent {
             self.stats.usage.cache_write_1h_tokens += usage.cache_write_1h_tokens;
             self.stats.usage.reasoning_tokens += usage.reasoning_tokens;
             let _ = events.send(AgentEvent::Usage {
-                model: self.model_id().to_string(),
+                model: model.to_string(),
                 usage,
             });
         }

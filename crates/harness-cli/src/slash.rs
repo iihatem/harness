@@ -138,7 +138,6 @@ pub fn turn_input(
     if let Some(model) = expansion.model {
         match registry::resolve(&model, &setup.config.providers, setup.keys()) {
             Ok(resolved) => {
-                messages.push(Message::Note(runs_on(&command.name, &resolved.id)));
                 input.model = Some(turn_model(
                     resolved,
                     &setup.config.profiles,
@@ -180,11 +179,6 @@ pub(crate) fn turn_model(
         id: resolved.id,
         name: resolved.model,
     }
-}
-
-/// The note that command `name` runs on `model`.
-fn runs_on(name: &str, model: &str) -> String {
-    format!("/{name} runs on {model}, as its command file asks")
 }
 
 /// The warning that command `name` asks for `model`, which `error` keeps from being used.
@@ -331,16 +325,12 @@ mod tests {
     // Review C, minor 7: a command's name is printed like any other text from a file: the
     // messages carry it as it is, and are escaped where they are printed.
     #[test]
-    fn model_messages_name_the_command_and_are_printed_safely() {
+    fn model_warning_names_the_command_and_is_printed_safely() {
         let name = "x\u{1b}[2J";
-        for message in [
-            runs_on(name, "mock/m"),
-            cannot_use(name, "mock/m", "unknown provider"),
-        ] {
-            assert!(message.contains("/x\u{1b}[2J"), "{message:?}");
-            let printed = terminal_safe(&message);
-            assert!(!printed.contains('\u{1b}'), "{printed:?}");
-            assert!(printed.contains("/x\\u{1b}[2J"), "{printed:?}");
-        }
+        let message = cannot_use(name, "mock/m", "unknown provider");
+        assert!(message.contains("/x\u{1b}[2J"), "{message:?}");
+        let printed = terminal_safe(&message);
+        assert!(!printed.contains('\u{1b}'), "{printed:?}");
+        assert!(printed.contains("/x\\u{1b}[2J"), "{printed:?}");
     }
 }

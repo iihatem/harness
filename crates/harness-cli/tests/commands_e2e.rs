@@ -306,7 +306,7 @@ async fn a_project_commands_model_applies_only_once_the_workspace_is_trusted() {
     assert!(trusted.status.success(), "{trusted:?}");
     let stderr = String::from_utf8_lossy(&trusted.stderr);
     assert!(
-        stderr.contains("note: /pick runs on mock/command-model"),
+        stderr.contains("switched to mock/command-model (main role, from mock/"),
         "{stderr}"
     );
     assert_eq!(
@@ -328,7 +328,8 @@ async fn a_global_commands_model_applies_without_trust() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("note: /pick runs on mock/command-model")
+        String::from_utf8_lossy(&output.stderr)
+            .contains("switched to mock/command-model (main role, from mock/")
     );
     assert_eq!(requested_models(&server).await, ["command-model"]);
 }
@@ -387,7 +388,8 @@ async fn a_workspace_with_only_command_files_can_be_trusted() {
     );
     assert!(trusted.status.success(), "{trusted:?}");
     assert!(
-        String::from_utf8_lossy(&trusted.stderr).contains("note: /pick runs on mock/command-model"),
+        String::from_utf8_lossy(&trusted.stderr)
+            .contains("switched to mock/command-model (main role, from mock/"),
         "{trusted:?}"
     );
     assert_eq!(
@@ -493,7 +495,7 @@ async fn a_trusted_repository_roots_command_files_choose_their_model_in_a_subdir
     assert!(output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("note: /pick runs on mock/command-model"),
+        stderr.contains("switched to mock/command-model (main role, from mock/"),
         "{stderr}"
     );
     assert_eq!(requested_models(&server).await, ["command-model"]);

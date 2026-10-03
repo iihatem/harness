@@ -12,12 +12,13 @@ use common::{roles::*, *};
 use harness_core::{
     agent::{Agent, NonInteractive},
     event::{AgentEvent, TurnEndReason},
+    message::Usage,
     meter::{
         AccountKind, Avoided, BudgetKind, BudgetNotice, BudgetStatus, Meter, RequestCost,
         RequestRecord,
     },
     permission::Mode,
-    provider::ProviderError,
+    provider::{FinishReason, ProviderError, ProviderEvent},
     retry::RetryPolicy,
     role::{Role, SwitchReason},
     session::Session,
@@ -511,4 +512,117 @@ async fn a_plan_turn_moved_by_a_fallback_is_attributed_to_plan_and_fallback() {
             ..
         } if model == "openai/gpt-5"
     )));
+}
+
+// What the failed first attempt reported is billed, and shown in the turn's totals as in
+// `/usage`: the status line and the ledger agree.
+#[tokio::test]
+async fn the_failed_attempts_usage_counts_in_the_turns_totals() {
+    let fallback = candidate("openai/gpt-5", vec![Script::text("from the fallback")]);
+    let (mut agent, _primary) = setup(
+        vec![Script::Reply(vec![
+            Ok(ProviderEvent::Usage(Usage {
+                input_tokens: 777,
+                ..Default::default()
+            })),
+            Err(http(429, QUOTA)),
+        ])],
+        &[&fallback],
+        &["openai/gpt-5"],
+    );
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Usage { model, usage } if model == "mock/m1" && usage.input_tokens == 777
+        )),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnStats {
+                input_tokens: 777,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+}
+
+// The tokens a fallback model reported are not the primary's: the next turn, back on the
+// primary, estimates its input afresh.
+#[tokio::test]
+async fn the_return_after_a_fallback_does_not_trust_the_fallbacks_token_counts() {
+    let fallback = candidate(
+        "openai/gpt-5",
+        vec![Script::Reply(vec![
+            Ok(ProviderEvent::TextDelta("from the fallback".into())),
+            Ok(ProviderEvent::Usage(Usage {
+                input_tokens: 350_000,
+                ..Default::default()
+            })),
+            Ok(ProviderEvent::Finished(FinishReason::Stop)),
+        ])],
+    );
+    let (mut agent, primary) = setup(
+        vec![quota(), Script::text("primary again")],
+        &[&fallback],
+        &["openai/gpt-5"],
+    );
+    run(&mut agent, "go").await;
+    let (reason, events) = run(&mut agent, "next").await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compacted { .. } | AgentEvent::Warning { .. })),
+        "{events:?}"
+    );
+    assert_eq!(primary.requests().len(), 2);
+}
+
+/// A resolver that knows which side a model is on without making it ready, and counts how often
+/// one is made ready.
+struct Sides(std::sync::atomic::AtomicUsize);
+
+impl harness_core::role::ModelResolver for Sides {
+    fn chain(&self, _model_id: &str) -> Vec<String> {
+        vec!["ollama/llama3".to_string()]
+    }
+
+    fn runs_locally(&self, id: &str) -> Option<bool> {
+        Some(id.starts_with("ollama/"))
+    }
+
+    fn resolve(
+        &self,
+        _id: &str,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> futures::future::BoxFuture<'static, Result<TurnModel, String>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Err("a model loading into memory".to_string()) })
+    }
+}
+
+// A candidate on the other side of local and hosted is skipped before it is made ready, which
+// can load a model into memory, and silently: the spec has no warning for a side skip.
+#[tokio::test]
+async fn a_candidate_on_the_other_side_is_not_made_ready_and_not_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = MockProvider::new(vec![quota()]);
+    let sides = Arc::new(Sides(Default::default()));
+    let mut agent = agent(primary, Mode::Auto, Arc::new(NonInteractive), dir.path())
+        .with_resolver(sides.clone());
+    fast_retries(&mut agent);
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Error, "{events:?}");
+    assert_eq!(sides.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Warning { .. })),
+        "{events:?}"
+    );
 }

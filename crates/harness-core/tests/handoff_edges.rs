@@ -29,6 +29,10 @@ const PLAN: &str = "1. Read src/login.rs\n2. Add a limiter";
 struct Loading;
 
 impl ModelResolver for Loading {
+    fn chain(&self, _model_id: &str) -> Vec<String> {
+        vec!["chain/slow".to_string()]
+    }
+
     fn resolve(
         &self,
         _id: &str,
@@ -276,4 +280,72 @@ async fn a_compaction_inside_a_reduced_build_turn_keeps_the_set_aside_conversati
         &next.messages[0],
         Message::User { content } if content.starts_with(SUMMARY_PREFIX)
     ));
+}
+
+// Esc while the background model is made ready for a compaction is a stop, not a failure to
+// compact: no warning.
+#[tokio::test]
+async fn esc_while_the_background_model_is_made_ready_gives_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = MockProvider::new(vec![Script::text("noted"), Script::text("never")]);
+    let mut agent = agent(
+        main.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    )
+    .with_roles(RoleConfig {
+        background: Some("bg/slow".into()),
+        ..RoleConfig::default()
+    })
+    .with_resolver(Arc::new(Loading));
+    run(&mut agent, &"x".repeat(8_000)).await;
+    agent.config_mut().context_window = 2_500;
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.cancel();
+    });
+    let (reason, events) = run_with(&mut agent, "short question", cancel).await;
+    assert_eq!(reason, TurnEndReason::Interrupted, "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Warning { .. } | AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+}
+
+// Esc while a fallback candidate is made ready ends the turn as a stop, with no list of skipped
+// candidates.
+#[tokio::test]
+async fn esc_while_a_fallback_model_is_made_ready_gives_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = MockProvider::new(vec![Script::error(ProviderError::Http {
+        status: 429,
+        body: r#"{"error":{"type":"usage_limit_reached"}}"#.into(),
+        retry_after: None,
+    })]);
+    let mut agent = agent(
+        main.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    )
+    .with_resolver(Arc::new(Loading));
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.cancel();
+    });
+    let (reason, events) = run_with(&mut agent, "go", cancel).await;
+    assert_eq!(reason, TurnEndReason::Interrupted, "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Warning { .. } | AgentEvent::Error { .. })),
+        "{events:?}"
+    );
 }

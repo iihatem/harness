@@ -1,9 +1,12 @@
 //! Usage for harness: the ledger of model requests, its report cache, prices, budgets and the
 //! outcome log. Everything here is local: nothing is sent anywhere.
 
+pub mod date;
+pub mod error;
 pub mod ledger;
 pub mod meter;
 pub mod paths;
+pub mod store;
 
 /// The version of the SQLite library built into harness, which the report cache runs on.
 pub fn sqlite_version() -> String {

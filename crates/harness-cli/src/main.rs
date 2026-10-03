@@ -15,6 +15,7 @@ mod slash;
 mod start;
 mod term;
 mod trust;
+mod usage;
 
 use std::{io::IsTerminal, process::ExitCode};
 
@@ -105,6 +106,18 @@ enum Command {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+    /// Report model usage and cost from the local ledger, by model, provider, day or project
+    Usage {
+        /// What to group by: model, provider, day or project
+        #[arg(long, default_value = "model")]
+        by: String,
+        /// Only requests on or after this UTC date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Only requests on or before this UTC date (YYYY-MM-DD)
+        #[arg(long)]
+        until: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -181,6 +194,7 @@ fn command_line(command: &Command) -> &'static str {
         Command::Logout { .. } => "harness logout",
         Command::Trust { .. } => "harness trust",
         Command::Sandbox { .. } => "harness sandbox doctor",
+        Command::Usage { .. } => "harness usage",
     }
 }
 
@@ -294,6 +308,7 @@ fn main() -> ExitCode {
             Some(Command::Sandbox {
                 command: SandboxCommand::Doctor,
             }) => doctor::run(),
+            Some(Command::Usage { by, since, until }) => usage::report(&by, since, until),
             None => {
                 let pick_session = matches!(cli.resume, Some(None));
                 interactive::run(cli.model, cli.mode, session, pick_session).await

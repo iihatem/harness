@@ -160,3 +160,92 @@ async fn ask_writes_a_record_per_request_without_content() {
     let workspace = env.ws.path().canonicalize().unwrap();
     assert!(!text.contains(workspace.to_str().unwrap()), "{text}");
 }
+
+fn run_usage(env: &Env, args: &[&str]) -> std::process::Output {
+    env.cmd().args(args).output().unwrap()
+}
+
+fn stdout(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+async fn ask_twice(env: Env, server: &MockServer) -> Env {
+    two_requests(server).await;
+    tokio::task::spawn_blocking(move || {
+        let _ = env
+            .cmd()
+            .args(["--model", "mock/test-model", "ask", "go"])
+            .assert();
+        env
+    })
+    .await
+    .unwrap()
+}
+
+// `harness usage --by model` prints one row per model with requests and tokens, offline.
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_reports_by_model_from_the_ledger() {
+    let server = MockServer::start().await;
+    let env = ask_twice(Env::new(&server.uri(), ""), &server).await;
+    let out = run_usage(&env, &["usage", "--by", "model"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = stdout(&out);
+    assert!(text.starts_with("Usage by model"), "{text}");
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("mock/test-model"))
+        .expect(&text);
+    // Two requests, 200 + 300 input tokens, on a local server: $0.00, known.
+    assert!(row.contains(" 2 ") && row.contains("500"), "{row}");
+    assert!(row.contains("$0.00"), "{row}");
+    for by in ["provider", "day", "project"] {
+        let out = run_usage(&env, &["usage", "--by", by]);
+        assert!(out.status.success(), "{by}: {out:?}");
+        assert!(stdout(&out).starts_with(&format!("Usage by {by}")), "{by}");
+    }
+}
+
+// Deleting `index.sqlite` and running the report again shows the same totals as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_gives_the_same_report_after_the_cache_is_deleted() {
+    let server = MockServer::start().await;
+    let env = ask_twice(Env::new(&server.uri(), ""), &server).await;
+    let before = stdout(&run_usage(&env, &["usage"]));
+    let cache = env.usage_dir().join("index.sqlite");
+    assert!(cache.exists());
+    std::fs::remove_file(&cache).unwrap();
+    let after = stdout(&run_usage(&env, &["usage"]));
+    assert_eq!(before, after);
+    assert!(cache.exists(), "the cache is built again");
+}
+
+#[test]
+fn usage_with_an_empty_ledger_says_m1_sessions_are_not_included() {
+    let env = Env::new("http://127.0.0.1:9", "");
+    let out = run_usage(&env, &["usage"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = stdout(&out);
+    assert!(text.contains("No usage recorded yet"), "{text}");
+    assert!(text.contains("M1 sessions is not included"), "{text}");
+}
+
+#[test]
+fn usage_refuses_a_group_or_date_it_does_not_know() {
+    let env = Env::new("http://127.0.0.1:9", "");
+    for args in [
+        vec!["usage", "--by", "colour"],
+        vec!["usage", "--since", "2026-02-30"],
+        vec!["usage", "--until", "tomorrow"],
+    ] {
+        let out = run_usage(&env, &args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        assert!(!out.stderr.is_empty(), "{args:?}");
+    }
+}
+
+#[test]
+fn usage_is_listed_in_help() {
+    let env = Env::new("http://127.0.0.1:9", "");
+    let help = stdout(&run_usage(&env, &["--help"]));
+    assert!(help.contains("usage"), "{help}");
+}

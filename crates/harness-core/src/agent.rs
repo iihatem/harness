@@ -460,6 +460,9 @@ pub struct Agent {
     escalation: EscalationState,
     /// The conversation before a Build message that went alone, put back when the turn ends.
     handoff_stash: Option<(Vec<Message>, Vec<String>, Message)>,
+    /// The plan the user approved, while the Build turn that implements it runs: a compaction
+    /// summarizes around it and keeps it as written.
+    turn_plan: Option<String>,
 }
 
 impl Agent {
@@ -526,6 +529,7 @@ impl Agent {
             escalate_to: None,
             escalation: EscalationState::default(),
             handoff_stash: None,
+            turn_plan: None,
         }
     }
 
@@ -1336,22 +1340,22 @@ impl Agent {
         };
         let role_model = match role_model {
             Ok(model) => model,
-            Err(message) => {
-                // No request was made, and nothing of the turn is saved.
-                let _ = events.send(AgentEvent::TurnStarted);
-                let reason = if cancel.is_cancelled() {
-                    TurnEndReason::Interrupted
-                } else {
-                    let _ = events.send(AgentEvent::Error {
-                        kind: ErrorKind::Internal,
-                        message,
-                    });
-                    TurnEndReason::Error
-                };
-                let _ = events.send(AgentEvent::TurnFinished { reason });
-                return reason;
-            }
+            Err(message) => return self.refuse_turn(message, events, &cancel),
         };
+        if role == Role::Build
+            && let Some(plan) = &input.plan
+        {
+            let (id, window) = match (&input.model, &role_model) {
+                (Some(m), _) | (None, Some(m)) => (
+                    m.id.clone(),
+                    m.context_window.unwrap_or(self.config.context_window),
+                ),
+                (None, None) => (self.config.model_id.clone(), self.config.context_window),
+            };
+            if let Some(message) = self.plan_too_big(plan, &id, window) {
+                return self.refuse_turn(message, events, &cancel);
+            }
+        }
         // Why the model is not the role's own, when it is not; and the announcement of a turn on
         // another role's model than the last turn's.
         self.turn_reason = match (&input.model, self.roles.get(role)) {
@@ -1412,7 +1416,9 @@ impl Agent {
         if let Some((_, _, _, tools, section)) = session_format.clone() {
             self.use_edit_format(tools, section);
         }
+        self.turn_plan = input.plan.clone().filter(|_| role == Role::Build);
         let reason = self.turn(input, events, cancel).await;
+        self.turn_plan = None;
         if let Some((tools, section, prompt, _, _)) = session_format {
             self.set_tools(tools);
             self.config.edit_section = section;
@@ -1422,6 +1428,48 @@ impl Agent {
         self.policy.set_turn_rules(None);
         self.turn_model = None;
         reason
+    }
+
+    /// Ends a turn that never started: no request was made, and nothing of it is saved.
+    fn refuse_turn(
+        &self,
+        message: String,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> TurnEndReason {
+        let _ = events.send(AgentEvent::TurnStarted);
+        let reason = if cancel.is_cancelled() {
+            TurnEndReason::Interrupted
+        } else {
+            let _ = events.send(AgentEvent::Error {
+                kind: ErrorKind::Internal,
+                message,
+            });
+            TurnEndReason::Error
+        };
+        let _ = events.send(AgentEvent::TurnFinished { reason });
+        reason
+    }
+
+    /// Why a Build turn on `model`, whose window is `window`, cannot start: the approved plan
+    /// alone, with the system prompt and the tool definitions, reaches the compaction threshold.
+    /// A compaction keeps the plan as written, so it could never make room.
+    fn plan_too_big(&self, plan: &str, model: &str, window: u64) -> Option<String> {
+        let message = Message::User {
+            content: format!("Implement this plan:\n\n{plan}"),
+        };
+        let needed = compaction::request_tokens(
+            &self.config.system_prompt,
+            &self.tools.specs(),
+            std::slice::from_ref(&message),
+        );
+        let limit = (window as f64 * self.config.compaction.threshold) as u64;
+        (needed > limit).then(|| {
+            format!(
+                "the approved plan is about {} tokens, and with the system prompt and the tools the request would be about {needed}: that does not fit {model}'s {window}-token window, where compaction starts at {limit}, and a plan is never summarized away. Nothing was sent and the plan is still approved: choose Build again after setting a `build` model with a larger window (/model --role build <id>, or [roles].build in config.toml), or edit the plan to make it shorter",
+                crate::tokens::estimate(plan)
+            )
+        })
     }
 
     async fn turn(
@@ -1815,7 +1863,13 @@ impl Agent {
             },
             Trigger::Manual => fits.unwrap_or(self.history.len()),
         };
-        let part = self.summary_part(cut);
+        let mut part = self.summary_part(cut);
+        // An earlier summary of this turn carries the plan; the new one is written around it.
+        if self.turn_plan.is_some()
+            && let Some(first) = part.first_mut()
+        {
+            *first = compaction::without_plan(first);
+        }
         if !compaction::summarizes(&part) {
             return Err(CompactError::NothingToCompact);
         }
@@ -1865,8 +1919,20 @@ impl Agent {
             }
         };
         let first_kept = self.history_ids.get(cut).cloned();
+        // The approved plan of a Build turn is its contract: it is never left to a summary of it.
+        // A kept message that holds it makes this unnecessary.
+        let stored = match &self.turn_plan {
+            Some(plan)
+                if !self.history[cut..].iter().any(
+                    |m| matches!(m, Message::User { content } if content.contains(plan.as_str())),
+                ) =>
+            {
+                compaction::with_plan(&summary, plan)
+            }
+            _ => summary.clone(),
+        };
         self.session.append(EntryKind::Compaction {
-            summary: summary.clone(),
+            summary: stored,
             first_kept,
         });
         self.after_session_change();

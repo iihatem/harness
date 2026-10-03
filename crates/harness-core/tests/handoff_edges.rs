@@ -90,9 +90,26 @@ async fn reduced(
     Arc<MockProvider>,
     tempfile::TempDir,
 ) {
+    reduced_with(PLAN, 3_000, 12_000, builder_script, main_script).await
+}
+
+/// [`reduced`] with the plan the planner writes, the build model's window in tokens, and the
+/// length of the question the conversation starts with.
+async fn reduced_with(
+    plan: &str,
+    window: u64,
+    question_chars: usize,
+    builder_script: Vec<Script>,
+    main_script: Vec<Script>,
+) -> (
+    Agent,
+    Arc<MockProvider>,
+    Arc<MockProvider>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let main = MockProvider::new(main_script);
-    let planner = MockProvider::new(vec![Script::text(PLAN)]);
+    let planner = MockProvider::new(vec![Script::text(plan)]);
     let builder = MockProvider::new(builder_script);
     let mut agent = with_models(
         agent(
@@ -103,7 +120,7 @@ async fn reduced(
         ),
         vec![
             model("plan/big", &planner, 1_000_000),
-            model("build/small", &builder, 3_000),
+            model("build/small", &builder, window),
         ],
     )
     .with_roles(RoleConfig {
@@ -113,15 +130,15 @@ async fn reduced(
     })
     .with_session(Session::create(&dir.path().join("sessions"), dir.path()));
     agent.config_mut().context_window = 1_000_000;
-    run(&mut agent, &"q".repeat(12_000)).await;
+    run(&mut agent, &"q".repeat(question_chars)).await;
     agent.set_mode(Mode::Auto);
     (agent, main, builder, dir)
 }
 
-fn build_input() -> TurnInput {
+fn build_input_for(plan: &str) -> TurnInput {
     TurnInput {
         parts: vec![InputPart::Text("Implement the plan above.".into())],
-        plan: Some(PLAN.into()),
+        plan: Some(plan.into()),
         role: Some(Role::Build),
         ..TurnInput::default()
     }
@@ -131,14 +148,35 @@ async fn build_with(
     agent: &mut Agent,
     cancel: CancellationToken,
 ) -> (TurnEndReason, Vec<AgentEvent>) {
+    build_plan_with(agent, PLAN, cancel).await
+}
+
+async fn build_plan_with(
+    agent: &mut Agent,
+    plan: &str,
+    cancel: CancellationToken,
+) -> (TurnEndReason, Vec<AgentEvent>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let reason = agent.run_turn(build_input(), &tx, cancel).await;
+    let reason = agent.run_turn(build_input_for(plan), &tx, cancel).await;
     drop(tx);
     let mut events = Vec::new();
     while let Some(event) = rx.recv().await {
         events.push(event);
     }
     (reason, events)
+}
+
+/// Every message of `request` as one text.
+fn request_text(request: &harness_core::message::ChatRequest) -> String {
+    request
+        .messages
+        .iter()
+        .map(|m| match m {
+            Message::User { content } | Message::Tool { content, .. } => content.clone(),
+            Message::Assistant { content, .. } => content.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n")
 }
 
 fn users(agent: &Agent) -> Vec<String> {
@@ -262,6 +300,12 @@ async fn a_compaction_inside_a_reduced_build_turn_keeps_the_set_aside_conversati
     assert!(content.contains("Read src/login.rs"), "the plan");
     // The Build message as the session has it, not the plan the build model was sent in its place.
     assert!(content.contains("Implement the plan above."), "{content}");
+    // The build model's next request carries the plan itself, not only a summary of it.
+    assert!(
+        request_text(&builder.requests()[1]).contains(PLAN),
+        "{:?}",
+        builder.requests()[1].messages
+    );
     // The history is the summary, then what the compaction kept of the turn.
     let history = agent.history();
     assert!(matches!(
@@ -347,5 +391,193 @@ async fn esc_while_a_fallback_model_is_made_ready_gives_no_warning() {
             .iter()
             .any(|e| matches!(e, AgentEvent::Warning { .. } | AgentEvent::Error { .. })),
         "{events:?}"
+    );
+}
+
+/// A plan of about 28,000 characters: 7,000 tokens, more than the compaction keeps room for.
+fn long_plan() -> String {
+    (1..)
+        .map(|i| format!("{i}. Change module {i} and run its tests.\n"))
+        .take(600)
+        .collect::<String>()
+}
+
+// Review I1: the approved plan is the build turn's contract. A compaction inside the turn
+// summarizes around it, and the build model's next request has the whole plan, past the 4,000
+// characters a summary transcript clips a message to.
+#[tokio::test]
+async fn a_compaction_in_a_build_turn_keeps_a_long_plan_verbatim() {
+    let plan = long_plan();
+    assert!(plan.len() > 20_000);
+    let (mut agent, _main, builder, _dir) = reduced_with(
+        &plan,
+        12_288,
+        40_000,
+        vec![
+            Script::tool_call("c1", "echo", json!({"text": "x".repeat(10_000)})),
+            Script::text("built"),
+        ],
+        vec![
+            Script::text("planned and built so far"),
+            Script::text("main again"),
+        ],
+    )
+    .await;
+    let (reason, events) = build_plan_with(&mut agent, &plan, CancellationToken::new()).await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::HandoffReduced { .. })),
+        "the plan goes alone"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compacted { .. })),
+        "{events:?}"
+    );
+    let requests = builder.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(request_text(&requests[0]).contains(&plan));
+    assert!(
+        request_text(&requests[1]).contains(&plan),
+        "the plan is not in the request after the compaction: {:?}",
+        requests[1]
+            .messages
+            .iter()
+            .map(|m| format!("{m:?}").len())
+            .collect::<Vec<_>>()
+    );
+    // A second compaction in the turn does not keep two copies.
+    let history = agent.history();
+    let copies = history
+        .iter()
+        .filter(|m| matches!(m, Message::User { content } if content.contains(&plan)))
+        .count();
+    assert_eq!(copies, 1);
+    // It is in the session too: a resumed conversation has it.
+    let path = agent.session().path().unwrap().to_path_buf();
+    drop(agent);
+    let (reopened, _) = Session::open(&path).unwrap();
+    assert!(
+        reopened
+            .messages()
+            .iter()
+            .any(|(_, m)| matches!(m, Message::User { content } if content.contains(&plan)))
+    );
+}
+
+// The plan alone, with the system prompt and the tools, cannot fit the build model's window: the
+// turn does not start, nothing is sent, and the conversation is as it was.
+#[tokio::test]
+async fn a_plan_too_big_for_the_build_models_window_does_not_start_the_turn() {
+    let plan = long_plan();
+    let (mut agent, main, builder, _dir) = reduced_with(
+        &plan,
+        4_096,
+        12_000,
+        vec![Script::text("never")],
+        vec![Script::text("main answers")],
+    )
+    .await;
+    let before = agent.history().len();
+    let (reason, events) = build_plan_with(&mut agent, &plan, CancellationToken::new()).await;
+    assert_eq!(reason, TurnEndReason::Error);
+    assert!(builder.requests().is_empty());
+    assert!(main.requests().is_empty());
+    let message = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("an error");
+    assert!(message.contains("build/small"), "{message}");
+    assert!(message.contains("4096"), "{message}");
+    assert!(
+        message.contains(&format!("about {} tokens", plan.len().div_ceil(4))),
+        "{message}"
+    );
+    assert!(
+        message.contains("larger") && message.contains("plan"),
+        "{message}"
+    );
+    // Nothing of the turn is saved, and the conversation goes on.
+    assert_eq!(agent.history().len(), before);
+    assert_eq!(agent.approved_plan(), None);
+    let (reply, _) = run(&mut agent, "and now?").await;
+    assert_eq!(reply, TurnEndReason::Completed);
+}
+
+// The same, when the build model gets the whole conversation: the plan is in the history as the
+// planner's reply, which a summary transcript clips, and the Build message only points at it.
+#[tokio::test]
+async fn a_compaction_in_a_build_turn_with_the_whole_conversation_keeps_the_plan_verbatim() {
+    let plan = long_plan();
+    let (mut agent, _main, builder, _dir) = reduced_with(
+        &plan,
+        12_288,
+        2_000,
+        vec![
+            Script::tool_call("c1", "echo", json!({"text": "x".repeat(10_000)})),
+            Script::text("built"),
+        ],
+        vec![Script::text("the planning and the build so far")],
+    )
+    .await;
+    let (reason, events) = build_plan_with(&mut agent, &plan, CancellationToken::new()).await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::HandoffReduced { .. })),
+        "the conversation fits"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compacted { .. })),
+        "{events:?}"
+    );
+    let requests = builder.requests();
+    assert!(request_text(&requests[1]).contains(&plan));
+}
+
+// On the model that planned (a hand-off to itself): the plan is in the request after the
+// compaction, once.
+#[tokio::test]
+async fn a_compaction_on_the_planning_model_keeps_one_copy_of_the_plan() {
+    let plan = long_plan();
+    let dir = tempfile::tempdir().unwrap();
+    let main = MockProvider::new(vec![
+        Script::text(&plan),
+        Script::tool_call("c1", "echo", json!({"text": "x".repeat(10_000)})),
+        Script::text("summary one"),
+        Script::text("built"),
+    ]);
+    let mut agent = agent(
+        main.clone(),
+        Mode::Plan,
+        Arc::new(NonInteractive),
+        dir.path(),
+    )
+    .with_session(Session::create(&dir.path().join("sessions"), dir.path()));
+    agent.config_mut().context_window = 12_288;
+    run(&mut agent, "plan it").await;
+    agent.set_mode(Mode::Auto);
+    let (reason, events) = build_plan_with(&mut agent, &plan, CancellationToken::new()).await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compacted { .. }))
+    );
+    let requests = main.requests();
+    let last = request_text(requests.last().unwrap());
+    assert_eq!(
+        last.matches(&plan).count(),
+        1,
+        "the plan once in the last request"
     );
 }

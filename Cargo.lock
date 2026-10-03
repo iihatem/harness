@@ -1477,12 +1477,16 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "harness-core",
+ "harness-tools",
+ "harness-tui",
  "lsp-types",
+ "ratatui",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

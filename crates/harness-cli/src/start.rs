@@ -237,7 +237,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
                 monthly_usd: budgets.monthly_usd,
             }),
     );
-    let diagnostics = crate::lsp::diagnostics(setup);
+    let diagnostics = crate::lsp::diagnostics(setup, interactive.then(|| approver.clone()));
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin_for(model.edit_format),

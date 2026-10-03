@@ -674,6 +674,9 @@ pub struct Config {
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
     pub trusted: bool,
+    /// What the user answered to "start language servers here?" for this workspace, if they did.
+    /// A trusted workspace starts them whatever this says.
+    pub lsp_servers_allowed: Option<bool>,
     pub warnings: Vec<String>,
 }
 
@@ -958,6 +961,7 @@ pub fn load(
     let project = parse_file(&path)?;
     let widening = widening(project.as_ref().unwrap_or(&ConfigFile::default()), baseline);
     cfg.trusted = trust.is_trusted(workspace, &widening.fingerprint);
+    cfg.lsp_servers_allowed = trust.servers_answer(workspace);
     if let Some(project) = project {
         if let Some(message) = project
             .compaction

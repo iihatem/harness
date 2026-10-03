@@ -8,7 +8,7 @@ use std::{
 };
 
 use harness_core::{permission::FsAccess, tool::CommandSandbox};
-use harness_lsp::{Launch, Manager, Report, ServerSetting, Settings, language_of};
+use harness_lsp::{Launch, Manager, Report, ServerConsent, ServerSetting, Settings, language_of};
 
 const SERVER: &str = env!("CARGO_BIN_EXE_fake-lsp-server");
 
@@ -58,6 +58,7 @@ impl Fixture {
             first_wait: Duration::from_secs(10),
             servers: BTreeMap::new(),
             trusted: true,
+            allowed: None,
             path: vec![self.dir.path().join("bin")],
             init_timeout: Duration::from_secs(10),
         }
@@ -247,41 +248,200 @@ async fn disabled_servers_do_not_start() {
     assert!(f.log().is_empty());
 }
 
-// Spec "Untrusted workspace": no server, one note, and not a second.
+/// Answers the question "start language servers here?" as scripted, and counts how often it is
+/// asked.
+struct Consent {
+    answer: Option<bool>,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl Consent {
+    fn saying(answer: Option<bool>) -> Arc<Consent> {
+        Arc::new(Consent {
+            answer,
+            asked: Default::default(),
+        })
+    }
+
+    fn asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ServerConsent for Consent {
+    async fn ask(&self) -> Option<bool> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.answer
+    }
+}
+
+impl Fixture {
+    /// A manager for a workspace that is not trusted, with `answer` stored and `consent` to ask.
+    fn untrusted(&self, answer: Option<bool>, consent: Option<Arc<Consent>>) -> Manager {
+        let mut settings = self.settings();
+        settings.trusted = false;
+        settings.allowed = answer;
+        let manager = self.manager(settings);
+        match consent {
+            Some(consent) => manager.with_consent(consent),
+            None => manager,
+        }
+    }
+}
+
+// Ruling P3: in an untrusted workspace the first edit of a file with a server asks once; a yes
+// starts the server, and the second edit does not ask again.
 #[tokio::test]
-async fn an_untrusted_workspace_starts_no_server_and_says_so_once() {
+async fn the_first_edit_with_a_server_asks_once_and_a_yes_starts_it() {
     let f = Fixture::new();
     f.install("rust-analyzer");
-    let mut settings = f.settings();
-    settings.trusted = false;
-    let manager = f.manager(settings);
-    let first = manager
+    let consent = Consent::saying(Some(true));
+    let manager = f.untrusted(None, Some(consent.clone()));
+    let report = manager
         .check(&f.file("lib.rs", "x // ERROR\n"), &direct())
         .await;
-    let Report::Note(note) = first else {
-        panic!("{first:?}")
-    };
-    assert!(note.contains("trust"), "{note}");
-    assert_eq!(
-        manager
-            .check(&f.file("lib.rs", "x // ERROR\n"), &direct())
-            .await,
-        Report::NoServer
-    );
+    assert_eq!(errors(&report), 1);
+    assert_eq!(consent.asked(), 1);
+    let report = manager
+        .check(&f.file("lib.rs", "x // ERROR\n"), &direct())
+        .await;
+    assert_eq!(errors(&report), 1);
+    assert_eq!(consent.asked(), 1);
+    manager.shutdown().await;
+}
+
+// Declining starts nothing, says nothing, and is not asked again.
+#[tokio::test]
+async fn a_no_starts_no_server_and_is_not_asked_again() {
+    let f = Fixture::new();
+    f.install("rust-analyzer");
+    let consent = Consent::saying(Some(false));
+    let manager = f.untrusted(None, Some(consent.clone()));
+    for _ in 0..2 {
+        assert_eq!(
+            manager
+                .check(&f.file("lib.rs", "x // ERROR\n"), &direct())
+                .await,
+            Report::NoServer
+        );
+    }
+    assert_eq!(consent.asked(), 1);
     assert!(f.log().is_empty());
 }
 
-// An untrusted workspace with no server for the language has nothing to say about trust.
+// An answer that could not be had (nobody there) is no answer: nothing starts, and it is asked
+// again at the next edit.
 #[tokio::test]
-async fn an_untrusted_workspace_without_a_server_says_nothing() {
+async fn a_question_nobody_answered_starts_nothing() {
     let f = Fixture::new();
-    let mut settings = f.settings();
-    settings.trusted = false;
-    let manager = f.manager(settings);
+    f.install("rust-analyzer");
+    let consent = Consent::saying(None);
+    let manager = f.untrusted(None, Some(consent.clone()));
+    for _ in 0..2 {
+        assert_eq!(
+            manager
+                .check(&f.file("lib.rs", "x // ERROR\n"), &direct())
+                .await,
+            Report::NoServer
+        );
+    }
+    assert_eq!(consent.asked(), 2);
+    assert!(f.log().is_empty());
+}
+
+// The stored answer is the answer: a yes starts the server with no question, a no never does.
+#[tokio::test]
+async fn a_stored_answer_is_not_asked_again() {
+    let f = Fixture::new();
+    f.install("rust-analyzer");
+    let consent = Consent::saying(Some(false));
+    let yes = f.untrusted(Some(true), Some(consent.clone()));
+    let report = yes
+        .check(&f.file("lib.rs", "x // ERROR\n"), &direct())
+        .await;
+    assert_eq!(errors(&report), 1);
+    yes.shutdown().await;
+    let no = f.untrusted(Some(false), Some(consent.clone()));
+    assert_eq!(
+        no.check(&f.file("lib.rs", "x // ERROR\n"), &direct()).await,
+        Report::NoServer
+    );
+    assert_eq!(consent.asked(), 0);
+}
+
+// Headless runs never ask: with no stored yes and no trust, no server starts, and there is no
+// note either.
+#[tokio::test]
+async fn without_anyone_to_ask_an_unanswered_workspace_starts_no_server() {
+    let f = Fixture::new();
+    f.install("rust-analyzer");
+    let manager = f.untrusted(None, None);
+    for _ in 0..2 {
+        assert_eq!(
+            manager
+                .check(&f.file("lib.rs", "x // ERROR\n"), &direct())
+                .await,
+            Report::NoServer
+        );
+    }
+    assert!(f.log().is_empty());
+}
+
+// Nothing to ask about without a server for the file, and a trusted workspace is never asked.
+#[tokio::test]
+async fn no_question_without_a_server_or_in_a_trusted_workspace() {
+    let f = Fixture::new();
+    let consent = Consent::saying(Some(true));
+    let manager = f.untrusted(None, Some(consent.clone()));
     assert_eq!(
         manager.check(&f.file("lib.rs", "x\n"), &direct()).await,
         Report::NoServer
     );
+    f.install("rust-analyzer");
+    let trusted = f.manager(f.settings()).with_consent(consent.clone());
+    let report = trusted
+        .check(&f.file("lib.rs", "x // ERROR\n"), &direct())
+        .await;
+    assert_eq!(errors(&report), 1);
+    trusted.shutdown().await;
+    assert_eq!(consent.asked(), 0);
+}
+
+// Two files edited at once ask once.
+#[tokio::test]
+async fn files_checked_together_ask_once() {
+    let f = Fixture::new();
+    f.install("rust-analyzer");
+    f.install("gopls");
+    let consent = Consent::saying(Some(true));
+    let manager = f.untrusted(None, Some(consent.clone()));
+    let (rs, go) = (
+        f.file("lib.rs", "x // ERROR\n"),
+        f.file("main.go", "x // ERROR\n"),
+    );
+    let launch = direct();
+    let (a, b) = tokio::join!(manager.check(&rs, &launch), manager.check(&go, &launch));
+    assert_eq!((errors(&a), errors(&b)), (1, 1));
+    assert_eq!(consent.asked(), 1);
+    manager.shutdown().await;
+}
+
+// With no sandbox to run it in, a server is not asked about: it could not start anyway.
+#[tokio::test]
+async fn no_question_when_no_server_could_start() {
+    let f = Fixture::new();
+    f.install("rust-analyzer");
+    let consent = Consent::saying(Some(true));
+    let manager = f.untrusted(None, Some(consent.clone()));
+    let no_sandbox = Launch {
+        sandbox: None,
+        access: FsAccess::WorkspaceWrite,
+        unsandboxed_ok: false,
+    };
+    let report = manager.check(&f.file("lib.rs", "x\n"), &no_sandbox).await;
+    assert!(matches!(report, Report::Note(_)), "{report:?}");
+    assert_eq!(consent.asked(), 0);
 }
 
 /// Starts what it is asked to through `/bin/sh -c exec`, as a sandbox would wrap a command, and

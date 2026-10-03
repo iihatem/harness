@@ -3,7 +3,9 @@
 
 use std::{sync::Arc, time::Duration};
 
-use harness_lsp::{LspDiagnostics, Manager, ServerSetting, Settings};
+use harness_config::trust::TrustStore;
+use harness_core::agent::Approver;
+use harness_lsp::{AskThroughApprover, LspDiagnostics, Manager, ServerSetting, Settings};
 
 use crate::setup::Setup;
 
@@ -34,6 +36,7 @@ pub fn settings(setup: &Setup) -> Settings {
             })
             .collect(),
         trusted: setup.config.trusted,
+        allowed: setup.config.lsp_servers_allowed,
         path: (setup.env)("PATH")
             .map(|path| std::env::split_paths(&path).collect())
             .unwrap_or_default(),
@@ -41,12 +44,29 @@ pub fn settings(setup: &Setup) -> Settings {
     }
 }
 
-/// The diagnostics for a session in `setup`'s workspace.
-pub fn diagnostics(setup: &Setup) -> Arc<LspDiagnostics> {
-    Arc::new(LspDiagnostics::new(
-        Manager::new(settings(setup), setup.workspace.clone()),
-        setup.workspace.clone(),
-    ))
+/// The diagnostics for a session in `setup`'s workspace. With an `approver` (an interactive
+/// session), the first edit of a file that has a server, in a workspace not yet trusted for
+/// servers, asks once whether they may start, and the answer is stored with the workspace's trust
+/// record. Without one, servers start only where the workspace is trusted or the stored answer is
+/// yes.
+pub fn diagnostics(setup: &Setup, approver: Option<Arc<dyn Approver>>) -> Arc<LspDiagnostics> {
+    let mut manager = Manager::new(settings(setup), setup.workspace.clone());
+    if let Some(approver) = approver {
+        let workspace = setup.workspace.clone();
+        let data_dir = setup.paths.data_dir.clone();
+        let stored = workspace.clone();
+        manager = manager.with_consent(Arc::new(AskThroughApprover::new(
+            approver,
+            workspace,
+            // A trust file that cannot be written leaves the answer for this session only.
+            move |yes| {
+                if let Ok(mut store) = TrustStore::load(&data_dir) {
+                    let _ = store.set_servers_answer(&stored, yes);
+                }
+            },
+        )));
+    }
+    Arc::new(LspDiagnostics::new(manager, setup.workspace.clone()))
 }
 
 #[cfg(test)]
@@ -103,5 +123,20 @@ mod tests {
         let s = settings(&setup(Config::default(), None));
         assert!(!s.trusted);
         assert!(s.path.is_empty());
+    }
+
+    // Ruling P3: the stored answer reaches the manager, so a headless run in a workspace the user
+    // said yes to starts servers, and one never asked does not.
+    #[test]
+    fn the_stored_answer_becomes_the_managers_setting() {
+        for answer in [None, Some(true), Some(false)] {
+            let config = Config {
+                lsp_servers_allowed: answer,
+                ..Config::default()
+            };
+            let s = settings(&setup(config, None));
+            assert!(!s.trusted);
+            assert_eq!(s.allowed, answer);
+        }
     }
 }

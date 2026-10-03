@@ -128,3 +128,49 @@ fn a_trust_file_from_before_gate_answers_still_loads() {
     let store = TrustStore::load(&data).unwrap();
     assert!(store.is_trusted(std::path::Path::new("/x"), "abc"));
 }
+
+// Ruling P3: the answer to "start language servers here?" is stored with the workspace's trust
+// record, by canonical path, and a yes or a no is not asked again.
+#[test]
+fn the_language_server_answer_is_stored_with_the_trust_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut store = TrustStore::load(&data).unwrap();
+    assert_eq!(store.servers_answer(&ws), None);
+    store.set_servers_answer(&ws, false).unwrap();
+    let again = TrustStore::load(&data).unwrap();
+    assert_eq!(again.servers_answer(&ws), Some(false));
+    assert_eq!(again.servers_answer(&ws.join("../ws")), Some(false));
+    let mut again = again;
+    again.set_servers_answer(&ws, true).unwrap();
+    assert_eq!(
+        TrustStore::load(&data).unwrap().servers_answer(&ws),
+        Some(true)
+    );
+    // Revoking trust takes the permission to run project code with it.
+    again.trust(&ws, "fingerprint").unwrap();
+    assert!(again.revoke(&ws).unwrap());
+    assert_eq!(TrustStore::load(&data).unwrap().servers_answer(&ws), None);
+    // A workspace that was never trusted but answered: revoking says it was not trusted, and
+    // still forgets the answer.
+    again.set_servers_answer(&ws, true).unwrap();
+    assert!(!again.revoke(&ws).unwrap());
+    assert_eq!(TrustStore::load(&data).unwrap().servers_answer(&ws), None);
+}
+
+#[test]
+fn the_loaded_configuration_carries_the_language_server_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let global = dir.path().join("config.toml");
+    let mut store = TrustStore::load(&dir.path().join("data")).unwrap();
+    let load = |store: &TrustStore| harness_config::config::load(&global, &ws, store).unwrap();
+    assert_eq!(load(&store).lsp_servers_allowed, None);
+    store.set_servers_answer(&ws, true).unwrap();
+    assert_eq!(load(&store).lsp_servers_allowed, Some(true));
+    store.set_servers_answer(&ws, false).unwrap();
+    assert_eq!(load(&store).lsp_servers_allowed, Some(false));
+}

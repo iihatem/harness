@@ -18,6 +18,9 @@ struct TrustFile {
     /// The answers to the one-time proposal of a detected gate, by workspace.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     gates: BTreeMap<String, GateAnswer>,
+    /// The answers to "start language servers here?", by workspace.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    servers: BTreeMap<String, bool>,
 }
 
 /// What the user answered when harness proposed a detected gate for a workspace: confirmed, as
@@ -103,10 +106,23 @@ impl TrustStore {
         self.save()
     }
 
-    /// Returns whether the workspace was trusted before.
+    /// Whether the user said language servers may start in `workspace` (they run the project's
+    /// build code): `None` until it was answered.
+    pub fn servers_answer(&self, workspace: &Path) -> Option<bool> {
+        self.file.servers.get(&Self::key(workspace)).copied()
+    }
+
+    pub fn set_servers_answer(&mut self, workspace: &Path, yes: bool) -> Result<(), ConfigError> {
+        self.file.servers.insert(Self::key(workspace), yes);
+        self.save()
+    }
+
+    /// Returns whether the workspace was trusted before. The answer about language servers goes
+    /// with the trust.
     pub fn revoke(&mut self, workspace: &Path) -> Result<bool, ConfigError> {
         let removed = self.file.workspaces.remove(&Self::key(workspace)).is_some();
-        if removed {
+        let answered = self.file.servers.remove(&Self::key(workspace)).is_some();
+        if removed || answered {
             self.save()?;
         }
         Ok(removed)

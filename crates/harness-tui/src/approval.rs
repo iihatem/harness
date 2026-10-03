@@ -218,9 +218,14 @@ impl Prompt {
             return None;
         }
         let last = self.rows.get().saturating_sub(rows);
+        let question = self.request.kind == ApprovalKind::StartServers;
         match key.code {
             KeyCode::Char('y') if plain => {
                 return Some(Answered::Decided(ApprovalDecision::Approve));
+            }
+            // A plain question: `n`, and Enter alone, mean no, with no reason asked for.
+            KeyCode::Char('n') | KeyCode::Enter if question && plain => {
+                return Some(Answered::Decided(ApprovalDecision::Deny { feedback: None }));
             }
             KeyCode::Char('a') if plain && self.request.kind == ApprovalKind::Action => {
                 return Some(Answered::Decided(ApprovalDecision::ApproveForSession));
@@ -244,7 +249,14 @@ impl Prompt {
     pub fn render(&self, width: usize, rows: usize, theme: &Theme) -> Vec<Line<'static>> {
         let mut head = wrap(
             &Line::from(vec![
-                Span::styled("approve? ", theme.warning()),
+                Span::styled(
+                    if self.request.kind == ApprovalKind::StartServers {
+                        ""
+                    } else {
+                        "approve? "
+                    },
+                    theme.warning(),
+                ),
                 Span::styled(
                     reveal(&sanitize(&self.request.reason).replace('\n', " ")),
                     theme.bold(),
@@ -270,7 +282,11 @@ impl Prompt {
                     keys.push(Span::raw("yes, for this session  "));
                 }
                 keys.push(Span::styled("[n] ", theme.accent()));
-                keys.push(Span::raw("no  "));
+                if self.request.kind == ApprovalKind::StartServers {
+                    keys.push(Span::raw("no (or Enter)  "));
+                } else {
+                    keys.push(Span::raw("no  "));
+                }
                 keys.push(Span::styled("[Esc] ", theme.accent()));
                 keys.push(Span::raw("no, and stop"));
                 foot.extend(wrap(&Line::from(keys), width, &[], &[]));
@@ -322,6 +338,18 @@ impl Prompt {
     pub fn outcome(&self, answered: &Answered, theme: &Theme) -> Line<'static> {
         let reason = reveal(&sanitize(&self.request.reason).replace('\n', " "));
         let (mark, text) = match answered {
+            Answered::Decided(ApprovalDecision::Approve)
+                if self.request.kind == ApprovalKind::StartServers =>
+            {
+                ("✓", "language servers may start here".to_string())
+            }
+            Answered::Decided(_) if self.request.kind == ApprovalKind::StartServers => {
+                ("✗", "language servers stay off here".to_string())
+            }
+            Answered::Interrupt if self.request.kind == ApprovalKind::StartServers => (
+                "✗",
+                "language servers stay off here, and the turn stopped".to_string(),
+            ),
             Answered::Decided(ApprovalDecision::Approve) => ("✓", format!("approved: {reason}")),
             Answered::Decided(ApprovalDecision::ApproveForSession)
                 if self.request.kept_for_session =>

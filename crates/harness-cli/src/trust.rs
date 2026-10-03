@@ -274,6 +274,10 @@ pub fn first_use(
     store
         .trust(workspace, &widening.fingerprint)
         .map_err(std::io::Error::other)?;
+    // Trusting a workspace lets its language servers start, so they are not asked about.
+    store
+        .set_servers_answer(workspace, true)
+        .map_err(std::io::Error::other)?;
     writeln!(
         out,
         "Trusted {}.",
@@ -378,10 +382,13 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
             return 0;
         }
     }
-    match store.trust(&workspace, &widening.fingerprint) {
+    match store
+        .trust(&workspace, &widening.fingerprint)
+        .and_then(|()| store.set_servers_answer(&workspace, true))
+    {
         Ok(()) => {
             println!(
-                "Trusted {}.",
+                "Trusted {}. Language servers may start in it (they run the project's build code).",
                 terminal_safe(&workspace.display().to_string())
             );
             0
@@ -620,6 +627,23 @@ mod tests {
         assert_eq!(allowed(&w), ["bash:make *"]);
         // Asked once: trusted now.
         assert_eq!(ask(&w, "").0, FirstUse::NothingToAsk);
+    }
+
+    // Ruling P3: trusting also enables language servers, which are then not asked about.
+    #[test]
+    fn trusting_on_first_use_also_enables_language_servers() {
+        let w = workspace("[permissions]\nallow = [\"bash:make*\"]\n");
+        assert_eq!(ask(&w, "y\n").0, FirstUse::Trusted);
+        let store = TrustStore::load(&w.paths.data_dir).unwrap();
+        assert_eq!(store.servers_answer(&w.ws), Some(true));
+    }
+
+    #[test]
+    fn declining_leaves_language_servers_unanswered() {
+        let w = workspace("[permissions]\nallow = [\"bash:make*\"]\n");
+        assert_eq!(ask(&w, "n\n").0, FirstUse::Declined);
+        let store = TrustStore::load(&w.paths.data_dir).unwrap();
+        assert_eq!(store.servers_answer(&w.ws), None);
     }
 
     #[test]

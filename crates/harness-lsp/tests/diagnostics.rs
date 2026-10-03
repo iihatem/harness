@@ -44,6 +44,7 @@ impl Fixture {
                     first_wait: wait,
                     servers: BTreeMap::new(),
                     trusted,
+                    allowed: None,
                     path: vec![self.dir.path().join("bin")],
                     init_timeout: Duration::from_secs(10),
                 },
@@ -150,20 +151,19 @@ async fn a_language_without_a_server_adds_nothing() {
     );
 }
 
-// Spec "Untrusted workspace": a note on the first edit, and none on the second.
+// Ruling P3: where nobody can be asked (a headless run), an unanswered, untrusted workspace gets
+// no diagnostics and no note: the question replaced the note.
 #[tokio::test]
-async fn an_untrusted_workspace_gets_one_note_about_trust() {
+async fn an_unanswered_untrusted_workspace_with_nobody_to_ask_says_nothing() {
     let f = Fixture::new();
     let d = f.diagnostics(Duration::from_secs(5), false);
-    let first = after_edit(&d, &[f.file("a.ts", "x // ERROR\n")])
-        .await
-        .unwrap();
-    assert!(first.contains("trusted workspace"), "{first}");
-    assert!(
-        after_edit(&d, &[f.file("a.ts", "x // ERROR\n")])
-            .await
-            .is_none()
-    );
+    for _ in 0..2 {
+        assert!(
+            after_edit(&d, &[f.file("a.ts", "x // ERROR\n")])
+                .await
+                .is_none()
+        );
+    }
 }
 
 // A tool that changes several files (a patch) is checked file by file, errors listed together.

@@ -16,4 +16,8 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+harness-tools.workspace = true
+harness-tui.workspace = true
+ratatui.workspace = true
 tempfile.workspace = true
+tokio-util.workspace = true

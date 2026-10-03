@@ -1016,3 +1016,98 @@ async fn a_write_to_a_fifo_is_asked_about_at_once() {
     settle(&mut ui).await;
     ui.finish().await.unwrap();
 }
+
+/// The question asked at the first edit of a file that has a language server.
+const SERVERS_QUESTION: &str = "Start language servers here? They run this project's build code.";
+
+fn servers_request(dir: &Path) -> ApprovalRequest {
+    ApprovalRequest {
+        call_id: "lsp".into(),
+        tool: "language servers".into(),
+        arguments: serde_json::Value::Null,
+        action: Action::Read(dir.to_path_buf()),
+        reason: SERVERS_QUESTION.into(),
+        kind: ApprovalKind::StartServers,
+        kept_for_session: false,
+    }
+}
+
+type Asked = (
+    Ui<TestBackend>,
+    oneshot::Receiver<ApprovalDecision>,
+    mpsc::UnboundedSender<(ApprovalRequest, oneshot::Sender<ApprovalDecision>)>,
+);
+
+/// A session that is asked the language-server question, and where the answer goes.
+fn asked_about_servers(dir: &Path) -> Asked {
+    let (requests, approvals) = mpsc::unbounded_channel();
+    let ui = start_with(MockProvider::new(vec![]), dir, Mode::Ask, Some(approvals));
+    let (reply, answer) = oneshot::channel();
+    requests.send((servers_request(dir), reply)).unwrap();
+    (ui, answer, requests)
+}
+
+async fn until_server_question(ui: &mut Ui<TestBackend>) {
+    let (_keys, input) = futures::channel::mpsc::unbounded::<std::io::Result<Event>>();
+    let run = ui.run(input, std::future::pending());
+    let _ = tokio::time::timeout(Duration::from_millis(200), run).await;
+    assert!(ui.app().prompt().is_some(), "the question was not shown");
+    until_armed(ui).await;
+}
+
+// Ruling P3: the question reads as asked, and `y` answers yes.
+#[tokio::test]
+async fn the_language_server_question_is_shown_and_y_says_yes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut answer, _requests) = asked_about_servers(dir.path());
+    until_server_question(&mut ui).await;
+    let shown = screen(&ui).join("\n");
+    assert!(shown.contains(SERVERS_QUESTION), "{shown}");
+    assert!(shown.contains("[y] yes"), "{shown}");
+    assert!(!shown.contains("for this session"), "{shown}");
+    press(&mut ui, KeyCode::Char('y'));
+    assert_eq!(answer.try_recv(), Ok(ApprovalDecision::Approve));
+    ui.finish().await.unwrap();
+}
+
+// Enter alone means no, and so does `n`, at once: no reason is asked for.
+#[tokio::test]
+async fn enter_and_n_say_no_to_the_language_server_question() {
+    for code in [KeyCode::Enter, KeyCode::Char('n')] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ui, mut answer, _requests) = asked_about_servers(dir.path());
+        until_server_question(&mut ui).await;
+        press(&mut ui, code);
+        assert_eq!(
+            answer.try_recv(),
+            Ok(ApprovalDecision::Deny { feedback: None }),
+            "{code:?}"
+        );
+        assert!(!screen(&ui).iter().any(|r| r.starts_with("tell the model")));
+        ui.finish().await.unwrap();
+    }
+}
+
+// P5a's protection holds for this question: keys typed as it appears go to the input, an Enter
+// among them included, and answer nothing until the user pauses.
+#[tokio::test]
+async fn keys_typed_ahead_do_not_answer_the_language_server_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut answer, _requests) = asked_about_servers(dir.path());
+    let (_keys, input) = futures::channel::mpsc::unbounded::<std::io::Result<Event>>();
+    let run = ui.run(input, std::future::pending());
+    let _ = tokio::time::timeout(Duration::from_millis(200), run).await;
+    let early = ui.app().armed_at().unwrap() - Duration::from_millis(100);
+    for code in [KeyCode::Char('y'), KeyCode::Enter] {
+        ui.handle_at(key(code, KeyModifiers::NONE), early).unwrap();
+    }
+    assert!(ui.app().prompt().is_some());
+    assert!(answer.try_recv().is_err());
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Enter);
+    assert_eq!(
+        answer.try_recv(),
+        Ok(ApprovalDecision::Deny { feedback: None })
+    );
+    ui.finish().await.unwrap();
+}

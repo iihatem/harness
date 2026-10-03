@@ -180,6 +180,10 @@ pub enum ApprovalKind {
     /// Whether a command may run without the sandbox: once, or not. It is never approved for
     /// the session.
     RunUnsandboxed,
+    /// Whether language servers, which run the project's build code, may start in this workspace:
+    /// yes or no, kept with the workspace's trust record, so it is asked once. The request's
+    /// `reason` is the question.
+    StartServers,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

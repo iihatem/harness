@@ -10,7 +10,12 @@ use std::{
     time::Duration,
 };
 
-use harness_core::{permission::FsAccess, tool::CommandSandbox};
+use async_trait::async_trait;
+use harness_core::{
+    agent::{ApprovalDecision, ApprovalKind, ApprovalRequest, Approver},
+    permission::{Action, FsAccess},
+    tool::CommandSandbox,
+};
 use lsp_types::Diagnostic;
 use tokio::process::Command;
 
@@ -100,8 +105,11 @@ pub struct Settings {
     pub first_wait: Duration,
     /// By language name (see [`Found::name`]).
     pub servers: BTreeMap<String, ServerSetting>,
-    /// Servers run project code, so they start only in a trusted workspace.
+    /// Servers run project code, so they start only in a trusted workspace, or where the user
+    /// said yes to the question about them (`allowed`).
     pub trusted: bool,
+    /// The stored answer to "start language servers here?": `None` until it was asked.
+    pub allowed: Option<bool>,
     /// The directories servers are looked for in.
     pub path: Vec<PathBuf>,
     /// How long a server gets to answer `initialize`.
@@ -129,14 +137,69 @@ pub enum Report {
     Checked(Vec<Diagnostic>),
 }
 
-/// What the note for an untrusted workspace says.
-pub const UNTRUSTED_NOTE: &str = "diagnostics are off: language servers run project code, so they start only in a trusted workspace; run `harness trust` to review and trust this one";
+/// Asks the user whether language servers may start in the workspace: they run the project's
+/// build code. Only an interactive session has one to ask.
+#[async_trait]
+pub trait ServerConsent: Send + Sync {
+    /// Asks, and keeps a yes or a no where the workspace's trust record is kept, so that it is not
+    /// asked again. `None` when nobody answered: it is asked at the next edit.
+    async fn ask(&self) -> Option<bool>;
+}
 
 /// What the note says when there is no sandbox to run a server in.
 pub const NO_SANDBOX_NOTE: &str = "diagnostics are off: language servers run only inside the sandbox, and none is available in this mode";
 
 /// Crashes in a session after which a server is not started again.
 const MAX_CRASHES: u32 = 2;
+
+/// The question asked of the user: the request's `reason`.
+pub const SERVERS_QUESTION: &str =
+    "Start language servers here? They run this project's build code.";
+
+/// Asks the session's user the question through its approvals (so that it is shown, and takes
+/// keys, as an approval does), and keeps a yes or a no with `remember`.
+pub struct AskThroughApprover {
+    approver: Arc<dyn Approver>,
+    workspace: PathBuf,
+    remember: Box<dyn Fn(bool) + Send + Sync>,
+}
+
+impl AskThroughApprover {
+    pub fn new(
+        approver: Arc<dyn Approver>,
+        workspace: PathBuf,
+        remember: impl Fn(bool) + Send + Sync + 'static,
+    ) -> AskThroughApprover {
+        AskThroughApprover {
+            approver,
+            workspace,
+            remember: Box::new(remember),
+        }
+    }
+}
+
+#[async_trait]
+impl ServerConsent for AskThroughApprover {
+    async fn ask(&self) -> Option<bool> {
+        let request = ApprovalRequest {
+            call_id: "language-servers".into(),
+            tool: "language servers".into(),
+            arguments: serde_json::Value::Null,
+            action: Action::Read(self.workspace.clone()),
+            reason: SERVERS_QUESTION.into(),
+            kind: ApprovalKind::StartServers,
+            kept_for_session: false,
+        };
+        let yes = match self.approver.decide(&request).await {
+            ApprovalDecision::Approve | ApprovalDecision::ApproveForSession => true,
+            // Only an answer of `n` or Enter carries no reason: a turn that was stopped does.
+            ApprovalDecision::Deny { feedback: None } => false,
+            ApprovalDecision::Deny { .. } | ApprovalDecision::Unavailable => return None,
+        };
+        (self.remember)(yes);
+        Some(yes)
+    }
+}
 
 #[derive(Default)]
 struct Slot {
@@ -150,18 +213,65 @@ pub struct Manager {
     settings: Settings,
     workspace: PathBuf,
     slots: Mutex<HashMap<Language, Arc<tokio::sync::Mutex<Slot>>>>,
-    noted_untrusted: AtomicBool,
     noted_sandbox: AtomicBool,
+    /// The answer to the question, as stored or as given in this session.
+    answer: Mutex<Option<bool>>,
+    consent: Option<Arc<dyn ServerConsent>>,
+    /// Held while the question is asked, so that files edited together ask it once.
+    asking: tokio::sync::Mutex<()>,
 }
 
 impl Manager {
     pub fn new(settings: Settings, workspace: PathBuf) -> Manager {
         Manager {
+            answer: Mutex::new(settings.allowed),
             settings,
             workspace,
             slots: Mutex::default(),
-            noted_untrusted: AtomicBool::new(false),
             noted_sandbox: AtomicBool::new(false),
+            consent: None,
+            asking: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Lets the manager ask the user whether servers may start in an untrusted workspace.
+    pub fn with_consent(mut self, consent: Arc<dyn ServerConsent>) -> Manager {
+        self.consent = Some(consent);
+        self
+    }
+
+    fn answer(&self) -> Option<bool> {
+        *self.answer.lock().expect("answer lock")
+    }
+
+    /// Whether servers may start: the workspace is trusted, or the user said yes, now or before.
+    /// In an untrusted, unanswered workspace the user is asked, once, when someone can be.
+    async fn may_start(&self, launch: &Launch) -> Option<Report> {
+        if self.settings.trusted || self.answer() == Some(true) {
+            return None;
+        }
+        let no = Some(Report::NoServer);
+        if self.answer() == Some(false) {
+            return no;
+        }
+        let Some(consent) = &self.consent else {
+            return no;
+        };
+        // A server that could not be started in this mode is not asked about.
+        if launch.sandbox.is_none() && !launch.unsandboxed_ok {
+            return Some(once(&self.noted_sandbox, NO_SANDBOX_NOTE));
+        }
+        let _asking = self.asking.lock().await;
+        match self.answer() {
+            Some(true) => None,
+            Some(false) => no,
+            None => match consent.ask().await {
+                Some(yes) => {
+                    *self.answer.lock().expect("answer lock") = Some(yes);
+                    if yes { None } else { no }
+                }
+                None => no,
+            },
         }
     }
 
@@ -232,8 +342,8 @@ impl Manager {
         let Some((program, args)) = self.command(found.language) else {
             return Report::NoServer;
         };
-        if !self.settings.trusted {
-            return once(&self.noted_untrusted, UNTRUSTED_NOTE);
+        if let Some(report) = self.may_start(launch).await {
+            return report;
         }
         let Ok(text) = std::fs::read_to_string(file) else {
             return Report::NoServer;
@@ -316,7 +426,6 @@ impl Manager {
     /// Stops every server, without waiting for them, and forgets what went wrong: a new session
     /// starts afresh.
     pub fn reset(&self) {
-        self.noted_untrusted.store(false, Ordering::SeqCst);
         self.noted_sandbox.store(false, Ordering::SeqCst);
         let slots: Vec<_> = self.slots.lock().expect("slots lock").drain().collect();
         for (_, slot) in slots {

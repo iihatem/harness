@@ -47,6 +47,7 @@ async fn rust_analyzer_reports_a_type_error_after_an_edit() {
                 first_wait: Duration::from_secs(120),
                 servers: BTreeMap::new(),
                 trusted: true,
+                allowed: None,
                 path,
                 init_timeout: Duration::from_secs(60),
             },

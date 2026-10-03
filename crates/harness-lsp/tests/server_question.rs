@@ -218,7 +218,11 @@ async fn enter_says_no_and_no_server_runs() {
     until_asked(&mut s.ui).await;
     press(&mut s.ui, KeyCode::Enter);
     settle(&mut s.ui).await;
-    for result in edit_results(&s.provider) {
+    // No diagnostics, and one note, once, that they are off and what turns them on.
+    let results = edit_results(&s.provider);
+    assert!(results[0].contains("harness trust"), "{results:?}");
+    assert!(!results[0].contains("[diagnostics:"), "{results:?}");
+    for result in &results[1..] {
         assert!(!result.contains("diagnostics"), "{result}");
     }
     assert_eq!(*s.remembered.lock().unwrap(), [false]);

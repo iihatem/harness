@@ -156,6 +156,9 @@ pub const NO_SANDBOX_NOTE: &str = "diagnostics are off: language servers run onl
 pub const READ_ONLY_NOTE: &str =
     "diagnostics for Rust are off in read-only mode: rust-analyzer's cargo check writes to target/";
 
+/// What the note says when language servers are not allowed in the workspace.
+pub const NOT_ALLOWED_NOTE: &str = "diagnostics are off: language servers are not allowed in this workspace; run `harness trust` to turn them on";
+
 /// Crashes in a session after which a server is not started again.
 const MAX_CRASHES: u32 = 2;
 
@@ -222,6 +225,7 @@ pub struct Manager {
     slots: Mutex<HashMap<Language, Arc<tokio::sync::Mutex<Slot>>>>,
     noted_sandbox: AtomicBool,
     noted_read_only: AtomicBool,
+    noted_not_allowed: AtomicBool,
     /// The answer to the question, as stored or as given in this session.
     answer: Mutex<Option<bool>>,
     consent: Option<Arc<dyn ServerConsent>>,
@@ -238,6 +242,7 @@ impl Manager {
             slots: Mutex::default(),
             noted_sandbox: AtomicBool::new(false),
             noted_read_only: AtomicBool::new(false),
+            noted_not_allowed: AtomicBool::new(false),
             consent: None,
             asking: tokio::sync::Mutex::new(()),
         }
@@ -259,12 +264,12 @@ impl Manager {
         if self.settings.trusted || self.answer() == Some(true) {
             return None;
         }
-        let no = Some(Report::NoServer);
+        let no = || Some(once(&self.noted_not_allowed, NOT_ALLOWED_NOTE));
         if self.answer() == Some(false) {
-            return no;
+            return no();
         }
         let Some(consent) = &self.consent else {
-            return no;
+            return no();
         };
         // A server that could not be started in this mode is not asked about.
         if launch.sandbox.is_none() && !launch.unsandboxed_ok {
@@ -273,13 +278,14 @@ impl Manager {
         let _asking = self.asking.lock().await;
         match self.answer() {
             Some(true) => None,
-            Some(false) => no,
+            Some(false) => no(),
             None => match consent.ask().await {
                 Some(yes) => {
                     *self.answer.lock().expect("answer lock") = Some(yes);
-                    if yes { None } else { no }
+                    if yes { None } else { no() }
                 }
-                None => no,
+                // Nobody answered: it is asked again at the next edit, and nothing is said yet.
+                None => Some(Report::NoServer),
             },
         }
     }
@@ -435,6 +441,8 @@ impl Manager {
     /// starts afresh.
     pub fn reset(&self) {
         self.noted_sandbox.store(false, Ordering::SeqCst);
+        self.noted_read_only.store(false, Ordering::SeqCst);
+        self.noted_not_allowed.store(false, Ordering::SeqCst);
         let slots: Vec<_> = self.slots.lock().expect("slots lock").drain().collect();
         for (_, slot) in slots {
             if let Ok(mut slot) = slot.try_lock()

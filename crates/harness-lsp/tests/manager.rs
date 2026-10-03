@@ -311,20 +311,20 @@ async fn the_first_edit_with_a_server_asks_once_and_a_yes_starts_it() {
     manager.shutdown().await;
 }
 
-// Declining starts nothing, says nothing, and is not asked again.
+// Declining starts nothing, is not asked again, and says once that diagnostics are off.
 #[tokio::test]
 async fn a_no_starts_no_server_and_is_not_asked_again() {
     let f = Fixture::new();
     f.install("rust-analyzer");
     let consent = Consent::saying(Some(false));
     let manager = f.untrusted(None, Some(consent.clone()));
+    let file = f.file("lib.rs", "x // ERROR\n");
+    let Report::Note(note) = manager.check(&file, &direct()).await else {
+        panic!("a note was expected")
+    };
+    assert!(note.contains("harness trust"), "{note}");
     for _ in 0..2 {
-        assert_eq!(
-            manager
-                .check(&f.file("lib.rs", "x // ERROR\n"), &direct())
-                .await,
-            Report::NoServer
-        );
+        assert_eq!(manager.check(&file, &direct()).await, Report::NoServer);
     }
     assert_eq!(consent.asked(), 1);
     assert!(f.log().is_empty());
@@ -363,29 +363,56 @@ async fn a_stored_answer_is_not_asked_again() {
     assert_eq!(errors(&report), 1);
     yes.shutdown().await;
     let no = f.untrusted(Some(false), Some(consent.clone()));
-    assert_eq!(
-        no.check(&f.file("lib.rs", "x // ERROR\n"), &direct()).await,
-        Report::NoServer
-    );
+    let file = f.file("lib.rs", "x // ERROR\n");
+    assert!(matches!(no.check(&file, &direct()).await, Report::Note(_)));
+    assert_eq!(no.check(&file, &direct()).await, Report::NoServer);
     assert_eq!(consent.asked(), 0);
 }
 
-// Headless runs never ask: with no stored yes and no trust, no server starts, and there is no
-// note either.
+// Headless runs never ask: with no stored yes and no trust, no server starts, and the first edit
+// says once that diagnostics are off and `harness trust` turns them on; `/new` lets it say so again.
 #[tokio::test]
-async fn without_anyone_to_ask_an_unanswered_workspace_starts_no_server() {
+async fn without_anyone_to_ask_an_unanswered_workspace_starts_no_server_and_says_so_once() {
     let f = Fixture::new();
     f.install("rust-analyzer");
     let manager = f.untrusted(None, None);
-    for _ in 0..2 {
-        assert_eq!(
-            manager
-                .check(&f.file("lib.rs", "x // ERROR\n"), &direct())
-                .await,
-            Report::NoServer
-        );
-    }
+    let file = f.file("lib.rs", "x // ERROR\n");
+    let Report::Note(note) = manager.check(&file, &direct()).await else {
+        panic!("a note was expected")
+    };
+    assert!(note.contains("diagnostics are off"), "{note}");
+    assert!(note.contains("harness trust"), "{note}");
+    assert_eq!(manager.check(&file, &direct()).await, Report::NoServer);
+    manager.reset();
+    assert!(matches!(
+        manager.check(&file, &direct()).await,
+        Report::Note(_)
+    ));
     assert!(f.log().is_empty());
+}
+
+// `/new` starts the notes afresh, the read-only one included.
+#[tokio::test]
+async fn a_new_session_says_the_read_only_note_again() {
+    let f = Fixture::new();
+    f.install("rust-analyzer");
+    let manager = f.manager(f.settings());
+    let read_only = Launch {
+        sandbox: None,
+        access: FsAccess::ReadOnly,
+        unsandboxed_ok: true,
+    };
+    let file = f.file("a.rs", "x\n");
+    assert!(matches!(
+        manager.check(&file, &read_only).await,
+        Report::Note(_)
+    ));
+    assert_eq!(manager.check(&file, &read_only).await, Report::NoServer);
+    manager.reset();
+    assert!(matches!(
+        manager.check(&file, &read_only).await,
+        Report::Note(_)
+    ));
 }
 
 // Nothing to ask about without a server for the file, and a trusted workspace is never asked.

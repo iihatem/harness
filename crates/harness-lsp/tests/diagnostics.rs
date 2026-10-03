@@ -151,19 +151,22 @@ async fn a_language_without_a_server_adds_nothing() {
     );
 }
 
-// Ruling P3: where nobody can be asked (a headless run), an unanswered, untrusted workspace gets
-// no diagnostics and no note: the question replaced the note.
+// Where nobody can be asked (a headless run), an unanswered, untrusted workspace gets no
+// diagnostics, and the first edit says once that they are off and `harness trust` turns them on.
 #[tokio::test]
-async fn an_unanswered_untrusted_workspace_with_nobody_to_ask_says_nothing() {
+async fn an_unanswered_untrusted_workspace_with_nobody_to_ask_says_so_once() {
     let f = Fixture::new();
     let d = f.diagnostics(Duration::from_secs(5), false);
-    for _ in 0..2 {
-        assert!(
-            after_edit(&d, &[f.file("a.ts", "x // ERROR\n")])
-                .await
-                .is_none()
-        );
-    }
+    let said = after_edit(&d, &[f.file("a.ts", "x // ERROR\n")])
+        .await
+        .unwrap();
+    assert!(said.contains("diagnostics are off"), "{said}");
+    assert!(said.contains("harness trust"), "{said}");
+    assert!(
+        after_edit(&d, &[f.file("a.ts", "x // ERROR\n")])
+            .await
+            .is_none()
+    );
 }
 
 // A tool that changes several files (a patch) is checked file by file, errors listed together.

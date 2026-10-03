@@ -941,11 +941,19 @@ impl App {
             // waits for the user to pause.
             self.arming.typed(now);
         }
+        // While a picker is open (not yet taking keys, or it would have had this one), what is
+        // typed goes to the draft and nothing else happens: the draft is not sent, no command
+        // runs, the mode does not change, and neither Esc nor Ctrl+D leaves or opens anything. It
+        // waits for the picker to close.
+        let under_picker = self.picker.is_some();
+        if under_picker && (key.code == KeyCode::BackTab || key.code == KeyCode::Esc) {
+            return None;
+        }
         if ctrl && key.code == KeyCode::Char('d') && self.editor.is_empty() {
-            return self.quit();
+            return if under_picker { None } else { self.quit() };
         }
         if ctrl && key.code == KeyCode::Char('s') {
-            return self.send_now();
+            return if under_picker { None } else { self.send_now() };
         }
         if let Some(action) = self.completion_key(key) {
             return action;
@@ -958,6 +966,7 @@ impl App {
             _ => {}
         }
         match self.editor.key(key) {
+            Edit::Submit if under_picker => {}
             Edit::Submit => return self.submit(),
             Edit::Handled => self.update_completion(),
             Edit::Ignored => {}

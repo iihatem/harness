@@ -305,3 +305,87 @@ async fn ctrl_c_closes_a_picker_and_a_second_one_exits() {
     assert_eq!(flow, harness_tui::ui::Flow::Quit);
     ui.finish().await.unwrap();
 }
+
+// Review A I1: keys typed before a picker takes keys go to the draft, so nothing is lost, but
+// Enter never sends the draft while the picker is open: no turn starts under the full-screen
+// view, where its output and any approval it asks for could not be seen.
+#[tokio::test]
+async fn enter_typed_ahead_of_a_picker_does_not_send_the_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::text("Hello.")]);
+    let (mut ui, _log) = open(provider.clone(), dir.path());
+    // One burst: the command, then a message and its Enter, before the picker is drawn armed.
+    type_text(&mut ui, "/mode ");
+    press(&mut ui, KeyCode::Enter);
+    assert!(ui.app().picker().is_some());
+    type_text(&mut ui, "hello");
+    press(&mut ui, KeyCode::Enter);
+    assert!(ui.app().picker().is_some());
+    assert!(!ui.app().busy());
+    assert_eq!(ui.app().editor().text(), "hello");
+    assert!(provider.requests().is_empty());
+    // Nor does Ctrl+S, or a paste that ends in a newline.
+    ctrl(&mut ui, 's');
+    ui.app_mut().on_paste("again\n");
+    press(&mut ui, KeyCode::Enter);
+    assert!(!ui.app().busy());
+    assert!(provider.requests().is_empty());
+    assert!(ui.app().picker().is_some());
+    // Once the picker is closed the draft is still there, and Enter sends it.
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Esc);
+    assert!(ui.app().picker().is_none());
+    assert!(ui.app().editor().text().starts_with("hello"));
+    assert!(provider.requests().is_empty());
+    ui.finish().await.unwrap();
+}
+
+// Review A I1 (and its minor 3): Esc typed ahead of a picker neither reopens the rewind list over
+// it nor quits, and Ctrl+D does not quit.
+#[tokio::test]
+async fn escape_and_ctrl_d_typed_ahead_of_a_picker_do_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, _log) = open(MockProvider::new(Vec::new()), dir.path());
+    send(&mut ui, "/mode");
+    press(&mut ui, KeyCode::Esc);
+    press(&mut ui, KeyCode::Esc);
+    let flow = ui
+        .handle(ratatui::crossterm::event::Event::Key(
+            ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char('d'),
+                ratatui::crossterm::event::KeyModifiers::CONTROL,
+            ),
+        ))
+        .unwrap();
+    assert!(matches!(flow, harness_tui::ui::Flow::Continue));
+    let shown = screen(&ui);
+    assert_eq!(shown[0], "Choose the approval mode", "{shown:#?}");
+    ui.finish().await.unwrap();
+}
+
+// Review A I2: `/mode` and Enter open the mode picker, though `/model` starts with it too, and
+// `/model` and Enter open the model picker.
+#[tokio::test]
+async fn a_command_typed_in_full_runs_rather_than_completes_to_a_longer_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = options(dir.path(), Mode::Auto);
+    options.commands = vec![
+        ("model".into(), "Switch the model".into()),
+        ("mode".into(), "Switch the approval mode".into()),
+    ];
+    let (mut ui, _log) = start(
+        agent(MockProvider::new(Vec::new()), dir.path(), Mode::Auto),
+        Box::new(NoCommands),
+        options,
+    );
+    send(&mut ui, "/mode");
+    assert_eq!(screen(&ui)[0], "Choose the approval mode");
+    until_armed(&ui).await;
+    press(&mut ui, KeyCode::Esc);
+    assert!(ui.app().picker().is_none());
+    assert_eq!(ui.app().editor().text(), "");
+    send(&mut ui, "/model");
+    assert!(ui.app().picker().is_some(), "{:#?}", screen(&ui));
+    assert_ne!(screen(&ui)[0], "Choose the approval mode");
+    ui.finish().await.unwrap();
+}

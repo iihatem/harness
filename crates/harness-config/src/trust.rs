@@ -15,6 +15,30 @@ use crate::config::ConfigError;
 struct TrustFile {
     #[serde(default)]
     workspaces: BTreeMap<String, String>,
+    /// The answers to the one-time proposal of a detected gate, by workspace.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    gates: BTreeMap<String, GateAnswer>,
+}
+
+/// What the user answered when harness proposed a detected gate for a workspace: confirmed, as
+/// proposed or edited, or declined. Either way it is not asked again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateAnswer {
+    pub confirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_edit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test: Option<String>,
+}
+
+impl GateAnswer {
+    pub fn declined() -> GateAnswer {
+        GateAnswer {
+            confirmed: false,
+            after_edit: None,
+            test: None,
+        }
+    }
 }
 
 /// Workspaces the user trusted, keyed by canonical path, each with the fingerprint of the widening
@@ -62,6 +86,20 @@ impl TrustStore {
         self.file
             .workspaces
             .insert(Self::key(workspace), fingerprint.to_string());
+        self.save()
+    }
+
+    /// The answer to the proposal of a detected gate for `workspace`, if it was answered.
+    pub fn gate_answer(&self, workspace: &Path) -> Option<&GateAnswer> {
+        self.file.gates.get(&Self::key(workspace))
+    }
+
+    pub fn set_gate_answer(
+        &mut self,
+        workspace: &Path,
+        answer: GateAnswer,
+    ) -> Result<(), ConfigError> {
+        self.file.gates.insert(Self::key(workspace), answer);
         self.save()
     }
 

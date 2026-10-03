@@ -2,6 +2,7 @@ mod ask;
 mod auth;
 mod context;
 mod doctor;
+mod gates;
 mod host;
 mod interactive;
 mod login;

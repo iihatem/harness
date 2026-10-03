@@ -79,3 +79,52 @@ fn a_damaged_trust_file_never_quotes_its_line() {
     assert!(err.contains("line 1, column"), "{err}");
     assert!(!err.contains("SECRETVALUE"), "{err}");
 }
+
+// Spec "Declined once", and the answer to a proposal "stored with the workspace's trust record".
+#[test]
+fn a_gate_answer_round_trips_through_disk_by_canonical_path() {
+    use harness_config::trust::GateAnswer;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut store = TrustStore::load(&data).unwrap();
+    assert_eq!(store.gate_answer(&ws), None);
+    let answer = GateAnswer {
+        confirmed: true,
+        after_edit: Some("npm run lint".into()),
+        test: Some("npm test".into()),
+    };
+    store.set_gate_answer(&ws, answer.clone()).unwrap();
+    let again = TrustStore::load(&data).unwrap();
+    assert_eq!(again.gate_answer(&ws), Some(&answer));
+    // Another spelling of the same directory.
+    assert_eq!(again.gate_answer(&ws.join("../ws")), Some(&answer));
+    // Trust and the answer are separate: revoking trust keeps the answer, and the other way round.
+    let mut again = again;
+    again.trust(&ws, "fingerprint").unwrap();
+    assert!(again.revoke(&ws).unwrap());
+    assert_eq!(again.gate_answer(&ws), Some(&answer));
+}
+
+#[test]
+fn a_declined_proposal_is_an_answer_too() {
+    use harness_config::trust::GateAnswer;
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut store = TrustStore::load(&dir.path().join("data")).unwrap();
+    store.set_gate_answer(&ws, GateAnswer::declined()).unwrap();
+    let answer = store.gate_answer(&ws).unwrap();
+    assert!(!answer.confirmed && answer.test.is_none() && answer.after_edit.is_none());
+}
+
+#[test]
+fn a_trust_file_from_before_gate_answers_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("trust.toml"), "[workspaces]\n\"/x\" = \"abc\"\n").unwrap();
+    let store = TrustStore::load(&data).unwrap();
+    assert!(store.is_trusted(std::path::Path::new("/x"), "abc"));
+}

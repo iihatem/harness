@@ -199,6 +199,18 @@ pub fn prepare() -> Option<u8> {
             eprintln!("error: {}", terminal_safe(&e.to_string()));
             return Some(1);
         }
+        // After trust, which can configure gates itself: a detected gate is proposed once.
+        let proposed = crate::gates::propose(
+            &workspace,
+            &paths,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            &mut crate::trust::StdinTyping,
+        );
+        if let Err(e) = proposed {
+            eprintln!("error: {}", terminal_safe(&e.to_string()));
+            return Some(1);
+        }
     }
     None
 }

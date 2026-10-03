@@ -956,6 +956,14 @@ pub fn load(
             }
         }
     }
+    // A detected gate the user confirmed is configuration, when none is configured.
+    if gates.after_edit.is_none()
+        && gates.test.is_none()
+        && let Some(answer) = trust.gate_answer(workspace).filter(|a| a.confirmed)
+    {
+        gates.after_edit = answer.after_edit.clone();
+        gates.test = answer.test.clone();
+    }
     cfg.gates = gates.resolve();
     Ok(cfg)
 }

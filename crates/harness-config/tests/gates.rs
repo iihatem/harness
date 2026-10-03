@@ -169,3 +169,63 @@ fn invalid_gates_are_errors_naming_the_file() {
         );
     }
 }
+
+// A confirmed detection is configuration: it supplies the commands when none is configured.
+mod answers {
+    use super::*;
+    use harness_config::trust::GateAnswer;
+
+    fn confirmed(test: &str) -> GateAnswer {
+        GateAnswer {
+            confirmed: true,
+            after_edit: None,
+            test: Some(test.into()),
+        }
+    }
+
+    #[test]
+    fn a_confirmed_detection_supplies_the_commands() {
+        let mut f = fixture("", "");
+        f.trust
+            .set_gate_answer(&f.workspace, confirmed("cargo test"))
+            .unwrap();
+        let gates = f.load().unwrap().gates;
+        assert_eq!(gates.test.as_deref(), Some("cargo test"));
+        assert_eq!(gates.after_edit, None);
+        assert_eq!(gates.timeout_s, 300);
+    }
+
+    #[test]
+    fn configured_gates_win_over_a_confirmed_detection() {
+        let mut f = fixture("[gates]\nafter_edit = \"make lint\"\n", "");
+        f.trust
+            .set_gate_answer(&f.workspace, confirmed("cargo test"))
+            .unwrap();
+        let gates = f.load().unwrap().gates;
+        assert_eq!(gates.after_edit.as_deref(), Some("make lint"));
+        assert_eq!(gates.test, None);
+    }
+
+    #[test]
+    fn settings_without_commands_keep_their_values_beside_a_confirmed_detection() {
+        let mut f = fixture("[gates]\ntimeout_s = 20\n", "");
+        f.trust
+            .set_gate_answer(&f.workspace, confirmed("cargo test"))
+            .unwrap();
+        let gates = f.load().unwrap().gates;
+        assert_eq!(
+            (gates.test.as_deref(), gates.timeout_s),
+            (Some("cargo test"), 20)
+        );
+    }
+
+    // Spec "Declined once": no gate runs.
+    #[test]
+    fn a_declined_detection_supplies_nothing() {
+        let mut f = fixture("", "");
+        f.trust
+            .set_gate_answer(&f.workspace, GateAnswer::declined())
+            .unwrap();
+        assert!(!f.load().unwrap().gates.is_configured());
+    }
+}

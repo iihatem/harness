@@ -7,15 +7,21 @@ use std::{
 
 use harness_core::{
     message::Buckets,
-    meter::{AccountKind, Avoided, Meter, RequestCost, RequestRecord, WindowSnapshot},
+    meter::{
+        AccountKind, Avoided, BudgetKind, BudgetNotice, BudgetStatus, Meter, RequestCost,
+        RequestRecord, WindowSnapshot,
+    },
+    time::civil_date,
     time::now_unix,
 };
 use sha2::{Digest, Sha256};
 
 use crate::{
+    budget::{BudgetLine, Budgets, KINDS, reached},
     ledger::{Ledger, LedgerRecord, VERSION},
     paths::Dirs,
     pricing::Pricing,
+    store::Store,
 };
 
 /// Where the current time comes from, in seconds since the epoch: the clock, or a test's.
@@ -56,6 +62,12 @@ pub struct UsageMeter {
     /// The snapshot the request in flight has seen, to name in its record, and the last one
     /// written, so a snapshot repeated by every response is written once.
     window: Mutex<(Option<String>, Option<String>)>,
+    dirs: Dirs,
+    budgets: Mutex<Budgets>,
+    /// The report cache the budgets are checked against, opened when first needed.
+    store: Mutex<Option<Store>>,
+    /// The 80% warnings given: budget, period and limit, so a raised limit warns again.
+    warned: Mutex<std::collections::HashSet<String>>,
 }
 
 impl UsageMeter {
@@ -71,6 +83,10 @@ impl UsageMeter {
             warnings: Mutex::new(Vec::new()),
             failed: Mutex::new(false),
             window: Mutex::new((None, None)),
+            dirs: Dirs::under(data),
+            budgets: Mutex::new(Budgets::default()),
+            store: Mutex::new(None),
+            warned: Mutex::new(Default::default()),
         }
     }
 
@@ -90,6 +106,57 @@ impl UsageMeter {
     pub fn with_baseline(mut self, baseline: Option<String>) -> UsageMeter {
         self.baseline = baseline;
         self
+    }
+
+    /// Checks requests against `budgets`.
+    pub fn with_budgets(self, budgets: Budgets) -> UsageMeter {
+        *self.budgets.lock().unwrap_or_else(|e| e.into_inner()) = budgets;
+        self
+    }
+
+    /// The budgets now in force.
+    pub fn budgets(&self) -> Budgets {
+        self.budgets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Sets the session budget, for this session only (`/budget <usd>`).
+    pub fn set_session_budget(&self, usd: f64) {
+        self.budgets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session_usd = Some(usd);
+    }
+
+    /// What each budget allows and what is spent against it, for `session` today and this month.
+    pub fn budget_report(&self, session: &str) -> Vec<BudgetLine> {
+        let budgets = self.budgets();
+        KINDS
+            .iter()
+            .map(|&kind| BudgetLine {
+                budget: kind,
+                limit_usd: budgets.limit(kind),
+                spent_usd: self.spent(kind, session).unwrap_or(0.0),
+            })
+            .collect()
+    }
+
+    /// What was billed against `kind`, from the ledger.
+    fn spent(&self, kind: BudgetKind, session: &str) -> crate::error::Result<f64> {
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        if store.is_none() {
+            *store = Some(Store::open(&self.dirs)?);
+        }
+        let store = store.as_mut().expect("opened above");
+        store.sync()?;
+        let day = civil_date((self.clock)());
+        match kind {
+            BudgetKind::Session => store.session_spent(session),
+            BudgetKind::Daily => store.day_spent(&day),
+            BudgetKind::Monthly => store.month_spent(&day[..7]),
+        }
     }
 
     /// The prices requests are costed with.
@@ -200,6 +267,47 @@ impl Meter for UsageMeter {
                 self.ledger.dir().display()
             ));
         }
+    }
+
+    fn check_budget(&self, session: &str) -> BudgetStatus {
+        let budgets = self.budgets();
+        let mut status = BudgetStatus::default();
+        for kind in KINDS {
+            let Some(limit) = budgets.limit(kind) else {
+                continue;
+            };
+            let spent = match self.spent(kind, session) {
+                Ok(spent) => spent,
+                Err(e) => {
+                    self.warn(format!("cannot check the budgets: {e}"));
+                    return BudgetStatus::default();
+                }
+            };
+            let notice = BudgetNotice {
+                budget: kind,
+                spent_usd: spent,
+                limit_usd: limit,
+            };
+            if reached(spent, limit, 100.0) {
+                status.stop.get_or_insert(notice);
+            } else if reached(spent, limit, 80.0) {
+                let period = match kind {
+                    BudgetKind::Session => session.to_string(),
+                    BudgetKind::Daily => civil_date((self.clock)()),
+                    BudgetKind::Monthly => civil_date((self.clock)())[..7].to_string(),
+                };
+                let key = format!("{}:{period}:{limit}", kind.name());
+                if self
+                    .warned
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key)
+                {
+                    status.warnings.push(notice);
+                }
+            }
+        }
+        status
     }
 
     fn take_warnings(&self) -> Vec<String> {

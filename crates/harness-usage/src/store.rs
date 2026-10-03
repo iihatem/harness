@@ -337,6 +337,29 @@ impl Store {
         })
     }
 
+    /// What `session` has been billed, in USD: API-key requests only; an unpriced request cannot
+    /// be counted.
+    pub fn session_spent(&self, session: &str) -> Result<f64> {
+        self.spent("session = ?1", session)
+    }
+
+    /// What was billed on the UTC day `day` (`YYYY-MM-DD`).
+    pub fn day_spent(&self, day: &str) -> Result<f64> {
+        self.spent("day = ?1", day)
+    }
+
+    /// What was billed in the UTC month `month` (`YYYY-MM`).
+    pub fn month_spent(&self, month: &str) -> Result<f64> {
+        self.spent("substr(day, 1, 7) = ?1", month)
+    }
+
+    fn spent(&self, filter: &str, value: &str) -> Result<f64> {
+        let sql = format!(
+            "SELECT COALESCE(SUM(billed), 0) FROM requests WHERE account = 'api_key' AND {filter}"
+        );
+        Ok(self.db.query_row(&sql, [value], |r| r.get(0))?)
+    }
+
     /// Where the cache is.
     pub fn path(&self) -> &std::path::Path {
         &self.path

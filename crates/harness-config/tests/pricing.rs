@@ -81,3 +81,48 @@ fn the_baseline_is_read_from_the_global_config_only() {
     );
     assert_eq!(load("", None).unwrap().usage.baseline, None);
 }
+
+// `[budgets]`: money limits on billed cost. A project may only tighten them.
+#[test]
+fn budgets_are_read_and_checked() {
+    let cfg = load(
+        "[budgets]\nsession_usd = 1.5\ndaily_usd = 5\nmonthly_usd = 50\n",
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.budgets.session_usd, Some(1.5));
+    assert_eq!(cfg.budgets.daily_usd, Some(5.0));
+    assert_eq!(cfg.budgets.monthly_usd, Some(50.0));
+    assert_eq!(load("", None).unwrap().budgets.session_usd, None);
+    for bad in [
+        "[budgets]\nsession_usd = 0\n",
+        "[budgets]\ndaily_usd = -1\n",
+        "[budgets]\nmonthly_usd = \"lots\"\n",
+        "[budgets]\nweekly_usd = 1\n",
+    ] {
+        assert!(load(bad, None).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn a_project_can_lower_a_budget_and_never_raise_it() {
+    let cfg = load(
+        "[budgets]\nsession_usd = 5\ndaily_usd = 10\n",
+        Some("[budgets]\nsession_usd = 2\ndaily_usd = 100\nmonthly_usd = 20\n"),
+    )
+    .unwrap();
+    assert_eq!(cfg.budgets.session_usd, Some(2.0), "lowered");
+    assert_eq!(cfg.budgets.daily_usd, Some(10.0), "not raised");
+    assert_eq!(
+        cfg.budgets.monthly_usd,
+        Some(20.0),
+        "a limit where there was none"
+    );
+    assert!(
+        cfg.warnings
+            .iter()
+            .any(|w| w.contains("budgets.daily_usd") && w.contains("raise")),
+        "{:?}",
+        cfg.warnings
+    );
+}

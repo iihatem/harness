@@ -381,3 +381,42 @@ async fn usage_shows_the_avoided_figure_only_with_a_baseline() {
     let without = stdout(&run_usage(&env, &["usage"]));
     assert!(!without.contains("Avoided"), "{without}");
 }
+
+// A budget stops a headless run before the request that would cross it, with exit code 4, and the
+// `--json` output ends with the budget event and a turn-finished event with reason `budget`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_headless_budget_stop_exits_4() {
+    let server = MockServer::start().await;
+    two_requests(&server).await;
+    // The mock server is on this machine, so a profile says it is hosted; its tokens cost $1 each.
+    let config = "[budgets]\nsession_usd = 0.10\n[profiles.\"mock/*\"]\nlocal = false\n[pricing.\"mock/*\"]\ninput = 1000000\noutput = 1000000\n";
+    let env = Env::new(&server.uri(), config);
+    let (code, stdout) = tokio::task::spawn_blocking(move || {
+        let out = env
+            .cmd()
+            .args(["--model", "mock/test-model", "ask", "--json", "go"])
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, Some(4), "{stdout}");
+    let events: Vec<Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let n = events.len();
+    assert_eq!(events[n - 1]["type"], "turn_finished");
+    assert_eq!(events[n - 1]["reason"], "budget");
+    let reached = events[n - 4..n - 1]
+        .iter()
+        .find(|e| e["type"] == "budget_reached")
+        .expect("the budget event comes just before the turn's end");
+    assert_eq!(reached["notice"]["budget"], "session");
+    // Only the first request was sent.
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}

@@ -415,6 +415,28 @@ impl Agent {
         self
     }
 
+    /// Asks the meter whether the budgets allow the next request: says each 80% warning, and
+    /// whether one is reached (said as an event too).
+    fn budget_reached(&self, events: &UnboundedSender<AgentEvent>) -> bool {
+        let Some(meter) = &self.meter else {
+            return false;
+        };
+        let status = meter.check_budget(self.session.id());
+        for notice in status.warnings {
+            let _ = events.send(AgentEvent::BudgetWarning { notice });
+        }
+        for message in meter.take_warnings() {
+            let _ = events.send(AgentEvent::Warning { message });
+        }
+        match status.stop {
+            Some(notice) => {
+                let _ = events.send(AgentEvent::BudgetReached { notice });
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Tells the meter, if there is one, that a model request ended as `outcome` (`ok`, or
     /// `error:<kind>`) with `usage`, `started` being when it was sent. What the meter could not
     /// keep is shown as warnings.
@@ -973,6 +995,10 @@ impl Agent {
 
         let mut auto_compaction_failed = false;
         for _ in 0..self.config.max_steps {
+            // Before each request, not each turn: a turn with many tool calls can overrun.
+            if self.budget_reached(events) {
+                return self.finish(TurnEndReason::Budget, events);
+            }
             if !auto_compaction_failed {
                 auto_compaction_failed = !self.compact_automatically(events, &cancel).await;
             }

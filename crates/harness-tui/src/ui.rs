@@ -126,6 +126,8 @@ enum Background {
     /// What the provider said of its usage windows when the session asked as it started, or
     /// after a model switch.
     Windows(Result<WindowSnapshot, String>),
+    /// What `/budget` found out.
+    Budget(Result<Vec<String>, String>),
     /// What `/usage` asked for: the provider's windows (when it has any) and the ledger's report.
     Usage {
         windows: Option<Result<WindowSnapshot, String>>,
@@ -436,6 +438,14 @@ where
                     if windows.is_some() || !ledger.is_empty() {
                         let _ = tx.send(Background::Usage { windows, ledger });
                     }
+                });
+                Flow::Continue
+            }
+            Action::Budget { session, set } => {
+                let budget = self.app.host().budget(&session, set);
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(Background::Budget(budget.await));
                 });
                 Flow::Continue
             }
@@ -783,6 +793,7 @@ where
                 });
                 self.next_actions()?;
             }
+            Background::Budget(result) => self.app.on_budget(result),
             Background::Windows(result) => self.app.on_windows(result),
             Background::Usage { windows, ledger } => self.app.on_usage(windows, ledger),
             Background::Note(note) => self.app.push_note(&note),

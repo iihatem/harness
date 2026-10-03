@@ -1,6 +1,7 @@
 //! Usage for harness: the ledger of model requests, its report cache, prices, budgets and the
 //! outcome log. Everything here is local: nothing is sent anywhere.
 
+pub mod budget;
 pub mod date;
 pub mod error;
 pub mod ledger;

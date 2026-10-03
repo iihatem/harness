@@ -227,6 +227,15 @@ pub trait Host: Send {
     fn usage_report(&self, _args: &str) -> BoxFuture<'static, Vec<String>> {
         Box::pin(async { Vec::new() })
     }
+    /// The budgets with what is spent against them, in `session`; with `set`, first sets the
+    /// session budget to that many USD (for this session only). Errors say why not.
+    fn budget(
+        &self,
+        _session: &str,
+        _set: Option<f64>,
+    ) -> BoxFuture<'static, Result<Vec<String>, String>> {
+        Box::pin(async { Err("there are no budgets here".to_string()) })
+    }
     /// Signs in to `provider`, with a device code when `device` is set: what the user must do
     /// (the address to open, the code) goes to `notes` as it comes, and `cancel` stops it. Ok:
     /// what to tell the user; errors say why not.
@@ -321,6 +330,8 @@ pub enum Action {
     /// Ask the provider where its usage windows stand, and the host for the ledger's report, for
     /// `/usage` with these arguments.
     Usage(String),
+    /// Show the budgets, or raise the session's (`/budget <usd>`), in this session.
+    Budget { session: String, set: Option<f64> },
     /// Look for the models, for the model picker.
     ListModels,
     /// Continue on the model with this id.
@@ -559,6 +570,24 @@ impl App {
                 .map(|l| Line::from(sanitize(l)))
                 .collect::<Vec<_>>();
             self.transcript.push_lines(lines, width);
+        }
+    }
+
+    /// What `/budget` found out: the budgets and their spend, or why not.
+    pub fn on_budget(&mut self, result: Result<Vec<String>, String>) {
+        let width = self.width;
+        match result {
+            Ok(lines) => {
+                let lines = lines
+                    .iter()
+                    .map(|l| Line::from(sanitize(l)))
+                    .collect::<Vec<_>>();
+                self.transcript.push_lines(lines, width);
+            }
+            Err(why) => {
+                let why = self.redacted(&why);
+                self.transcript.push_error(&why, width);
+            }
         }
     }
 
@@ -947,6 +976,7 @@ impl App {
                 TurnEndReason::Completed => Some("the turn finished"),
                 TurnEndReason::Error => Some("the turn stopped with an error"),
                 TurnEndReason::StepLimit => Some("the turn stopped at the step limit"),
+                TurnEndReason::Budget => Some("the turn stopped at its budget"),
                 TurnEndReason::Interrupted => None,
             };
             if let Some(how) = how.filter(|_| took >= notify::LONG_TURN) {
@@ -1436,8 +1466,35 @@ impl App {
         let width = self.width;
         match name {
             "quit" => return self.quit(),
-            "mode" | "compact" | "rewind" | "new" | "resume" | "model" | "login"
+            "mode" | "compact" | "rewind" | "new" | "resume" | "model" | "login" | "budget"
                 if !self.between_turns(name) => {}
+            "budget" => {
+                let amount = args.trim().trim_start_matches('$');
+                let set = if amount.is_empty() {
+                    None
+                } else {
+                    match amount.parse::<f64>() {
+                        Ok(usd) if usd.is_finite() && usd > 0.0 => Some(usd),
+                        _ => {
+                            self.editor.submit();
+                            self.transcript.push_user(full, width);
+                            self.transcript.push_error(
+                                &format!(
+                                    "/budget takes an amount in USD above 0, such as /budget 2.00, not `{args}`"
+                                ),
+                                width,
+                            );
+                            return None;
+                        }
+                    }
+                };
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return Some(Action::Budget {
+                    session: self.session_id.clone(),
+                    set,
+                });
+            }
             "login" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);

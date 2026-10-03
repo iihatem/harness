@@ -36,6 +36,8 @@ pub struct CliHost {
     pub writable: Vec<PathBuf>,
     /// The first run's model, to be saved as the default once it has answered.
     pub unsaved_default: std::sync::Mutex<Option<String>>,
+    /// Keeps the budgets, which `/budget` shows and raises.
+    pub meter: Arc<harness_usage::meter::UsageMeter>,
 }
 
 impl Host for CliHost {
@@ -142,6 +144,27 @@ impl Host for CliHost {
             baseline: self.setup.config.usage.baseline.clone(),
             prices: crate::pricing::load(&self.setup).snapshot().label(),
         }
+    }
+
+    fn budget(
+        &self,
+        session: &str,
+        set: Option<f64>,
+    ) -> BoxFuture<'static, Result<Vec<String>, String>> {
+        let (meter, session) = (self.meter.clone(), session.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut lines = Vec::new();
+                if let Some(usd) = set {
+                    meter.set_session_budget(usd);
+                    lines.push(format!("session budget set to ${usd:.2} for this session"));
+                }
+                lines.extend(crate::usage::budget_lines(&meter.budget_report(&session)));
+                Ok(lines)
+            })
+            .await
+            .map_err(|e| format!("reading the budgets failed: {e}"))?
+        })
     }
 
     fn usage_report(&self, args: &str) -> BoxFuture<'static, Vec<String>> {
@@ -287,7 +310,16 @@ pub mod tests {
             policy,
             writable: Vec::new(),
             unsaved_default: Default::default(),
+            meter: Arc::new(harness_usage::meter::UsageMeter::open(
+                &paths_data(home),
+                workspace,
+            )),
         }
+    }
+
+    /// Where harness's data lives under `home`.
+    fn paths_data(home: &Path) -> std::path::PathBuf {
+        home.join("data")
     }
 
     // Final review minor 1: the first run's choice becomes the default only once it has answered.
@@ -376,6 +408,31 @@ pub mod tests {
         assert!(wrong.contains("--by takes"), "{wrong}");
         let bad_flag = host.usage_report("--wat").await.join("\n");
         assert!(bad_flag.contains("not `--wat`"), "{bad_flag}");
+    }
+
+    // `/budget` shows each budget with its spend, and `/budget <usd>` raises the session's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn budget_shows_the_budgets_and_raises_the_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        std::fs::write(
+            home.path().join("config/config.toml"),
+            "[budgets]\nsession_usd = 1.0\n",
+        )
+        .unwrap();
+        let host = host(home.path(), &workspace);
+        // This host's meter is built by the test, without the configuration's budgets.
+        let shown = host.budget("s1", None).await.unwrap().join("\n");
+        assert!(
+            shown.contains("session") && shown.contains("no limit"),
+            "{shown}"
+        );
+        let raised = host.budget("s1", Some(2.0)).await.unwrap().join("\n");
+        assert!(raised.contains("session budget set to $2.00"), "{raised}");
+        assert!(raised.contains("of $2.00"), "{raised}");
+        assert_eq!(host.meter.budgets().session_usd, Some(2.0));
     }
 
     /// A keychain that does not answer until `release` is dropped or sent to.
@@ -706,6 +763,7 @@ pub mod tests {
             policy,
             window_note,
             writable,
+            meter,
             ..
         }) = start::start(
             Request {
@@ -730,6 +788,7 @@ pub mod tests {
             policy,
             writable,
             unsaved_default: Default::default(),
+            meter: meter.clone(),
         };
         let options = Options {
             theme: Theme::monochrome(),
@@ -822,6 +881,7 @@ pub mod tests {
             policy,
             window_note,
             writable,
+            meter,
             ..
         }) = start::start(
             Request {
@@ -846,6 +906,7 @@ pub mod tests {
             policy,
             writable,
             unsaved_default: Default::default(),
+            meter: meter.clone(),
         };
         let options = Options {
             theme: Theme::monochrome(),
@@ -1035,6 +1096,7 @@ pub mod tests {
             policy,
             window_note,
             writable,
+            meter,
             ..
         }) = start::start(
             Request {
@@ -1059,6 +1121,7 @@ pub mod tests {
             policy,
             writable,
             unsaved_default: Default::default(),
+            meter: meter.clone(),
         };
         let options = Options {
             theme: Theme::monochrome(),

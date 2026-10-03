@@ -277,6 +277,57 @@ pub struct UsageSettings {
     pub baseline: Option<String>,
 }
 
+/// `[budgets]`: money limits on billed cost, in USD. A budget that is not set has no limit.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetSettings {
+    pub session_usd: Option<f64>,
+    pub daily_usd: Option<f64>,
+    pub monthly_usd: Option<f64>,
+}
+
+impl BudgetSettings {
+    fn named(&self) -> [(&'static str, Option<f64>); 3] {
+        [
+            ("session_usd", self.session_usd),
+            ("daily_usd", self.daily_usd),
+            ("monthly_usd", self.monthly_usd),
+        ]
+    }
+
+    /// What is wrong with these budgets, if anything: a limit must be above 0.
+    fn problem(&self) -> Option<String> {
+        self.named().into_iter().find_map(|(name, value)| {
+            value
+                .is_some_and(|v| !v.is_finite() || v <= 0.0)
+                .then(|| format!("budgets.{name} must be an amount in USD above 0"))
+        })
+    }
+
+    /// These budgets with `project`'s: it may lower a limit or set one where there was none, and
+    /// never raise one. The keys it tried to raise are returned.
+    fn tightened_by(&self, project: &BudgetSettings) -> (BudgetSettings, Vec<&'static str>) {
+        let mut raised = Vec::new();
+        let mut pick =
+            |name: &'static str, global: Option<f64>, project: Option<f64>| match (global, project)
+            {
+                (Some(g), Some(p)) if p > g => {
+                    raised.push(name);
+                    Some(g)
+                }
+                (Some(g), Some(p)) => Some(g.min(p)),
+                (None, Some(p)) => Some(p),
+                (g, None) => g,
+            };
+        let merged = BudgetSettings {
+            session_usd: pick("session_usd", self.session_usd, project.session_usd),
+            daily_usd: pick("daily_usd", self.daily_usd, project.daily_usd),
+            monthly_usd: pick("monthly_usd", self.monthly_usd, project.monthly_usd),
+        };
+        (merged, raised)
+    }
+}
+
 /// `[notifications]`: what the interactive session does when a long turn ends or an approval
 /// waits. A project may set it without trust: it changes nothing the agent may do.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -337,6 +388,8 @@ pub struct ConfigFile {
     pub pricing: BTreeMap<String, PriceSettings>,
     #[serde(default)]
     pub usage: UsageSettings,
+    #[serde(default)]
+    pub budgets: BudgetSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -373,6 +426,8 @@ pub struct Config {
     pub pricing: BTreeMap<String, PriceSettings>,
     /// `[usage]` (global config only).
     pub usage: UsageSettings,
+    /// `[budgets]`: the global config's, which a project may only lower.
+    pub budgets: BudgetSettings,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -618,6 +673,7 @@ pub fn load(
             .problem()
             .or_else(|| profiles_problem(&g.profiles))
             .or_else(|| pricing_problem(&g.pricing))
+            .or_else(|| g.budgets.problem())
     }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
@@ -641,6 +697,7 @@ pub fn load(
         cfg.profiles = global.profiles;
         cfg.pricing = global.pricing;
         cfg.usage = global.usage;
+        cfg.budgets = global.budgets;
         cfg.notifications = cfg.notifications.overlaid(&global.notifications);
     }
     let path = project_file(workspace);
@@ -660,6 +717,17 @@ pub fn load(
             cfg.warnings.push(format!(
                 "{}: ignoring [pricing]: prices are read from the global config only, so a cloned repository cannot make a model look free",
                 path.display()
+            ));
+        }
+        if let Some(message) = project.budgets.problem() {
+            return Err(ConfigError::Parse { path, message });
+        }
+        let (budgets, raised) = cfg.budgets.tightened_by(&project.budgets);
+        cfg.budgets = budgets;
+        for name in raised {
+            cfg.warnings.push(format!(
+                "{}: ignoring budgets.{name}: a project may lower a budget but not raise it",
+                project_file(workspace).display()
             ));
         }
         if project.usage != UsageSettings::default() {

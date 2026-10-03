@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     message::Usage,
-    meter::{RequestCost, WindowSnapshot},
+    meter::{BudgetNotice, RequestCost, WindowSnapshot},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,6 +12,8 @@ pub enum TurnEndReason {
     StepLimit,
     Interrupted,
     Error,
+    /// A money budget was reached, so the next request was not sent.
+    Budget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +69,15 @@ pub enum AgentEvent {
     /// Where a subscription's usage windows stand, as the provider just said.
     RateLimits {
         snapshot: WindowSnapshot,
+    },
+    /// 80% of a money budget is spent.
+    BudgetWarning {
+        notice: BudgetNotice,
+    },
+    /// A money budget is reached: the next request was not sent, and the turn ends with reason
+    /// `budget`.
+    BudgetReached {
+        notice: BudgetNotice,
     },
     Retrying {
         attempt: u32,

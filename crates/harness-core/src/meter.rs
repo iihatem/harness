@@ -164,10 +164,94 @@ pub struct RequestCost {
     pub avoided: Avoided,
 }
 
+/// Which money budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetKind {
+    Session,
+    Daily,
+    Monthly,
+}
+
+impl BudgetKind {
+    /// The word for it: `session`, `daily` or `monthly`.
+    pub fn name(self) -> &'static str {
+        match self {
+            BudgetKind::Session => "session",
+            BudgetKind::Daily => "daily",
+            BudgetKind::Monthly => "monthly",
+        }
+    }
+
+    /// The `[budgets]` key that sets it.
+    pub fn config_key(self) -> &'static str {
+        match self {
+            BudgetKind::Session => "session_usd",
+            BudgetKind::Daily => "daily_usd",
+            BudgetKind::Monthly => "monthly_usd",
+        }
+    }
+}
+
+/// A budget, what it allows and what has been spent against it (billed cost only).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BudgetNotice {
+    pub budget: BudgetKind,
+    pub spent_usd: f64,
+    pub limit_usd: f64,
+}
+
+impl BudgetNotice {
+    /// What to tell the user when 80% of the budget is spent.
+    pub fn warning_message(&self) -> String {
+        let percent = (self.spent_usd / self.limit_usd * 100.0 + 1e-9).floor();
+        format!(
+            "{percent:.0}% of the {} budget of ${:.2} is spent (${:.2}); requests go on until it is reached",
+            self.budget.name(),
+            self.limit_usd,
+            self.spent_usd
+        )
+    }
+
+    /// What to tell the user when the budget is reached: which one, and how to raise it.
+    pub fn reached_message(&self) -> String {
+        let raise = match self.budget {
+            BudgetKind::Session => format!(
+                "raise it with /budget <usd> for this session, or set budgets.{} in the configuration",
+                self.budget.config_key()
+            ),
+            _ => format!(
+                "raise it by setting budgets.{} in the configuration",
+                self.budget.config_key()
+            ),
+        };
+        format!(
+            "the {} budget of ${:.2} is reached (${:.2} spent), so the request was not sent; {raise}",
+            self.budget.name(),
+            self.limit_usd,
+            self.spent_usd
+        )
+    }
+}
+
+/// What the budgets say before a request: the ones at 80% (each said once), and the one that is
+/// reached, if any.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BudgetStatus {
+    pub warnings: Vec<BudgetNotice>,
+    pub stop: Option<BudgetNotice>,
+}
+
 /// Where the runtime reports what each model request took. Implemented by `harness-usage`.
 pub trait Meter: Send + Sync {
     /// Records `request`, and says what it cost.
     fn record_request(&self, request: &RequestRecord) -> RequestCost;
+
+    /// Asked before each model request in `session`: whether a money budget allows it. The
+    /// meter says each 80% warning once.
+    fn check_budget(&self, _session: &str) -> BudgetStatus {
+        BudgetStatus::default()
+    }
 
     /// A window snapshot the provider reported during a request that has not ended yet: the
     /// meter keeps it, and names it in that request's record.

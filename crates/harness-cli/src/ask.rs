@@ -205,6 +205,7 @@ pub fn exit_code(reason: TurnEndReason, blocked: bool) -> u8 {
         TurnEndReason::Completed if blocked => 3,
         TurnEndReason::Completed => 0,
         TurnEndReason::Interrupted => 130,
+        TurnEndReason::Budget => 4,
         TurnEndReason::StepLimit | TurnEndReason::Error => 1,
     }
 }
@@ -481,6 +482,12 @@ impl Shown {
             }
             AgentEvent::Warning { message } if !json => {
                 eprintln!("warning: {}", terminal_safe(message))
+            }
+            AgentEvent::BudgetWarning { notice } if !json => {
+                eprintln!("warning: {}", notice.warning_message())
+            }
+            AgentEvent::BudgetReached { notice } if !json => {
+                eprintln!("error: {}", notice.reached_message())
             }
             AgentEvent::Compacted {
                 summary,

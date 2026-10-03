@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "calc.go"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: calc.go\n@@\n package task\n \n func Max(a, b int) int {\n-\tif a < b {\n+\tif a > b {\n \t\treturn a\n \t}\n \treturn b\n*** End Patch\n"
+      }
+    }
+  ]
+}

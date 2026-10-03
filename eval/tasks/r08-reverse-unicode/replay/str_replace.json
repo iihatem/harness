@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "pub fn reverse(s: &str) -> String {\n    s.chars().rev().collect()\n}",
+        "old_string": "pub fn reverse(s: &str) -> String {\n    String::from_utf8(s.bytes().rev().collect()).unwrap()\n}",
+        "path": "src/lib.rs"
+      }
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "    if x < lo {\n        lo\n    } else if x > hi {\n        hi\n    } else {",
+        "old_string": "    if x < lo {\n        hi\n    } else if x > hi {\n        lo\n    } else {",
+        "path": "src/lib.rs"
+      }
+    }
+  ]
+}

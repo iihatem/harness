@@ -37,6 +37,50 @@ impl Env {
     }
 }
 
+/// The text of the trust file under the isolated home, empty when there is none.
+fn trust_file(env: &Env) -> String {
+    fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == "trust.toml") {
+                return Some(path);
+            }
+            if path.is_dir()
+                && let Some(found) = find(&path)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    find(env.home.path())
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default()
+}
+
+// Ruling P3: `harness trust` also enables language servers, and revoking takes that back.
+#[test]
+fn trusting_a_workspace_enables_its_language_servers_and_revoking_disables_them() {
+    let env = Env::new(None);
+    env.cmd()
+        .args(["trust", "--yes"])
+        .assert()
+        .success()
+        .stdout(contains("Language servers may start"));
+    assert!(
+        trust_file(&env).contains("[servers]"),
+        "{}",
+        trust_file(&env)
+    );
+    assert!(trust_file(&env).contains("= true"), "{}", trust_file(&env));
+    env.cmd().args(["trust", "--revoke"]).assert().success();
+    assert!(
+        !trust_file(&env).contains("[servers]"),
+        "{}",
+        trust_file(&env)
+    );
+}
+
 const PROJECT: &str = "[permissions]\nallow = [\"bash:make*\"]\n";
 
 // Ruling P3-R1: a workspace without widening settings can still be trusted (for its command

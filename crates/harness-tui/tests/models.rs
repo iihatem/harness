@@ -73,6 +73,8 @@ impl Host for Models {
                     context_window: window,
                     request: RequestOptions::default(),
                     text_tool_calls: false,
+                    tools: None,
+                    edit_section: None,
                 },
                 window_note: "from the model's profile".into(),
                 warnings: vec!["a warning about the window".into()],

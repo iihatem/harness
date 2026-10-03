@@ -1,0 +1,4 @@
+language = "python"
+title = "scale accepts strings"
+prompt = "scale(x, factor) should raise TypeError when x is not an int or a float, instead of repeating a string."
+test = "python3 -m unittest -q"

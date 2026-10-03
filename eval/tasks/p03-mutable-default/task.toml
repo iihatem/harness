@@ -1,0 +1,4 @@
+language = "python"
+title = "a shared default list"
+prompt = "add_item keeps adding to the same list across calls because of its default argument. Each call without a list should start with a new one."
+test = "python3 -m unittest -q"

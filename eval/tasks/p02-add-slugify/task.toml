@@ -1,0 +1,4 @@
+language = "python"
+title = "add slugify"
+prompt = "Add slugify(text) to app.py: lowercase the text, replace each run of non-alphanumeric characters with a single hyphen, and strip hyphens from both ends."
+test = "python3 -m unittest -q"

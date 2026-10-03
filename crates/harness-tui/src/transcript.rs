@@ -236,7 +236,12 @@ impl Transcript {
                         self.push_error("stopped after reaching the step limit", width)
                     }
                     // The budget event just before said which budget, and how to raise it.
-                    TurnEndReason::Completed | TurnEndReason::Error | TurnEndReason::Budget => {}
+                    TurnEndReason::Budget => {}
+                    TurnEndReason::GateFailed => self.push_error(
+                        "stopped because the tests still fail; the last failure is above",
+                        width,
+                    ),
+                    TurnEndReason::Completed | TurnEndReason::Error => {}
                 }
             }
             AgentEvent::TurnStats {
@@ -265,12 +270,38 @@ impl Transcript {
             AgentEvent::BudgetReached { notice } => {
                 self.push_error(&notice.reached_message(), width);
             }
+            AgentEvent::GateResult {
+                gate,
+                command,
+                status,
+                exit_code,
+                tail,
+            } => {
+                let (text, ok) = gate_line(*gate, command.as_deref(), *status, *exit_code);
+                self.gap();
+                let style = if ok {
+                    self.theme.dim()
+                } else {
+                    self.theme.warning()
+                };
+                self.push_lines(lines(&text, style), width);
+                if let Some(tail) = tail {
+                    let dim = self.theme.dim();
+                    let shown: String = tail
+                        .trim_end()
+                        .lines()
+                        .map(|line| format!("  {line}\n"))
+                        .collect();
+                    self.push_lines(lines(shown.trim_end(), dim), width);
+                }
+            }
             AgentEvent::ApprovalNeeded { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::Metered { .. }
             | AgentEvent::RateLimits { .. }
             | AgentEvent::LimitReached { .. }
-            | AgentEvent::CheckpointCreated { .. } => {}
+            | AgentEvent::CheckpointCreated { .. }
+            | AgentEvent::ChangesChecked { .. } => {}
         }
     }
 
@@ -373,5 +404,64 @@ pub fn call_summary(name: &str, args: &Value) -> String {
             let shown: String = args.to_string().chars().take(80).collect();
             format!("{other} {shown}")
         }
+    }
+}
+
+/// The line a gate's result is shown as, and whether it is a success (or a skip).
+pub fn gate_line(
+    gate: harness_core::event::GateKind,
+    command: Option<&str>,
+    status: harness_core::event::GateStatus,
+    exit_code: Option<i32>,
+) -> (String, bool) {
+    use harness_core::event::{GateKind, GateStatus};
+    let name = match gate {
+        GateKind::AfterEdit => "after-edit check",
+        GateKind::Test => "tests",
+    };
+    let command = command.map(|c| format!(": {c}")).unwrap_or_default();
+    match status {
+        GateStatus::Passed => (format!("{name} passed{command}"), true),
+        GateStatus::Skipped => (format!("{name} skipped in this mode{command}"), true),
+        GateStatus::Failed => match exit_code {
+            Some(code) => (format!("{name} failed (exit code {code}){command}"), false),
+            None => (format!("{name} failed{command}"), false),
+        },
+        GateStatus::TimedOut => (format!("{name} timed out{command}"), false),
+        GateStatus::Blocked => (format!("{name} blocked, did not run{command}"), false),
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use harness_core::event::{GateKind, GateStatus};
+
+    #[test]
+    fn a_gate_result_is_one_line_saying_what_ran_and_how_it_ended() {
+        let line = |gate, status, code| gate_line(gate, Some("cargo test"), status, code);
+        assert_eq!(
+            line(GateKind::Test, GateStatus::Passed, Some(0)),
+            ("tests passed: cargo test".to_string(), true)
+        );
+        assert_eq!(
+            line(GateKind::Test, GateStatus::Failed, Some(101)),
+            (
+                "tests failed (exit code 101): cargo test".to_string(),
+                false
+            )
+        );
+        assert_eq!(
+            line(GateKind::AfterEdit, GateStatus::TimedOut, None),
+            ("after-edit check timed out: cargo test".to_string(), false)
+        );
+        assert_eq!(
+            line(GateKind::AfterEdit, GateStatus::Blocked, None),
+            (
+                "after-edit check blocked, did not run: cargo test".to_string(),
+                false
+            )
+        );
+        assert!(line(GateKind::Test, GateStatus::Skipped, None).1);
     }
 }

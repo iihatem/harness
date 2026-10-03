@@ -14,12 +14,14 @@ brush-parser = "=0.4.0"
 harness-config = { path = "crates/harness-config" }
 harness-context = { path = "crates/harness-context" }
 harness-core = { path = "crates/harness-core" }
+harness-lsp = { path = "crates/harness-lsp" }
 harness-providers = { path = "crates/harness-providers", default-features = false }
 harness-sandbox = { path = "crates/harness-sandbox" }
 harness-shell = { path = "crates/harness-shell" }
 harness-tools = { path = "crates/harness-tools" }
 harness-tui = { path = "crates/harness-tui" }
 harness-usage = { path = "crates/harness-usage" }
+xtask = { path = "crates/xtask" }
 async-stream = "0.3"
 base64 = "0.23.1"
 async-trait = "0.1.92"
@@ -34,10 +36,12 @@ landlock = "0.4.7"
 libc = "0.2"
 jsonschema = "0.57.0"
 keyring-core = "1.0.0"
+lsp-types = "0.97"
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }
 nix = { version = "0.31.3", features = ["signal", "process"] }
 nucleo-matcher = "0.3.1"
+proptest = { version = "1", default-features = false, features = ["std"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 regex = "1"

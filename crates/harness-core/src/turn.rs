@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::{engine::RuleSet, message::RequestOptions, provider::Provider};
+use crate::{engine::RuleSet, message::RequestOptions, provider::Provider, tool::ToolRegistry};
 
 /// One piece of a turn's user message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,10 @@ pub struct TurnModel {
     /// Whether it runs on a server of the user's own (its profile's `local`), which gets longer to
     /// start a reply, and is not asked again when it does not.
     pub local: bool,
+    /// The tools it is offered, when they are not the session's: its edit format's.
+    pub tools: Option<ToolRegistry>,
+    /// What the system prompt's edit section becomes for the turn.
+    pub edit_section: Option<String>,
 }
 
 impl TurnModel {

@@ -1,0 +1,30 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "calc.go"
+      }
+    },
+    {
+      "name": "read",
+      "arguments": {
+        "path": "run.go"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "package task\n\nfunc Double(x int) int {\n\treturn x * 2\n}\n",
+        "path": "calc.go"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "package task\n\nfunc Run() int {\n\treturn Double(21)\n}\n",
+        "path": "run.go"
+      }
+    }
+  ]
+}

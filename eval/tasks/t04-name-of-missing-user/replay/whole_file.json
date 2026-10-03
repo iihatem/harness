@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "export interface User {\n  name?: string;\n}\n\nexport function getName(user: User | undefined): string {\n  return user?.name ?? \"anonymous\";\n}\n",
+        "path": "mod.ts"
+      }
+    }
+  ]
+}

@@ -9,7 +9,7 @@ use std::{
 
 use harness_config::config;
 use harness_context::project::project_root;
-use harness_core::permission::Mode;
+use harness_core::{diag::Diagnostics, permission::Mode};
 use harness_providers::registry;
 use harness_tui::{
     app::{Host, Options},
@@ -199,6 +199,18 @@ pub fn prepare() -> Option<u8> {
             eprintln!("error: {}", terminal_safe(&e.to_string()));
             return Some(1);
         }
+        // After trust, which can configure gates itself: a detected gate is proposed once.
+        let proposed = crate::gates::propose(
+            &workspace,
+            &paths,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            &mut crate::trust::StdinTyping,
+        );
+        if let Err(e) = proposed {
+            eprintln!("error: {}", terminal_safe(&e.to_string()));
+            return Some(1);
+        }
     }
     None
 }
@@ -278,6 +290,7 @@ pub async fn run(
         write_mode_warning,
         writable,
         meter,
+        diagnostics,
     }) = start::start(
         Request {
             setup: &setup,
@@ -339,6 +352,8 @@ pub async fn run(
         first_run,
     )
     .await;
+    // The language servers stop before the sandbox's session ends.
+    diagnostics.shutdown().await;
     sandbox_session.end();
     match result {
         Ok(ending) => exit_code(ending),

@@ -1,0 +1,4 @@
+language = "go"
+title = "ParsePort ignores the error"
+prompt = "ParsePort returns 0 for text that is not a number. It should return the error from the conversion too; the tests expect an error for bad input."
+test = "go test ./..."

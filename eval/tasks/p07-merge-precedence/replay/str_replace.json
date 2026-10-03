@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "def merge(defaults, overrides):\n    return {**defaults, **overrides}",
+        "old_string": "def merge(defaults, overrides):\n    return {**overrides, **defaults}",
+        "path": "app.py"
+      }
+    }
+  ]
+}

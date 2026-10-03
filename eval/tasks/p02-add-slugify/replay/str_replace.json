@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "import re\n\n\ndef title(text):\n    return text.strip().title()\n\n\ndef slugify(text):\n    return re.sub(r\"[^a-z0-9]+\", \"-\", text.lower()).strip(\"-\")",
+        "old_string": "def title(text):\n    return text.strip().title()",
+        "path": "app.py"
+      }
+    }
+  ]
+}

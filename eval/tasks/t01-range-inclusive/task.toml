@@ -1,0 +1,4 @@
+language = "typescript"
+title = "range leaves out the end"
+prompt = "range(a, b) should list the integers from a to b inclusive, but it stops one short."
+test = "deno test --no-check --quiet"

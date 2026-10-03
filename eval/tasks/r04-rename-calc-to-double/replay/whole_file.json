@@ -1,0 +1,30 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/math.rs"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "pub mod math;\n\npub fn run() -> i32 {\n    math::double(21)\n}\n",
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "pub fn double(x: i32) -> i32 {\n    x * 2\n}\n",
+        "path": "src/math.rs"
+      }
+    }
+  ]
+}

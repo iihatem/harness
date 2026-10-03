@@ -1,0 +1,19 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "text.go"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "8#de1",
+        "new_text": "\tr := []rune(s)\n\tfor i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {\n\t\tr[i], r[j] = r[j], r[i]\n\t}\n\treturn string(r)",
+        "path": "text.go",
+        "start": "4#84e"
+      }
+    }
+  ]
+}

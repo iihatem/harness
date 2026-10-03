@@ -274,12 +274,27 @@ pub fn first_use(
     store
         .trust(workspace, &widening.fingerprint)
         .map_err(std::io::Error::other)?;
+    // Trusting a workspace lets its language servers start, so they are not asked about.
+    store
+        .set_servers_answer(workspace, true)
+        .map_err(std::io::Error::other)?;
     writeln!(
         out,
         "Trusted {}.",
         terminal_safe(&workspace.display().to_string())
     )?;
     Ok(FirstUse::Trusted)
+}
+
+/// What `harness trust --revoke` says it did.
+fn revoked_message(workspace: &str, revoked: harness_config::trust::Revoked) -> String {
+    match (revoked.trusted, revoked.servers_answer) {
+        (true, _) => format!("Revoked trust for {workspace}."),
+        (false, true) => format!(
+            "{workspace} was not trusted; the answer stored about language servers was cleared."
+        ),
+        (false, false) => format!("{workspace} was not trusted."),
+    }
 }
 
 pub fn run(yes: bool, revoke: bool) -> u8 {
@@ -309,17 +324,10 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
     };
     if revoke {
         return match store.revoke(&workspace) {
-            Ok(true) => {
+            Ok(revoked) => {
                 println!(
-                    "Revoked trust for {}.",
-                    terminal_safe(&workspace.display().to_string())
-                );
-                0
-            }
-            Ok(false) => {
-                println!(
-                    "{} was not trusted.",
-                    terminal_safe(&workspace.display().to_string())
+                    "{}",
+                    revoked_message(&terminal_safe(&workspace.display().to_string()), revoked)
                 );
                 0
             }
@@ -378,10 +386,13 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
             return 0;
         }
     }
-    match store.trust(&workspace, &widening.fingerprint) {
+    match store
+        .trust(&workspace, &widening.fingerprint)
+        .and_then(|()| store.set_servers_answer(&workspace, true))
+    {
         Ok(()) => {
             println!(
-                "Trusted {}.",
+                "Trusted {}. Language servers may start in it (they run the project's build code).",
                 terminal_safe(&workspace.display().to_string())
             );
             0
@@ -396,6 +407,23 @@ pub fn run(yes: bool, revoke: bool) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revoking_says_what_was_forgotten() {
+        use harness_config::trust::Revoked;
+        let said = |trusted, servers_answer| {
+            revoked_message(
+                "/w",
+                Revoked {
+                    trusted,
+                    servers_answer,
+                },
+            )
+        };
+        assert_eq!(said(true, true), "Revoked trust for /w.");
+        assert_eq!(said(false, false), "/w was not trusted.");
+        assert!(said(false, true).contains("answer stored about language servers was cleared"));
+    }
 
     struct Workspace {
         _dir: tempfile::TempDir,
@@ -620,6 +648,23 @@ mod tests {
         assert_eq!(allowed(&w), ["bash:make *"]);
         // Asked once: trusted now.
         assert_eq!(ask(&w, "").0, FirstUse::NothingToAsk);
+    }
+
+    // Ruling P3: trusting also enables language servers, which are then not asked about.
+    #[test]
+    fn trusting_on_first_use_also_enables_language_servers() {
+        let w = workspace("[permissions]\nallow = [\"bash:make*\"]\n");
+        assert_eq!(ask(&w, "y\n").0, FirstUse::Trusted);
+        let store = TrustStore::load(&w.paths.data_dir).unwrap();
+        assert_eq!(store.servers_answer(&w.ws), Some(true));
+    }
+
+    #[test]
+    fn declining_leaves_language_servers_unanswered() {
+        let w = workspace("[permissions]\nallow = [\"bash:make*\"]\n");
+        assert_eq!(ask(&w, "n\n").0, FirstUse::Declined);
+        let store = TrustStore::load(&w.paths.data_dir).unwrap();
+        assert_eq!(store.servers_answer(&w.ws), None);
     }
 
     #[test]

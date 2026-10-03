@@ -1,0 +1,4 @@
+language = "python"
+title = "add shout to util and use it in greet"
+prompt = "Add shout(text) to util.py (it returns the text in upper case with an exclamation mark) and make greet in main.py use it."
+test = "python3 -m unittest -q"

@@ -1,0 +1,4 @@
+language = "go"
+title = "rename Calc to Double in two files"
+prompt = "Rename the function Calc to Double in calc.go and in its caller in run.go. The tests call Double."
+test = "go test ./..."

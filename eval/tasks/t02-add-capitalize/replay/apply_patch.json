@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: mod.ts\n@@\n export function lower(s: string): string {\n   return s.toLowerCase();\n }\n+\n+export function capitalize(s: string): string {\n+  return s.charAt(0).toUpperCase() + s.slice(1);\n+}\n*** End Patch\n"
+      }
+    }
+  ]
+}

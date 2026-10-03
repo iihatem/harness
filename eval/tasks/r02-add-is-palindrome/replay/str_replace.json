@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "}\n\npub fn is_palindrome(s: &str) -> bool {\n    s == reverse(s)\n}",
+        "old_string": "}",
+        "path": "src/lib.rs"
+      }
+    }
+  ]
+}

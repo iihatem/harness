@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: mod.ts\n@@\n export function abs(x: number): number {\n   return x < 0 ? -x : x;\n }\n+\n+export function clamp(x: number, lo: number, hi: number): number {\n+  return Math.min(Math.max(x, lo), hi);\n+}\n*** End Patch\n"
+      }
+    }
+  ]
+}

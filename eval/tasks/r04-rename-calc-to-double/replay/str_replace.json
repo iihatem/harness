@@ -1,0 +1,32 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/math.rs"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "pub fn run() -> i32 {\n    math::double(21)\n}",
+        "old_string": "pub fn run() -> i32 {\n    math::calc(21)\n}",
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "pub fn double(x: i32) -> i32 {\n    x * 2",
+        "old_string": "pub fn calc(x: i32) -> i32 {\n    x * 2",
+        "path": "src/math.rs"
+      }
+    }
+  ]
+}

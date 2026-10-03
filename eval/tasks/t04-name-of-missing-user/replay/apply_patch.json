@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: mod.ts\n@@\n }\n \n export function getName(user: User | undefined): string {\n-  return user.name;\n+  return user?.name ?? \"anonymous\";\n }\n*** End Patch\n"
+      }
+    }
+  ]
+}

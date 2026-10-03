@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "def add_item(item, items=None):\n    if items is None:\n        items = []\n    items.append(item)\n    return items\n",
+        "path": "app.py"
+      }
+    }
+  ]
+}

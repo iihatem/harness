@@ -1,0 +1,34 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "cart.ts"
+      }
+    },
+    {
+      "name": "read",
+      "arguments": {
+        "path": "price.ts"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "4#870",
+        "new_text": "import { formatPrice } from \"./price.ts\";\n\nexport function total(items: number[]): string {\n  return formatPrice(items.reduce((a, b) => a + b, 0));",
+        "path": "cart.ts",
+        "start": "1#767"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "1#639",
+        "new_text": "export function formatPrice(cents: number): string {",
+        "path": "price.ts",
+        "start": "1#639"
+      }
+    }
+  ]
+}

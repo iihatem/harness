@@ -1,0 +1,32 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "main.py"
+      }
+    },
+    {
+      "name": "read",
+      "arguments": {
+        "path": "util.py"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "from util import clean, shout\n\n\ndef greet(name):\n    return shout(\"hello \" + clean(name))",
+        "old_string": "from util import clean\n\n\ndef greet(name):\n    return \"hello \" + clean(name)",
+        "path": "main.py"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "    return text.strip()\n\n\ndef shout(text):\n    return text.upper() + \"!\"",
+        "old_string": "    return text.strip()",
+        "path": "util.py"
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn parse_port(s: &str) -> u16 {\n-    s.trim().parse().unwrap()\n+pub fn parse_port(s: &str) -> Result<u16, std::num::ParseIntError> {\n+    s.trim().parse()\n }\n*** End Patch\n"
+      }
+    }
+  ]
+}

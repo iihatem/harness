@@ -18,17 +18,7 @@ pub fn limit_output(
     if content.len() <= limit {
         return content.to_string();
     }
-    let safe_id: String = call_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let file = dir.join(format!("{safe_id}.txt"));
+    let file = spill_path(dir, call_id);
     let saved = save(
         dir,
         &file,
@@ -58,6 +48,38 @@ pub fn limit_output(
         omitted.lines().count(),
         &content[tail_start..]
     )
+}
+
+/// Where the full output of tool call `call_id` goes in `dir`.
+fn spill_path(dir: &Path, call_id: &str) -> std::path::PathBuf {
+    let safe_id: String = call_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    dir.join(format!("{safe_id}.txt"))
+}
+
+/// Saves `content`, redacted, as the full output of tool call `call_id` in `dir`, as
+/// [`limit_output`] does for output over the limit; where it went.
+pub fn spill(
+    content: &str,
+    dir: &Path,
+    call_id: &str,
+    redactor: Option<&Redactor>,
+) -> std::io::Result<std::path::PathBuf> {
+    let file = spill_path(dir, call_id);
+    save(
+        dir,
+        &file,
+        &redactor.map_or_else(|| content.to_string(), |r| r.redact(content)),
+    )?;
+    Ok(file)
 }
 
 /// Writes `content` to `file` in `dir`. It holds what the session file holds, so like session

@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "export function range(a: number, b: number): number[] {\n  const out: number[] = [];\n  for (let i = a; i <= b; i++) {\n    out.push(i);\n  }\n  return out;\n}\n",
+        "path": "mod.ts"
+      }
+    }
+  ]
+}

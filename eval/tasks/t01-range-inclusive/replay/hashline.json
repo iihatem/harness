@@ -1,0 +1,19 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "3#d63",
+        "new_text": "  for (let i = a; i <= b; i++) {",
+        "path": "mod.ts",
+        "start": "3#d63"
+      }
+    }
+  ]
+}

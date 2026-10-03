@@ -13,10 +13,14 @@ use serde_json::{Value, json};
 use tokio::{sync::mpsc::UnboundedSender, time::Instant};
 use tokio_util::sync::CancellationToken;
 
+mod gates;
+
 use crate::{
     checkpoint::{CheckpointError, Checkpoints},
     compaction::{self, CompactionConfig},
+    diag::Diagnostics,
     event::{AgentEvent, ErrorKind, TurnEndReason},
+    gate::Gates,
     message::{ChatRequest, Message, RequestOptions, ToolCall, Usage},
     meter::{AccountKind, GateCounts, MAIN_ROLE, Meter, RequestRecord, TurnRecord},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
@@ -91,6 +95,9 @@ pub struct AgentConfig {
     pub request: RequestOptions,
     /// Run tool calls the model writes as text (`textcalls`): for local models.
     pub text_tool_calls: bool,
+    /// The text of the system prompt that describes how the model edits files, when the prompt
+    /// has one: a switch to a model with another edit format replaces it.
+    pub edit_section: Option<String>,
 }
 
 impl AgentConfig {
@@ -112,6 +119,7 @@ impl AgentConfig {
             compaction: CompactionConfig::default(),
             request: RequestOptions::default(),
             text_tool_calls: false,
+            edit_section: None,
         }
     }
 }
@@ -128,6 +136,10 @@ pub struct SessionModel {
     pub context_window: u64,
     pub request: RequestOptions,
     pub text_tool_calls: bool,
+    /// The tools the model is offered, when they are not the session's: its edit format's.
+    pub tools: Option<ToolRegistry>,
+    /// What the system prompt's edit section becomes for the model.
+    pub edit_section: Option<String>,
 }
 
 impl std::fmt::Debug for SessionModel {
@@ -168,6 +180,10 @@ pub enum ApprovalKind {
     /// Whether a command may run without the sandbox: once, or not. It is never approved for
     /// the session.
     RunUnsandboxed,
+    /// Whether language servers, which run the project's build code, may start in this workspace:
+    /// yes or no, kept with the workspace's trust record, so it is asked once. The request's
+    /// `reason` is the question.
+    StartServers,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +346,10 @@ pub struct Agent {
     checkpoints: Option<Arc<Checkpoints>>,
     /// Whether the current turn already took its snapshot.
     turn_checkpointed: bool,
+    /// The commit of the current turn's snapshot, which "the turn changed files" is measured from.
+    turn_baseline: Option<String>,
+    /// The tree the test gate last passed on this turn: later changes are measured from it.
+    tested_tree: Option<String>,
     /// Whether the current turn's user message is saved yet. A slash command's shell parts run
     /// before it is, and entries about the turn they make wait in `held_entries`, to be saved
     /// just after it: rewinding to the message looks for them after it.
@@ -368,6 +388,20 @@ pub struct Agent {
     retry_count: std::sync::atomic::AtomicU32,
     /// Whether the user switched the session's model with `/model`.
     model_chosen_by_user: bool,
+    /// The verification gates; none runs unless one is configured.
+    gates: Gates,
+    /// Whether an edit tool changed a file in the current turn.
+    turn_changed: bool,
+    /// How the gates of the current turn ended, for its outcome record.
+    gate_counts: GateCounts,
+    /// Gate commands run so far, for their call ids.
+    gate_calls: u64,
+    /// What the end-of-turn test gate has done in the current turn.
+    gate_turn: gates::GateTurn,
+    /// The test gate's skip was said, and the mode has not changed since.
+    gate_skip_said: bool,
+    /// Language-server diagnostics for edited files.
+    diagnostics: Option<Arc<dyn Diagnostics>>,
 }
 
 impl Agent {
@@ -379,15 +413,7 @@ impl Agent {
         config: AgentConfig,
         ctx: ToolContext,
     ) -> Self {
-        let validators = tools
-            .specs()
-            .into_iter()
-            .map(|spec| {
-                let validator = jsonschema::validator_for(&spec.parameters)
-                    .unwrap_or_else(|e| panic!("tool `{}` has an invalid schema: {e}", spec.name));
-                (spec.name, validator)
-            })
-            .collect();
+        let validators = validators_of(&tools);
         Agent {
             provider,
             tools,
@@ -401,6 +427,8 @@ impl Agent {
             warnings: Vec::new(),
             checkpoints: None,
             turn_checkpointed: false,
+            turn_baseline: None,
+            tested_tree: None,
             message_recorded: true,
             held_entries: Vec::new(),
             reported_usage: None,
@@ -419,6 +447,13 @@ impl Agent {
             turn_entry: String::new(),
             retry_count: std::sync::atomic::AtomicU32::new(0),
             model_chosen_by_user: false,
+            gates: Gates::default(),
+            turn_changed: false,
+            gate_counts: GateCounts::default(),
+            gate_calls: 0,
+            gate_turn: gates::GateTurn::default(),
+            gate_skip_said: false,
+            diagnostics: None,
         }
     }
 
@@ -458,7 +493,7 @@ impl Agent {
             finish_reason: reason.as_str().to_string(),
             started_at,
             ended_at: crate::time::now_unix(),
-            gates: GateCounts::default(),
+            gates: self.gate_counts,
         });
     }
 
@@ -529,6 +564,16 @@ impl Agent {
         for message in meter.take_warnings() {
             let _ = events.send(AgentEvent::Warning { message });
         }
+    }
+
+    /// The definitions of the tools the model is offered.
+    pub fn tool_specs(&self) -> Vec<crate::message::ToolSpec> {
+        self.tools.specs()
+    }
+
+    fn set_tools(&mut self, tools: ToolRegistry) {
+        self.validators = validators_of(&tools);
+        self.tools = tools;
     }
 
     /// Ensures every call in `calls` has a non-empty id not already used in this session,
@@ -628,6 +673,25 @@ impl Agent {
 
     /// Gives the model what the user sends through `steering` while a turn runs, with the
     /// results of the next tool calls.
+    /// Runs `gates`: the after-edit command after each successful edit.
+    pub fn with_gates(mut self, gates: Gates) -> Self {
+        self.gates = gates;
+        self
+    }
+
+    /// Appends the errors language servers find in the files an edit changed to its result.
+    pub fn with_diagnostics(mut self, diagnostics: Arc<dyn Diagnostics>) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    /// Stops the language servers and waits for them: the session is over.
+    pub async fn close(&self) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.shutdown().await;
+        }
+    }
+
     pub fn with_steering(mut self, steering: Steering) -> Self {
         self.steering = Some(steering);
         self
@@ -648,12 +712,17 @@ impl Agent {
     /// system prompt stay as they are, so providers keep their prompt caches. The session left
     /// is released, for another process to continue.
     pub fn start_session(&mut self, session: Session, checkpoints: Option<Arc<Checkpoints>>) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.reset();
+        }
         self.session = session;
         if let Some(redactor) = &self.redactor {
             self.session.set_redactor(redactor.clone());
         }
         self.checkpoints = checkpoints;
         self.turn_checkpointed = false;
+        self.turn_baseline = None;
+        self.tested_tree = None;
         self.message_recorded = true;
         self.held_entries.clear();
         self.invalid_calls = 0;
@@ -908,6 +977,7 @@ impl Agent {
         let result = tokio::task::spawn_blocking(move || checkpoints.snapshot(&message)).await;
         match result {
             Ok(Ok(commit)) => {
+                self.turn_baseline = Some(commit.clone());
                 self.append_turn_entry(EntryKind::Checkpoint {
                     commit: commit.clone(),
                     workspace: Some(workspace),
@@ -1002,9 +1072,29 @@ impl Agent {
         self.config.context_window = model.context_window;
         self.config.request = model.request;
         self.config.text_tool_calls = model.text_tool_calls;
+        self.use_edit_format(model.tools, model.edit_section);
         self.reported_usage = None;
         self.auto_compaction_paused = false;
         self.model_chosen_by_user = true;
+    }
+
+    /// Offers `tools` (when given) and puts `section` (when given) in the system prompt's edit
+    /// section: the edit format of a model. The one place a model's edit format is applied, for a
+    /// `/model` switch and for a turn on another model. The prompt changes only where the section
+    /// is, and only when the format does: it stays byte for byte the same for as long as the
+    /// model does.
+    fn use_edit_format(&mut self, tools: Option<ToolRegistry>, section: Option<String>) {
+        if let Some(tools) = tools {
+            self.set_tools(tools);
+        }
+        if let Some(section) = section {
+            if let Some(old) = self.config.edit_section.take()
+                && old != section
+            {
+                self.config.system_prompt = self.config.system_prompt.replacen(&old, &section, 1);
+            }
+            self.config.edit_section = Some(section);
+        }
     }
 
     /// Switches the approval mode between turns, and with [`with_sandboxes`](Self::with_sandboxes)
@@ -1043,6 +1133,11 @@ impl Agent {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.turn_started = Some((Instant::now(), crate::time::now_unix()));
         self.turn_checkpointed = false;
+        self.turn_baseline = None;
+        self.tested_tree = None;
+        self.turn_changed = false;
+        self.gate_counts = GateCounts::default();
+        self.gate_turn = gates::GateTurn::default();
         // Settings that apply to this turn only.
         self.turn_model = input.model.clone();
         self.policy.set_turn_rules(Some(input.rules.clone()));
@@ -1050,7 +1145,27 @@ impl Agent {
         if input.read_only_shell {
             self.ctx.access = FsAccess::ReadOnly;
         }
+        // A turn on another model uses that model's edit format; the session's comes back after.
+        let session_format = self.turn_model.as_ref().and_then(|m| {
+            (m.tools.is_some() || m.edit_section.is_some()).then(|| {
+                (
+                    self.tools.clone(),
+                    self.config.edit_section.clone(),
+                    self.config.system_prompt.clone(),
+                    m.tools.clone(),
+                    m.edit_section.clone(),
+                )
+            })
+        });
+        if let Some((_, _, _, tools, section)) = session_format.clone() {
+            self.use_edit_format(tools, section);
+        }
         let reason = self.turn(input, events, cancel).await;
+        if let Some((tools, section, prompt, _, _)) = session_format {
+            self.set_tools(tools);
+            self.config.edit_section = section;
+            self.config.system_prompt = prompt;
+        }
         self.ctx.access = access;
         self.policy.set_turn_rules(None);
         self.turn_model = None;
@@ -1135,7 +1250,10 @@ impl Agent {
                 continue;
             }
             if calls.is_empty() {
-                return self.finish(TurnEndReason::Completed, events);
+                match self.end_of_turn(events, &cancel).await {
+                    gates::EndOfTurn::Finish(reason) => return self.finish(reason, events),
+                    gates::EndOfTurn::Continue => continue,
+                }
             }
             for (index, call) in calls.iter().enumerate() {
                 if cancel.is_cancelled() {
@@ -1163,6 +1281,11 @@ impl Agent {
                 return self.finish(TurnEndReason::Interrupted, events);
             }
             self.deliver_steering(events);
+        }
+        // The steps ran out while the latest test run was a failure the model was sent to fix:
+        // that is what the turn ends on, not the limit.
+        if self.gate_turn.failed_and_continued {
+            return self.finish(TurnEndReason::GateFailed, events);
         }
         self.finish(TurnEndReason::StepLimit, events)
     }
@@ -1196,11 +1319,14 @@ impl Agent {
     }
 
     /// Adds what the user sent during the turn to the conversation, after the tool results.
-    fn deliver_steering(&mut self, events: &UnboundedSender<AgentEvent>) {
+    /// Whether there was anything to deliver.
+    fn deliver_steering(&mut self, events: &UnboundedSender<AgentEvent>) -> bool {
         let Some(steering) = &self.steering else {
-            return;
+            return false;
         };
-        for text in steering.take() {
+        let taken = steering.take();
+        let any = !taken.is_empty();
+        for text in taken {
             self.record(
                 Message::User {
                     content: text.clone(),
@@ -1210,6 +1336,7 @@ impl Agent {
             );
             let _ = events.send(AgentEvent::Steered { text });
         }
+        any
     }
 
     /// The turn's user message: text parts as they are, and each shell part replaced by the output
@@ -1858,13 +1985,21 @@ impl Agent {
             arguments: call.arguments.clone(),
         });
         let raw = self.execute_inner(call, events).await;
-        let content = limit_output(
+        let mut content = limit_output(
             &raw.content,
             self.config.output_limit,
             &self.config.output_dir,
             &call.id,
             self.redactor.as_deref(),
         );
+        // What the checks after an edit found goes in the same result, after the limit, which
+        // would cut into it.
+        if !raw.is_error
+            && let Some(checks) = self.after_edit(call, events).await
+        {
+            content.push('\n');
+            content.push_str(&checks);
+        }
         let output = ToolOutput { content, ..raw };
         let _ = events.send(AgentEvent::ToolCallFinished {
             id: call.id.clone(),
@@ -1917,9 +2052,30 @@ impl Agent {
             ));
         }
 
-        let action = tool.action(&args, &self.ctx);
-        let mutating = self.is_mutating(&action);
-        let decision = self.policy.check(&action);
+        // A call that does several things is checked for each, and the strictest answer decides:
+        // a refusal first, then a question, and the action it is about is the one asked about.
+        let mut actions = tool.actions(&args, &self.ctx);
+        if actions.is_empty() {
+            actions.push(tool.action(&args, &self.ctx));
+        }
+        let mutating = actions.iter().any(|a| self.is_mutating(a));
+        let mut checked: Vec<(Action, Decision)> = actions
+            .into_iter()
+            .map(|a| {
+                let decision = self.policy.check(&a);
+                (a, decision)
+            })
+            .collect();
+        let at = checked
+            .iter()
+            .position(|(_, d)| matches!(d, Decision::Deny(_)))
+            .or_else(|| {
+                checked
+                    .iter()
+                    .position(|(_, d)| matches!(d, Decision::Ask(_)))
+            })
+            .unwrap_or(0);
+        let (action, decision) = checked.swap_remove(at);
         // A sandbox that can no longer run this command (Linux, git protection required, after a
         // drop to the basic tier) leaves one way to run it: outside the sandbox, if approved.
         if let (Decision::Allow | Decision::Ask(_), Action::Bash(command)) = (&decision, &action)
@@ -1950,7 +2106,7 @@ impl Agent {
         }
         match decision {
             Decision::Allow => {}
-            Decision::Deny(reason) => return ToolOutput::error(format!("denied: {reason}")),
+            Decision::Deny(reason) => return ToolOutput::refused(format!("denied: {reason}")),
             Decision::Ask(reason) => {
                 let request = ApprovalRequest {
                     call_id: call.id.clone(),
@@ -1978,17 +2134,17 @@ impl Agent {
                     ApprovalDecision::Deny {
                         feedback: Some(note),
                     } => {
-                        return ToolOutput::error(format!("the user denied this action: {note}"));
+                        return ToolOutput::refused(format!("the user denied this action: {note}"));
                     }
                     ApprovalDecision::Deny { feedback: None } => {
-                        return ToolOutput::error("the user denied this action");
+                        return ToolOutput::refused("the user denied this action");
                     }
                     ApprovalDecision::Unavailable => {
                         let _ = events.send(AgentEvent::ActionBlocked {
                             id: call.id.clone(),
                             reason: reason.clone(),
                         });
-                        return ToolOutput::error(format!(
+                        return ToolOutput::refused(format!(
                             "blocked: {reason} needs approval and no user is available to approve it"
                         ));
                     }
@@ -2099,11 +2255,11 @@ impl Agent {
             }
             ApprovalDecision::Deny {
                 feedback: Some(note),
-            } => ToolOutput::error(format!(
+            } => ToolOutput::refused(format!(
                 "the user declined to run it without the sandbox: {note}"
             )),
             ApprovalDecision::Deny { feedback: None } => {
-                ToolOutput::error("the user declined to run it without the sandbox")
+                ToolOutput::refused("the user declined to run it without the sandbox")
             }
             ApprovalDecision::Unavailable => {
                 let blocked = format!(
@@ -2113,7 +2269,7 @@ impl Agent {
                     id: call.id.clone(),
                     reason: blocked.clone(),
                 });
-                ToolOutput::error(format!("blocked: {blocked}"))
+                ToolOutput::refused(format!("blocked: {blocked}"))
             }
         }
     }
@@ -2178,6 +2334,19 @@ impl Agent {
     }
 }
 
+/// The validator of each tool's arguments.
+fn validators_of(tools: &ToolRegistry) -> HashMap<String, jsonschema::Validator> {
+    tools
+        .specs()
+        .into_iter()
+        .map(|spec| {
+            let validator = jsonschema::validator_for(&spec.parameters)
+                .unwrap_or_else(|e| panic!("tool `{}` has an invalid schema: {e}", spec.name));
+            (spec.name, validator)
+        })
+        .collect()
+}
+
 /// What a shell part becomes in the user message: the command's output, or, when it did not run
 /// or failed, a note saying so followed by what the tool reported.
 fn shell_part_text(command: &str, output: &ToolOutput) -> String {
@@ -2192,7 +2361,7 @@ fn shell_part_text(command: &str, output: &ToolOutput) -> String {
 
 /// The result of a tool call the user stopped the turn before, while harness waited to ask or
 /// for the answer.
-const STOPPED_BEFORE_RUNNING: &str = "interrupted by the user before this tool ran";
+pub(crate) const STOPPED_BEFORE_RUNNING: &str = "interrupted by the user before this tool ran";
 
 /// The result given to a tool call that a stopped run left without one.
 fn stopped_result(call_id: String) -> Message {

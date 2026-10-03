@@ -1,0 +1,19 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "port.go"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "6#dd5",
+        "new_text": "\tn, err := strconv.Atoi(s)\n\tif err != nil {\n\t\treturn 0, err\n\t}",
+        "path": "port.go",
+        "start": "6#dd5"
+      }
+    }
+  ]
+}

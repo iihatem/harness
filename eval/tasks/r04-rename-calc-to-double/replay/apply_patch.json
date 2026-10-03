@@ -1,0 +1,22 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/math.rs"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n pub mod math;\n \n pub fn run() -> i32 {\n-    math::calc(21)\n+    math::double(21)\n }\n*** Update File: src/math.rs\n@@\n-pub fn calc(x: i32) -> i32 {\n+pub fn double(x: i32) -> i32 {\n     x * 2\n }\n*** End Patch\n"
+      }
+    }
+  ]
+}

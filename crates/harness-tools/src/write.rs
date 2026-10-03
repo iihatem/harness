@@ -27,6 +27,10 @@ impl Tool for WriteTool {
         Action::Write(ctx.resolve(args["path"].as_str().unwrap_or_default()))
     }
 
+    fn changed_paths(&self, args: &Value, ctx: &ToolContext) -> Vec<std::path::PathBuf> {
+        vec![ctx.resolve(args["path"].as_str().unwrap_or_default())]
+    }
+
     async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let path = ctx.resolve(args["path"].as_str().unwrap_or_default());
         let content = args["content"].as_str().unwrap_or_default();

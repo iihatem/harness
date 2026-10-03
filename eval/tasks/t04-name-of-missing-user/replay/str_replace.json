@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "export function getName(user: User | undefined): string {\n  return user?.name ?? \"anonymous\";\n}",
+        "old_string": "export function getName(user: User | undefined): string {\n  return user.name;\n}",
+        "path": "mod.ts"
+      }
+    }
+  ]
+}

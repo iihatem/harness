@@ -1,0 +1,4 @@
+language = "typescript"
+title = "rename an export used in two files"
+prompt = "Rename the exported function fmt to formatPrice in price.ts and in its caller in cart.ts. The tests use formatPrice."
+test = "deno test --no-check --quiet"

@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "def scale(x, factor):\n    if not isinstance(x, (int, float)):\n        raise TypeError(\"x must be a number\")\n    return x * factor\n",
+        "path": "app.py"
+      }
+    }
+  ]
+}

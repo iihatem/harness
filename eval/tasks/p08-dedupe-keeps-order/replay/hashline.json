@@ -1,0 +1,19 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "2#be3",
+        "new_text": "    seen = set()\n    out = []\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            out.append(x)\n    return out",
+        "path": "app.py",
+        "start": "2#be3"
+      }
+    }
+  ]
+}

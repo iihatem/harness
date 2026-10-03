@@ -1,0 +1,4 @@
+language = "rust"
+title = "parse_port panics on bad input"
+prompt = "parse_port panics when the text is not a number. Make it return Result<u16, std::num::ParseIntError> instead; the tests expect an Err for bad input."
+test = "cargo test --quiet --offline"

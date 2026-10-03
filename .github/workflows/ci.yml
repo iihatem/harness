@@ -45,10 +45,28 @@ jobs:
           cargo clippy -p harness-providers -p harness-cli --no-default-features --all-targets --locked -- -D warnings
           cargo test -p harness-cli --no-default-features --locked --test no_sign_in_e2e
       - uses: taiki-e/install-action@nextest
+      # rust-analyzer, for the language-server test that talks to a real server; where it is
+      # installed, its absence is a failure.
+      - name: Install rust-analyzer
+        if: matrix.tier != 'full' && runner.os == 'Linux'
+        run: rustup component add rust-analyzer
       - run: cargo nextest run --workspace --locked
         env:
+          HARNESS_REQUIRE_RA: ${{ runner.os == 'Linux' && matrix.tier != 'full' && '1' || '' }}
           HARNESS_REQUIRE_LINUX_SANDBOX: ${{ runner.os == 'Linux' && '1' || '0' }}
           HARNESS_EXPECT_LINUX_TIER: ${{ runner.os == 'Linux' && (matrix.tier == 'full' && 'full' || 'basic') || '' }}
+  eval-replay:
+    # The edit-format eval suite in replay mode: recorded model outputs applied to every task in
+    # every format, with no model. The task tests (the oracles) need four toolchains, so they are
+    # not run here.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: eval
+      - run: cargo xtask eval replay
   deny:
     runs-on: ubuntu-latest
     steps:

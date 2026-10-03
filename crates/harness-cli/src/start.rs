@@ -7,6 +7,7 @@ use std::{io::Write, path::Path, sync::Arc};
 use harness_config::config::LinuxGitProtection;
 use harness_core::{
     agent::{Agent, AgentConfig, Approver, Sandboxes},
+    edit_format::EditFormat,
     engine::{EngineConfig, PermissionEngine, RuleSet},
     message::RequestOptions,
     permission::{FsAccess, Mode},
@@ -52,6 +53,8 @@ pub struct Started {
     pub writable: Vec<std::path::PathBuf>,
     /// Keeps the usage ledger and the budgets.
     pub meter: Arc<harness_usage::meter::UsageMeter>,
+    /// The language servers, for the session to stop when it ends.
+    pub diagnostics: Arc<harness_lsp::LspDiagnostics>,
 }
 
 /// A new run's id: its start time and the process id.
@@ -193,12 +196,16 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         resolved.model.clone(),
         crate::context::system_prompt(
             setup,
-            &prompt::base_prompt(mode, sandboxed, interactive),
+            &prompt::with_edit_section(
+                &prompt::base_prompt(mode, sandboxed, interactive),
+                model.edit_format,
+            ),
             context_window,
             notices,
         ),
         output_dir,
     );
+    config.edit_section = Some(prompt::edit_section(model.edit_format));
     config.context_window = context_window;
     config.request = model.request;
     config.text_tool_calls = model.text_tool_calls;
@@ -230,9 +237,10 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
                 monthly_usd: budgets.monthly_usd,
             }),
     );
+    let diagnostics = crate::lsp::diagnostics(setup, interactive.then(|| approver.clone()));
     let mut agent = Agent::new(
         resolved.provider,
-        harness_tools::builtin(),
+        harness_tools::builtin_for(model.edit_format),
         policy.clone(),
         approver,
         config,
@@ -241,7 +249,9 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     .with_redactor(setup.redactor.clone())
     .with_session(session)
     .with_checkpoints(checkpoints)
-    .with_meter(meter.clone());
+    .with_meter(meter.clone())
+    .with_gates(setup.config.gates.clone())
+    .with_diagnostics(diagnostics.clone());
     if interactive {
         agent = agent.with_sandboxes(sandboxes);
     }
@@ -253,6 +263,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         write_mode_warning,
         writable: writable_roots,
         meter,
+        diagnostics,
     })
 }
 
@@ -337,6 +348,8 @@ fn write_modes(
 /// What harness knows of a model before asking it anything: its window and where that comes
 /// from, what its profile sets for requests, and what to warn about.
 pub struct ModelSetup {
+    /// How the model edits files, from its profile.
+    pub edit_format: EditFormat,
     pub context_window: u64,
     pub window_note: &'static str,
     pub request: RequestOptions,
@@ -366,6 +379,7 @@ pub async fn model_setup(
     let window_note = window_note(running.tokens(), profile.context_window);
     let window = window::effective_window(&resolved.id, &profile, running, server);
     Some(ModelSetup {
+        edit_format: profile.edit_format,
         context_window: window.tokens,
         window_note,
         request: profile.request_options(),

@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n     pub fn pop(&mut self) -> Option<T> {\n         self.items.pop()\n     }\n+\n+    pub fn peek(&self) -> Option<&T> {\n+        self.items.last()\n+    }\n }\n \n impl<T> Default for Stack<T> {\n*** End Patch\n"
+      }
+    }
+  ]
+}

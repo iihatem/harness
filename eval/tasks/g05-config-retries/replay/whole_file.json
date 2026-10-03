@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "config.go"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "package task\n\ntype Config struct {\n\tName    string\n\tRetries int\n}\n\nfunc NewConfig(name string, retries int) Config {\n\treturn Config{Name: name, Retries: retries}\n}\n",
+        "path": "config.go"
+      }
+    }
+  ]
+}

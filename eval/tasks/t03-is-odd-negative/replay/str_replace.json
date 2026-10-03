@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "export function isOdd(n: number): boolean {\n  return Math.abs(n % 2) === 1;\n}",
+        "old_string": "export function isOdd(n: number): boolean {\n  return n % 2 === 1;\n}",
+        "path": "mod.ts"
+      }
+    }
+  ]
+}

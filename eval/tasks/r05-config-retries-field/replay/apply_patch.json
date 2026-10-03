@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n pub struct Config {\n     pub name: String,\n-}\n-\n-impl Config {\n-    pub fn new(name: &str) -> Config {\n-        Config {\n-            name: name.to_string(),\n+    pub retries: u32,\n+}\n+\n+impl Config {\n+    pub fn new(name: &str, retries: u32) -> Config {\n+        Config {\n+            name: name.to_string(),\n+            retries,\n         }\n     }\n }\n*** End Patch\n"
+      }
+    }
+  ]
+}

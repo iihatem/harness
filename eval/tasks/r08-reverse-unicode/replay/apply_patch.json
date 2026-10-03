@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n pub fn reverse(s: &str) -> String {\n-    String::from_utf8(s.bytes().rev().collect()).unwrap()\n+    s.chars().rev().collect()\n }\n*** End Patch\n"
+      }
+    }
+  ]
+}

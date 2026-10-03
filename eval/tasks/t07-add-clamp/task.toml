@@ -1,0 +1,4 @@
+language = "typescript"
+title = "add clamp"
+prompt = "Add an exported clamp(x, lo, hi) to mod.ts that limits x to the range from lo to hi."
+test = "deno test --no-check --quiet"

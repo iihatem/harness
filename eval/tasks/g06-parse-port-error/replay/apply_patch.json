@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "port.go"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: port.go\n@@\n import \"strconv\"\n \n func ParsePort(s string) (int, error) {\n-\tn, _ := strconv.Atoi(s)\n+\tn, err := strconv.Atoi(s)\n+\tif err != nil {\n+\t\treturn 0, err\n+\t}\n \treturn n, nil\n }\n*** End Patch\n"
+      }
+    }
+  ]
+}

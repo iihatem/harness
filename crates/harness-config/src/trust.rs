@@ -15,6 +15,33 @@ use crate::config::ConfigError;
 struct TrustFile {
     #[serde(default)]
     workspaces: BTreeMap<String, String>,
+    /// The answers to the one-time proposal of a detected gate, by workspace.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    gates: BTreeMap<String, GateAnswer>,
+    /// The answers to "start language servers here?", by workspace.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    servers: BTreeMap<String, bool>,
+}
+
+/// What the user answered when harness proposed a detected gate for a workspace: confirmed, as
+/// proposed or edited, or declined. Either way it is not asked again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateAnswer {
+    pub confirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_edit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test: Option<String>,
+}
+
+impl GateAnswer {
+    pub fn declined() -> GateAnswer {
+        GateAnswer {
+            confirmed: false,
+            after_edit: None,
+            test: None,
+        }
+    }
 }
 
 /// Workspaces the user trusted, keyed by canonical path, each with the fingerprint of the widening
@@ -23,6 +50,15 @@ struct TrustFile {
 pub struct TrustStore {
     path: Option<PathBuf>,
     file: TrustFile,
+}
+
+/// What revoking a workspace's trust forgot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Revoked {
+    /// The workspace was trusted.
+    pub trusted: bool,
+    /// An answer about language servers was stored.
+    pub servers_answer: bool,
 }
 
 impl TrustStore {
@@ -65,13 +101,43 @@ impl TrustStore {
         self.save()
     }
 
-    /// Returns whether the workspace was trusted before.
-    pub fn revoke(&mut self, workspace: &Path) -> Result<bool, ConfigError> {
-        let removed = self.file.workspaces.remove(&Self::key(workspace)).is_some();
-        if removed {
+    /// The answer to the proposal of a detected gate for `workspace`, if it was answered.
+    pub fn gate_answer(&self, workspace: &Path) -> Option<&GateAnswer> {
+        self.file.gates.get(&Self::key(workspace))
+    }
+
+    pub fn set_gate_answer(
+        &mut self,
+        workspace: &Path,
+        answer: GateAnswer,
+    ) -> Result<(), ConfigError> {
+        self.file.gates.insert(Self::key(workspace), answer);
+        self.save()
+    }
+
+    /// Whether the user said language servers may start in `workspace` (they run the project's
+    /// build code): `None` until it was answered.
+    pub fn servers_answer(&self, workspace: &Path) -> Option<bool> {
+        self.file.servers.get(&Self::key(workspace)).copied()
+    }
+
+    pub fn set_servers_answer(&mut self, workspace: &Path, yes: bool) -> Result<(), ConfigError> {
+        self.file.servers.insert(Self::key(workspace), yes);
+        self.save()
+    }
+
+    /// Forgets the workspace's trust, and the answer about language servers with it; says which
+    /// there were.
+    pub fn revoke(&mut self, workspace: &Path) -> Result<Revoked, ConfigError> {
+        let trusted = self.file.workspaces.remove(&Self::key(workspace)).is_some();
+        let servers_answer = self.file.servers.remove(&Self::key(workspace)).is_some();
+        if trusted || servers_answer {
             self.save()?;
         }
-        Ok(removed)
+        Ok(Revoked {
+            trusted,
+            servers_answer,
+        })
     }
 
     fn save(&self) -> Result<(), ConfigError> {

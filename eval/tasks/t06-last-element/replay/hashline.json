@@ -1,0 +1,19 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "2#2d8",
+        "new_text": "  return xs[xs.length - 1];",
+        "path": "mod.ts",
+        "start": "2#2d8"
+      }
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+language = "go"
+title = "Max returns the smaller number"
+prompt = "Max(a, b) returns the smaller of the two. Fix it."
+test = "go test ./..."

@@ -1,0 +1,4 @@
+language = "typescript"
+title = "last returns undefined"
+prompt = "last(xs) should return the final element of the array, but it reads past the end."
+test = "deno test --no-check --quiet"

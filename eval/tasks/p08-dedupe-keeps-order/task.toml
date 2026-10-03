@@ -1,0 +1,4 @@
+language = "python"
+title = "dedupe loses the order"
+prompt = "dedupe(xs) should remove repeated items but keep the order of first appearance; it scrambles the order now."
+test = "python3 -m unittest -q"

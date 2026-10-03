@@ -777,6 +777,10 @@ impl App {
     fn resume_line(&self, theme: &Theme) -> Option<Line<'static>> {
         let now = (self.clock)();
         let text = match self.resume? {
+            // What asks first has the keys, and the offer waits behind it (the language-server
+            // question, an approval, a picker, a running turn): two prompts for `y` and `n`
+            // would not say which one a key answers.
+            Resume::Asking { .. } if !self.offer_active() => return None,
             Resume::Asking { .. } => "answer y or n to resume automatically".to_string(),
             Resume::Waiting { at, .. } => {
                 let left = at.saturating_sub(now);
@@ -1204,6 +1208,7 @@ impl App {
                 TurnEndReason::Error => Some("the turn stopped with an error"),
                 TurnEndReason::StepLimit => Some("the turn stopped at the step limit"),
                 TurnEndReason::Budget => Some("the turn stopped at its budget"),
+                TurnEndReason::GateFailed => Some("the turn stopped: the tests still fail"),
                 TurnEndReason::Interrupted => None,
             };
             if let Some(how) = how.filter(|_| took >= notify::LONG_TURN) {

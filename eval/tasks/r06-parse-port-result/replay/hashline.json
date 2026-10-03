@@ -1,0 +1,19 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "2#55a",
+        "new_text": "pub fn parse_port(s: &str) -> Result<u16, std::num::ParseIntError> {\n    s.trim().parse()",
+        "path": "src/lib.rs",
+        "start": "1#361"
+      }
+    }
+  ]
+}

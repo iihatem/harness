@@ -38,6 +38,8 @@ async fn the_conversation_continues_on_the_new_model() {
             ..RequestOptions::default()
         },
         text_tool_calls: false,
+        tools: None,
+        edit_section: None,
     });
     assert_eq!(agent.model_id(), "other/big");
     assert_eq!(agent.context_usage().window, 200_000);
@@ -106,6 +108,8 @@ async fn a_smaller_window_is_compacted_into_before_the_next_request() {
         context_window: 2_048,
         request: RequestOptions::default(),
         text_tool_calls: false,
+        tools: None,
+        edit_section: None,
     });
     let (_, events) = run(&mut agent, "and now?").await;
     assert!(

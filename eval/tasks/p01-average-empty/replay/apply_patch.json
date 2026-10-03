@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: app.py\n@@\n def average(xs):\n+    if not xs:\n+        return 0.0\n     return sum(xs) / len(xs)\n*** End Patch\n"
+      }
+    }
+  ]
+}

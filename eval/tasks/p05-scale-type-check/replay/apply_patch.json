@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: app.py\n@@\n def scale(x, factor):\n+    if not isinstance(x, (int, float)):\n+        raise TypeError(\"x must be a number\")\n     return x * factor\n*** End Patch\n"
+      }
+    }
+  ]
+}

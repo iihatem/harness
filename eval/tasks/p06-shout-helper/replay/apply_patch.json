@@ -1,0 +1,22 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "main.py"
+      }
+    },
+    {
+      "name": "read",
+      "arguments": {
+        "path": "util.py"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: main.py\n@@\n-from util import clean\n-\n-\n-def greet(name):\n-    return \"hello \" + clean(name)\n+from util import clean, shout\n+\n+\n+def greet(name):\n+    return shout(\"hello \" + clean(name))\n*** Update File: util.py\n@@\n def clean(text):\n     return text.strip()\n+\n+\n+def shout(text):\n+    return text.upper() + \"!\"\n*** End Patch\n"
+      }
+    }
+  ]
+}

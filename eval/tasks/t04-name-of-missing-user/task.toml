@@ -1,0 +1,4 @@
+language = "typescript"
+title = "getName crashes without a user"
+prompt = "getName(user) throws when the user is undefined. It should return \"anonymous\" when there is no user or no name."
+test = "deno test --no-check --quiet"

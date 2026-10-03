@@ -1,0 +1,4 @@
+language = "rust"
+title = "rename calc to double in two files"
+prompt = "Rename the function calc to double, in src/math.rs and wherever it is used. The tests call double."
+test = "cargo test --quiet --offline"

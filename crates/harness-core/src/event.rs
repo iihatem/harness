@@ -14,6 +14,9 @@ pub enum TurnEndReason {
     Error,
     /// A money budget was reached, so the next request was not sent.
     Budget,
+    /// The tests still failed when the turn had to stop: the retries were used up, or the same
+    /// failure came twice.
+    GateFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +27,7 @@ pub enum ErrorKind {
 }
 
 impl TurnEndReason {
-    /// The word for it in records: `completed`, `step_limit`, `interrupted`, `error`, `budget`.
+    /// The word for it in records: `completed`, `step_limit`, `interrupted`, `error`, `budget`, `gate_failed`.
     pub fn as_str(self) -> &'static str {
         match self {
             TurnEndReason::Completed => "completed",
@@ -32,8 +35,43 @@ impl TurnEndReason {
             TurnEndReason::Interrupted => "interrupted",
             TurnEndReason::Error => "error",
             TurnEndReason::Budget => "budget",
+            TurnEndReason::GateFailed => "gate_failed",
         }
     }
+}
+
+/// Which verification gate a result belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    /// The lint command run after an edit.
+    AfterEdit,
+    /// The test command run when a turn that changed files ends.
+    Test,
+}
+
+/// How the end-of-turn test gate found out whether the turn changed files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeSource {
+    /// By comparing the workspace with the turn's checkpoint: any change counts, `bash`'s included.
+    Checkpoint,
+    /// By the edit tools' changed paths: checkpoints are off or unavailable, so only what the
+    /// edit tools changed is known.
+    EditTools,
+}
+
+/// How a gate command ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateStatus {
+    Passed,
+    Failed,
+    TimedOut,
+    /// It did not run: a rule denied it, or it needed an approval it did not get.
+    Blocked,
+    /// It did not run: the mode is `plan` or `read-only`.
+    Skipped,
 }
 
 /// Everything observable about a turn. Frontends render these; `harness ask --json` prints one per line.
@@ -132,6 +170,20 @@ pub enum AgentEvent {
         input_tokens: u64,
         output_tokens: u64,
         cached_tokens: u64,
+    },
+    /// A verification gate ran, or was skipped. `tail` is the last lines of a failing command's
+    /// output, as the model got them.
+    GateResult {
+        gate: GateKind,
+        command: Option<String>,
+        status: GateStatus,
+        exit_code: Option<i32>,
+        tail: Option<String>,
+    },
+    /// The end-of-turn test gate checked whether the turn changed files, and how it knew.
+    ChangesChecked {
+        by: ChangeSource,
+        changed: bool,
     },
     TurnFinished {
         reason: TurnEndReason,

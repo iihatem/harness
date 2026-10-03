@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: app.py\n@@\n def fizzbuzz(n):\n     out = []\n-    for i in range(1, n):\n+    for i in range(1, n + 1):\n         if i % 15 == 0:\n             out.append(\"FizzBuzz\")\n         elif i % 3 == 0:\n*** End Patch\n"
+      }
+    }
+  ]
+}

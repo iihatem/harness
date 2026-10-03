@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "        self.items.pop()\n    }\n\n    pub fn peek(&self) -> Option<&T> {\n        self.items.last()\n    }\n}\n",
+        "old_string": "        self.items.pop()\n    }\n}\n",
+        "path": "src/lib.rs"
+      }
+    }
+  ]
+}

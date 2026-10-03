@@ -296,7 +296,7 @@ pub struct TurnRecord {
     pub tool_calls: u32,
     pub invalid_calls: u32,
     pub retries: u32,
-    /// `completed`, `step_limit`, `interrupted`, `error` or `budget`.
+    /// `completed`, `step_limit`, `interrupted`, `error`, `budget` or `gate_failed`.
     pub finish_reason: String,
     /// When the turn started and ended, in seconds since the Unix epoch: where the turn's
     /// requests are in the ledger.

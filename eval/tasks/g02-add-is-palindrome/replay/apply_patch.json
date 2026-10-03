@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "text.go"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: text.go\n@@\n \t}\n \treturn string(r)\n }\n+\n+func IsPalindrome(s string) bool {\n+\treturn s == Reverse(s)\n+}\n*** End Patch\n"
+      }
+    }
+  ]
+}

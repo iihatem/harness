@@ -1,0 +1,4 @@
+language = "python"
+title = "average of an empty list"
+prompt = "average([]) raises ZeroDivisionError. It should return 0.0 for an empty list."
+test = "python3 -m unittest -q"

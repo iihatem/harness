@@ -1,0 +1,4 @@
+language = "typescript"
+title = "isOdd is wrong for negative numbers"
+prompt = "isOdd(-3) returns false. Fix it so negative odd numbers are odd."
+test = "deno test --no-check --quiet"

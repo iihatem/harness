@@ -187,6 +187,7 @@ pub async fn run(
             terminal_safe_text(&final_text)
         );
     }
+    agent.close().await;
     end_run(agent, sandbox_session);
     exit_code(reason, blocked)
 }
@@ -207,6 +208,7 @@ pub fn exit_code(reason: TurnEndReason, blocked: bool) -> u8 {
         TurnEndReason::Interrupted => 130,
         TurnEndReason::Budget => 4,
         TurnEndReason::StepLimit | TurnEndReason::Error => 1,
+        TurnEndReason::GateFailed => 5,
     }
 }
 
@@ -477,6 +479,24 @@ impl Shown {
                     terminal_safe(reason)
                 );
             }
+            AgentEvent::GateResult {
+                gate,
+                command,
+                status,
+                exit_code,
+                tail,
+            } if !json => {
+                let (line, _) = harness_tui::transcript::gate_line(
+                    *gate,
+                    command.as_deref(),
+                    *status,
+                    *exit_code,
+                );
+                eprintln!("{}", terminal_safe(&line));
+                if let Some(tail) = tail {
+                    eprintln!("{}", terminal_safe_text(tail.trim_end()));
+                }
+            }
             AgentEvent::Error { message, .. } if !json => {
                 eprintln!("error: {}", terminal_safe(message))
             }
@@ -503,6 +523,11 @@ impl Shown {
                 reason: TurnEndReason::StepLimit,
             } if !json => {
                 eprintln!("error: stopped after reaching the step limit");
+            }
+            AgentEvent::TurnFinished {
+                reason: TurnEndReason::GateFailed,
+            } if !json => {
+                eprintln!("error: stopped because the tests still fail");
             }
             _ => {}
         }
@@ -588,6 +613,7 @@ mod tests {
         assert_eq!(exit_code(TurnEndReason::Completed, true), 3);
         assert_eq!(exit_code(TurnEndReason::Error, false), 1);
         assert_eq!(exit_code(TurnEndReason::StepLimit, false), 1);
+        assert_eq!(exit_code(TurnEndReason::GateFailed, false), 5);
         assert_eq!(exit_code(TurnEndReason::Interrupted, false), 130);
     }
 }

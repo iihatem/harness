@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "new_text": "}\n\npub fn is_palindrome(s: &str) -> bool {\n    s == reverse(s)\n}",
+        "path": "src/lib.rs",
+        "start": "3#894"
+      }
+    }
+  ]
+}

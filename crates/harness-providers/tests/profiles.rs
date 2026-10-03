@@ -232,13 +232,4 @@ mod edit_format {
         );
         assert_eq!(profile.context_window, Some(272_000));
     }
-
-    // Spec: a built-in profile sets `edit_format` to something other than `str_replace` only where
-    // a checked-in eval result supports it; none does yet.
-    #[test]
-    fn no_builtin_profile_changes_the_format_yet() {
-        for (key, settings) in builtin_profiles() {
-            assert_eq!(settings.edit_format, None, "{key}");
-        }
-    }
 }

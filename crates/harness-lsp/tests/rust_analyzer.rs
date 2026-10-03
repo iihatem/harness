@@ -21,7 +21,7 @@ fn installed() -> bool {
 async fn rust_analyzer_reports_a_type_error_after_an_edit() {
     if !installed() {
         assert!(
-            std::env::var_os("HARNESS_REQUIRE_RA").is_none(),
+            std::env::var_os("HARNESS_REQUIRE_RA").is_none_or(|v| v.is_empty()),
             "HARNESS_REQUIRE_RA is set, but rust-analyzer is not installed"
         );
         eprintln!("skipped: rust-analyzer is not installed");

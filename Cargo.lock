@@ -4344,7 +4344,9 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "globset",
  "harness-core",
+ "harness-providers",
  "harness-tools",
  "serde",
  "serde_json",

@@ -130,6 +130,9 @@ impl Host for CliHost {
             let model = crate::start::model_setup(&setup, &resolved, &cancel)
                 .await
                 .ok_or("stopped")?;
+            // The instruction files in the system prompt may not fit the new, smaller window.
+            let mut warnings = model.warnings;
+            warnings.extend(crate::context::oversize_for(&setup, model.context_window));
             Ok(ModelSwitch {
                 model: SessionModel {
                     provider: resolved.provider,
@@ -140,7 +143,7 @@ impl Host for CliHost {
                     text_tool_calls: model.text_tool_calls,
                 },
                 window_note: model.window_note.into(),
-                warnings: model.warnings,
+                warnings,
             })
         })
     }
@@ -285,6 +288,45 @@ pub mod tests {
                 "{model}: {after:?}"
             );
         }
+    }
+
+    // Review B M7: the system prompt does not hold the window, so a switch leaves it as it is (the
+    // cache-stable prefix); what the window decides is the warning about instruction files that
+    // take too much of it, which a switch to a smaller window raises again.
+    #[tokio::test]
+    async fn switching_to_a_smaller_window_warns_of_instructions_that_no_longer_fit() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        std::fs::write(
+            workspace.join("AGENTS.md"),
+            "instruction words ".repeat(300),
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        std::fs::write(
+            home.path().join("config/config.toml"),
+            "[providers.chat]\nprotocol = \"openai-chat\"\nbase_url = \"http://127.0.0.1:9/v1\"\n[profiles.\"chat/small\"]\ncontext_window = 1000\n[profiles.\"chat/big\"]\ncontext_window = 200000\n",
+        )
+        .unwrap();
+        let host = host(home.path(), &workspace);
+        let big = host
+            .switch_model("chat/big", CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(big.warnings.is_empty(), "{:?}", big.warnings);
+        let small = host
+            .switch_model("chat/small", CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            small
+                .warnings
+                .iter()
+                .any(|w| w.contains("instruction files") && w.contains("1000-token")),
+            "{:?}",
+            small.warnings
+        );
     }
 
     /// A Chat Completions stream of `chunks`.

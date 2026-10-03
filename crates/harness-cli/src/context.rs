@@ -35,6 +35,15 @@ pub fn system_prompt(
     prompt::assemble(base, &loaded.files, &environment)
 }
 
+/// The warning that the instruction files take more than a quarter of a `context_window`-token
+/// window, if they do: what a switch to another model says, since the system prompt itself does
+/// not change (D15).
+pub fn oversize_for(setup: &Setup, context_window: u64) -> Option<String> {
+    let loaded =
+        instructions::discover(&setup.workspace, &setup.paths.config_dir, home().as_deref());
+    prompt::oversize_warning(&loaded.files, context_window)
+}
+
 /// The instruction files in the session's system prompt and their estimated tokens, for
 /// `/context`: named relative to the workspace when inside it.
 pub fn instruction_files(setup: &Setup) -> Vec<(String, u64)> {

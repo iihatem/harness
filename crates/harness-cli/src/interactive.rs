@@ -240,7 +240,7 @@ pub async fn run(
     };
     // The first run's choice is saved as the default once the model has answered.
     let mut first_run = false;
-    let model_id = match model_flag.or_else(|| setup.config.model.clone()) {
+    let model_id = match crate::start::configured_model(&setup, model_flag) {
         Some(id) => id,
         None => match first_model(&setup, &mut notices).await {
             Ok(FirstModel::Chosen(id)) => {

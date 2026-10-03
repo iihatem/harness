@@ -465,6 +465,8 @@ pub struct App {
     resume: Option<Resume>,
     /// The user's answer to the offer to resume automatically, for the session.
     resume_answer: Option<bool>,
+    /// Each role's model, as the agent last said.
+    roles: Vec<harness_core::role::RoleLine>,
     /// The time, in seconds since the Unix epoch.
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -523,6 +525,7 @@ impl App {
             costs: Costs::default(),
             windows: None,
             window_warnings: std::collections::HashMap::new(),
+            roles: Vec::new(),
             clock: Arc::new(harness_core::time::now_unix),
             host,
         }
@@ -1258,6 +1261,11 @@ impl App {
         self.send(shown, full)
     }
 
+    /// Each role's model and where it came from, now.
+    pub fn set_roles(&mut self, roles: Vec<harness_core::role::RoleLine>) {
+        self.roles = roles;
+    }
+
     /// Where the next request's tokens go, now.
     pub fn set_context(&mut self, context: ContextUsage) {
         self.context = context;
@@ -1846,6 +1854,13 @@ impl App {
                     self.window_note.as_deref(),
                     &theme,
                 );
+                self.transcript.push_lines(lines, width);
+            }
+            "roles" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                let theme = self.theme();
+                let lines = status::roles_report(&self.roles, &theme);
                 self.transcript.push_lines(lines, width);
             }
             "usage" => {

@@ -28,6 +28,7 @@ use crate::{
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
     redact::Redactor,
     retry::RetryPolicy,
+    role::{Role, RoleConfig, RoleLine, RoleSource, RoleTable},
     session::{Entry, EntryKind, RewindScope, Session},
     tokens::DEFAULT_CONTEXT_WINDOW,
     tool::{CommandSandbox, Tool, ToolContext, ToolOutput, ToolRegistry},
@@ -402,6 +403,8 @@ pub struct Agent {
     gate_skip_said: bool,
     /// Language-server diagnostics for edited files.
     diagnostics: Option<Arc<dyn Diagnostics>>,
+    /// The models of the roles other than `main`.
+    roles: RoleTable,
 }
 
 impl Agent {
@@ -454,7 +457,44 @@ impl Agent {
             gate_turn: gates::GateTurn::default(),
             gate_skip_said: false,
             diagnostics: None,
+            roles: RoleTable::default(),
         }
+    }
+
+    /// Sets the models of the roles from the configuration.
+    pub fn with_roles(mut self, config: RoleConfig) -> Self {
+        self.roles = RoleTable::from_config(&config);
+        self
+    }
+
+    /// Sets the model of `role` for the session, as `/model --role` does: `plan`, `build` or
+    /// `background`. `false` for `main`, which `switch_model` changes.
+    pub fn set_role_model(&mut self, role: Role, id: &str) -> bool {
+        self.roles.set(role, id)
+    }
+
+    /// Each role's model and where it came from, `main` first, for `/roles`. A role that is not
+    /// set shows `main`'s model, inherited.
+    pub fn role_lines(&self) -> Vec<RoleLine> {
+        Role::ALL
+            .into_iter()
+            .map(|role| match self.roles.get(role) {
+                Some((model, source)) => RoleLine {
+                    role,
+                    model: model.clone(),
+                    source: *source,
+                },
+                None => RoleLine {
+                    role,
+                    model: self.config.model_id.clone(),
+                    source: match role {
+                        Role::Main if self.model_chosen_by_user => RoleSource::Session,
+                        Role::Main => RoleSource::Config,
+                        _ => RoleSource::Inherited,
+                    },
+                },
+            })
+            .collect()
     }
 
     /// Reports every model request to `meter`: the turn's requests, a failed or stopped one, and

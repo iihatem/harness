@@ -141,6 +141,8 @@ enum Background {
 /// the job ended when that has something to tell.
 struct Update {
     context: ContextUsage,
+    /// Each role's model and where it came from.
+    roles: Vec<harness_core::role::RoleLine>,
     /// What the conversation can be rewound to, and whether the last rewind can be undone.
     rewind: (Vec<RewindPoint>, bool),
     /// The session the agent continues in.
@@ -207,6 +209,7 @@ where
         let provider = agent.provider();
         let agent = agent.with_steering(app.steering());
         app.set_context(agent.context_usage());
+        app.set_roles(agent.role_lines());
         app.set_rewind(agent.rewind_points(), agent.can_undo_rewind());
         app.set_session_id(agent.session().id());
         let runner = tokio::spawn(async move {
@@ -259,6 +262,7 @@ where
                 };
                 let _ = updates_tx.send(Update {
                     context: agent.context_usage(),
+                    roles: agent.role_lines(),
                     rewind: (agent.rewind_points(), agent.can_undo_rewind()),
                     session: agent.session().id().to_string(),
                     done,
@@ -736,6 +740,7 @@ where
             self.show(event);
         }
         self.app.set_context(update.context);
+        self.app.set_roles(update.roles);
         let (points, can_undo) = update.rewind;
         self.app.set_rewind(points, can_undo);
         self.app.set_session_id(&update.session);

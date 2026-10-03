@@ -61,7 +61,7 @@ pub async fn run(
             return 2;
         }
     };
-    let Some(model_id) = model_flag.or_else(|| setup.config.model.clone()) else {
+    let Some(model_id) = crate::start::configured_model(&setup, model_flag) else {
         eprintln!("error: no model configured.");
         let found = models::available(&setup).await;
         credential_warnings(&setup, &mut notices);

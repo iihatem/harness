@@ -9,6 +9,7 @@ use harness_core::{
     edit_format::EditFormat,
     gate::{Gates, MAX_TIMEOUT_S},
     permission::Mode,
+    role::{HandoffMode, RoleConfig},
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -475,6 +476,88 @@ impl GateSettings {
     }
 }
 
+/// `[roles]`: the model of each role, and `[roles.handoff]`. A project's roles need trust: they
+/// choose where a conversation is sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleSettings {
+    pub main: Option<String>,
+    pub plan: Option<String>,
+    pub build: Option<String>,
+    pub background: Option<String>,
+    #[serde(default)]
+    pub handoff: HandoffSettings,
+}
+
+/// `[roles.handoff]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffSettings {
+    pub mode: Option<HandoffMode>,
+}
+
+impl RoleSettings {
+    fn named(&self) -> [(&'static str, &Option<String>); 4] {
+        [
+            ("main", &self.main),
+            ("plan", &self.plan),
+            ("build", &self.build),
+            ("background", &self.background),
+        ]
+    }
+
+    /// What is wrong with these settings, if anything: a role is a `provider/model` id.
+    fn problem(&self) -> Option<String> {
+        self.named().into_iter().find_map(|(role, id)| {
+            let id = id.as_deref()?;
+            let well_formed = id
+                .split_once('/')
+                .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty());
+            (!well_formed).then(|| {
+                format!(
+                    "roles.{role} must be a provider/model id, such as ollama/llama3, not {id:?}"
+                )
+            })
+        })
+    }
+
+    /// These settings with `other`'s over them, role by role.
+    fn overlaid(&self, other: &RoleSettings) -> RoleSettings {
+        RoleSettings {
+            main: other.main.clone().or_else(|| self.main.clone()),
+            plan: other.plan.clone().or_else(|| self.plan.clone()),
+            build: other.build.clone().or_else(|| self.build.clone()),
+            background: other.background.clone().or_else(|| self.background.clone()),
+            handoff: HandoffSettings {
+                mode: other.handoff.mode.or(self.handoff.mode),
+            },
+        }
+    }
+
+    fn resolve(&self) -> RoleConfig {
+        RoleConfig {
+            main: self.main.clone(),
+            plan: self.plan.clone(),
+            build: self.build.clone(),
+            background: self.background.clone(),
+            handoff: self.handoff.mode,
+        }
+    }
+
+    /// The settings that are set, as `roles.<key> = <value>`, for listings and fingerprints.
+    fn items(&self) -> Vec<String> {
+        let mut items: Vec<String> = self
+            .named()
+            .into_iter()
+            .filter_map(|(role, id)| Some(format!("roles.{role} = {:?}", id.as_deref()?)))
+            .collect();
+        if let Some(mode) = self.handoff.mode {
+            items.push(format!("roles.handoff.mode = {:?}", mode.as_str()));
+        }
+        items
+    }
+}
+
 /// The languages `[lsp.servers]` names.
 pub const LSP_LANGUAGES: [&str; 4] = ["rust", "typescript", "python", "go"];
 
@@ -638,6 +721,8 @@ pub struct ConfigFile {
     pub gates: GateSettings,
     #[serde(default)]
     pub lsp: LspSettings,
+    #[serde(default)]
+    pub roles: RoleSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -683,6 +768,8 @@ pub struct Config {
     pub gates: Gates,
     /// The language servers' settings: the global config's, with a project's over them.
     pub lsp: LspConfig,
+    /// The model roles: the global config's, with a trusted project's over them.
+    pub roles: RoleConfig,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -861,6 +948,8 @@ fn widening(project: &ConfigFile, baseline: Baseline) -> Widening {
     items.extend(project.gates.items());
     // Language-server commands run project code.
     items.extend(project.lsp.items());
+    // Roles choose which provider a conversation goes to.
+    items.extend(project.roles.items());
     if project.sandbox.linux_git_protection == Some(LinuxGitProtection::BestEffort)
         && baseline.linux_git_protection == LinuxGitProtection::Required
     {
@@ -907,6 +996,7 @@ pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening
         .or_else(|| profiles_problem(&project.profiles))
         .or_else(|| project.gates.problem())
         .or_else(|| project.lsp.problem())
+        .or_else(|| project.roles.problem())
     {
         return Err(ConfigError::Parse { path, message });
     }
@@ -931,6 +1021,7 @@ pub fn load(
     let home = home.as_deref();
     let mut cfg = Config::default();
     let mut gates = GateSettings::default();
+    let mut roles = RoleSettings::default();
     let global = parse_file(global_file)?;
     let baseline = Baseline::new(global.as_ref(), workspace);
     if let Some(message) = global.as_ref().and_then(|g| {
@@ -941,6 +1032,7 @@ pub fn load(
             .or_else(|| g.budgets.problem())
             .or_else(|| g.gates.problem())
             .or_else(|| g.lsp.problem())
+            .or_else(|| g.roles.problem())
     }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
@@ -968,6 +1060,7 @@ pub fn load(
         cfg.outcomes_disabled = global.outcomes.enabled == Some(false);
         cfg.notifications = cfg.notifications.overlaid(&global.notifications);
         gates = global.gates;
+        roles = global.roles;
         cfg.lsp.overlaid(&global.lsp, true);
     }
     let path = project_file(workspace);
@@ -982,6 +1075,7 @@ pub fn load(
             .or_else(|| profiles_problem(&project.profiles))
             .or_else(|| project.gates.problem())
             .or_else(|| project.lsp.problem())
+            .or_else(|| project.roles.problem())
         {
             return Err(ConfigError::Parse { path, message });
         }
@@ -1101,6 +1195,7 @@ pub fn load(
                     *merged = merged.overlaid(profile);
                 }
                 gates = gates.overlaid(&project.gates);
+                roles = roles.overlaid(&project.roles);
             } else {
                 let items: Vec<&str> = widening_items.iter().map(|item| item.as_str()).collect();
                 cfg.warnings.push(format!(
@@ -1121,6 +1216,7 @@ pub fn load(
         gates.test = answer.test.clone();
     }
     cfg.gates = gates.resolve();
+    cfg.roles = roles.resolve();
     Ok(cfg)
 }
 

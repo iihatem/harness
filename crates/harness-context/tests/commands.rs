@@ -389,3 +389,18 @@ fn a_linked_subdirectory_in_a_project_commands_directory_is_skipped_with_a_warni
         found.warnings[0]
     );
 }
+
+// Spec "Built-in commands": `/roles`, `/escalate` and `/budget` are built in, so `/help` lists
+// them and a command file cannot take their names.
+#[test]
+fn the_model_routing_commands_are_built_in() {
+    for name in ["roles", "escalate", "budget"] {
+        assert!(commands::is_builtin(name), "/{name}");
+        assert!(
+            commands::BUILTINS
+                .iter()
+                .any(|(builtin, _)| *builtin == name),
+            "/{name} is listed by /help"
+        );
+    }
+}

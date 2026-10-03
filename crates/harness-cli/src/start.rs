@@ -57,6 +57,13 @@ pub struct Started {
     pub diagnostics: Arc<harness_lsp::LspDiagnostics>,
 }
 
+/// The model a session starts on when it is not chosen another way: the `--model` flag, then
+/// `[roles] main`, then `model`.
+pub fn configured_model(setup: &Setup, flag: Option<String>) -> Option<String> {
+    flag.or_else(|| setup.config.roles.main.clone())
+        .or_else(|| setup.config.model.clone())
+}
+
 /// A new run's id: its start time and the process id.
 pub fn run_id() -> String {
     format!(
@@ -251,7 +258,8 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     .with_checkpoints(checkpoints)
     .with_meter(meter.clone())
     .with_gates(setup.config.gates.clone())
-    .with_diagnostics(diagnostics.clone());
+    .with_diagnostics(diagnostics.clone())
+    .with_roles(setup.config.roles.clone());
     if interactive {
         agent = agent.with_sandboxes(sandboxes);
     }
@@ -705,6 +713,31 @@ mod tests {
             assert_eq!(lack.warning.as_deref(), said);
             assert_eq!(lack.unsandboxed, reason);
         }
+    }
+
+    // The session's model: the flag, then `[roles] main`, then `model`.
+    #[test]
+    fn the_session_model_is_the_flag_then_roles_main_then_model() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        let configured = |text: &str| {
+            std::fs::write(home.path().join("config/config.toml"), text).unwrap();
+            crate::host::tests::setup_in(home.path(), &workspace)
+        };
+        let both = configured("model = \"ollama/a\"\n[roles]\nmain = \"ollama/b\"\n");
+        assert_eq!(configured_model(&both, None).as_deref(), Some("ollama/b"));
+        assert_eq!(
+            configured_model(&both, Some("ollama/c".into())).as_deref(),
+            Some("ollama/c")
+        );
+        let only_model = configured("model = \"ollama/a\"\n");
+        assert_eq!(
+            configured_model(&only_model, None).as_deref(),
+            Some("ollama/a")
+        );
+        assert_eq!(configured_model(&configured(""), None), None);
     }
 
     // `/context` says where the window comes from, now that it is no longer assumed.

@@ -433,6 +433,10 @@ pub mod tests {
             shown.contains("session") && shown.contains("no limit"),
             "{shown}"
         );
+        assert!(
+            shown.contains("API key") && shown.contains("local models go on"),
+            "/budget says what a reached budget pauses: {shown}"
+        );
         let raised = host.budget("s1", Some(2.0)).await.unwrap().join("\n");
         assert!(raised.contains("session budget set to $2.00"), "{raised}");
         assert!(raised.contains("of $2.00"), "{raised}");

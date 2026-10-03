@@ -11,7 +11,7 @@ use std::{
 
 use harness_core::{
     message::Usage,
-    meter::{BudgetKind, Meter, RequestRecord},
+    meter::{AccountKind, BudgetKind, Meter, RequestRecord},
 };
 use harness_usage::{
     budget::Budgets,
@@ -77,19 +77,22 @@ fn session_budget(usd: f64) -> Budgets {
 fn a_warning_at_80_percent_once_then_a_stop_at_100() {
     let data = tempfile::tempdir().unwrap();
     let m = meter(data.path(), session_budget(10.0), clock(NOW));
-    assert_eq!(m.check_budget("s"), Default::default());
+    assert_eq!(m.check_budget("s", AccountKind::ApiKey), Default::default());
     spend(&m, "s", "openai/gpt-5", false, 7);
-    assert!(m.check_budget("s").warnings.is_empty(), "70% is not yet");
+    assert!(
+        m.check_budget("s", AccountKind::ApiKey).warnings.is_empty(),
+        "70% is not yet"
+    );
     spend(&m, "s", "openai/gpt-5", false, 1);
-    let status = m.check_budget("s");
+    let status = m.check_budget("s", AccountKind::ApiKey);
     assert_eq!(status.warnings.len(), 1, "{status:?}");
     assert_eq!(status.warnings[0].budget, BudgetKind::Session);
     assert!((status.warnings[0].spent_usd - 8.0).abs() < 1e-9);
     assert!(status.stop.is_none());
     // Once.
-    assert!(m.check_budget("s").warnings.is_empty());
+    assert!(m.check_budget("s", AccountKind::ApiKey).warnings.is_empty());
     spend(&m, "s", "openai/gpt-5", false, 2);
-    let status = m.check_budget("s");
+    let status = m.check_budget("s", AccountKind::ApiKey);
     let stop = status.stop.expect("100% stops");
     assert_eq!(stop.budget, BudgetKind::Session);
     assert!((stop.spent_usd - 10.0).abs() < 1e-9 && (stop.limit_usd - 10.0).abs() < 1e-9);
@@ -110,7 +113,7 @@ fn subscription_and_local_use_is_not_spend() {
     );
     spend(&m, "s", "chatgpt/gpt-5", false, 10_000_000);
     spend(&m, "s", "ollama/qwen3-coder", true, 10_000_000);
-    assert_eq!(m.check_budget("s"), Default::default());
+    assert_eq!(m.check_budget("s", AccountKind::ApiKey), Default::default());
 }
 
 #[test]
@@ -118,7 +121,7 @@ fn a_request_with_no_price_cannot_be_counted() {
     let data = tempfile::tempdir().unwrap();
     let m = meter(data.path(), session_budget(1.0), clock(NOW));
     spend(&m, "s", "openrouter/some/new-model", false, 10_000_000);
-    assert_eq!(m.check_budget("s"), Default::default());
+    assert_eq!(m.check_budget("s", AccountKind::ApiKey), Default::default());
 }
 
 #[test]
@@ -129,8 +132,19 @@ fn the_session_budget_counts_this_session_only_and_survives_a_resume() {
     spend(&first, "other", "openai/gpt-5", false, 50);
     // Another process resumes session s1: the ledger holds its history.
     let resumed = meter(data.path(), session_budget(10.0), clock(NOW));
-    assert_eq!(resumed.check_budget("s1").warnings.len(), 1);
-    assert!(resumed.check_budget("fresh").warnings.is_empty());
+    assert_eq!(
+        resumed
+            .check_budget("s1", AccountKind::ApiKey)
+            .warnings
+            .len(),
+        1
+    );
+    assert!(
+        resumed
+            .check_budget("fresh", AccountKind::ApiKey)
+            .warnings
+            .is_empty()
+    );
 }
 
 #[test]
@@ -149,10 +163,10 @@ fn the_daily_budget_counts_today_and_the_monthly_one_this_month() {
     spend(&m, "a", "openai/gpt-5", false, 10);
     t.store(NOW, Ordering::SeqCst);
     // $60 this month, none today: nothing yet.
-    assert_eq!(m.check_budget("a"), Default::default());
+    assert_eq!(m.check_budget("a", AccountKind::ApiKey), Default::default());
     // $8 today is 80% of the day's $10.
     spend(&m, "a", "openai/gpt-5", false, 8);
-    let status = m.check_budget("a");
+    let status = m.check_budget("a", AccountKind::ApiKey);
     assert_eq!(
         status.warnings.iter().map(|w| w.budget).collect::<Vec<_>>(),
         [BudgetKind::Daily]
@@ -160,7 +174,7 @@ fn the_daily_budget_counts_today_and_the_monthly_one_this_month() {
     assert!(status.stop.is_none());
     // $23 today is past it, and $83 of the month's $100 is 80% of that.
     spend(&m, "a", "openai/gpt-5", false, 15);
-    let status = m.check_budget("a");
+    let status = m.check_budget("a", AccountKind::ApiKey);
     assert_eq!(
         status.stop.expect("the day's budget").budget,
         BudgetKind::Daily
@@ -171,7 +185,7 @@ fn the_daily_budget_counts_today_and_the_monthly_one_this_month() {
     );
     // Tomorrow the daily budget is fresh, and the month's warning was given.
     t.store(NOW + DAY, Ordering::SeqCst);
-    assert_eq!(m.check_budget("a"), Default::default());
+    assert_eq!(m.check_budget("a", AccountKind::ApiKey), Default::default());
 }
 
 #[test]
@@ -179,12 +193,12 @@ fn raising_the_session_budget_lets_requests_go_on_and_warns_again_at_80_percent_
     let data = tempfile::tempdir().unwrap();
     let m = meter(data.path(), session_budget(1.0), clock(NOW));
     spend(&m, "s", "openai/gpt-5", false, 1);
-    assert!(m.check_budget("s").stop.is_some());
+    assert!(m.check_budget("s", AccountKind::ApiKey).stop.is_some());
     m.set_session_budget(10.0);
-    assert_eq!(m.check_budget("s").stop, None);
+    assert_eq!(m.check_budget("s", AccountKind::ApiKey).stop, None);
     assert_eq!(m.budgets().session_usd, Some(10.0));
     spend(&m, "s", "openai/gpt-5", false, 7);
-    let status = m.check_budget("s");
+    let status = m.check_budget("s", AccountKind::ApiKey);
     assert_eq!(status.warnings.len(), 1, "{status:?}");
     assert!((status.warnings[0].limit_usd - 10.0).abs() < 1e-9);
 }
@@ -216,8 +230,32 @@ fn budgets_that_are_not_set_cost_nothing_to_check() {
     let data = tempfile::tempdir().unwrap();
     let m = meter(data.path(), Budgets::default(), clock(NOW));
     spend(&m, "s", "openai/gpt-5", false, 1_000);
-    assert_eq!(m.check_budget("s"), Default::default());
+    assert_eq!(m.check_budget("s", AccountKind::ApiKey), Default::default());
     // No cache was needed for it.
     let _ = Ledger::new(&Dirs::under(data.path()).usage);
     let _: Option<LedgerRecord> = None;
+}
+
+// At 100% the budget refuses only requests on an API key: a subscription or a local request goes
+// on, and the status says paid models are paused. The check still runs before every request.
+#[test]
+fn a_reached_budget_pauses_api_key_requests_only() {
+    let data = tempfile::tempdir().unwrap();
+    let m = meter(data.path(), session_budget(1.0), clock(NOW));
+    spend(&m, "s", "openai/gpt-5", false, 1);
+    let billed = m.check_budget("s", AccountKind::ApiKey);
+    assert!(
+        billed.stop.is_some() && billed.paused.is_none(),
+        "{billed:?}"
+    );
+    for account in [AccountKind::Local, AccountKind::Subscription] {
+        let free = m.check_budget("s", account);
+        assert_eq!(free.stop, None, "{account:?}");
+        let paused = free.paused.expect("the pause is reported");
+        assert_eq!(paused.budget, BudgetKind::Session);
+    }
+    // Raising the budget clears both.
+    m.set_session_budget(10.0);
+    let status = m.check_budget("s", AccountKind::Local);
+    assert_eq!((status.stop, status.paused), (None, None));
 }

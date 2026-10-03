@@ -49,7 +49,7 @@ impl Meter for Capped {
         }
     }
 
-    fn check_budget(&self, _session: &str) -> BudgetStatus {
+    fn check_budget(&self, _session: &str, account: AccountKind) -> BudgetStatus {
         let spent = self.requests.load(Ordering::SeqCst);
         let notice = |spent: usize| BudgetNotice {
             budget: BudgetKind::Session,
@@ -57,9 +57,17 @@ impl Meter for Capped {
             limit_usd: 1.0,
         };
         if spent >= self.stop_after {
-            return BudgetStatus {
-                warnings: Vec::new(),
-                stop: Some(notice(spent)),
+            // Only a request that would add billed cost is refused.
+            return if account == AccountKind::ApiKey {
+                BudgetStatus {
+                    stop: Some(notice(spent)),
+                    ..BudgetStatus::default()
+                }
+            } else {
+                BudgetStatus {
+                    paused: Some(notice(spent)),
+                    ..BudgetStatus::default()
+                }
             };
         }
         let mut warned = self.warned.lock().unwrap();
@@ -67,7 +75,7 @@ impl Meter for Capped {
             *warned = true;
             return BudgetStatus {
                 warnings: vec![notice(spent)],
-                stop: None,
+                ..BudgetStatus::default()
             };
         }
         BudgetStatus::default()
@@ -176,6 +184,56 @@ async fn a_new_turn_asks_again_and_runs_when_the_budget_allows() {
     assert_eq!(provider.requests().len(), 1);
 }
 
+// At 100% a model of the user's own is not billed, so its requests go on; the user is told once
+// per turn that paid models are paused, and the check still runs before every request.
+#[tokio::test]
+async fn a_local_request_goes_on_at_100_percent_and_the_pause_is_said_once_per_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        echo("c1"),
+        echo("c2"),
+        Script::text("done"),
+        Script::text("again"),
+    ]);
+    let meter = Capped::new(0);
+    let mut agent = agent(
+        provider.clone(),
+        Mode::Auto,
+        Arc::new(NonInteractive),
+        dir.path(),
+    )
+    .with_meter(meter);
+    agent.config_mut().request.local = true;
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    assert_eq!(provider.requests().len(), 3, "no request was refused");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::BudgetReached { .. }))
+    );
+    let paused: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Warning { message } if message.contains("paused") => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        paused.len(),
+        1,
+        "once per turn, not per request: {events:?}"
+    );
+    assert!(paused[0].contains("session budget"), "{}", paused[0]);
+    // The next turn says it again.
+    let (_, events) = run(&mut agent, "more").await;
+    let again = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Warning { message } if message.contains("paused")))
+        .count();
+    assert_eq!(again, 1);
+}
+
 #[test]
 fn the_messages_name_the_budget_and_how_to_raise_it() {
     let notice = BudgetNotice {
@@ -207,4 +265,8 @@ fn the_messages_name_the_budget_and_how_to_raise_it() {
             .warning_message()
             .contains("session budget of $1.00")
     );
+    let paused = notice.paused_message();
+    assert!(paused.contains("paused"), "{paused}");
+    assert!(paused.contains("session budget of $1.00"), "{paused}");
+    assert!(paused.contains("API"), "{paused}");
 }

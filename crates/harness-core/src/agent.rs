@@ -18,7 +18,7 @@ use crate::{
     compaction::{self, CompactionConfig},
     event::{AgentEvent, ErrorKind, TurnEndReason},
     message::{ChatRequest, Message, RequestOptions, ToolCall, Usage},
-    meter::{GateCounts, MAIN_ROLE, Meter, RequestRecord, TurnRecord},
+    meter::{AccountKind, GateCounts, MAIN_ROLE, Meter, RequestRecord, TurnRecord},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
     permission::{Action, Decision, FsAccess, Mode, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
@@ -464,16 +464,28 @@ impl Agent {
 
     /// Asks the meter whether the budgets allow the next request: says each 80% warning, and
     /// whether one is reached (said as an event too).
-    fn budget_reached(&self, events: &UnboundedSender<AgentEvent>) -> bool {
+    fn budget_reached(&self, events: &UnboundedSender<AgentEvent>, said_paused: &mut bool) -> bool {
         let Some(meter) = &self.meter else {
             return false;
         };
-        let status = meter.check_budget(self.session.id());
+        let local = match &self.turn_model {
+            Some(turn) => turn.options().local,
+            None => self.config.request.local,
+        };
+        let account = AccountKind::of(self.model_id(), local);
+        let status = meter.check_budget(self.session.id(), account);
         for notice in status.warnings {
             let _ = events.send(AgentEvent::BudgetWarning { notice });
         }
         for message in meter.take_warnings() {
             let _ = events.send(AgentEvent::Warning { message });
+        }
+        if let Some(notice) = status.paused
+            && !std::mem::replace(said_paused, true)
+        {
+            let _ = events.send(AgentEvent::Warning {
+                message: notice.paused_message(),
+            });
         }
         match status.stop {
             Some(notice) => {
@@ -1065,9 +1077,10 @@ impl Agent {
         }
 
         let mut auto_compaction_failed = false;
+        let mut said_paused = false;
         for _ in 0..self.config.max_steps {
             // Before each request, not each turn: a turn with many tool calls can overrun.
-            if self.budget_reached(events) {
+            if self.budget_reached(events, &mut said_paused) {
                 return self.finish(TurnEndReason::Budget, events);
             }
             if !auto_compaction_failed {

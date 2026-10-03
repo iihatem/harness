@@ -421,6 +421,45 @@ async fn a_headless_budget_stop_exits_4() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
+// With the daily budget reached by billed requests, a headless run on a local model is not
+// affected: both its requests go, and it exits 0. The same run on the billed account still
+// stops with reason `budget` and exit 4.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reached_budget_does_not_stop_a_headless_run_on_a_local_model() {
+    let server = MockServer::start().await;
+    two_requests(&server).await;
+    let billed = "[budgets]\ndaily_usd = 0.10\n[profiles.\"mock/*\"]\nlocal = false\n[pricing.\"mock/*\"]\ninput = 1000000\noutput = 1000000\n";
+    let env = Env::new(&server.uri(), billed);
+    let env = std::sync::Arc::new(env);
+    let run = |env: std::sync::Arc<Env>| {
+        tokio::task::spawn_blocking(move || {
+            env.cmd()
+                .args(["--model", "mock/test-model", "ask", "go"])
+                .output()
+                .unwrap()
+                .status
+                .code()
+        })
+    };
+    assert_eq!(run(env.clone()).await.unwrap(), Some(4), "billed, first");
+    // The same day, the same server, but now it is a server of the user's own.
+    let local = billed.replace("[profiles.\"mock/*\"]\nlocal = false\n", "");
+    std::fs::write(
+        env.home.path().join("config/config.toml"),
+        format!(
+            "{local}\n[providers.mock]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n",
+            server.uri()
+        ),
+    )
+    .unwrap();
+    assert_eq!(run(env.clone()).await.unwrap(), Some(0), "local");
+    let ledger = env.ledger();
+    assert!(
+        ledger.iter().filter(|r| r["account"] == "local").count() >= 2,
+        "{ledger:?}"
+    );
+}
+
 // Headless runs never auto-resume: `harness ask` that hits a subscription limit exits with its M1
 // error behaviour at once and does not wait for the reset.
 #[tokio::test(flavor = "multi_thread")]

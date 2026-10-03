@@ -107,8 +107,10 @@ pub fn report(by: &str, since: Option<String>, until: Option<String>) -> u8 {
     }
 }
 
-/// `/budget`'s lines: each budget with what is spent against it.
+/// `/budget`'s lines: each budget with what is spent against it, and what a reached one stops.
 pub fn budget_lines(report: &[harness_usage::budget::BudgetLine]) -> Vec<String> {
+    let note =
+        "a reached budget pauses requests on an API key; ChatGPT plans and local models go on";
     report
         .iter()
         .map(|line| {
@@ -122,6 +124,7 @@ pub fn budget_lines(report: &[harness_usage::budget::BudgetLine]) -> Vec<String>
                 None => format!("{name:<8}  ${:.2} spent, no limit", line.spent_usd),
             }
         })
+        .chain(std::iter::once(note.to_string()))
         .collect()
 }
 

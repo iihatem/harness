@@ -202,6 +202,20 @@ pub struct BudgetNotice {
 }
 
 impl BudgetNotice {
+    /// How to raise the budget.
+    fn raise_hint(&self) -> String {
+        match self.budget {
+            BudgetKind::Session => format!(
+                "raise it with /budget <usd> for this session, or set budgets.{} in the configuration",
+                self.budget.config_key()
+            ),
+            _ => format!(
+                "raise it by setting budgets.{} in the configuration",
+                self.budget.config_key()
+            ),
+        }
+    }
+
     /// What to tell the user when 80% of the budget is spent.
     pub fn warning_message(&self) -> String {
         let percent = (self.spent_usd / self.limit_usd * 100.0 + 1e-9).floor();
@@ -215,16 +229,7 @@ impl BudgetNotice {
 
     /// What to tell the user when the budget is reached: which one, and how to raise it.
     pub fn reached_message(&self) -> String {
-        let raise = match self.budget {
-            BudgetKind::Session => format!(
-                "raise it with /budget <usd> for this session, or set budgets.{} in the configuration",
-                self.budget.config_key()
-            ),
-            _ => format!(
-                "raise it by setting budgets.{} in the configuration",
-                self.budget.config_key()
-            ),
-        };
+        let raise = self.raise_hint();
         format!(
             "the {} budget of ${:.2} is reached (${:.2} spent), so the request was not sent; {raise}",
             self.budget.name(),
@@ -234,12 +239,31 @@ impl BudgetNotice {
     }
 }
 
+impl BudgetNotice {
+    /// What to tell the user when the budget is reached but the request is not billed: paid
+    /// models are paused, and this one goes on.
+    pub fn paused_message(&self) -> String {
+        format!(
+            "the {} budget of ${:.2} is reached (${:.2} spent): requests on an API key are paused, \
+             while ChatGPT plans and local models go on; {}",
+            self.budget.name(),
+            self.limit_usd,
+            self.spent_usd,
+            self.raise_hint()
+        )
+    }
+}
+
 /// What the budgets say before a request: the ones at 80% (each said once), and the one that is
-/// reached, if any.
+/// reached, if any. A reached budget refuses only a request that would add billed cost: for any
+/// other account it is `paused` instead of `stop`, and the request goes on.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BudgetStatus {
     pub warnings: Vec<BudgetNotice>,
+    /// Reached, and the request is on an API key: it is not sent.
     pub stop: Option<BudgetNotice>,
+    /// Reached, but the request is on a subscription or a local model: it is sent.
+    pub paused: Option<BudgetNotice>,
 }
 
 /// How the gates of a turn ended (counts only).
@@ -285,9 +309,10 @@ pub trait Meter: Send + Sync {
     /// Records `request`, and says what it cost.
     fn record_request(&self, request: &RequestRecord) -> RequestCost;
 
-    /// Asked before each model request in `session`: whether a money budget allows it. The
-    /// meter says each 80% warning once.
-    fn check_budget(&self, _session: &str) -> BudgetStatus {
+    /// Asked before each model request in `session`, which `account` pays for: whether a money
+    /// budget allows it. A reached budget refuses only an `ApiKey` request. The meter says each
+    /// 80% warning once.
+    fn check_budget(&self, _session: &str, _account: AccountKind) -> BudgetStatus {
         BudgetStatus::default()
     }
 

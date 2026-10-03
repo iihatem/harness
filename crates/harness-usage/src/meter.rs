@@ -306,7 +306,7 @@ impl Meter for UsageMeter {
         }
     }
 
-    fn check_budget(&self, session: &str) -> BudgetStatus {
+    fn check_budget(&self, session: &str, account: AccountKind) -> BudgetStatus {
         let budgets = self.budgets();
         let mut status = BudgetStatus::default();
         for kind in KINDS {
@@ -326,7 +326,12 @@ impl Meter for UsageMeter {
                 limit_usd: limit,
             };
             if reached(spent, limit, 100.0) {
-                status.stop.get_or_insert(notice);
+                // Only a request that would add billed cost is refused.
+                if account == AccountKind::ApiKey {
+                    status.stop.get_or_insert(notice);
+                } else {
+                    status.paused.get_or_insert(notice);
+                }
             } else if reached(spent, limit, 80.0) {
                 let period = match kind {
                     BudgetKind::Session => session.to_string(),

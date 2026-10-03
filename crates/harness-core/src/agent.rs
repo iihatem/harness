@@ -18,7 +18,7 @@ use crate::{
     compaction::{self, CompactionConfig},
     event::{AgentEvent, ErrorKind, TurnEndReason},
     message::{ChatRequest, Message, RequestOptions, ToolCall, Usage},
-    meter::{MAIN_ROLE, Meter, RequestRecord},
+    meter::{GateCounts, MAIN_ROLE, Meter, RequestRecord, TurnRecord},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
     permission::{Action, Decision, FsAccess, Mode, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
@@ -236,6 +236,8 @@ struct Stats {
     time_to_first_token: Option<Duration>,
     generation: Duration,
     usage: Usage,
+    /// Tool calls run in the turn.
+    tool_calls: u32,
 }
 
 /// What one model call produced so far. Kept outside the stream future so partial output survives.
@@ -358,6 +360,14 @@ pub struct Agent {
     steering: Option<Steering>,
     /// Told about every model request, for the usage ledger.
     meter: Option<Arc<dyn Meter>>,
+    /// The current turn: when it started (for its duration, and as seconds since the epoch), and
+    /// its user message's entry.
+    turn_started: Option<(Instant, u64)>,
+    turn_entry: String,
+    /// Retries made in the current turn.
+    retry_count: std::sync::atomic::AtomicU32,
+    /// Whether the user switched the session's model with `/model`.
+    model_chosen_by_user: bool,
 }
 
 impl Agent {
@@ -405,6 +415,10 @@ impl Agent {
             sandboxes: None,
             steering: None,
             meter: None,
+            turn_started: None,
+            turn_entry: String::new(),
+            retry_count: std::sync::atomic::AtomicU32::new(0),
+            model_chosen_by_user: false,
         }
     }
 
@@ -413,6 +427,39 @@ impl Agent {
     pub fn with_meter(mut self, meter: Arc<dyn Meter>) -> Self {
         self.meter = Some(meter);
         self
+    }
+
+    /// Tells the meter that the turn ended as `reason`, with `stats`.
+    fn meter_turn(&self, reason: TurnEndReason, stats: &Stats) {
+        let Some(meter) = &self.meter else {
+            return;
+        };
+        let (started, started_at) = self
+            .turn_started
+            .unwrap_or_else(|| (Instant::now(), crate::time::now_unix()));
+        meter.record_turn(&TurnRecord {
+            session: self.session.id().to_string(),
+            turn: self.turn_entry.clone(),
+            role: MAIN_ROLE.to_string(),
+            model: self.model_id().to_string(),
+            selected_by: if self.model_chosen_by_user {
+                "user"
+            } else {
+                "config"
+            }
+            .to_string(),
+            input_tokens: stats.usage.input_tokens,
+            output_tokens: stats.usage.output_tokens,
+            first_token_ms: stats.time_to_first_token.map(|d| d.as_millis() as u64),
+            duration_ms: started.elapsed().as_millis() as u64,
+            tool_calls: stats.tool_calls,
+            invalid_calls: self.invalid_calls,
+            retries: self.retry_count.load(std::sync::atomic::Ordering::Relaxed),
+            finish_reason: reason.as_str().to_string(),
+            started_at,
+            ended_at: crate::time::now_unix(),
+            gates: GateCounts::default(),
+        });
     }
 
     /// Asks the meter whether the budgets allow the next request: says each 80% warning, and
@@ -721,6 +768,24 @@ impl Agent {
             },
         );
         self.after_session_change();
+        // The turns from that message on are the ones undone.
+        if let Some(meter) = &self.meter {
+            let undone: Vec<String> = branch[position..]
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.kind,
+                        EntryKind::Message {
+                            message: Message::User { .. },
+                            note: false,
+                            ..
+                        }
+                    )
+                })
+                .map(|e| e.id.clone())
+                .collect();
+            meter.turns_rewound(self.session.id(), &undone);
+        }
         Ok(())
     }
 
@@ -878,7 +943,7 @@ impl Agent {
         display: Option<String>,
         note: bool,
         plan: Option<String>,
-    ) {
+    ) -> String {
         let id = self.session.append(EntryKind::Message {
             message: message.clone(),
             display,
@@ -886,8 +951,9 @@ impl Agent {
             plan,
         });
         self.history.push(message);
-        self.history_ids.push(id);
+        self.history_ids.push(id.clone());
         self.note_save_error();
+        id
     }
 
     pub fn config_mut(&mut self) -> &mut AgentConfig {
@@ -926,6 +992,7 @@ impl Agent {
         self.config.text_tool_calls = model.text_tool_calls;
         self.reported_usage = None;
         self.auto_compaction_paused = false;
+        self.model_chosen_by_user = true;
     }
 
     /// Switches the approval mode between turns, and with [`with_sandboxes`](Self::with_sandboxes)
@@ -960,6 +1027,9 @@ impl Agent {
         self.ctx.cancel = cancel.clone();
         self.invalid_calls = 0;
         self.stats = Stats::default();
+        self.retry_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.turn_started = Some((Instant::now(), crate::time::now_unix()));
         self.turn_checkpointed = false;
         // Settings that apply to this turn only.
         self.turn_model = input.model.clone();
@@ -984,7 +1054,8 @@ impl Agent {
         let _ = events.send(AgentEvent::TurnStarted);
         self.message_recorded = false;
         let content = self.user_message(input.parts, events).await;
-        self.record_entry(Message::User { content }, input.display, false, input.plan);
+        self.turn_entry =
+            self.record_entry(Message::User { content }, input.display, false, input.plan);
         self.message_recorded = true;
         for kind in std::mem::take(&mut self.held_entries) {
             self.append_turn_entry(kind);
@@ -1066,6 +1137,7 @@ impl Agent {
                     }
                     return self.finish(TurnEndReason::Interrupted, events);
                 }
+                self.stats.tool_calls += 1;
                 let output = self.execute(call, events).await;
                 let message = Message::Tool {
                     call_id: call.id.clone(),
@@ -1524,6 +1596,8 @@ impl Agent {
                             .is_some_and(|d| d > crate::retry::MAX_AUTOMATIC_RETRY_AFTER) =>
                 {
                     let delay = self.config.retry.delay(attempt, error.retry_after());
+                    self.retry_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let _ = events.send(AgentEvent::Retrying {
                         attempt,
                         reason: error.to_string(),
@@ -1597,6 +1671,7 @@ impl Agent {
             let _ = events.send(AgentEvent::Warning { message });
         }
         let stats = std::mem::take(&mut self.stats);
+        self.meter_turn(reason, &stats);
         if let Some(model) = stats.model {
             let _ = events.send(AgentEvent::TurnStats {
                 model,

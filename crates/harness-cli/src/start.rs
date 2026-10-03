@@ -223,6 +223,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         harness_usage::meter::UsageMeter::open(&setup.paths.data_dir, &setup.workspace)
             .with_pricing(crate::pricing::load(setup))
             .with_baseline(setup.config.usage.baseline.clone())
+            .with_outcomes(!setup.config.outcomes_disabled)
             .with_budgets(harness_usage::budget::Budgets {
                 session_usd: budgets.session_usd,
                 daily_usd: budgets.daily_usd,

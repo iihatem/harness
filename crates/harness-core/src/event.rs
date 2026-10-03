@@ -23,6 +23,19 @@ pub enum ErrorKind {
     Internal,
 }
 
+impl TurnEndReason {
+    /// The word for it in records: `completed`, `step_limit`, `interrupted`, `error`, `budget`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnEndReason::Completed => "completed",
+            TurnEndReason::StepLimit => "step_limit",
+            TurnEndReason::Interrupted => "interrupted",
+            TurnEndReason::Error => "error",
+            TurnEndReason::Budget => "budget",
+        }
+    }
+}
+
 /// Everything observable about a turn. Frontends render these; `harness ask --json` prints one per line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

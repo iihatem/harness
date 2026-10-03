@@ -242,6 +242,44 @@ pub struct BudgetStatus {
     pub stop: Option<BudgetNotice>,
 }
 
+/// How the gates of a turn ended (counts only).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateCounts {
+    pub passed: u32,
+    pub failed: u32,
+    pub skipped: u32,
+}
+
+/// One finished turn: how it went, as counts and ids; never the prompt, the reply, paths or
+/// commands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnRecord {
+    pub session: String,
+    /// The turn's user message, as the entry that holds it in the session.
+    pub turn: String,
+    pub role: String,
+    /// The model that answered last.
+    pub model: String,
+    /// What chose the model: `config`, `user`, `fallback` or `escalation`.
+    pub selected_by: String,
+    /// The tokens the provider reported for the turn's requests.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// From the request to the first output, of the turn's first reply that had any.
+    pub first_token_ms: Option<u64>,
+    pub duration_ms: u64,
+    pub tool_calls: u32,
+    pub invalid_calls: u32,
+    pub retries: u32,
+    /// `completed`, `step_limit`, `interrupted`, `error` or `budget`.
+    pub finish_reason: String,
+    /// When the turn started and ended, in seconds since the Unix epoch: where the turn's
+    /// requests are in the ledger.
+    pub started_at: u64,
+    pub ended_at: u64,
+    pub gates: GateCounts,
+}
+
 /// Where the runtime reports what each model request took. Implemented by `harness-usage`.
 pub trait Meter: Send + Sync {
     /// Records `request`, and says what it cost.
@@ -256,6 +294,13 @@ pub trait Meter: Send + Sync {
     /// A window snapshot the provider reported during a request that has not ended yet: the
     /// meter keeps it, and names it in that request's record.
     fn record_window(&self, _snapshot: &WindowSnapshot) {}
+
+    /// Records a finished turn.
+    fn record_turn(&self, _turn: &TurnRecord) {}
+
+    /// The user rewound the conversation to before these turns of `session` (each named by its
+    /// user message's entry).
+    fn turns_rewound(&self, _session: &str, _turns: &[String]) {}
 
     /// What went wrong keeping the record, such as a ledger that cannot be written, each given
     /// once; the runtime shows them as warnings.

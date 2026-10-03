@@ -124,3 +124,56 @@ pub fn budget_lines(report: &[harness_usage::budget::BudgetLine]) -> Vec<String>
         })
         .collect()
 }
+
+/// `harness usage export`: the ledger's records on standard output.
+pub fn export(since: Option<&str>, format: &str) -> u8 {
+    let Some(format) = harness_usage::export::Format::parse(format) else {
+        eprintln!("error: --format takes jsonl or csv, not `{format}`");
+        return 2;
+    };
+    let setup = match setup::load() {
+        Ok(setup) => setup,
+        Err(message) => {
+            eprintln!("error: {}", terminal_safe(&message));
+            return 2;
+        }
+    };
+    let dirs = Dirs::under(&setup.paths.data_dir);
+    let mut out = Vec::new();
+    if let Err(e) = harness_usage::export::export(&dirs, since, format, &mut out) {
+        eprintln!("error: {}", terminal_safe(&e.to_string()));
+        return 2;
+    }
+    // A closed pipe is the reader's choice, not an error of ours.
+    let _ = std::io::Write::write_all(&mut std::io::stdout().lock(), &out);
+    0
+}
+
+/// `harness usage forget`: deletes the ledger and the outcome log, in a range, and rebuilds the
+/// cache. With neither `--before` nor `--all` it deletes nothing and says so.
+pub fn forget(before: Option<&str>, all: bool) -> u8 {
+    if before.is_none() && !all {
+        eprintln!(
+            "error: usage forget needs a range: --before DATE (UTC, YYYY-MM-DD) or --all; nothing was deleted"
+        );
+        return 2;
+    }
+    let setup = match setup::load() {
+        Ok(setup) => setup,
+        Err(message) => {
+            eprintln!("error: {}", terminal_safe(&message));
+            return 2;
+        }
+    };
+    let dirs = Dirs::under(&setup.paths.data_dir);
+    match harness_usage::export::forget(&dirs, before) {
+        Ok(files) => {
+            println!("Forgot usage data: {files} file(s) deleted or shortened.");
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {}", terminal_safe(&e.to_string()));
+            1
+        }
+    }
+}

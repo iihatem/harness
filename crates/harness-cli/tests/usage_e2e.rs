@@ -464,3 +464,154 @@ fn harness_core_now() -> u64 {
         .unwrap()
         .as_secs()
 }
+
+fn outcome_lines(env: &Env) -> Vec<Value> {
+    let dir = env.home.path().join("data/outcomes");
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    files.sort();
+    files
+        .iter()
+        .flat_map(|f| {
+            std::fs::read_to_string(f)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect::<Vec<Value>>()
+        })
+        .collect()
+}
+
+// `harness ask` writes an outcome line for its turn, with counts and no content.
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_writes_an_outcome_line_without_content() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(stream(&[text_chunk("All done"), usage_chunk(300, 20)]))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(stream(&[
+            tool_chunk("c1", "bash", r#"{"command":"cargo test -p billing"}"#),
+            usage_chunk(200, 10),
+        ]))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri(), "");
+    let env = tokio::task::spawn_blocking(move || {
+        let _ = env
+            .cmd()
+            .args([
+                "--model",
+                "mock/test-model",
+                "ask",
+                "fix src/billing/invoice.rs",
+            ])
+            .assert();
+        env
+    })
+    .await
+    .unwrap();
+    let lines = outcome_lines(&env);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["model"], "mock/test-model");
+    assert_eq!(lines[0]["role"], "main");
+    assert_eq!(lines[0]["selected_by"], "config");
+    assert_eq!(lines[0]["tool_calls"], 1);
+    assert_eq!(lines[0]["input_tokens"], 500);
+    assert_eq!(lines[0]["output_tokens"], 30);
+    assert_eq!(lines[0]["user_signal"], "continued");
+    let file = std::fs::read_dir(env.home.path().join("data/outcomes"))
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let text = std::fs::read_to_string(&file).unwrap();
+    for forbidden in ["invoice.rs", "billing", "cargo test", "fix src"] {
+        assert!(!text.contains(forbidden), "{forbidden}: {text}");
+    }
+}
+
+// `[outcomes] enabled = false`: no outcome file, and `harness usage` still reports the requests.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_outcomes_off_the_ledger_and_the_report_still_work() {
+    let server = MockServer::start().await;
+    let env = ask_twice(
+        Env::new(&server.uri(), "[outcomes]\nenabled = false\n"),
+        &server,
+    )
+    .await;
+    assert!(!env.home.path().join("data/outcomes").exists());
+    let report = stdout(&run_usage(&env, &["usage"]));
+    assert!(report.contains("mock/test-model"), "{report}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_export_writes_csv_and_jsonl_to_stdout() {
+    let server = MockServer::start().await;
+    let env = ask_twice(Env::new(&server.uri(), ""), &server).await;
+    let csv = stdout(&run_usage(
+        &env,
+        &[
+            "usage",
+            "export",
+            "--format",
+            "csv",
+            "--since",
+            "2020-01-01",
+        ],
+    ));
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(lines.len(), 3, "{csv}");
+    assert!(lines[0].starts_with("t,time,session,"), "{csv}");
+    let jsonl = stdout(&run_usage(&env, &["usage", "export"]));
+    assert_eq!(jsonl.lines().count(), 2);
+    let first: Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+    assert_eq!(first["model"], "mock/test-model");
+    let none = stdout(&run_usage(
+        &env,
+        &["usage", "export", "--since", "2999-01-01"],
+    ));
+    assert!(none.is_empty(), "{none}");
+    let bad = run_usage(&env, &["usage", "export", "--format", "xml"]);
+    assert!(!bad.status.success());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_forget_needs_a_range_and_forget_all_empties_the_report() {
+    let server = MockServer::start().await;
+    let env = ask_twice(Env::new(&server.uri(), ""), &server).await;
+    // With neither flag: nothing is deleted, and it exits non-zero, saying so.
+    let refused = run_usage(&env, &["usage", "forget"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--before"),
+        "{refused:?}"
+    );
+    assert_eq!(env.ledger().len(), 2);
+    assert_eq!(outcome_lines(&env).len(), 1);
+    let both = run_usage(
+        &env,
+        &["usage", "forget", "--all", "--before", "2026-01-01"],
+    );
+    assert!(!both.status.success());
+    let done = run_usage(&env, &["usage", "forget", "--all"]);
+    assert!(done.status.success(), "{done:?}");
+    assert!(env.ledger().is_empty());
+    assert!(outcome_lines(&env).is_empty());
+    let report = stdout(&run_usage(&env, &["usage"]));
+    assert!(report.contains("No usage recorded yet"), "{report}");
+    let help = stdout(&run_usage(&env, &["usage", "--help"]));
+    assert!(help.contains("export") && help.contains("forget"), "{help}");
+}

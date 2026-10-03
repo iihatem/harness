@@ -148,3 +148,31 @@ fn auto_resume_asks_by_default_and_can_be_turned_off() {
     );
     assert!(load("[usage]\nauto_resume = \"always\"\n", None).is_err());
 }
+
+// `[outcomes] enabled`: on by default, off when set to false; read from the global config only.
+#[test]
+fn the_outcome_log_is_on_by_default_and_can_be_turned_off() {
+    assert!(!load("", None).unwrap().outcomes_disabled);
+    assert!(
+        load("[outcomes]\nenabled = false\n", None)
+            .unwrap()
+            .outcomes_disabled
+    );
+    assert!(
+        !load("[outcomes]\nenabled = true\n", None)
+            .unwrap()
+            .outcomes_disabled
+    );
+    // A cloned repository cannot turn the user's log on or off.
+    let cfg = load(
+        "[outcomes]\nenabled = false\n",
+        Some("[outcomes]\nenabled = true\n"),
+    )
+    .unwrap();
+    assert!(cfg.outcomes_disabled);
+    assert!(
+        cfg.warnings.iter().any(|w| w.contains("[outcomes]")),
+        "{:?}",
+        cfg.warnings
+    );
+}

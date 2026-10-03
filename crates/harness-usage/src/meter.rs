@@ -9,7 +9,7 @@ use harness_core::{
     message::Buckets,
     meter::{
         AccountKind, Avoided, BudgetKind, BudgetNotice, BudgetStatus, Meter, RequestCost,
-        RequestRecord, WindowSnapshot,
+        RequestRecord, TurnRecord, WindowSnapshot,
     },
     time::civil_date,
     time::now_unix,
@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     budget::{BudgetLine, Budgets, KINDS, reached},
     ledger::{Ledger, LedgerRecord, VERSION},
+    outcomes::{OutcomeLog, OutcomeRecord},
     paths::Dirs,
     pricing::Pricing,
     store::Store,
@@ -63,6 +64,9 @@ pub struct UsageMeter {
     /// written, so a snapshot repeated by every response is written once.
     window: Mutex<(Option<String>, Option<String>)>,
     dirs: Dirs,
+    outcomes: OutcomeLog,
+    /// Whether turns are written to the outcome log (`[outcomes] enabled`).
+    outcomes_enabled: bool,
     budgets: Mutex<Budgets>,
     /// The report cache the budgets are checked against, opened when first needed.
     store: Mutex<Option<Store>>,
@@ -84,6 +88,8 @@ impl UsageMeter {
             failed: Mutex::new(false),
             window: Mutex::new((None, None)),
             dirs: Dirs::under(data),
+            outcomes: OutcomeLog::new(&Dirs::under(data).outcomes),
+            outcomes_enabled: true,
             budgets: Mutex::new(Budgets::default()),
             store: Mutex::new(None),
             warned: Mutex::new(Default::default()),
@@ -105,6 +111,12 @@ impl UsageMeter {
     /// Measures the avoided figure against `baseline` (`<provider>/<model>`), when there is one.
     pub fn with_baseline(mut self, baseline: Option<String>) -> UsageMeter {
         self.baseline = baseline;
+        self
+    }
+
+    /// Turns the outcome log on or off. The usage ledger does not depend on it.
+    pub fn with_outcomes(mut self, enabled: bool) -> UsageMeter {
+        self.outcomes_enabled = enabled;
         self
     }
 
@@ -265,6 +277,31 @@ impl Meter for UsageMeter {
             self.warn(format!(
                 "cannot write the usage ledger in {}: {e}; requests are no longer recorded",
                 self.ledger.dir().display()
+            ));
+        }
+    }
+
+    fn record_turn(&self, turn: &TurnRecord) {
+        if !self.outcomes_enabled {
+            return;
+        }
+        let record = OutcomeRecord::of(turn, &self.project);
+        if let Err(e) = self.outcomes.append(&record) {
+            self.warn(format!(
+                "cannot write the outcome log in {}: {e}",
+                self.dirs.outcomes.display()
+            ));
+        }
+    }
+
+    fn turns_rewound(&self, session: &str, turns: &[String]) {
+        if !self.outcomes_enabled || turns.is_empty() {
+            return;
+        }
+        if let Err(e) = self.outcomes.mark_rewound(session, turns) {
+            self.warn(format!(
+                "cannot update the outcome log in {}: {e}",
+                self.dirs.outcomes.display()
             ));
         }
     }

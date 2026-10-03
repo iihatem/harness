@@ -112,8 +112,11 @@ enum Command {
         #[command(subcommand)]
         command: PricingCommand,
     },
-    /// Report model usage and cost from the local ledger, by model, provider, day or project
+    /// Report model usage and cost from the local ledger, by model, provider, day or project;
+    /// `usage export` and `usage forget` handle the data
     Usage {
+        #[command(subcommand)]
+        command: Option<UsageCommand>,
         /// What to group by: model, provider, day or project
         #[arg(long, default_value = "model")]
         by: String,
@@ -142,6 +145,28 @@ enum AuthCommand {
         provider: String,
         /// The account profile
         profile: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum UsageCommand {
+    /// Write the ledger's records to standard output
+    Export {
+        /// Only requests on or after this UTC date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// jsonl (the default) or csv
+        #[arg(long, default_value = "jsonl")]
+        format: String,
+    },
+    /// Delete the ledger and the outcome log, in a range, and rebuild the report cache
+    Forget {
+        /// Delete what is before this UTC date (YYYY-MM-DD)
+        #[arg(long, conflicts_with = "all")]
+        before: Option<String>,
+        /// Delete all of it
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -321,7 +346,20 @@ fn main() -> ExitCode {
             Some(Command::Sandbox {
                 command: SandboxCommand::Doctor,
             }) => doctor::run(),
-            Some(Command::Usage { by, since, until }) => usage::report(&by, since, until),
+            Some(Command::Usage {
+                command: None,
+                by,
+                since,
+                until,
+            }) => usage::report(&by, since, until),
+            Some(Command::Usage {
+                command: Some(UsageCommand::Export { since, format }),
+                ..
+            }) => usage::export(since.as_deref(), &format),
+            Some(Command::Usage {
+                command: Some(UsageCommand::Forget { before, all }),
+                ..
+            }) => usage::forget(before.as_deref(), all),
             Some(Command::Pricing {
                 command: PricingCommand::Update,
             }) => pricing::update().await,

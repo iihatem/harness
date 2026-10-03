@@ -292,6 +292,13 @@ pub struct UsageSettings {
     pub baseline: Option<String>,
 }
 
+/// `[outcomes]`: the per-turn outcome log, on unless `enabled = false`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeSettings {
+    pub enabled: Option<bool>,
+}
+
 /// `[budgets]`: money limits on billed cost, in USD. A budget that is not set has no limit.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -405,6 +412,8 @@ pub struct ConfigFile {
     pub usage: UsageSettings,
     #[serde(default)]
     pub budgets: BudgetSettings,
+    #[serde(default)]
+    pub outcomes: OutcomeSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -443,6 +452,9 @@ pub struct Config {
     pub usage: UsageSettings,
     /// `[budgets]`: the global config's, which a project may only lower.
     pub budgets: BudgetSettings,
+    /// Whether the outcome log is turned off (`[outcomes] enabled = false`; it is on by default;
+    /// global config only).
+    pub outcomes_disabled: bool,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -713,6 +725,7 @@ pub fn load(
         cfg.pricing = global.pricing;
         cfg.usage = global.usage;
         cfg.budgets = global.budgets;
+        cfg.outcomes_disabled = global.outcomes.enabled == Some(false);
         cfg.notifications = cfg.notifications.overlaid(&global.notifications);
     }
     let path = project_file(workspace);
@@ -743,6 +756,12 @@ pub fn load(
             cfg.warnings.push(format!(
                 "{}: ignoring budgets.{name}: a project may lower a budget but not raise it",
                 project_file(workspace).display()
+            ));
+        }
+        if project.outcomes != OutcomeSettings::default() {
+            cfg.warnings.push(format!(
+                "{}: ignoring [outcomes]: it is read from the global config only",
+                path.display()
             ));
         }
         if project.usage != UsageSettings::default() {

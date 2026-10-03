@@ -84,8 +84,15 @@ fn diagnostics(text: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Like typescript-language-server, the fake publishes nothing unless the client said, when it
+/// initialized, that it takes `textDocument/publishDiagnostics`.
+static CLIENT_TAKES_DIAGNOSTICS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn publish(out: &mut impl Write, uri: &Value, text: &str) {
-    if text.contains("NOPUBLISH") {
+    if text.contains("NOPUBLISH")
+        || !CLIENT_TAKES_DIAGNOSTICS.load(std::sync::atomic::Ordering::SeqCst)
+    {
         return;
     }
     if let Some(ms) = text
@@ -128,6 +135,11 @@ fn main() {
         log(if method.is_empty() { "reply" } else { &method });
         match method.as_str() {
             "initialize" => {
+                CLIENT_TAKES_DIAGNOSTICS.store(
+                    message["params"]["capabilities"]["textDocument"]["publishDiagnostics"]
+                        .is_object(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
                 // Requests of the server's own, which the client must answer without being asked.
                 send(
                     &mut out,

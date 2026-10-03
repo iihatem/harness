@@ -11,9 +11,9 @@ use std::{
 
 use lsp_types::{
     ClientCapabilities, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidOpenTextDocumentParams, InitializeParams, PublishDiagnosticsParams,
-    TextDocumentContentChangeEvent, TextDocumentItem, VersionedTextDocumentIdentifier,
-    WorkspaceFolder,
+    DidOpenTextDocumentParams, InitializeParams, PublishDiagnosticsClientCapabilities,
+    PublishDiagnosticsParams, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentItem, VersionedTextDocumentIdentifier, WorkspaceFolder,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -161,7 +161,15 @@ impl Client {
                         .map_or_else(|| "workspace".into(), |n| n.to_string_lossy().into_owned()),
                 }]
             }),
-            capabilities: ClientCapabilities::default(),
+            // Some servers (typescript-language-server) publish diagnostics only to a client that
+            // says it takes them.
+            capabilities: ClientCapabilities {
+                text_document: Some(TextDocumentClientCapabilities {
+                    publish_diagnostics: Some(PublishDiagnosticsClientCapabilities::default()),
+                    ..TextDocumentClientCapabilities::default()
+                }),
+                ..ClientCapabilities::default()
+            },
             ..InitializeParams::default()
         };
         let initialized = client.request("initialize", serde_json::to_value(params).unwrap());

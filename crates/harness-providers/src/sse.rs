@@ -166,6 +166,10 @@ fn events_within<P: EventParser>(
                 yield item;
             }
         } else {
+            // The 429 that ends a turn on a full window carries the newest figures: say them first.
+            for item in parser.response_headers(response.headers()) {
+                yield item;
+            }
             // `?` on an `Err` ends the stream with this error.
             Err::<(), ProviderError>(http_error(response).await)?;
         }

@@ -31,7 +31,7 @@ pub fn from_headers(headers: &HeaderMap, now: u64) -> Option<WindowSnapshot> {
             let minutes = header_number(headers, &format!("x-codex-{which}-window-minutes"));
             let resets = header_number(headers, &format!("x-codex-{which}-reset-at"));
             (used.is_some() || minutes.is_some() || resets.is_some()).then(|| Window {
-                window_minutes: minutes.map(|m| m as u64),
+                window_minutes: whole_minutes(minutes),
                 used_percent: used,
                 resets_at: resets.map(|r| r as u64),
                 source: WindowSource::Header,
@@ -42,6 +42,11 @@ pub fn from_headers(headers: &HeaderMap, now: u64) -> Option<WindowSnapshot> {
         windows,
         observed_at: now,
     })
+}
+
+/// A window's length in minutes: zero or negative is not a length, so it is unknown.
+fn whole_minutes(value: Option<f64>) -> Option<u64> {
+    value.filter(|m| *m >= 1.0).map(|m| m as u64)
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -59,7 +64,7 @@ pub fn from_event(event: &Value, now: u64) -> Option<WindowSnapshot> {
             let minutes = window.get("window_minutes").and_then(number);
             let resets = window.get("reset_at").and_then(number);
             (used.is_some() || minutes.is_some() || resets.is_some()).then(|| Window {
-                window_minutes: minutes.map(|m| m as u64),
+                window_minutes: whole_minutes(minutes),
                 used_percent: used,
                 resets_at: resets.map(|r| r as u64),
                 source: WindowSource::Stream,
@@ -90,10 +95,10 @@ pub fn from_usage_body(body: &Value, now: u64) -> WindowSnapshot {
                     window
                         .get("reset_after_seconds")
                         .and_then(number)
-                        .map(|after| now + after as u64)
+                        .map(|after| now.saturating_add(after.max(0.0) as u64))
                 });
             (used.is_some() || seconds.is_some() || resets.is_some()).then(|| Window {
-                window_minutes: seconds.map(|s| (s / 60.0).round() as u64),
+                window_minutes: whole_minutes(seconds.map(|s| (s / 60.0).round())),
                 used_percent: used,
                 resets_at: resets,
                 source: WindowSource::Poll,

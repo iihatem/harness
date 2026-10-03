@@ -269,3 +269,53 @@ fn only_the_chatgpt_provider_can_be_polled_for_windows() {
     let provider = OpenAiResponses::new("http://127.0.0.1:9/v1", Some("key".into()));
     assert!(provider.windows().is_none());
 }
+
+// A6: a server-supplied reset that would overflow does not panic, and a zero-length window is
+// unknown, not "0m".
+#[test]
+fn an_absurd_reset_and_a_zero_window_are_read_without_panicking() {
+    let body = json!({"rate_limit": {"primary_window": {"used_percent": 5, "limit_window_seconds": 0, "reset_after_seconds": 1.9e19}}});
+    let snapshot = from_usage_body(&body, NOW);
+    assert_eq!(snapshot.windows[0].window_minutes, None);
+    assert_eq!(snapshot.windows[0].resets_at, Some(u64::MAX));
+    let map = headers(&[
+        ("x-codex-primary-used-percent", "5"),
+        ("x-codex-primary-window-minutes", "0"),
+    ]);
+    assert_eq!(
+        from_headers(&map, NOW).unwrap().windows[0].window_minutes,
+        None
+    );
+    let event = json!({"rate_limits": {"primary": {"used_percent": 5, "window_minutes": -3}}});
+    assert_eq!(
+        from_event(&event, NOW).unwrap().windows[0].window_minutes,
+        None
+    );
+}
+
+// A10: the 429 that ends a turn on a full window still carries the window headers.
+#[tokio::test]
+async fn a_failed_response_still_yields_its_window_event() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("x-codex-primary-used-percent", "100")
+                .insert_header("x-codex-primary-window-minutes", "300")
+                .set_body_string("{}"),
+        )
+        .mount(&server)
+        .await;
+    let provider = OpenAiResponses::new(format!("{}/v1", server.uri()), None);
+    let events: Vec<_> = provider.stream(request()).collect().await;
+    let window = events.iter().find_map(|e| match e {
+        Ok(ProviderEvent::RateLimits(s)) => Some(s),
+        _ => None,
+    });
+    assert_eq!(
+        window.expect("a window event").windows[0].used_percent,
+        Some(100.0)
+    );
+    assert!(events.last().unwrap().is_err());
+}

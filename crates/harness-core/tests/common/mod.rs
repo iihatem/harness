@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod gates;
+pub mod roles;
 
 use std::{path::Path, sync::Arc, time::Duration};
 

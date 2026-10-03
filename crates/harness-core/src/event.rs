@@ -202,6 +202,15 @@ pub enum AgentEvent {
         by: ChangeSource,
         changed: bool,
     },
+    /// A Build turn on another model goes with the plan alone, not the conversation: it does not
+    /// fit the build model's window (`window`, against `history_tokens`), or `[roles.handoff]
+    /// mode` says so (`forced`).
+    HandoffReduced {
+        to: String,
+        history_tokens: u64,
+        window: u64,
+        forced: bool,
+    },
     TurnFinished {
         reason: TurnEndReason,
     },

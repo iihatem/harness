@@ -148,6 +148,54 @@ impl HandoffMode {
     }
 }
 
+/// How a Build turn got the conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffKind {
+    /// The build model is the one that planned: the turn goes on as it would have.
+    SameModel,
+    /// Another model, with the whole conversation.
+    History,
+    /// Another model, with the plan alone.
+    PlanOnly,
+}
+
+impl HandoffKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HandoffKind::SameModel => "same_model",
+            HandoffKind::History => "history",
+            HandoffKind::PlanOnly => "plan_only",
+        }
+    }
+}
+
+/// What a Build turn's hand-off was, as the session records it on the Build message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handoff {
+    pub kind: HandoffKind,
+    /// `[roles.handoff] mode` chose it.
+    pub forced: bool,
+    /// The estimated tokens of the conversation before the Build message.
+    pub history_tokens: u64,
+    /// The build model's effective context window.
+    pub window: u64,
+}
+
+/// The notice that a Build turn goes with the plan alone.
+pub fn handoff_reduced_text(to: &str, history_tokens: u64, window: u64, forced: bool) -> String {
+    let what = "the system prompt, the instruction files and the approved plan";
+    if forced {
+        format!(
+            "[roles.handoff] mode = \"plan_only\" is set, so the build turn on {to} gets the plan alone: {what}"
+        )
+    } else {
+        format!(
+            "the conversation (about {history_tokens} tokens) does not fit {to}'s {window}-token window, so the build turn gets the plan alone: {what}"
+        )
+    }
+}
+
 /// The roles as the configuration sets them: model ids, and the hand-off mode.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleConfig {
@@ -175,6 +223,7 @@ impl RoleConfig {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RoleTable {
     slots: [Option<(String, RoleSource)>; 3],
+    pub(crate) handoff: Option<HandoffMode>,
 }
 
 impl RoleTable {
@@ -186,6 +235,7 @@ impl RoleTable {
                 slot(&config.build),
                 slot(&config.background),
             ],
+            handoff: config.handoff,
         }
     }
 

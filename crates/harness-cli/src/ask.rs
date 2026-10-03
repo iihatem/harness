@@ -515,6 +515,22 @@ impl Shown {
                     ))
                 );
             }
+            AgentEvent::HandoffReduced {
+                to,
+                history_tokens,
+                window,
+                forced,
+            } if !json => {
+                eprintln!(
+                    "warning: {}",
+                    terminal_safe(&harness_core::role::handoff_reduced_text(
+                        to,
+                        *history_tokens,
+                        *window,
+                        *forced
+                    ))
+                );
+            }
             AgentEvent::Error { message, .. } if !json => {
                 eprintln!("error: {}", terminal_safe(message))
             }

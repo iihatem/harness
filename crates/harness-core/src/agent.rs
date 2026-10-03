@@ -28,7 +28,10 @@ use crate::{
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
     redact::Redactor,
     retry::RetryPolicy,
-    role::{ModelResolver, Role, RoleConfig, RoleLine, RoleSource, RoleTable, SwitchReason},
+    role::{
+        Handoff, HandoffKind, HandoffMode, ModelResolver, Role, RoleConfig, RoleLine, RoleSource,
+        RoleTable, SwitchReason,
+    },
     session::{Attribution, Entry, EntryKind, RewindScope, Session},
     tokens::DEFAULT_CONTEXT_WINDOW,
     tool::{CommandSandbox, Tool, ToolContext, ToolOutput, ToolRegistry},
@@ -433,6 +436,12 @@ pub struct Agent {
     main_reason: Option<SwitchReason>,
     /// The model the last turn's role used, to announce a turn on another.
     last_role_model: String,
+    /// The model that last planned, which a Build turn's hand-off comes from.
+    last_planner: Option<String>,
+    /// How the current turn, if it is a Build turn, got the conversation.
+    turn_handoff: Option<Handoff>,
+    /// The conversation before a Build message that went alone, put back when the turn ends.
+    handoff_stash: Option<(Vec<Message>, Vec<String>, Message)>,
 }
 
 impl Agent {
@@ -492,6 +501,9 @@ impl Agent {
             turn_reason: None,
             main_reason: None,
             last_role_model,
+            last_planner: None,
+            turn_handoff: None,
+            handoff_stash: None,
         }
     }
 
@@ -747,6 +759,7 @@ impl Agent {
         }
         self.history = history;
         self.history_ids = ids;
+        self.handoff_stash = None;
         self.reported_usage = None;
         for call_id in waiting {
             if save {
@@ -1307,6 +1320,19 @@ impl Agent {
                 });
             }
         }
+        // Where the plan goes, and what went before it.
+        let target = role_model
+            .as_ref()
+            .map_or_else(|| self.config.model_id.clone(), |m| m.id.clone());
+        let window = role_model
+            .as_ref()
+            .and_then(|m| m.context_window)
+            .unwrap_or(self.config.context_window);
+        self.turn_handoff = (role == Role::Build && input.model.is_none())
+            .then(|| self.plan_handoff(&target, window, &input));
+        if role == Role::Plan && input.model.is_none() {
+            self.last_planner = Some(target);
+        }
         // Settings that apply to this turn only.
         self.turn_model = input.model.clone().or(role_model);
         self.policy.set_turn_rules(Some(input.rules.clone()));
@@ -1350,14 +1376,21 @@ impl Agent {
         let _ = events.send(AgentEvent::TurnStarted);
         self.message_recorded = false;
         let content = self.user_message(input.parts, events).await;
+        let plan = input.plan.clone();
+        let attribution = self.turn_handoff.map(|handoff| Attribution {
+            role: Role::Build,
+            switch_reason: None,
+            handoff: Some(handoff),
+        });
         self.turn_entry = self.record_entry(
             Message::User { content },
             input.display,
             false,
             input.plan,
-            None,
+            attribution,
         );
         self.message_recorded = true;
+        self.begin_handoff(plan.as_deref(), events);
         for kind in std::mem::take(&mut self.held_entries) {
             self.append_turn_entry(kind);
         }
@@ -1951,6 +1984,99 @@ impl Agent {
         self.make_ready(role, id, cancel).await.map(Some)
     }
 
+    /// How a Build turn on `target`, whose window is `window`, gets the conversation: the model
+    /// that planned is not handed anything; another gets the whole conversation when it fits
+    /// (the conversation, the system prompt, the tools and the Build message within the
+    /// compaction threshold of the window, so the model need not compact at once), else the plan
+    /// alone; `[roles.handoff] mode` forces either.
+    fn plan_handoff(&self, target: &str, window: u64, input: &TurnInput) -> Handoff {
+        let planner = self
+            .last_planner
+            .clone()
+            .unwrap_or_else(|| self.role_model_id(Role::Plan));
+        let history_tokens: u64 = self.history.iter().map(compaction::message_tokens).sum();
+        if target == planner {
+            return Handoff {
+                kind: HandoffKind::SameModel,
+                forced: false,
+                history_tokens,
+                window,
+            };
+        }
+        let build_message: u64 = input
+            .parts
+            .iter()
+            .map(|part| match part {
+                InputPart::Text(text) => crate::tokens::estimate(text),
+                InputPart::Shell(_) => 0,
+            })
+            .sum::<u64>()
+            + 4;
+        let needed = compaction::request_tokens(
+            &self.config.system_prompt,
+            &self.tools.specs(),
+            &self.history,
+        ) + build_message;
+        let fits = needed as f64 <= window as f64 * self.config.compaction.threshold;
+        let kind = match (self.roles.handoff, fits) {
+            (Some(HandoffMode::History), _) | (None, true) => HandoffKind::History,
+            (Some(HandoffMode::PlanOnly), _) | (None, false) => HandoffKind::PlanOnly,
+        };
+        Handoff {
+            kind,
+            forced: self.roles.handoff.is_some(),
+            history_tokens,
+            window,
+        }
+    }
+
+    /// Once the Build message is saved: a hand-off of the plan alone is announced, and the
+    /// conversation before the message is put aside for the turn, so the build model is sent the
+    /// system prompt and the plan only.
+    fn begin_handoff(&mut self, plan: Option<&str>, events: &UnboundedSender<AgentEvent>) {
+        let Some(handoff) = self.turn_handoff else {
+            return;
+        };
+        if handoff.kind != HandoffKind::PlanOnly {
+            return;
+        }
+        let _ = events.send(AgentEvent::HandoffReduced {
+            to: self.model_id().to_string(),
+            history_tokens: handoff.history_tokens,
+            window: handoff.window,
+            forced: handoff.forced,
+        });
+        let at = self.history.len().saturating_sub(1);
+        let head: Vec<Message> = self.history.drain(..at).collect();
+        let ids: Vec<String> = self.history_ids.drain(..at).collect();
+        // A message that only points at the plan above is given the plan itself: that is all the
+        // build model is sent. The session keeps the message as it was.
+        let original = self.history[0].clone();
+        if let (Some(plan), Message::User { content }) = (plan, &mut self.history[0])
+            && !content.contains(plan)
+        {
+            *content = format!("Implement this plan:\n\n{plan}");
+        }
+        self.handoff_stash = Some((head, ids, original));
+        self.reported_usage = None;
+    }
+
+    /// Puts back the conversation a hand-off of the plan alone set aside, unless a compaction
+    /// rebuilt the history from the session meanwhile.
+    fn end_handoff(&mut self) {
+        if let Some((mut head, mut ids, original)) = self.handoff_stash.take() {
+            if let Some(first) = self.history.first_mut() {
+                *first = original;
+            }
+            head.append(&mut self.history);
+            ids.append(&mut self.history_ids);
+            self.history = head;
+            self.history_ids = ids;
+            self.reported_usage = None;
+        }
+        self.turn_handoff = None;
+    }
+
     /// The context window of the model answering the current turn.
     fn window(&self) -> u64 {
         self.turn_model
@@ -2101,6 +2227,7 @@ impl Agent {
         let attribution = Attribution {
             role: self.turn_role,
             switch_reason: self.turn_reason,
+            handoff: None,
         };
         self.record_entry(message, None, false, None, Some(attribution));
     }
@@ -2136,6 +2263,7 @@ impl Agent {
         reason: TurnEndReason,
         events: &UnboundedSender<AgentEvent>,
     ) -> TurnEndReason {
+        self.end_handoff();
         for message in self.warnings.drain(..) {
             let _ = events.send(AgentEvent::Warning { message });
         }

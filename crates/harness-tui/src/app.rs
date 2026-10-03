@@ -1425,6 +1425,7 @@ impl App {
                     parts: vec![harness_core::turn::InputPart::Text(choice.build_message())],
                     display: Some("Build the plan".into()),
                     plan: Some(choice.plan),
+                    role: Some(Role::Build),
                     ..TurnInput::default()
                 };
                 Some(Action::RunIn(mode, input))

@@ -19,7 +19,7 @@ use crate::{
     compaction,
     message::Message,
     redact::Redactor,
-    role::{Role, SwitchReason},
+    role::{Handoff, Role, SwitchReason},
     time,
 };
 
@@ -104,12 +104,15 @@ pub enum EntryKind {
 }
 
 /// Which role an assistant message was written for, and why its model is not the one that role is
-/// configured to use.
+/// configured to use; for a Build message, its hand-off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attribution {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch_reason: Option<SwitchReason>,
+    /// On the message that asks to build a plan: how the turn got the conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
 }
 
 /// What a rewind restores.

@@ -306,6 +306,16 @@ impl Transcript {
                     harness_core::role::switched_text(from, to, *role, *reason, detail.as_deref());
                 self.push_note(&text, width);
             }
+            AgentEvent::HandoffReduced {
+                to,
+                history_tokens,
+                window,
+                forced,
+            } => {
+                let text =
+                    harness_core::role::handoff_reduced_text(to, *history_tokens, *window, *forced);
+                self.push_warning(&text, width);
+            }
             AgentEvent::ApprovalNeeded { .. }
             | AgentEvent::Usage { .. }
             | AgentEvent::Metered { .. }

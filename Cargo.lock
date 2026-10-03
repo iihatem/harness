@@ -1396,6 +1396,7 @@ dependencies = [
  "harness-sandbox",
  "harness-tools",
  "harness-tui",
+ "harness-usage",
  "nix",
  "predicates",
  "ratatui",
@@ -1546,8 +1547,16 @@ dependencies = [
 name = "harness-usage"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "harness-core",
+ "hex",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

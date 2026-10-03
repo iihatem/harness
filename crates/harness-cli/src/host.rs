@@ -561,6 +561,123 @@ pub mod tests {
             .unwrap();
     }
 
+    /// The ledger's records, parsed, of the run with harness's files under `home`.
+    fn ledger_records(home: &Path) -> Vec<serde_json::Value> {
+        let dir = home.join("data/usage");
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        files.sort();
+        files
+            .iter()
+            .flat_map(|f| {
+                std::fs::read_to_string(f)
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect::<Vec<serde_json::Value>>()
+            })
+            .collect()
+    }
+
+    // The ledger is written the same way by the terminal session as by `harness ask`: the same
+    // start, the same meter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_terminal_session_writes_the_same_ledger_as_ask() {
+        use serde_json::json;
+        use wiremock::{
+            Mock, MockServer,
+            matchers::{method, path},
+        };
+
+        let chat = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(chat_stream(&[
+                json!({"choices": [{"index": 0, "delta": {"content": "Hello."}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 5}}),
+            ]))
+            .mount(&chat)
+            .await;
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir(workspace.join(".git")).unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        std::fs::write(
+            home.path().join("config/config.toml"),
+            format!(
+                "[providers.chat]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n[profiles.\"chat/*\"]\ncontext_window = 32768\n",
+                chat.uri()
+            ),
+        )
+        .unwrap();
+        let setup = setup_in(home.path(), &workspace);
+        let mut notices = Notices::quiet(setup.redactor.clone());
+        let session = sessions::open(&setup, &Choice::New, &mut notices).unwrap();
+        let resolved =
+            registry::resolve("chat/small", &setup.config.providers, setup.keys()).unwrap();
+        let (approver, approvals) = ChannelApprover::new();
+        let Some(Started {
+            agent,
+            sandbox_session,
+            policy,
+            window_note,
+            writable,
+            ..
+        }) = start::start(
+            Request {
+                setup: &setup,
+                mode: Mode::Auto,
+                model: resolved,
+                session,
+                approver,
+                interactive: true,
+                run_id: start::run_id(),
+                cancel: CancellationToken::new(),
+            },
+            &mut notices,
+        )
+        .await
+        else {
+            panic!("the start was cancelled");
+        };
+        let host = CliHost {
+            setup: setup.clone(),
+            commands: Commands::default(),
+            policy,
+            writable,
+            unsaved_default: Default::default(),
+        };
+        let options = Options {
+            theme: Theme::monochrome(),
+            model: "chat/small".into(),
+            mode: Mode::Auto,
+            commands: Vec::new(),
+            workspace: workspace.clone(),
+            history: Vec::new(),
+            instruction_files: Vec::new(),
+            window_note: Some(window_note),
+            default_mode: Mode::Auto,
+            text_editor: None,
+            notifier: None,
+        };
+        let term = InlineTerminal::new(TestBackend::new(100, 30), 0).unwrap();
+        let mut ui = Ui::start(agent, Box::new(host), term, options, approvals)
+            .with_redactor(setup.redactor.clone());
+        ui.draw().unwrap();
+        send(&mut ui, "say hello");
+        settle(&mut ui).await;
+        ui.finish().await.unwrap();
+        sandbox_session.end();
+        let records = ledger_records(home.path());
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["model"], "chat/small");
+        assert_eq!(records[0]["account"], "local");
+        assert_eq!(records[0]["input"], 50);
+        assert_eq!(records[0]["outcome"], "ok");
+    }
+
     // M1's done criterion, with mock servers: a conversation held on a Chat Completions model
     // continues on an Anthropic model after `/model`. The tool call's id and the reply that was
     // only whitespace, which the Messages API would reject, reach it in a form it takes.

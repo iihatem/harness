@@ -173,6 +173,34 @@ impl ProviderError {
         .any(|phrase| text.contains(phrase))
     }
 
+    /// What kind of failure this is, in the word the usage ledger records after `error:`:
+    /// `unavailable` (a 5xx, or a network error), `rate_limited`, `quota`, `spend_cap`, `auth`,
+    /// `context_overflow`, `rejected` (another 4xx) or `protocol`.
+    pub fn kind(&self) -> &'static str {
+        if self.is_spend_cap() {
+            return "spend_cap";
+        }
+        if self.is_quota_exhausted() {
+            return "quota";
+        }
+        if self.is_context_overflow() {
+            return "context_overflow";
+        }
+        match self {
+            ProviderError::Network(_) | ProviderError::NoStart { .. } => "unavailable",
+            ProviderError::Http { status, .. } | ProviderError::Reported { status, .. } => {
+                match status {
+                    429 => "rate_limited",
+                    401 | 403 => "auth",
+                    500..=599 => "unavailable",
+                    _ => "rejected",
+                }
+            }
+            ProviderError::KeyRefused { .. } => "auth",
+            ProviderError::Protocol(_) | ProviderError::InStream(_) => "protocol",
+        }
+    }
+
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             ProviderError::Http { retry_after, .. }

@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::Agent;
 use crate::{
-    event::{AgentEvent, GateKind, GateStatus, TurnEndReason},
+    event::{AgentEvent, ChangeSource, GateKind, GateStatus, TurnEndReason},
     gate::{Outcome, outcome, tail},
     message::{Message, ToolCall},
     output::spill,
@@ -229,7 +229,7 @@ impl Agent {
             });
             return done;
         }
-        if !self.turn_changed || self.gate_turn.blocked {
+        if self.gate_turn.blocked || !self.turn_changed_files(events).await {
             return done;
         }
         let Some(run) = self.run_gate(GateKind::Test, &command, events).await else {
@@ -242,6 +242,7 @@ impl Agent {
             GateStatus::Passed => {
                 // Changes the tests have passed on need no second run.
                 self.turn_changed = false;
+                self.remember_tested_tree().await;
                 self.gate_turn.last_failure = None;
                 if self.deliver_steering(events) {
                     return EndOfTurn::Continue;
@@ -272,6 +273,52 @@ impl Agent {
                 EndOfTurn::Continue
             }
         }
+    }
+
+    /// Whether the turn changed any file since the turn's checkpoint, or since the tests last
+    /// passed: by comparing the workspace with it, so a change `bash` made counts. Where there is
+    /// no checkpoint, or it cannot be compared, the edit tools' changed paths decide. Says which
+    /// on `events`.
+    async fn turn_changed_files(&mut self, events: &UnboundedSender<AgentEvent>) -> bool {
+        let reference = self
+            .tested_tree
+            .clone()
+            .or_else(|| self.turn_baseline.clone());
+        let compared = match (self.checkpoints.clone(), reference) {
+            (Some(checkpoints), Some(reference)) => {
+                let tested = self.tested_tree.is_some();
+                tokio::task::spawn_blocking(move || {
+                    let now = checkpoints.tree_now()?;
+                    let then = if tested {
+                        reference
+                    } else {
+                        checkpoints.tree_of(&reference)?
+                    };
+                    Ok::<_, crate::checkpoint::CheckpointError>(now != then)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+            }
+            _ => None,
+        };
+        let (by, changed) = match compared {
+            Some(changed) => (ChangeSource::Checkpoint, changed),
+            None => (ChangeSource::EditTools, self.turn_changed),
+        };
+        let _ = events.send(AgentEvent::ChangesChecked { by, changed });
+        changed
+    }
+
+    /// The tests passed: changes are measured from the workspace as it is now.
+    async fn remember_tested_tree(&mut self) {
+        let Some(checkpoints) = self.checkpoints.clone() else {
+            return;
+        };
+        self.tested_tree = tokio::task::spawn_blocking(move || checkpoints.tree_now())
+            .await
+            .ok()
+            .and_then(Result::ok);
     }
 
     /// Adds what the gate found to the conversation, for the model to read.

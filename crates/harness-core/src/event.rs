@@ -50,6 +50,17 @@ pub enum GateKind {
     Test,
 }
 
+/// How the end-of-turn test gate found out whether the turn changed files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeSource {
+    /// By comparing the workspace with the turn's checkpoint: any change counts, `bash`'s included.
+    Checkpoint,
+    /// By the edit tools' changed paths: checkpoints are off or unavailable, so only what the
+    /// edit tools changed is known.
+    EditTools,
+}
+
 /// How a gate command ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -168,6 +179,11 @@ pub enum AgentEvent {
         status: GateStatus,
         exit_code: Option<i32>,
         tail: Option<String>,
+    },
+    /// The end-of-turn test gate checked whether the turn changed files, and how it knew.
+    ChangesChecked {
+        by: ChangeSource,
+        changed: bool,
     },
     TurnFinished {
         reason: TurnEndReason,

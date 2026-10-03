@@ -342,6 +342,10 @@ pub struct Agent {
     checkpoints: Option<Arc<Checkpoints>>,
     /// Whether the current turn already took its snapshot.
     turn_checkpointed: bool,
+    /// The commit of the current turn's snapshot, which "the turn changed files" is measured from.
+    turn_baseline: Option<String>,
+    /// The tree the test gate last passed on this turn: later changes are measured from it.
+    tested_tree: Option<String>,
     /// Whether the current turn's user message is saved yet. A slash command's shell parts run
     /// before it is, and entries about the turn they make wait in `held_entries`, to be saved
     /// just after it: rewinding to the message looks for them after it.
@@ -415,6 +419,8 @@ impl Agent {
             warnings: Vec::new(),
             checkpoints: None,
             turn_checkpointed: false,
+            turn_baseline: None,
+            tested_tree: None,
             message_recorded: true,
             held_entries: Vec::new(),
             reported_usage: None,
@@ -705,6 +711,8 @@ impl Agent {
         }
         self.checkpoints = checkpoints;
         self.turn_checkpointed = false;
+        self.turn_baseline = None;
+        self.tested_tree = None;
         self.message_recorded = true;
         self.held_entries.clear();
         self.invalid_calls = 0;
@@ -959,6 +967,7 @@ impl Agent {
         let result = tokio::task::spawn_blocking(move || checkpoints.snapshot(&message)).await;
         match result {
             Ok(Ok(commit)) => {
+                self.turn_baseline = Some(commit.clone());
                 self.append_turn_entry(EntryKind::Checkpoint {
                     commit: commit.clone(),
                     workspace: Some(workspace),
@@ -1107,6 +1116,8 @@ impl Agent {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.turn_started = Some((Instant::now(), crate::time::now_unix()));
         self.turn_checkpointed = false;
+        self.turn_baseline = None;
+        self.tested_tree = None;
         self.turn_changed = false;
         self.gate_turn = gates::GateTurn::default();
         // Settings that apply to this turn only.

@@ -426,6 +426,39 @@ impl Checkpoints {
     }
 
     fn snapshot_until(&self, message: &str, deadline: Instant) -> Result<String, CheckpointError> {
+        let (tree, record) = self.stage(deadline)?;
+        self.commit_snapshot(&tree, record, message, deadline)
+    }
+
+    /// Whether the workspace differs from `commit` (a snapshot of this session): the files a
+    /// snapshot would hold now, compared with the ones `commit` holds, by git's own tree ids. No
+    /// snapshot is made, so nothing is left to prune. Anything that changed counts, `bash`'s
+    /// changes included.
+    pub fn changed_since(&self, commit: &str) -> Result<bool, CheckpointError> {
+        check_commit(commit)?;
+        Ok(self.tree_now()? != self.tree_of(commit)?)
+    }
+
+    /// The id of the tree a snapshot taken now would hold, without making one. Equal ids mean
+    /// equal contents (and executable bits).
+    pub fn tree_now(&self) -> Result<String, CheckpointError> {
+        let deadline = Instant::now() + self.timeout;
+        let staged = self.stage(deadline).map(|(tree, _)| tree);
+        self.unlock_after(staged)
+    }
+
+    /// The id of the tree `commit` holds.
+    pub fn tree_of(&self, commit: &str) -> Result<String, CheckpointError> {
+        check_commit(commit)?;
+        self.git(
+            &["rev-parse", "--verify", "-q", &format!("{commit}^{{tree}}")],
+            self.restore_timeout,
+        )
+    }
+
+    /// Brings the session's index to what a snapshot would hold now, and returns the tree and the
+    /// record that go with it.
+    fn stage(&self, deadline: Instant) -> Result<(String, Record), CheckpointError> {
         // Everything in the index, and every file git would add; and the directories it could not
         // open, which it only warns about.
         let within = self.within();
@@ -557,6 +590,17 @@ impl Checkpoints {
             }
         }
         let tree = self.git(&["write-tree"], remaining(deadline)?)?;
+        Ok((tree, record))
+    }
+
+    /// Commits `tree` with its `record` as the session's next snapshot.
+    fn commit_snapshot(
+        &self,
+        tree: &str,
+        record: Record,
+        message: &str,
+        deadline: Instant,
+    ) -> Result<String, CheckpointError> {
         let record = record.encode();
         let last = self.last.lock().expect("last snapshot lock").clone();
         // The snapshot's first parent holds its record; the snapshot before it is reachable from
@@ -575,7 +619,7 @@ impl Checkpoints {
                 vec![self.write_record(&record, previous.as_deref(), deadline)?]
             }
         };
-        let mut args = vec!["commit-tree", "--no-gpg-sign", &tree];
+        let mut args = vec!["commit-tree", "--no-gpg-sign", tree];
         for parent in &parents {
             args.extend(["-p", parent]);
         }

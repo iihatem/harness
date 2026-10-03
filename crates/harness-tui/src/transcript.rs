@@ -300,7 +300,8 @@ impl Transcript {
             | AgentEvent::Metered { .. }
             | AgentEvent::RateLimits { .. }
             | AgentEvent::LimitReached { .. }
-            | AgentEvent::CheckpointCreated { .. } => {}
+            | AgentEvent::CheckpointCreated { .. }
+            | AgentEvent::ChangesChecked { .. } => {}
         }
     }
 

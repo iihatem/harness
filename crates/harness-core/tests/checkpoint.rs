@@ -1497,3 +1497,28 @@ fn is_root() -> bool {
     // SAFETY: `geteuid` cannot fail.
     unsafe { libc::geteuid() == 0 }
 }
+
+// Ruling P4: "the turn changed files" is found by comparing with the turn's checkpoint, so a change
+// made any way at all counts, and no snapshot is made to find out.
+#[test]
+fn the_workspace_is_compared_with_a_snapshot_without_making_one() {
+    let f = fixture();
+    f.write("a.txt", "one\n");
+    let cp = f.checkpoints();
+    let before = cp.snapshot("before").unwrap();
+    assert!(!cp.changed_since(&before).unwrap());
+    // What `sed -i` does: the content changes under the same name.
+    f.write("a.txt", "two\n");
+    assert!(cp.changed_since(&before).unwrap());
+    // Put back, it is the snapshot again.
+    f.write("a.txt", "one\n");
+    assert!(!cp.changed_since(&before).unwrap());
+    f.write("new.txt", "x\n");
+    assert!(cp.changed_since(&before).unwrap());
+    std::fs::remove_file(f.ws.join("new.txt")).unwrap();
+    std::fs::remove_file(f.ws.join("a.txt")).unwrap();
+    assert!(cp.changed_since(&before).unwrap());
+    // The tree ids a gate remembers.
+    f.write("a.txt", "one\n");
+    assert_eq!(cp.tree_now().unwrap(), cp.tree_of(&before).unwrap());
+}

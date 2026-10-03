@@ -44,6 +44,19 @@ impl Item {
     }
 }
 
+/// `text` as dim lines of at most `width` columns, at most `rows` of them.
+fn wrapped(text: &str, rows: usize, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    wrap(
+        &Line::from(Span::styled(sanitize(text), theme.dim())),
+        width,
+        &[],
+        &[],
+    )
+    .into_iter()
+    .take(rows)
+    .collect()
+}
+
 /// The item for the model `id` in a list of models: marked when it is the `current` one, and
 /// when it is one a ChatGPT plan includes (a `chatgpt/` model).
 pub fn model_item(id: &str, current: bool) -> Item {
@@ -282,10 +295,7 @@ impl Picker {
     /// The list's lines, at most `rows`, scrolled so that the selected item shows.
     fn list(&self, rows: usize, width: usize, theme: &Theme) -> Vec<Line<'static>> {
         let Some(items) = &self.items else {
-            return vec![Line::from(Span::styled(
-                sanitize(&self.waiting),
-                theme.dim(),
-            ))];
+            return wrapped(&self.waiting, rows, width, theme);
         };
         if self.shown.is_empty() {
             let text = if self.filter.is_empty() {
@@ -293,7 +303,8 @@ impl Picker {
             } else {
                 "nothing matches"
             };
-            return vec![Line::from(Span::styled(sanitize(text), theme.dim()))];
+            // The advice may be long: it wraps, so none of it is cut off.
+            return wrapped(text, rows, width, theme);
         }
         let mut top = self.top.get();
         if self.selected < top {

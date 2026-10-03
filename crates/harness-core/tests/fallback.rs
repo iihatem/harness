@@ -463,3 +463,52 @@ async fn a_reply_that_had_begun_is_not_re_sent() {
     assert!(switches(&events).is_empty());
     assert!(fallback.provider.requests().is_empty());
 }
+
+// agent-runtime, "Role and reason recorded": a turn in `plan` mode re-sent by a fallback is
+// attributed to role `plan` with `switch_reason` `fallback`, and the `ModelSwitched` event with
+// reason `fallback` comes before its messages.
+#[tokio::test]
+async fn a_plan_turn_moved_by_a_fallback_is_attributed_to_plan_and_fallback() {
+    use harness_core::role::RoleConfig;
+    let fallback = candidate("openai/gpt-5", vec![Script::text("a plan")]);
+    let planner = MockProvider::new(vec![quota()]);
+    let dir = tempfile::tempdir().unwrap().keep();
+    let mut agent = with_chain(
+        common::agent(
+            MockProvider::new(vec![]),
+            Mode::Plan,
+            Arc::new(NonInteractive),
+            &dir,
+        ),
+        vec![
+            model("chatgpt/gpt-5", &planner, 400_000),
+            model("openai/gpt-5", &fallback.provider, 500_000),
+        ],
+        &[("chatgpt/gpt-5", &["openai/gpt-5"])],
+    )
+    .with_roles(RoleConfig {
+        plan: Some("chatgpt/gpt-5".into()),
+        ..RoleConfig::default()
+    });
+    let (reason, events) = run(&mut agent, "plan it").await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    let at = |f: fn(&AgentEvent) -> bool| events.iter().rposition(f).unwrap();
+    assert!(
+        at(|e| matches!(
+            e,
+            AgentEvent::ModelSwitched {
+                reason: SwitchReason::Fallback,
+                ..
+            }
+        )) < at(|e| matches!(e, AgentEvent::AssistantMessage { .. }))
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AssistantMessage {
+            model,
+            role: Role::Plan,
+            switch_reason: Some(SwitchReason::Fallback),
+            ..
+        } if model == "openai/gpt-5"
+    )));
+}

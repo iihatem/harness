@@ -156,3 +156,30 @@ fn roles_changed_after_trust_are_untrusted_again() {
     assert_eq!(cfg.roles.plan, None);
     assert_eq!(cfg.warnings.len(), 1);
 }
+
+// configuration, "Roles and language servers in an untrusted project": both are ignored with a
+// warning, `build` uses `main`, and the default language server lookup applies.
+#[test]
+fn an_untrusted_projects_roles_and_language_server_command_are_both_ignored() {
+    let f = fixture(
+        "",
+        "[roles]\nbuild = \"openai/gpt-5\"\n[lsp.servers.python]\ncommand = \"./evil-pyright\"\n",
+    );
+    let cfg = f.load().unwrap();
+    assert_eq!(cfg.roles.build, None);
+    assert!(!cfg.trusted);
+    assert_eq!(cfg.warnings.len(), 1, "{:?}", cfg.warnings);
+    let warning = &cfg.warnings[0];
+    assert!(
+        warning.contains("roles.build") && warning.contains("lsp.servers.python"),
+        "{warning}"
+    );
+    assert!(
+        cfg.lsp
+            .servers
+            .get("python")
+            .is_none_or(|s| s.command.is_none()),
+        "{:?}",
+        cfg.lsp
+    );
+}

@@ -6,6 +6,7 @@ mod gates;
 mod host;
 mod interactive;
 mod login;
+mod lsp;
 mod models;
 mod notices;
 mod pricing;

@@ -1407,6 +1407,7 @@ dependencies = [
  "harness-config",
  "harness-context",
  "harness-core",
+ "harness-lsp",
  "harness-providers",
  "harness-sandbox",
  "harness-tools",

@@ -52,6 +52,8 @@ pub struct Started {
     pub writable: Vec<std::path::PathBuf>,
     /// Keeps the usage ledger and the budgets.
     pub meter: Arc<harness_usage::meter::UsageMeter>,
+    /// The language servers, for the session to stop when it ends.
+    pub diagnostics: Arc<harness_lsp::LspDiagnostics>,
 }
 
 /// A new run's id: its start time and the process id.
@@ -230,6 +232,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
                 monthly_usd: budgets.monthly_usd,
             }),
     );
+    let diagnostics = crate::lsp::diagnostics(setup);
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin(),
@@ -242,7 +245,8 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     .with_session(session)
     .with_checkpoints(checkpoints)
     .with_meter(meter.clone())
-    .with_gates(setup.config.gates.clone());
+    .with_gates(setup.config.gates.clone())
+    .with_diagnostics(diagnostics.clone());
     if interactive {
         agent = agent.with_sandboxes(sandboxes);
     }
@@ -254,6 +258,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         write_mode_warning,
         writable: writable_roots,
         meter,
+        diagnostics,
     })
 }
 

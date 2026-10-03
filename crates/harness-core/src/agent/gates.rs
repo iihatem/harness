@@ -89,16 +89,33 @@ impl Agent {
     ) -> Option<String> {
         let tool = self.tools.get(&call.name)?;
         let args = serde_json::from_str(&call.arguments).ok()?;
-        if tool.changed_paths(&args, &self.ctx).is_empty() {
+        let paths = tool.changed_paths(&args, &self.ctx);
+        if paths.is_empty() {
             return None;
         }
         self.turn_changed = true;
-        let command = self.gates.after_edit.clone()?;
         if self.gates_skipped() {
             return None;
         }
-        let run = self.run_gate(GateKind::AfterEdit, &command, events).await?;
-        Some(run.report(self.gates.timeout_s))
+        let mut checks = Vec::new();
+        if let Some(command) = self.gates.after_edit.clone()
+            && let Some(run) = self.run_gate(GateKind::AfterEdit, &command, events).await
+        {
+            checks.push(run.report(self.gates.timeout_s));
+        }
+        if let Some(diagnostics) = self.diagnostics.clone() {
+            let edited = crate::diag::EditedFiles {
+                paths: &paths,
+                workspace: &self.ctx.workspace,
+                sandbox: self.ctx.sandbox.clone(),
+                access: self.ctx.access,
+                unsandboxed_ok: self.policy.mode() == Some(Mode::FullAccess),
+            };
+            if let Some(said) = diagnostics.after_edit(&edited).await {
+                checks.push(said);
+            }
+        }
+        (!checks.is_empty()).then(|| checks.join("\n"))
     }
 
     /// Runs `command` as a `bash` call of the gate `kind`, and reports how it ended on `events`. The

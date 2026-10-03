@@ -18,6 +18,7 @@ mod gates;
 use crate::{
     checkpoint::{CheckpointError, Checkpoints},
     compaction::{self, CompactionConfig},
+    diag::Diagnostics,
     event::{AgentEvent, ErrorKind, TurnEndReason},
     gate::Gates,
     message::{ChatRequest, Message, RequestOptions, ToolCall, Usage},
@@ -379,6 +380,8 @@ pub struct Agent {
     gate_calls: u64,
     /// What the end-of-turn test gate has done in the current turn.
     gate_turn: gates::GateTurn,
+    /// Language-server diagnostics for edited files.
+    diagnostics: Option<Arc<dyn Diagnostics>>,
 }
 
 impl Agent {
@@ -434,6 +437,7 @@ impl Agent {
             turn_changed: false,
             gate_calls: 0,
             gate_turn: gates::GateTurn::default(),
+            diagnostics: None,
         }
     }
 
@@ -649,6 +653,19 @@ impl Agent {
         self
     }
 
+    /// Appends the errors language servers find in the files an edit changed to its result.
+    pub fn with_diagnostics(mut self, diagnostics: Arc<dyn Diagnostics>) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    /// Stops the language servers and waits for them: the session is over.
+    pub async fn close(&self) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.shutdown().await;
+        }
+    }
+
     pub fn with_steering(mut self, steering: Steering) -> Self {
         self.steering = Some(steering);
         self
@@ -669,6 +686,9 @@ impl Agent {
     /// system prompt stay as they are, so providers keep their prompt caches. The session left
     /// is released, for another process to continue.
     pub fn start_session(&mut self, session: Session, checkpoints: Option<Arc<Checkpoints>>) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.reset();
+        }
         self.session = session;
         if let Some(redactor) = &self.redactor {
             self.session.set_redactor(redactor.clone());

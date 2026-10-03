@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod checkpoint;
 pub mod compaction;
+pub mod diag;
 pub mod engine;
 pub mod event;
 pub mod gate;

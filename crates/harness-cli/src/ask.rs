@@ -187,6 +187,7 @@ pub async fn run(
             terminal_safe_text(&final_text)
         );
     }
+    agent.close().await;
     end_run(agent, sandbox_session);
     exit_code(reason, blocked)
 }

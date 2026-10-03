@@ -87,6 +87,44 @@ impl Ledger {
         file.write_all(line.as_bytes())
     }
 
+    /// Appends `snapshot` to its month's window file, `windows-YYYY-MM.jsonl` (0600): its id, when
+    /// it was observed, and each window's length, used percent, reset time and source.
+    pub fn append_window(
+        &self,
+        snapshot: &harness_core::meter::WindowSnapshot,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        crate::paths::create_private_dir(&self.dir)?;
+        let windows: Vec<serde_json::Value> = snapshot
+            .windows
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "minutes": w.window_minutes,
+                    "used_percent": w.used_percent,
+                    "resets_at": w.resets_at,
+                    "source": w.source,
+                })
+            })
+            .collect();
+        let mut line = serde_json::json!({
+            "id": snapshot.id(),
+            "t": snapshot.observed_at,
+            "windows": windows,
+        })
+        .to_string();
+        line.push('\n');
+        let path = self
+            .dir
+            .join(format!("windows-{}.jsonl", month_of(snapshot.observed_at)));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(line.as_bytes())
+    }
+
     /// The file for the month of `t`.
     pub fn file_for(&self, t: u64) -> PathBuf {
         self.dir.join(format!("ledger-{}.jsonl", month_of(t)))

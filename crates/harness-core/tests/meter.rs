@@ -13,9 +13,13 @@ use harness_core::{
     agent::NonInteractive,
     event::{AgentEvent, TurnEndReason},
     message::Usage,
-    meter::{AccountKind, Avoided, Meter, RequestCost, RequestRecord},
+    meter::{
+        AccountKind, Avoided, Meter, RequestCost, RequestRecord, Window, WindowSnapshot,
+        WindowSource,
+    },
     permission::Mode,
     provider::{FinishReason, ProviderError, ProviderEvent},
+    redact::{EventRedactor, Redactor},
     testing::{MockProvider, Script},
 };
 use serde_json::json;
@@ -25,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 struct Recording {
     records: Mutex<Vec<RequestRecord>>,
     warnings: Mutex<Vec<String>>,
+    windows: Mutex<Vec<WindowSnapshot>>,
 }
 
 impl Meter for Recording {
@@ -36,6 +41,10 @@ impl Meter for Recording {
             list_usd: Some(0.25),
             avoided: Avoided::NotApplicable,
         }
+    }
+
+    fn record_window(&self, snapshot: &WindowSnapshot) {
+        self.windows.lock().unwrap().push(snapshot.clone());
     }
 
     fn take_warnings(&self) -> Vec<String> {
@@ -246,4 +255,61 @@ async fn a_request_s_cost_is_an_event() {
     assert_eq!(model, "mock/m1");
     assert_eq!(cost.billed_usd, Some(0.25));
     assert_eq!(cost.account, AccountKind::ApiKey);
+}
+
+fn snapshot() -> WindowSnapshot {
+    WindowSnapshot {
+        windows: vec![Window {
+            window_minutes: Some(300),
+            used_percent: Some(62.0),
+            resets_at: Some(1_790_946_000),
+            source: WindowSource::Header,
+        }],
+        observed_at: 1_790_943_000,
+    }
+}
+
+// A provider that learns where a subscription's windows stand says so; the runtime shows it as
+// an event and tells the meter, which names it in the request's record.
+#[tokio::test]
+async fn window_snapshots_are_events_and_reach_the_meter() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::Reply(vec![
+        Ok(ProviderEvent::RateLimits(snapshot())),
+        Ok(ProviderEvent::TextDelta("hi".into())),
+        Ok(ProviderEvent::Finished(FinishReason::Stop)),
+    ])]);
+    let meter = Arc::new(Recording::default());
+    let mut agent =
+        agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path()).with_meter(meter.clone());
+    let (_, events) = run(&mut agent, "go").await;
+    assert!(events.contains(&AgentEvent::RateLimits {
+        snapshot: snapshot()
+    }));
+    assert_eq!(*meter.windows.lock().unwrap(), vec![snapshot()]);
+}
+
+// A snapshot arrives with a response's headers, before its text: it must not make the redactor
+// release text it holds back because it could still become a secret.
+#[test]
+fn a_window_snapshot_does_not_release_text_held_back_for_a_secret() {
+    let redactor = Redactor::default();
+    redactor.add("sk-secret-0123456789");
+    let mut events = EventRedactor::new(Arc::new(redactor));
+    let first = events.push(AgentEvent::TextDelta {
+        text: "the key is sk-secret-01".into(),
+    });
+    let shown: String = first
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(!shown.contains("sk-secret"), "{shown}");
+    let between = events.push(AgentEvent::RateLimits {
+        snapshot: snapshot(),
+    });
+    assert_eq!(between.len(), 1, "{between:?}");
+    assert!(matches!(between[0], AgentEvent::RateLimits { .. }));
 }

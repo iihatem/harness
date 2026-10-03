@@ -7,7 +7,7 @@ use std::{
 
 use harness_core::{
     message::Buckets,
-    meter::{AccountKind, Avoided, Meter, RequestCost, RequestRecord},
+    meter::{AccountKind, Avoided, Meter, RequestCost, RequestRecord, WindowSnapshot},
     time::now_unix,
 };
 use sha2::{Digest, Sha256};
@@ -53,6 +53,9 @@ pub struct UsageMeter {
     warnings: Mutex<Vec<String>>,
     /// Whether the ledger failed to write already: it is said once.
     failed: Mutex<bool>,
+    /// The snapshot the request in flight has seen, to name in its record, and the last one
+    /// written, so a snapshot repeated by every response is written once.
+    window: Mutex<(Option<String>, Option<String>)>,
 }
 
 impl UsageMeter {
@@ -67,6 +70,7 @@ impl UsageMeter {
             baseline: None,
             warnings: Mutex::new(Vec::new()),
             failed: Mutex::new(false),
+            window: Mutex::new((None, None)),
         }
     }
 
@@ -165,7 +169,12 @@ impl Meter for UsageMeter {
             price,
             ms: request.duration.as_millis() as u64,
             outcome: request.outcome.clone(),
-            window: None,
+            window: self
+                .window
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+                .take(),
         };
         if let Err(e) = self.ledger.append(&record) {
             self.warn(format!(
@@ -174,6 +183,23 @@ impl Meter for UsageMeter {
             ));
         }
         cost
+    }
+
+    fn record_window(&self, snapshot: &WindowSnapshot) {
+        let id = snapshot.id();
+        let mut window = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        window.0 = Some(id.clone());
+        if window.1.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        window.1 = Some(id);
+        drop(window);
+        if let Err(e) = self.ledger.append_window(snapshot) {
+            self.warn(format!(
+                "cannot write the usage ledger in {}: {e}; requests are no longer recorded",
+                self.ledger.dir().display()
+            ));
+        }
     }
 
     fn take_warnings(&self) -> Vec<String> {

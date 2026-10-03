@@ -10,7 +10,10 @@ use harness_core::{
 };
 use serde_json::{Value, json};
 
-use crate::sse::{self, EventParser};
+use crate::{
+    codex_windows,
+    sse::{self, EventParser},
+};
 
 /// Builds a streaming Responses request body. With `summaries`, OpenAI's reasoning models are
 /// asked for reasoning summaries even when no profile sets an effort; without it, only a model
@@ -214,6 +217,14 @@ impl ResponsesStreamParser {
                 });
                 out.extend(self.finish());
             }
+            // ChatGPT reports where its usage windows stand in the stream too.
+            "codex.rate_limits" => {
+                if let Some(snapshot) =
+                    codex_windows::from_event(&event, harness_core::time::now_unix())
+                {
+                    out.push(ProviderEvent::RateLimits(snapshot));
+                }
+            }
             "response.failed" => return Err(stream_error(&event["response"]["error"])),
             // The details are at the top level, or nested under `error` (where Codex reads them).
             "error" => {
@@ -279,6 +290,13 @@ impl EventParser for ResponsesStreamParser {
 
     fn is_done(&self) -> bool {
         ResponsesStreamParser::is_done(self)
+    }
+
+    fn response_headers(&mut self, headers: &reqwest::header::HeaderMap) -> Vec<ProviderEvent> {
+        codex_windows::from_headers(headers, harness_core::time::now_unix())
+            .map(ProviderEvent::RateLimits)
+            .into_iter()
+            .collect()
     }
 }
 
@@ -445,6 +463,22 @@ impl OpenAiResponses {
 }
 
 impl Provider for OpenAiResponses {
+    fn windows(
+        &self,
+    ) -> Option<
+        futures::future::BoxFuture<'static, Result<harness_core::meter::WindowSnapshot, String>>,
+    > {
+        #[cfg(feature = "chatgpt-login")]
+        if let Auth::ChatGpt(auth) = &self.auth {
+            let (client, auth, base_url) =
+                (self.client.clone(), auth.clone(), self.base_url.clone());
+            return Some(Box::pin(async move {
+                crate::chatgpt::usage::poll(&client, &base_url, &auth).await
+            }));
+        }
+        None
+    }
+
     fn stream(&self, request: ChatRequest) -> ProviderStream {
         let url = format!("{}/responses", self.base_url);
         match &self.auth {

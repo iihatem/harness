@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{message::Usage, meter::RequestCost};
+use crate::{
+    message::Usage,
+    meter::{RequestCost, WindowSnapshot},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +63,10 @@ pub enum AgentEvent {
     Metered {
         model: String,
         cost: RequestCost,
+    },
+    /// Where a subscription's usage windows stand, as the provider just said.
+    RateLimits {
+        snapshot: WindowSnapshot,
     },
     Retrying {
         attempt: u32,

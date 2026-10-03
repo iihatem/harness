@@ -64,6 +64,81 @@ pub struct RequestRecord {
     pub outcome: String,
 }
 
+/// How long after it was observed a window snapshot is shown as stale, in seconds.
+pub const STALE_AFTER_SECS: u64 = 15 * 60;
+
+/// Where a window's figures were read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowSource {
+    /// The response headers of a request.
+    Header,
+    /// An event in the reply's stream.
+    Stream,
+    /// A call to the usage endpoint.
+    Poll,
+}
+
+/// One usage window of a subscription. Every field is optional: a provider says what it says.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Window {
+    pub window_minutes: Option<u64>,
+    /// 0 to 100.
+    pub used_percent: Option<f64>,
+    /// When it resets, in seconds since the Unix epoch.
+    pub resets_at: Option<u64>,
+    pub source: WindowSource,
+}
+
+impl Window {
+    /// The window's length as a name, never its position: `5h`, `7d`, `1d`, `90m`; `window` when
+    /// the length is not known.
+    pub fn label(&self) -> String {
+        match self.window_minutes {
+            Some(m) if m >= 1_440 && m % 1_440 == 0 => format!("{}d", m / 1_440),
+            Some(m) if m >= 60 && m % 60 == 0 => format!("{}h", m / 60),
+            Some(m) => format!("{m}m"),
+            None => "window".to_string(),
+        }
+    }
+}
+
+/// The windows a provider reported at one time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowSnapshot {
+    pub windows: Vec<Window>,
+    /// When it was observed, in seconds since the Unix epoch.
+    pub observed_at: u64,
+}
+
+impl WindowSnapshot {
+    /// Whether it was observed more than 15 minutes before `now`.
+    pub fn is_stale(&self, now: u64) -> bool {
+        now.saturating_sub(self.observed_at) > STALE_AFTER_SECS
+    }
+
+    /// The window with the highest used percentage; a window with no percentage is not a
+    /// candidate, since an unknown window is never shown as 0%.
+    pub fn most_used(&self) -> Option<&Window> {
+        self.windows
+            .iter()
+            .filter(|w| w.used_percent.is_some())
+            .max_by(|a, b| {
+                a.used_percent
+                    .partial_cmp(&b.used_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    /// A name for this snapshot that follows its content: the ledger refers to it by this.
+    pub fn id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let json = serde_json::to_string(&self.windows).unwrap_or_default();
+        let digest = Sha256::digest(json.as_bytes());
+        format!("w{}-{}", self.observed_at, hex::encode(&digest[..4]))
+    }
+}
+
 /// What the tokens avoided against a named baseline model, when there is one.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,6 +168,10 @@ pub struct RequestCost {
 pub trait Meter: Send + Sync {
     /// Records `request`, and says what it cost.
     fn record_request(&self, request: &RequestRecord) -> RequestCost;
+
+    /// A window snapshot the provider reported during a request that has not ended yet: the
+    /// meter keeps it, and names it in that request's record.
+    fn record_window(&self, _snapshot: &WindowSnapshot) {}
 
     /// What went wrong keeping the record, such as a ledger that cannot be written, each given
     /// once; the runtime shows them as warnings.

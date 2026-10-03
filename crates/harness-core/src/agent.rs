@@ -1665,6 +1665,12 @@ impl Agent {
                 // servers send it cumulatively, in every chunk, and counting each would
                 // over-count both `/usage` and the status line's session totals.
                 ProviderEvent::Usage(usage) => reply.usage = Some(usage),
+                ProviderEvent::RateLimits(snapshot) => {
+                    if let Some(meter) = &self.meter {
+                        meter.record_window(&snapshot);
+                    }
+                    let _ = events.send(AgentEvent::RateLimits { snapshot });
+                }
                 ProviderEvent::Finished(reason) => reply.finish = Some(reason),
             }
         }

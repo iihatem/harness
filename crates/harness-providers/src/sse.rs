@@ -19,6 +19,11 @@ pub trait EventParser: Send + 'static {
     fn may_end(&self) -> bool {
         self.is_done()
     }
+    /// The events the response's headers give, before its first payload (a provider that reports
+    /// usage windows there).
+    fn response_headers(&mut self, _headers: &reqwest::header::HeaderMap) -> Vec<ProviderEvent> {
+        Vec::new()
+    }
 }
 
 /// How long a response may send nothing, once its first data came, before the server counts as
@@ -101,6 +106,9 @@ fn events_within<P: EventParser>(
             .await
             .map_err(|_| no_start())??;
         if response.status().is_success() {
+            for item in parser.response_headers(response.headers()) {
+                yield item;
+            }
             let mut body = response.bytes_stream();
             // Each wait for data is limited, not the whole reply: until the first data, to what is
             // left of the first wait; after it, to the idle limit.

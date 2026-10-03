@@ -1,9 +1,12 @@
 use std::time::Duration;
 
-use futures::stream::BoxStream;
+use futures::{future::BoxFuture, stream::BoxStream};
 use serde::{Deserialize, Serialize};
 
-use crate::message::{ChatRequest, ToolCall, Usage};
+use crate::{
+    message::{ChatRequest, ToolCall, Usage},
+    meter::WindowSnapshot,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +29,9 @@ pub enum ProviderEvent {
     ReasoningDelta(String),
     ToolCall(ToolCall),
     Usage(Usage),
+    /// The provider said where a subscription's usage windows stand (response headers, or an event
+    /// in the stream).
+    RateLimits(WindowSnapshot),
     Finished(FinishReason),
 }
 
@@ -246,4 +252,10 @@ pub type ProviderStream = BoxStream<'static, Result<ProviderEvent, ProviderError
 /// A model backend: translates a [`ChatRequest`] to a wire protocol and streams events back.
 pub trait Provider: Send + Sync {
     fn stream(&self, request: ChatRequest) -> ProviderStream;
+
+    /// Asks the provider where the account's usage windows stand, when it has any (a ChatGPT
+    /// subscription's); `None` for a provider with none. Called on demand, never on a timer.
+    fn windows(&self) -> Option<BoxFuture<'static, Result<WindowSnapshot, String>>> {
+        None
+    }
 }

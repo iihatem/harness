@@ -3,6 +3,7 @@
 pub mod anthropic_messages;
 #[cfg(feature = "chatgpt-login")]
 pub mod chatgpt;
+pub mod codex_windows;
 pub mod credentials;
 pub mod discovery;
 mod http;

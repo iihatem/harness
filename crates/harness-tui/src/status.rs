@@ -3,10 +3,16 @@
 
 use std::collections::BTreeMap;
 
-use harness_core::{agent::ContextUsage, message::Usage, permission::Mode};
+use harness_core::{
+    agent::ContextUsage,
+    message::Usage,
+    meter::{AccountKind, Avoided, RequestCost, WindowSnapshot},
+    permission::Mode,
+    time::civil_date,
+};
 use ratatui::text::{Line, Span};
 
-use crate::{style::Theme, text::sanitize};
+use crate::{style::Theme, text::sanitize, usage::UsageContext};
 
 /// `n` tokens, short: `950`, `1.2k`, `34k`, `1.5M`.
 pub fn tokens(n: u64) -> String {
@@ -108,6 +114,26 @@ pub fn status_line(
     totals: &Totals,
     theme: &Theme,
 ) -> Line<'static> {
+    status_line_with(model, mode, context, totals, &Extras::default(), theme)
+}
+
+/// What the status line shows after the tokens: the session's billed cost once it made a billed
+/// request, and, for a subscription provider, the most-used usage window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Extras {
+    pub cost: Option<String>,
+    pub window: Option<String>,
+}
+
+/// [`status_line`], with the cost and window after the tokens.
+pub fn status_line_with(
+    model: &str,
+    mode: Mode,
+    context: &ContextUsage,
+    totals: &Totals,
+    extras: &Extras,
+    theme: &Theme,
+) -> Line<'static> {
     let (input, output) = totals.sum();
     // Nearest, not always up: rounding up made 3.07% read as "4%", which the status line then
     // disagreed with itself about once anyone did the arithmetic.
@@ -116,15 +142,17 @@ pub fn status_line(
     } else {
         (context.total as f64 * 100.0 / context.window as f64).round() as u64
     };
-    let mut spans = vec![Span::styled(
-        format!(
-            "{} · {mode} · {used}% of context · {} in, {} out",
-            sanitize(model),
-            tokens(input),
-            tokens(output)
-        ),
-        theme.dim(),
-    )];
+    let mut text = format!(
+        "{} · {mode} · {used}% of context · {} in, {} out",
+        sanitize(model),
+        tokens(input),
+        tokens(output)
+    );
+    for extra in [&extras.cost, &extras.window].into_iter().flatten() {
+        text.push_str(" · ");
+        text.push_str(extra);
+    }
+    let mut spans = vec![Span::styled(text, theme.dim())];
     if mode == Mode::FullAccess {
         spans.push(Span::styled(
             " · full-access: no sandbox, no approvals",
@@ -215,6 +243,221 @@ pub fn context_report(
                 percent(context.total, context.window),
             ),
             theme.dim(),
+        )));
+    }
+    lines
+}
+
+/// An amount in USD: `$1.25`, and `$0.0013` when a cent would hide it.
+pub fn usd(amount: f64) -> String {
+    if amount == 0.0 || amount >= 0.01 {
+        format!("${amount:.2}")
+    } else {
+        format!("${amount:.4}")
+    }
+}
+
+/// A sum of money and how many requests had no price (left out of it, never counted as 0).
+fn money(usd_sum: f64, unknown: u64) -> String {
+    match (unknown, usd_sum == 0.0) {
+        (0, _) => usd(usd_sum),
+        (_, true) => "price unknown".to_string(),
+        (n, false) => format!("{} + {n} price unknown", usd(usd_sum)),
+    }
+}
+
+/// What the session's requests cost on one model.
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelCost {
+    /// Requests paid for with an API key.
+    billed_requests: u64,
+    billed: f64,
+    billed_unknown: u64,
+    list: f64,
+    list_unknown: u64,
+    avoided: f64,
+    avoided_unknown: u64,
+    /// Requests the avoided figure applies to.
+    avoided_requests: u64,
+}
+
+/// The session's cost figures, per model, from the runtime's metered events. The three figures
+/// are never added together.
+#[derive(Debug, Clone, Default)]
+pub struct Costs {
+    per_model: BTreeMap<String, ModelCost>,
+}
+
+impl Costs {
+    pub fn add(&mut self, model: &str, cost: &RequestCost) {
+        let entry = self.per_model.entry(model.to_string()).or_default();
+        if cost.account == AccountKind::ApiKey {
+            entry.billed_requests += 1;
+            match cost.billed_usd {
+                Some(usd) => entry.billed += usd,
+                None => entry.billed_unknown += 1,
+            }
+        }
+        match cost.list_usd {
+            Some(usd) => entry.list += usd,
+            None => entry.list_unknown += 1,
+        }
+        match cost.avoided {
+            Avoided::NotApplicable => {}
+            Avoided::Unknown => {
+                entry.avoided_requests += 1;
+                entry.avoided_unknown += 1;
+            }
+            Avoided::Usd(usd) => {
+                entry.avoided_requests += 1;
+                entry.avoided += usd;
+            }
+        }
+    }
+
+    fn sum(&self) -> ModelCost {
+        self.per_model
+            .values()
+            .fold(ModelCost::default(), |a, m| ModelCost {
+                billed_requests: a.billed_requests + m.billed_requests,
+                billed: a.billed + m.billed,
+                billed_unknown: a.billed_unknown + m.billed_unknown,
+                list: a.list + m.list,
+                list_unknown: a.list_unknown + m.list_unknown,
+                avoided: a.avoided + m.avoided,
+                avoided_unknown: a.avoided_unknown + m.avoided_unknown,
+                avoided_requests: a.avoided_requests + m.avoided_requests,
+            })
+    }
+
+    /// Whether any request was metered.
+    pub fn is_empty(&self) -> bool {
+        self.per_model.is_empty()
+    }
+
+    /// The billed cost for the status line: shown once the session has made a billed request,
+    /// and `price unknown` when a billed request had no price.
+    pub fn status(&self) -> Option<String> {
+        let total = self.sum();
+        (total.billed_requests > 0).then(|| money(total.billed, total.billed_unknown))
+    }
+}
+
+/// `5h 62%` for the status line: the most-used window by its length, `(stale)` when it was
+/// observed more than 15 minutes before `now`, and `window unknown` when nothing is known: never 0%.
+pub fn window_segment(snapshot: Option<&WindowSnapshot>, now: u64) -> String {
+    match snapshot.and_then(|s| s.most_used().map(|w| (s, w))) {
+        Some((snapshot, window)) => {
+            let used = window.used_percent.unwrap_or(0.0);
+            let stale = if snapshot.is_stale(now) {
+                " (stale)"
+            } else {
+                ""
+            };
+            format!("{} {used:.0}%{stale}", window.label())
+        }
+        None => "window unknown".to_string(),
+    }
+}
+
+/// When a window resets: `14:30 UTC` within a day of `now`, else with its date.
+pub fn reset_text(resets_at: u64, now: u64) -> String {
+    let secs = resets_at % 86_400;
+    let time = format!("{:02}:{:02} UTC", secs / 3_600, secs / 60 % 60);
+    if resets_at.abs_diff(now) < 86_400 && civil_date(resets_at) == civil_date(now) {
+        time
+    } else {
+        format!("{} {time}", civil_date(resets_at))
+    }
+}
+
+/// The lines for the subscription windows, one for each window: its length, how much is used and
+/// when it resets; or that they are unknown.
+pub fn window_lines(
+    snapshot: Option<&WindowSnapshot>,
+    now: u64,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        "Subscription windows",
+        theme.bold(),
+    ))];
+    let windows = snapshot.filter(|s| !s.windows.is_empty());
+    let Some(snapshot) = windows else {
+        lines.push(Line::from("  window unknown"));
+        return lines;
+    };
+    for window in &snapshot.windows {
+        let used = window
+            .used_percent
+            .map_or("usage unknown".to_string(), |u| format!("{u:.0}% used"));
+        let resets = window.resets_at.map_or(String::new(), |r| {
+            format!(", resets {}", reset_text(r, now))
+        });
+        lines.push(Line::from(format!("  {:<6}{used}{resets}", window.label())));
+    }
+    if snapshot.is_stale(now) {
+        let minutes = now.saturating_sub(snapshot.observed_at) / 60;
+        lines.push(Line::from(Span::styled(
+            format!("  stale: observed {minutes} minutes ago"),
+            theme.dim(),
+        )));
+    }
+    lines
+}
+
+/// `/usage`'s cost lines: the session's billed cost, the list-price estimate and, with a baseline,
+/// what was avoided, then each model's.
+pub fn cost_lines(costs: &Costs, ctx: &UsageContext, theme: &Theme) -> Vec<Line<'static>> {
+    if costs.is_empty() {
+        return Vec::new();
+    }
+    let total = costs.sum();
+    let mut lines = vec![Line::from(Span::styled("Cost this session", theme.bold()))];
+    lines.push(Line::from(format!(
+        "  billed        {}   (requests paid for with an API key)",
+        money(total.billed, total.billed_unknown)
+    )));
+    lines.push(Line::from(format!(
+        "  list price    {}   (estimate: every hosted request at the table price)",
+        money(total.list, total.list_unknown)
+    )));
+    if let Some(baseline) = &ctx.baseline {
+        let figure = if total.avoided_requests == 0 {
+            usd(0.0)
+        } else {
+            money(total.avoided, total.avoided_unknown)
+        };
+        lines.push(Line::from(format!(
+            "  avoided       {figure}   vs {} (tokens on local or subscription models; plan and hardware fees not counted)",
+            sanitize(baseline)
+        )));
+    }
+    let width = costs
+        .per_model
+        .keys()
+        .map(|m| m.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(5);
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{:width$}  {:>22}  {}",
+            "model", "billed", "list price (estimate)"
+        ),
+        theme.bold(),
+    )));
+    for (model, cost) in &costs.per_model {
+        let billed = if cost.billed_requests == 0 {
+            "not billed".to_string()
+        } else {
+            money(cost.billed, cost.billed_unknown)
+        };
+        lines.push(Line::from(format!(
+            "{:width$}  {:>22}  {}",
+            sanitize(model),
+            billed,
+            money(cost.list, cost.list_unknown)
         )));
     }
     lines

@@ -11,7 +11,10 @@ use harness_core::{
     session::{self, SessionSummary},
 };
 use harness_providers::registry;
-use harness_tui::app::{Host, ModelSwitch, OpenedSession, Prepared};
+use harness_tui::{
+    app::{Host, ModelSwitch, OpenedSession, Prepared},
+    usage::UsageContext,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -132,6 +135,23 @@ impl Host for CliHost {
             ),
         };
         vec![self.setup.redactor.redact(&note)]
+    }
+
+    fn usage_context(&self) -> UsageContext {
+        UsageContext {
+            baseline: self.setup.config.usage.baseline.clone(),
+            prices: crate::pricing::load(&self.setup).snapshot().label(),
+        }
+    }
+
+    fn usage_report(&self, args: &str) -> BoxFuture<'static, Vec<String>> {
+        let (setup, args) = (self.setup.clone(), args.to_string());
+        // The cache is SQLite, which blocks.
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || crate::usage::session_lines(&setup, &args))
+                .await
+                .unwrap_or_default()
+        })
     }
 
     fn models(&self) -> BoxFuture<'static, Vec<String>> {
@@ -294,6 +314,68 @@ pub mod tests {
         );
         // Once.
         assert!(host.model_answered("ollama/llama3").is_empty());
+    }
+
+    // `/usage` in the terminal reports the ledger, and says so when it is empty.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn usage_reports_the_ledger_from_the_session() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        std::fs::write(
+            home.path().join("config/config.toml"),
+            "[usage]\nbaseline = \"openai/gpt-5\"\n",
+        )
+        .unwrap();
+        let host = host(home.path(), &workspace);
+        let context = host.usage_context();
+        assert_eq!(context.baseline.as_deref(), Some("openai/gpt-5"));
+        assert!(
+            context.prices.starts_with("embedded 20"),
+            "{}",
+            context.prices
+        );
+        let empty = host.usage_report("").await.join("\n");
+        assert!(empty.contains("M1 sessions is not included"), "{empty}");
+        // Another ledger writer: the host's own session, here a plain append.
+        let ledger = harness_usage::ledger::Ledger::new(
+            &harness_usage::paths::Dirs::under(&host.setup.paths.data_dir).usage,
+        );
+        ledger
+            .append(&harness_usage::ledger::LedgerRecord {
+                v: 1,
+                t: 1_790_942_400,
+                session: "s".into(),
+                project: "p".into(),
+                role: "main".into(),
+                model: "ollama/qwen3-coder".into(),
+                account: harness_core::meter::AccountKind::Local,
+                input: 1_000_000,
+                cache_read: 0,
+                cache_write: 0,
+                cache_write_1h: 0,
+                output: 0,
+                reasoning: 0,
+                billed_usd: Some(0.0),
+                list_usd: Some(0.0),
+                price: None,
+                ms: 1,
+                outcome: "ok".into(),
+                window: None,
+            })
+            .unwrap();
+        let report = host.usage_report("provider").await.join("\n");
+        assert!(report.starts_with("Usage by provider"), "{report}");
+        assert!(report.contains("ollama"), "{report}");
+        assert!(
+            report.contains("Avoided vs openai/gpt-5: $1.25"),
+            "{report}"
+        );
+        let wrong = host.usage_report("colour").await.join("\n");
+        assert!(wrong.contains("--by takes"), "{wrong}");
+        let bad_flag = host.usage_report("--wat").await.join("\n");
+        assert!(bad_flag.contains("not `--wat`"), "{bad_flag}");
     }
 
     /// A keychain that does not answer until `release` is dropped or sent to.

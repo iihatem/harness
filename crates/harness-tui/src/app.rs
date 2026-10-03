@@ -18,6 +18,7 @@ use harness_core::{
     checkpoint::Checkpoints,
     event::{AgentEvent, TurnEndReason},
     message::Message,
+    meter::WindowSnapshot,
     permission::Mode,
     redact::Redactor,
     session::{RewindScope, Session, SessionSummary},
@@ -38,10 +39,11 @@ use crate::{
     notify::{self, Notify},
     picker::{Item, Picked, Picker, model_item},
     plan::{Choice, PlanChoice, TextEditor},
-    status::{self, Totals},
+    status::{self, Costs, Totals},
     style::Theme,
     text::{sanitize, wrap},
     transcript::Transcript,
+    usage::UsageContext,
 };
 
 /// Ctrl+C twice within this long exits.
@@ -216,6 +218,15 @@ pub trait Host: Send {
     ) -> BoxFuture<'static, Result<ModelSwitch, String>> {
         Box::pin(async { Err("the model cannot change".into()) })
     }
+    /// The settings `/usage` shows beside what the session knows.
+    fn usage_context(&self) -> UsageContext {
+        UsageContext::default()
+    }
+    /// The ledger's report for `/usage <args>` (a group, `model`, `provider`, `day` or `project`,
+    /// and a period), as lines; none when there is no ledger to report.
+    fn usage_report(&self, _args: &str) -> BoxFuture<'static, Vec<String>> {
+        Box::pin(async { Vec::new() })
+    }
     /// Signs in to `provider`, with a device code when `device` is set: what the user must do
     /// (the address to open, the code) goes to `notes` as it comes, and `cancel` stops it. Ok:
     /// what to tell the user; errors say why not.
@@ -307,6 +318,9 @@ pub enum Action {
     UndoRewind,
     /// Continue in a new session (`None`), or in this project's session with this id.
     OpenSession(Option<String>),
+    /// Ask the provider where its usage windows stand, and the host for the ledger's report, for
+    /// `/usage` with these arguments.
+    Usage(String),
     /// Look for the models, for the model picker.
     ListModels,
     /// Continue on the model with this id.
@@ -403,6 +417,15 @@ pub struct App {
     mode_note_pending: bool,
     /// The model being switched to.
     switching: Option<String>,
+    /// What the session's requests cost, from the runtime's metered events.
+    costs: Costs,
+    /// Where the subscription's usage windows stand, as last said.
+    windows: Option<WindowSnapshot>,
+    /// How far each window's warnings went: 0, 80 or 95 (percent), by window length and reset.
+    window_warnings: std::collections::HashMap<(Option<u64>, Option<u64>), u8>,
+    usage_context: UsageContext,
+    /// The time, in seconds since the Unix epoch.
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl App {
@@ -412,7 +435,6 @@ impl App {
             editor: Editor::new(options.history),
             completer: Completer::new(options.commands, &options.workspace),
             completion: None,
-            host,
             model: options.model,
             mode: options.mode,
             hint: None,
@@ -452,6 +474,99 @@ impl App {
             start_mode: options.mode,
             mode_note_pending: false,
             switching: None,
+            usage_context: host.usage_context(),
+            costs: Costs::default(),
+            windows: None,
+            window_warnings: std::collections::HashMap::new(),
+            clock: Arc::new(harness_core::time::now_unix),
+            host,
+        }
+    }
+
+    /// Reads the time from `clock`, for the windows' staleness and reset times.
+    pub fn set_clock(&mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.clock = clock;
+    }
+
+    /// Sets what `/usage` shows beside the session's own figures.
+    pub fn set_usage_context(&mut self, context: UsageContext) {
+        self.usage_context = context;
+    }
+
+    /// Whether the usage windows are known.
+    pub fn has_windows(&self) -> bool {
+        self.windows.is_some()
+    }
+
+    /// Where the usage windows stand, as the provider said: shown in the status line, and a
+    /// warning once as each window crosses 80% and once as it crosses 95%. Nothing here
+    /// delays or refuses a request.
+    fn observe_windows(&mut self, snapshot: WindowSnapshot) {
+        let now = (self.clock)();
+        for window in &snapshot.windows {
+            let Some(used) = window.used_percent else {
+                continue;
+            };
+            let key = (window.window_minutes, window.resets_at);
+            let reached = self.window_warnings.entry(key).or_insert(0);
+            let level = if used >= 95.0 {
+                95
+            } else if used >= 80.0 {
+                80
+            } else {
+                0
+            };
+            if level > *reached {
+                *reached = level;
+                let resets = window.resets_at.map_or(String::new(), |r| {
+                    format!(", resets {}", status::reset_text(r, now))
+                });
+                self.transcript.push_warning(
+                    &format!("{} window at {used:.0}% used{resets}", window.label()),
+                    self.width,
+                );
+            }
+        }
+        self.windows = Some(snapshot);
+    }
+
+    /// The usage windows the provider just gave when asked, and the ledger's report, for
+    /// `/usage`.
+    pub fn on_usage(
+        &mut self,
+        windows: Option<Result<WindowSnapshot, String>>,
+        ledger: Vec<String>,
+    ) {
+        let width = self.width;
+        let theme = self.theme();
+        match windows {
+            Some(Ok(snapshot)) => {
+                self.observe_windows(snapshot);
+                let now = (self.clock)();
+                let lines = status::window_lines(self.windows.as_ref(), now, &theme);
+                self.transcript.push_lines(lines, width);
+            }
+            Some(Err(why)) => {
+                let why = self.redacted(&why);
+                self.transcript
+                    .push_note(&format!("could not read the usage windows: {why}"), width);
+            }
+            None => {}
+        }
+        if !ledger.is_empty() {
+            let lines = ledger
+                .iter()
+                .map(|l| Line::from(sanitize(l)))
+                .collect::<Vec<_>>();
+            self.transcript.push_lines(lines, width);
+        }
+    }
+
+    /// The windows the provider gave when the session asked at its start (or after a model
+    /// switch). One that could not be read says nothing: `/usage` says why.
+    pub fn on_windows(&mut self, windows: Result<WindowSnapshot, String>) {
+        if let Ok(snapshot) = windows {
+            self.observe_windows(snapshot);
         }
     }
 
@@ -764,6 +879,8 @@ impl App {
             AgentEvent::ToolCallRequested { .. } => self.ran_tools = true,
             AgentEvent::TurnFinished { reason } => self.turn_ended(*reason, now),
             AgentEvent::Usage { model, usage } => self.totals.add(model, usage),
+            AgentEvent::Metered { model, cost } => self.costs.add(model, cost),
+            AgentEvent::RateLimits { snapshot } => self.observe_windows(snapshot.clone()),
             AgentEvent::Steered { text } => {
                 if let Some(i) = self.sent_now.iter().position(|t| t == text) {
                     self.sent_now.remove(i);
@@ -1390,21 +1507,36 @@ impl App {
                 self.transcript.push_user(full, width);
                 self.help();
             }
-            "context" | "usage" => {
+            "context" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
                 let theme = self.theme();
-                let lines = if name == "context" {
-                    status::context_report(
-                        &self.context,
-                        &self.instruction_files,
-                        self.window_note.as_deref(),
-                        &theme,
-                    )
-                } else {
-                    self.totals.report(&theme)
-                };
+                let lines = status::context_report(
+                    &self.context,
+                    &self.instruction_files,
+                    self.window_note.as_deref(),
+                    &theme,
+                );
                 self.transcript.push_lines(lines, width);
+            }
+            "usage" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                let theme = self.theme();
+                let now = (self.clock)();
+                let mut lines = self.totals.report(&theme);
+                lines.extend(status::cost_lines(&self.costs, &self.usage_context, &theme));
+                if self.model.starts_with("chatgpt/") || self.windows.is_some() {
+                    lines.extend(status::window_lines(self.windows.as_ref(), now, &theme));
+                }
+                if !self.usage_context.prices.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("price snapshot: {}", sanitize(&self.usage_context.prices)),
+                        theme.dim(),
+                    )));
+                }
+                self.transcript.push_lines(lines, width);
+                return Some(Action::Usage(args.to_string()));
             }
             _ => {
                 self.transcript.push_error(
@@ -1650,11 +1782,20 @@ impl App {
 
     /// The status line.
     fn status(&self) -> Line<'static> {
-        let mut line = status::status_line(
+        let extras = status::Extras {
+            cost: self.costs.status(),
+            // Only a subscription provider has windows: others show none.
+            window: self
+                .model
+                .starts_with("chatgpt/")
+                .then(|| status::window_segment(self.windows.as_ref(), (self.clock)())),
+        };
+        let mut line = status::status_line_with(
             &self.model,
             self.mode,
             &self.context,
             &self.totals,
+            &extras,
             &self.theme(),
         );
         if let Some(next) = self.pending_mode {

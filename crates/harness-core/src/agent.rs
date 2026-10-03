@@ -1445,6 +1445,11 @@ impl Agent {
         }
     }
 
+    /// The provider the session's model runs on, to ask it where a subscription's windows stand.
+    pub fn provider(&self) -> Arc<dyn Provider> {
+        self.provider.clone()
+    }
+
     /// The id of the model answering the current turn: between turns, the session's.
     pub fn model_id(&self) -> &str {
         self.turn_model

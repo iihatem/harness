@@ -2,7 +2,7 @@
 //!
 //! In a file's text, a line holding `ERROR` is an error at that line, `WARN` a warning, `HINT` a
 //! hint; `SLOW:<ms>` delays the publish; `NOPUBLISH` publishes nothing; `CRASH` exits at once;
-//! `TWICE` publishes a syntax pass (no diagnostics) and then the real one 50 ms later.
+//! `TWICE` publishes a syntax pass (no diagnostics) and then the real one 5 ms later, well inside the client's 150 ms settle even on a loaded machine.
 //! Like rust-analyzer, `RALIKE` opens a progress token, publishes an empty set at once, and the
 //! real one 1.2 s later, and closes the token (the token is opened only for a client that said it
 //! takes work-done progress). `FLYCHECK` is rust-analyzer's order at its start: idle, and only
@@ -223,7 +223,7 @@ fn publish(out: &mut impl Write, uri: &Value, text: &str, version: i64) {
     }
     if text.contains("TWICE") {
         send(out, &diagnostics_message(uri, version, ""));
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(5));
     }
     send(out, &diagnostics_message(uri, version, text));
 }

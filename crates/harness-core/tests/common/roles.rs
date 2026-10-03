@@ -17,10 +17,17 @@ use harness_core::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// Resolves the ids it has a model for.
-pub struct Models(pub HashMap<String, TurnModel>);
+/// Resolves the ids it has a model for, and says which models a failed one falls back to.
+pub struct Models(
+    pub HashMap<String, TurnModel>,
+    pub HashMap<String, Vec<String>>,
+);
 
 impl ModelResolver for Models {
+    fn chain(&self, model_id: &str) -> Vec<String> {
+        self.1.get(model_id).cloned().unwrap_or_default()
+    }
+
     fn resolve(
         &self,
         id: &str,
@@ -52,8 +59,22 @@ pub fn model(id: &str, provider: &Arc<MockProvider>, window: u64) -> TurnModel {
 
 /// `agent` with a resolver that has `models`.
 pub fn with_models(agent: Agent, models: Vec<TurnModel>) -> Agent {
+    with_chain(agent, models, &[])
+}
+
+/// [`with_models`], with the chains `(failed id, candidates)`.
+pub fn with_chain(agent: Agent, models: Vec<TurnModel>, chains: &[(&str, &[&str])]) -> Agent {
     agent.with_resolver(Arc::new(Models(
         models.into_iter().map(|m| (m.id.clone(), m)).collect(),
+        chains
+            .iter()
+            .map(|(id, chain)| {
+                (
+                    id.to_string(),
+                    chain.iter().map(|c| c.to_string()).collect(),
+                )
+            })
+            .collect(),
     )))
 }
 

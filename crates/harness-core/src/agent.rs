@@ -440,6 +440,8 @@ pub struct Agent {
     last_planner: Option<String>,
     /// How the current turn, if it is a Build turn, got the conversation.
     turn_handoff: Option<Handoff>,
+    /// A fallback chain already moved a request of the current turn.
+    fell_back: bool,
     /// The conversation before a Build message that went alone, put back when the turn ends.
     handoff_stash: Option<(Vec<Message>, Vec<String>, Message)>,
 }
@@ -503,6 +505,7 @@ impl Agent {
             last_role_model,
             last_planner: None,
             turn_handoff: None,
+            fell_back: false,
             handoff_stash: None,
         }
     }
@@ -1273,6 +1276,7 @@ impl Agent {
             _ => Role::Main,
         });
         self.turn_role = role;
+        self.fell_back = false;
         self.turn_model = None;
         let role_model = match &input.model {
             Some(_) => Ok(None),
@@ -1408,7 +1412,17 @@ impl Agent {
             if !auto_compaction_failed {
                 auto_compaction_failed = !self.compact_automatically(events, &cancel).await;
             }
-            let outcome = self.call_model_compacting(events, &cancel).await;
+            let mut outcome = self.call_model_compacting(events, &cancel).await;
+            // A request that failed in a way a chain can answer is sent again on its next usable
+            // model, if the user configured one.
+            if let ModelOutcome::Failed(error, partial) = &outcome
+                && !partial.emitted
+                && error.is_fallback_trigger()
+                && !cancel.is_cancelled()
+                && self.fall_back(error, events, &cancel).await
+            {
+                outcome = self.call_model_compacting(events, &cancel).await;
+            }
             match &outcome {
                 ModelOutcome::Reply(reply)
                 | ModelOutcome::Failed(_, reply)
@@ -2075,6 +2089,82 @@ impl Agent {
             self.reported_usage = None;
         }
         self.turn_handoff = None;
+    }
+
+    /// Moves the rest of the turn to the first usable model of the failed model's chain: on the
+    /// same side of local and hosted, with a window at least as large, with credentials, and
+    /// within the budgets. Announced with the failure and whether the new model is billed. At most
+    /// once per turn. `false` when there is none, which leaves the failure as it was.
+    async fn fall_back(
+        &mut self,
+        error: &ProviderError,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> bool {
+        if self.fell_back {
+            return false;
+        }
+        let Some(resolver) = self.resolver.clone() else {
+            return false;
+        };
+        let failed = self.model_id().to_string();
+        let chain = resolver.chain(&failed);
+        let (failed_local, failed_window) = (self.answering().local, self.window());
+        // What the user can act on: a model without credentials, one a budget keeps from.
+        let mut skipped = Vec::new();
+        let mut chosen = None;
+        for id in chain.into_iter().filter(|id| *id != failed) {
+            let model = match resolver.resolve(&id, cancel.clone()).await {
+                Ok(model) => model,
+                Err(why) => {
+                    skipped.push(format!("{id} ({why})"));
+                    continue;
+                }
+            };
+            let options = model.options();
+            if options.local != failed_local
+                || model.context_window.is_none_or(|w| w < failed_window)
+            {
+                continue;
+            }
+            let account = AccountKind::of(&model.id, options.local);
+            if let Some(notice) = self.budget_check(account, events, &mut false) {
+                skipped.push(format!("{id} ({})", notice.reached_message()));
+                continue;
+            }
+            chosen = Some((model, account));
+            break;
+        }
+        if !skipped.is_empty() {
+            let _ = events.send(AgentEvent::Warning {
+                message: format!("fallback skipped: {}", skipped.join("; ")),
+            });
+        }
+        let Some((model, account)) = chosen else {
+            return false;
+        };
+        let failure = match error.kind() {
+            "quota" => "reported its usage limit",
+            "rate_limited" => "is rate limiting",
+            "unavailable" => "is unavailable",
+            _ => "failed",
+        };
+        let billing = if account == AccountKind::ApiKey {
+            "is billed"
+        } else {
+            "is not billed"
+        };
+        let _ = events.send(AgentEvent::ModelSwitched {
+            from: failed.clone(),
+            to: model.id.clone(),
+            role: self.turn_role,
+            reason: SwitchReason::Fallback,
+            detail: Some(format!("{failed} {failure}; {} {billing}", model.id)),
+        });
+        self.fell_back = true;
+        self.turn_reason = Some(SwitchReason::Fallback);
+        self.turn_model = Some(model);
+        true
     }
 
     /// The context window of the model answering the current turn.

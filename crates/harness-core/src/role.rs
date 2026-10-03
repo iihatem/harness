@@ -275,4 +275,10 @@ pub trait ModelResolver: Send + Sync {
         id: &str,
         cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<TurnModel, String>>;
+
+    /// The models a failed request on `model_id` may be sent to, in order: the `[fallback]` chain
+    /// whose glob matches it, none when no chain does.
+    fn chain(&self, _model_id: &str) -> Vec<String> {
+        Vec::new()
+    }
 }

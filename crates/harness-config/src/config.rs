@@ -476,6 +476,26 @@ impl GateSettings {
     }
 }
 
+/// Whether `id` is `<provider>/<model>`.
+fn is_model_id(id: &str) -> bool {
+    id.split_once('/')
+        .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
+}
+
+/// What is wrong with the `[fallback]` chains, if anything.
+fn fallback_problem(chains: &BTreeMap<String, Vec<String>>) -> Option<String> {
+    chains.iter().find_map(|(glob, ids)| {
+        if let Err(e) = globset::Glob::new(glob) {
+            return Some(format!("fallback.{glob:?} is not a valid glob: {e}"));
+        }
+        ids.iter().find(|id| !is_model_id(id)).map(|id| {
+            format!(
+                "fallback.{glob:?} must list provider/model ids, such as openai/gpt-5, not {id:?}"
+            )
+        })
+    })
+}
+
 /// `[roles]`: the model of each role, and `[roles.handoff]`. A project's roles need trust: they
 /// choose where a conversation is sent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -510,10 +530,7 @@ impl RoleSettings {
     fn problem(&self) -> Option<String> {
         self.named().into_iter().find_map(|(role, id)| {
             let id = id.as_deref()?;
-            let well_formed = id
-                .split_once('/')
-                .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty());
-            (!well_formed).then(|| {
+            (!is_model_id(id)).then(|| {
                 format!(
                     "roles.{role} must be a provider/model id, such as ollama/llama3, not {id:?}"
                 )
@@ -723,6 +740,9 @@ pub struct ConfigFile {
     pub lsp: LspSettings,
     #[serde(default)]
     pub roles: RoleSettings,
+    /// `[fallback]`: a model glob to the models a failed request on it is sent to, in order.
+    #[serde(default)]
+    pub fallback: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -770,6 +790,9 @@ pub struct Config {
     pub lsp: LspConfig,
     /// The model roles: the global config's, with a trusted project's over them.
     pub roles: RoleConfig,
+    /// The fallback chains by model-id glob: the global config's, with a trusted project's over
+    /// them.
+    pub fallback: BTreeMap<String, Vec<String>>,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -950,6 +973,10 @@ fn widening(project: &ConfigFile, baseline: Baseline) -> Widening {
     items.extend(project.lsp.items());
     // Roles choose which provider a conversation goes to.
     items.extend(project.roles.items());
+    // So do chains: a failed request goes to another provider, possibly billed.
+    for (glob, ids) in &project.fallback {
+        items.push(format!("fallback.{glob:?} = {ids:?}"));
+    }
     if project.sandbox.linux_git_protection == Some(LinuxGitProtection::BestEffort)
         && baseline.linux_git_protection == LinuxGitProtection::Required
     {
@@ -997,6 +1024,7 @@ pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening
         .or_else(|| project.gates.problem())
         .or_else(|| project.lsp.problem())
         .or_else(|| project.roles.problem())
+        .or_else(|| fallback_problem(&project.fallback))
     {
         return Err(ConfigError::Parse { path, message });
     }
@@ -1033,6 +1061,7 @@ pub fn load(
             .or_else(|| g.gates.problem())
             .or_else(|| g.lsp.problem())
             .or_else(|| g.roles.problem())
+            .or_else(|| fallback_problem(&g.fallback))
     }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
@@ -1061,6 +1090,7 @@ pub fn load(
         cfg.notifications = cfg.notifications.overlaid(&global.notifications);
         gates = global.gates;
         roles = global.roles;
+        cfg.fallback = global.fallback;
         cfg.lsp.overlaid(&global.lsp, true);
     }
     let path = project_file(workspace);
@@ -1076,6 +1106,7 @@ pub fn load(
             .or_else(|| project.gates.problem())
             .or_else(|| project.lsp.problem())
             .or_else(|| project.roles.problem())
+            .or_else(|| fallback_problem(&project.fallback))
         {
             return Err(ConfigError::Parse { path, message });
         }
@@ -1196,6 +1227,7 @@ pub fn load(
                 }
                 gates = gates.overlaid(&project.gates);
                 roles = roles.overlaid(&project.roles);
+                cfg.fallback.extend(project.fallback.clone());
             } else {
                 let items: Vec<&str> = widening_items.iter().map(|item| item.as_str()).collect();
                 cfg.warnings.push(format!(

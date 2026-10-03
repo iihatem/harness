@@ -30,6 +30,19 @@ impl CliResolver {
 }
 
 impl ModelResolver for CliResolver {
+    fn chain(&self, model_id: &str) -> Vec<String> {
+        harness_providers::profiles::best_match(
+            self.setup
+                .config
+                .fallback
+                .iter()
+                .map(|(glob, chain)| (glob.as_str(), chain)),
+            model_id,
+        )
+        .cloned()
+        .unwrap_or_default()
+    }
+
     fn resolve(
         &self,
         id: &str,
@@ -155,6 +168,23 @@ mod tests {
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&first.provider, &second.provider));
+    }
+
+    // The chain of a failed model is the one whose glob is the most specific, case aside.
+    #[test]
+    fn the_chain_comes_from_the_most_specific_glob() {
+        let (_dir, resolver) = resolver(
+            &format!(
+                "{LOCAL}[fallback]\n\"chatgpt/*\" = [\"openai/a\"]\n\"chatgpt/gpt-5*\" = [\"openai/b\", \"openai/c\"]\n"
+            ),
+            &[],
+        );
+        assert_eq!(
+            resolver.chain("chatgpt/gpt-5-codex"),
+            ["openai/b", "openai/c"]
+        );
+        assert_eq!(resolver.chain("ChatGPT/o3"), ["openai/a"]);
+        assert!(resolver.chain("openai/gpt-5").is_empty());
     }
 
     #[tokio::test]

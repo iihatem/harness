@@ -89,6 +89,8 @@ impl Ran {
 pub struct ScriptedBash {
     pub ran: Arc<Ran>,
     outputs: Mutex<HashMap<String, Vec<ToolOutput>>>,
+    /// Called as a command starts, for what the user does while it runs.
+    hooks: HashMap<String, Box<dyn Fn() + Send + Sync>>,
 }
 
 impl ScriptedBash {
@@ -103,9 +105,16 @@ impl ScriptedBash {
                         .map(|(command, outputs)| (command.to_string(), outputs))
                         .collect(),
                 ),
+                hooks: HashMap::new(),
             },
             ran,
         )
+    }
+
+    /// Calls `hook` each time `command` starts.
+    pub fn during(mut self, command: &str, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.hooks.insert(command.to_string(), Box::new(hook));
+        self
     }
 }
 
@@ -129,6 +138,9 @@ impl Tool for ScriptedBash {
             .lock()
             .unwrap()
             .push(args["timeout_secs"].as_u64());
+        if let Some(hook) = self.hooks.get(&command) {
+            hook();
+        }
         let mut outputs = self.outputs.lock().unwrap();
         match outputs.get_mut(&command) {
             Some(list) if list.len() > 1 => list.remove(0),

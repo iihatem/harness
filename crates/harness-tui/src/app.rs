@@ -1204,6 +1204,7 @@ impl App {
                 TurnEndReason::Error => Some("the turn stopped with an error"),
                 TurnEndReason::StepLimit => Some("the turn stopped at the step limit"),
                 TurnEndReason::Budget => Some("the turn stopped at its budget"),
+                TurnEndReason::GateFailed => Some("the turn stopped: the tests still fail"),
                 TurnEndReason::Interrupted => None,
             };
             if let Some(how) = how.filter(|_| took >= notify::LONG_TURN) {

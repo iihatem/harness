@@ -14,6 +14,9 @@ pub enum TurnEndReason {
     Error,
     /// A money budget was reached, so the next request was not sent.
     Budget,
+    /// The tests still failed when the turn had to stop: the retries were used up, or the same
+    /// failure came twice.
+    GateFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +27,7 @@ pub enum ErrorKind {
 }
 
 impl TurnEndReason {
-    /// The word for it in records: `completed`, `step_limit`, `interrupted`, `error`, `budget`.
+    /// The word for it in records: `completed`, `step_limit`, `interrupted`, `error`, `budget`, `gate_failed`.
     pub fn as_str(self) -> &'static str {
         match self {
             TurnEndReason::Completed => "completed",
@@ -32,6 +35,7 @@ impl TurnEndReason {
             TurnEndReason::Interrupted => "interrupted",
             TurnEndReason::Error => "error",
             TurnEndReason::Budget => "budget",
+            TurnEndReason::GateFailed => "gate_failed",
         }
     }
 }

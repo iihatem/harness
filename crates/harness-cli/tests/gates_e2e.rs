@@ -154,3 +154,57 @@ async fn a_gate_command_that_needs_approval_blocks_a_headless_run() {
     assert!(result.contains("after_edit gate blocked"), "{result}");
     assert!(events.iter().any(|e| e["type"] == "action_blocked"));
 }
+
+// Spec "A headless run ends on a gate failure": the final turn-finished event carries the reason
+// `gate_failed`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_headless_run_that_ends_on_a_gate_failure_says_gate_failed() {
+    let server = MockServer::start().await;
+    write_then_answer(&server).await;
+    let (home, ws) = env(
+        &server.uri(),
+        "[gates]\ntest = \"echo '1 test failed'; exit 1\"\n",
+    );
+    let output = tokio::task::spawn_blocking(move || {
+        cmd(&home, &ws)
+            .args(["--mode", "full-access", "ask", "--json", "make hello.txt"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let events = events(&output.stdout);
+    let last = events.last().unwrap();
+    assert_eq!(last["type"], "turn_finished");
+    assert_eq!(last["reason"], "gate_failed");
+    assert!(events.iter().any(|e| {
+        e["type"] == "gate_result"
+            && e["gate"] == "test"
+            && e["tail"]
+                .as_str()
+                .is_some_and(|t| t.contains("1 test failed"))
+    }));
+    assert_eq!(output.status.code(), Some(1));
+}
+
+// Spec "No gates configured": a finished turn runs no gate command.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_gates_a_turn_that_wrote_a_file_runs_nothing_at_its_end() {
+    let server = MockServer::start().await;
+    write_then_answer(&server).await;
+    let (home, ws) = env(&server.uri(), "");
+    let output = tokio::task::spawn_blocking(move || {
+        cmd(&home, &ws)
+            .args(["--mode", "full-access", "ask", "--json", "make hello.txt"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(output.status.success());
+    assert!(
+        !events(&output.stdout)
+            .iter()
+            .any(|e| e["type"] == "gate_result")
+    );
+}

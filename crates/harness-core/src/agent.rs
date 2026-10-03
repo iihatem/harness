@@ -377,6 +377,8 @@ pub struct Agent {
     turn_changed: bool,
     /// Gate commands run so far, for their call ids.
     gate_calls: u64,
+    /// What the end-of-turn test gate has done in the current turn.
+    gate_turn: gates::GateTurn,
 }
 
 impl Agent {
@@ -431,6 +433,7 @@ impl Agent {
             gates: Gates::default(),
             turn_changed: false,
             gate_calls: 0,
+            gate_turn: gates::GateTurn::default(),
         }
     }
 
@@ -1062,6 +1065,7 @@ impl Agent {
         self.turn_started = Some((Instant::now(), crate::time::now_unix()));
         self.turn_checkpointed = false;
         self.turn_changed = false;
+        self.gate_turn = gates::GateTurn::default();
         // Settings that apply to this turn only.
         self.turn_model = input.model.clone();
         self.policy.set_turn_rules(Some(input.rules.clone()));
@@ -1154,7 +1158,10 @@ impl Agent {
                 continue;
             }
             if calls.is_empty() {
-                return self.finish(TurnEndReason::Completed, events);
+                match self.end_of_turn(events, &cancel).await {
+                    gates::EndOfTurn::Finish(reason) => return self.finish(reason, events),
+                    gates::EndOfTurn::Continue => continue,
+                }
             }
             for (index, call) in calls.iter().enumerate() {
                 if cancel.is_cancelled() {
@@ -1215,11 +1222,14 @@ impl Agent {
     }
 
     /// Adds what the user sent during the turn to the conversation, after the tool results.
-    fn deliver_steering(&mut self, events: &UnboundedSender<AgentEvent>) {
+    /// Whether there was anything to deliver.
+    fn deliver_steering(&mut self, events: &UnboundedSender<AgentEvent>) -> bool {
         let Some(steering) = &self.steering else {
-            return;
+            return false;
         };
-        for text in steering.take() {
+        let taken = steering.take();
+        let any = !taken.is_empty();
+        for text in taken {
             self.record(
                 Message::User {
                     content: text.clone(),
@@ -1229,6 +1239,7 @@ impl Agent {
             );
             let _ = events.send(AgentEvent::Steered { text });
         }
+        any
     }
 
     /// The turn's user message: text parts as they are, and each shell part replaced by the output

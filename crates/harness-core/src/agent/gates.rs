@@ -5,11 +5,14 @@
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
 
+use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
+
 use super::Agent;
 use crate::{
-    event::{AgentEvent, GateKind, GateStatus},
+    event::{AgentEvent, GateKind, GateStatus, TurnEndReason},
     gate::{Outcome, outcome, tail},
-    message::ToolCall,
+    message::{Message, ToolCall},
     output::spill,
     permission::{Action, Decision, Mode},
 };
@@ -161,5 +164,100 @@ impl Agent {
             omitted,
             saved,
         })
+    }
+}
+
+/// What the end-of-turn gate has done in the current turn.
+#[derive(Default)]
+pub(super) struct GateTurn {
+    /// Continuations a failed test has caused.
+    retries: u32,
+    /// The exit code and a hash of the output tail of the last failure.
+    last_failure: Option<(Option<i32>, String)>,
+    /// The test command was blocked, and the model was told.
+    blocked: bool,
+}
+
+/// What happens when the model ends its turn.
+pub(super) enum EndOfTurn {
+    Finish(TurnEndReason),
+    /// A gate result was added to the conversation: the model answers it.
+    Continue,
+}
+
+impl Agent {
+    /// The model ended its turn without calling a tool: runs the test gate when the turn changed
+    /// files, and decides whether the turn is over.
+    pub(super) async fn end_of_turn(
+        &mut self,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> EndOfTurn {
+        let done = EndOfTurn::Finish(TurnEndReason::Completed);
+        let Some(command) = self.gates.test.clone() else {
+            return done;
+        };
+        if self.gates_skipped() {
+            let _ = events.send(AgentEvent::GateResult {
+                gate: GateKind::Test,
+                command: Some(command),
+                status: GateStatus::Skipped,
+                exit_code: None,
+                tail: None,
+            });
+            return done;
+        }
+        if !self.turn_changed || self.gate_turn.blocked {
+            return done;
+        }
+        let Some(run) = self.run_gate(GateKind::Test, &command, events).await else {
+            return done;
+        };
+        if run.outcome.interrupted || cancel.is_cancelled() {
+            return EndOfTurn::Finish(TurnEndReason::Interrupted);
+        }
+        match run.outcome.status {
+            GateStatus::Passed => {
+                // Changes the tests have passed on need no second run.
+                self.turn_changed = false;
+                self.gate_turn.last_failure = None;
+                if self.deliver_steering(events) {
+                    return EndOfTurn::Continue;
+                }
+                done
+            }
+            // The model is told once that the command could not run, which retrying would not
+            // change; it is no test failure.
+            GateStatus::Blocked | GateStatus::Skipped => {
+                self.gate_turn.blocked = true;
+                self.tell_gate_result(&run);
+                self.deliver_steering(events);
+                EndOfTurn::Continue
+            }
+            GateStatus::Failed | GateStatus::TimedOut => {
+                let key = (
+                    run.outcome.exit_code,
+                    hex::encode(Sha256::digest(run.tail.as_bytes())),
+                );
+                let identical = self.gate_turn.last_failure.as_ref() == Some(&key);
+                self.gate_turn.last_failure = Some(key);
+                self.tell_gate_result(&run);
+                if identical || self.gate_turn.retries >= self.gates.max_retries {
+                    return EndOfTurn::Finish(TurnEndReason::GateFailed);
+                }
+                self.gate_turn.retries += 1;
+                self.deliver_steering(events);
+                EndOfTurn::Continue
+            }
+        }
+    }
+
+    /// Adds what the gate found to the conversation, for the model to read.
+    fn tell_gate_result(&mut self, run: &GateRun) {
+        let text = format!(
+            "[harness] Gate result: {}",
+            run.report(self.gates.timeout_s)
+        );
+        self.record(Message::User { content: text }, None, true);
     }
 }

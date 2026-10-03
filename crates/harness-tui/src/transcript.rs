@@ -236,7 +236,12 @@ impl Transcript {
                         self.push_error("stopped after reaching the step limit", width)
                     }
                     // The budget event just before said which budget, and how to raise it.
-                    TurnEndReason::Completed | TurnEndReason::Error | TurnEndReason::Budget => {}
+                    TurnEndReason::Budget => {}
+                    TurnEndReason::GateFailed => self.push_error(
+                        "stopped because the tests still fail; the last failure is above",
+                        width,
+                    ),
+                    TurnEndReason::Completed | TurnEndReason::Error => {}
                 }
             }
             AgentEvent::TurnStats {

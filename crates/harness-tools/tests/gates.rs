@@ -122,3 +122,96 @@ async fn a_lint_that_runs_too_long_is_stopped_and_reported() {
         }
     )));
 }
+
+/// A turn that reads and edits `app.py` and ends twice, as a model does that is told its tests
+/// fail and answers without changing anything; the user messages of the last request.
+async fn test_turn(gates: Gates) -> (harness_core::event::TurnEndReason, Vec<AgentEvent>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "print(1)\n").unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("r1", "read", json!({"path": "app.py"})),
+        Script::tool_call(
+            "e1",
+            "edit",
+            json!({"path": "app.py", "old_string": "print(1)", "new_string": "print(2)"}),
+        ),
+        Script::text("done"),
+        Script::text("still done"),
+        Script::text("and again"),
+    ]);
+    let mut agent = agent(dir.path(), provider.clone(), gates);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let reason = agent
+        .run_turn("change it".to_string(), &tx, CancellationToken::new())
+        .await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let last = provider.requests().last().unwrap().messages.clone();
+    let users: Vec<String> = last
+        .iter()
+        .filter_map(|m| match m {
+            harness_core::message::Message::User { content } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    (reason, events, users.join("\n---\n"))
+}
+
+// Spec "A gate times out": `sleep 600` with `timeout_s = 5` (here 1): the command stops, and the
+// model receives a gate result saying it timed out.
+#[tokio::test]
+async fn a_test_command_that_runs_too_long_is_stopped_and_the_model_is_told() {
+    let started = std::time::Instant::now();
+    let (reason, events, seen) = test_turn(Gates {
+        test: Some("sleep 600".into()),
+        timeout_s: 1,
+        ..Gates::default()
+    })
+    .await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert!(seen.contains("test gate timed out after 1s"), "{seen}");
+    // Timing out twice with nothing printed is an identical failure.
+    assert_eq!(reason, harness_core::event::TurnEndReason::GateFailed);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::GateResult {
+            gate: GateKind::Test,
+            status: GateStatus::TimedOut,
+            ..
+        }
+    )));
+}
+
+// Spec "Tests fail, then pass", with the real bash tool.
+#[tokio::test]
+async fn a_real_failing_test_command_sends_its_exit_code_and_tail() {
+    let (reason, _, seen) = test_turn(Gates {
+        test: Some("echo '2 tests failed'; exit 3".into()),
+        ..Gates::default()
+    })
+    .await;
+    assert!(seen.contains("exit code 3"), "{seen}");
+    assert!(seen.contains("2 tests failed"), "{seen}");
+    assert_eq!(reason, harness_core::event::TurnEndReason::GateFailed);
+}
+
+#[tokio::test]
+async fn a_passing_real_test_command_finishes_the_turn() {
+    let (reason, events, _) = test_turn(Gates {
+        test: Some("true".into()),
+        ..Gates::default()
+    })
+    .await;
+    assert_eq!(reason, harness_core::event::TurnEndReason::Completed);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::GateResult {
+            gate: GateKind::Test,
+            status: GateStatus::Passed,
+            ..
+        }
+    )));
+}

@@ -196,6 +196,11 @@ pub trait Host: Send {
     ) -> BoxFuture<'static, Result<OpenedSession, String>> {
         Box::pin(async { Err("this session cannot change".to_string()) })
     }
+    /// The first run's model answered a request, so it can be kept as the default (what it
+    /// saved, or why it could not, is returned as notes to show).
+    fn model_answered(&self, _model: &str) -> Vec<String> {
+        Vec::new()
+    }
     /// The ids of the models harness finds: local servers', and those of providers with a key
     /// or a sign-in.
     fn models(&self) -> BoxFuture<'static, Vec<String>> {
@@ -223,6 +228,41 @@ pub trait Host: Send {
     ) -> BoxFuture<'static, Result<String, String>> {
         Box::pin(async { Err("sign-in is not available here".into()) })
     }
+}
+
+/// A model that has not answered yet: its id cannot be checked offline, so a wrong one shows up
+/// as a refused request.
+struct Unproven {
+    id: String,
+    /// The model before a `/model` switch, to offer the way back.
+    previous: Option<String>,
+    /// The first run's choice, kept as the default only once it has answered.
+    first_run: bool,
+}
+
+/// Whether `message`, of a failed request, says the model is the problem: it is not found, or the
+/// request is refused with a 4xx other than a key, a timeout or a rate limit.
+fn refuses_the_model(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    if lower.contains("not found")
+        || lower.contains("model_not_found")
+        || lower.contains("does not exist")
+    {
+        return true;
+    }
+    let Some(at) = message
+        .find("HTTP ")
+        .map(|i| i + 5)
+        .or_else(|| message.find("reported ").map(|i| i + 9))
+    else {
+        return false;
+    };
+    let status: String = message[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    matches!(status.parse::<u16>(), Ok(400..=499))
+        && !matches!(status.as_str(), "401" | "403" | "408" | "429")
 }
 
 /// Settings of the interactive session.
@@ -325,6 +365,8 @@ pub struct App {
     plan_note_pending: bool,
     /// A plan waiting for the user's choice.
     plan_choice: Option<PlanChoice>,
+    /// The model the session uses, until it has answered once.
+    unproven: Option<Unproven>,
     /// When the running turn started.
     turn_started: Option<Instant>,
     /// Notifications to send.
@@ -391,6 +433,7 @@ impl App {
             default_mode: options.default_mode,
             plan_note_pending: options.mode == Mode::Plan,
             plan_choice: None,
+            unproven: None,
             turn_started: None,
             notifications: Vec::new(),
             workspace: options.workspace,
@@ -517,7 +560,12 @@ impl App {
                     Ok(view) => {
                         self.transcript
                             .push_note(&format!("switched to {}", view.id), width);
-                        self.model = view.id;
+                        let previous = std::mem::replace(&mut self.model, view.id.clone());
+                        self.unproven = Some(Unproven {
+                            id: view.id,
+                            previous: Some(previous),
+                            first_run: false,
+                        });
                         self.window_note = Some(view.window_note);
                     }
                     Err(why) => {
@@ -537,6 +585,16 @@ impl App {
     /// one: a session that started in another mode was not told as it started.
     pub fn set_write_mode_warning(&mut self, warning: Option<String>) {
         self.write_mode_warning = warning;
+    }
+
+    /// The session's model is the first run's choice, which the host keeps as the default once
+    /// the model has answered.
+    pub fn set_first_run_model(&mut self) {
+        self.unproven = Some(Unproven {
+            id: self.model.clone(),
+            previous: None,
+            first_run: true,
+        });
     }
 
     /// Shows approvals with the secrets `redactor` knows replaced.
@@ -697,8 +755,11 @@ impl App {
                 self.turn_started = Some(now);
                 self.ran_tools = false;
             }
-            AgentEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
-                self.last_reply = content.clone();
+            AgentEvent::AssistantMessage { content, .. } => {
+                if !content.trim().is_empty() {
+                    self.last_reply = content.clone();
+                }
+                self.model_proven();
             }
             AgentEvent::ToolCallRequested { .. } => self.ran_tools = true,
             AgentEvent::TurnFinished { reason } => self.turn_ended(*reason, now),
@@ -711,6 +772,47 @@ impl App {
             _ => {}
         }
         self.transcript.on_event(event, self.width);
+        if let AgentEvent::Error { message, .. } = event {
+            self.model_refused(message);
+        }
+    }
+
+    /// The model answered: the first run's choice is kept as the default.
+    fn model_proven(&mut self) {
+        let Some(proven) = self.unproven.take() else {
+            return;
+        };
+        if proven.first_run {
+            for note in self.host.model_answered(&proven.id) {
+                self.push_note(&note);
+            }
+        }
+    }
+
+    /// A request failed before the model had answered once: says so when the model is the
+    /// problem.
+    fn model_refused(&mut self, message: &str) {
+        if !refuses_the_model(message) {
+            return;
+        }
+        let Some(failed) = self.unproven.take() else {
+            return;
+        };
+        let note = match (&failed.previous, failed.first_run) {
+            (_, true) => format!(
+                "{} did not answer, so it is not saved as your default; /model picks another",
+                failed.id
+            ),
+            (Some(previous), false) => format!(
+                "{} did not accept the request; /model {previous} switches back",
+                failed.id
+            ),
+            (None, false) => format!(
+                "{} did not accept the request; /model picks another",
+                failed.id
+            ),
+        };
+        self.push_note(&note);
     }
 
     /// A turn ended. Send-now input it did not take is sent next, before queued input. After an

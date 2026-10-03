@@ -21,12 +21,18 @@ use crate::{
     slash::{self, Message},
 };
 
+/// One session is opened at a time, so that a cancelled opening has let go of its session (its
+/// file's lock) before the next one is opened.
+static OPENING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct CliHost {
     pub setup: Arc<Setup>,
     pub commands: Commands,
     pub policy: Arc<PermissionEngine>,
     /// Where sandboxed commands can write, which a session's checkpoints must stay out of.
     pub writable: Vec<PathBuf>,
+    /// The first run's model, to be saved as the default once it has answered.
+    pub unsaved_default: std::sync::Mutex<Option<String>>,
 }
 
 impl Host for CliHost {
@@ -73,26 +79,59 @@ impl Host for CliHost {
         let setup = self.setup.clone();
         let writable = self.writable.clone();
         // Reading the file and opening the checkpoints (which runs `git`) block, so they run on
-        // a thread meant for that.
-        let opening = tokio::task::spawn_blocking(move || {
+        // a thread meant for that. Esc does not wait for it, but a session it opened stops
+        // being held before the next one is opened: that one waits its turn on the thread, and
+        // this one drops its session while still holding it.
+        let (done, opened) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let _turn = OPENING.lock().unwrap_or_else(|e| e.into_inner());
             // Nothing may print while the terminal UI runs: the UI shows the warnings.
             let mut notices = Notices::quiet(setup.redactor.clone());
-            let session =
-                sessions::open_listing(&setup, &choice, &mut notices, "`/resume` lists them")?;
-            let checkpoints = sessions::checkpoints(&setup, &session, &writable, &mut notices);
-            Ok(OpenedSession {
-                session,
-                checkpoints,
-                warnings: notices.into_messages(),
-            })
+            let opened =
+                sessions::open_listing(&setup, &choice, &mut notices, "`/resume` lists them").map(
+                    |session| {
+                        let checkpoints =
+                            sessions::checkpoints(&setup, &session, &writable, &mut notices);
+                        OpenedSession {
+                            session,
+                            checkpoints,
+                            warnings: notices.into_messages(),
+                        }
+                    },
+                );
+            // Nobody is waiting once Esc was pressed: the session is dropped here.
+            let _ = done.send(opened);
         });
         Box::pin(async move {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => Err("stopped".to_string()),
-                opened = opening => opened.unwrap_or_else(|e| Err(format!("opening it failed: {e}"))),
+                opened = opened => opened.unwrap_or_else(|e| Err(format!("opening it failed: {e}"))),
             }
         })
+    }
+
+    fn model_answered(&self, model: &str) -> Vec<String> {
+        let mut unsaved = self
+            .unsaved_default
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if unsaved.as_deref() != Some(model) {
+            return Vec::new();
+        }
+        *unsaved = None;
+        let global = self.setup.paths.global_config_file();
+        let note = match harness_config::config::save_default_model(&global, model) {
+            Ok(()) => format!(
+                "saved {model} as your default model in {}",
+                global.display()
+            ),
+            Err(e) => format!(
+                "cannot save {model} as the default model in {}: {e}",
+                global.display()
+            ),
+        };
+        vec![self.setup.redactor.redact(&note)]
     }
 
     fn models(&self) -> BoxFuture<'static, Vec<String>> {
@@ -125,8 +164,20 @@ impl Host for CliHost {
         let setup = self.setup.clone();
         let id = id.to_string();
         Box::pin(async move {
-            let resolved = registry::resolve(&id, &setup.config.providers, setup.keys())
-                .map_err(|e| e.to_string())?;
+            // Looking up the key can wait on the keychain (an unlock prompt, say), so it runs on a
+            // thread meant for blocking, and Esc stops the wait.
+            let resolving = {
+                let (setup, id) = (setup.clone(), id.clone());
+                tokio::task::spawn_blocking(move || {
+                    registry::resolve(&id, &setup.config.providers, setup.keys())
+                        .map_err(|e| e.to_string())
+                })
+            };
+            let resolved = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err("stopped".to_string()),
+                resolved = resolving => resolved.map_err(|e| format!("resolving it failed: {e}"))??,
+            };
             let model = crate::start::model_setup(&setup, &resolved, &cancel)
                 .await
                 .ok_or("stopped")?;
@@ -215,7 +266,129 @@ pub mod tests {
             commands: Commands::default(),
             policy,
             writable: Vec::new(),
+            unsaved_default: Default::default(),
         }
+    }
+
+    // Final review minor 1: the first run's choice becomes the default only once it has answered.
+    #[test]
+    fn the_first_runs_model_is_saved_once_it_answers_and_not_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, workspace) = (dir.path().join("home"), dir.path().join("work"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let host = host(&home, &workspace.canonicalize().unwrap());
+        let global = host.setup.paths.global_config_file();
+        *host.unsaved_default.lock().unwrap() = Some("ollama/llama3".into());
+        assert!(!global.exists());
+        // Another model's answer saves nothing.
+        assert!(host.model_answered("ollama/other").is_empty());
+        assert!(!global.exists());
+        let notes = host.model_answered("ollama/llama3");
+        assert!(
+            notes[0].contains("saved ollama/llama3 as your default"),
+            "{notes:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&global).unwrap(),
+            "model = \"ollama/llama3\"\n"
+        );
+        // Once.
+        assert!(host.model_answered("ollama/llama3").is_empty());
+    }
+
+    /// A keychain that does not answer until `release` is dropped or sent to.
+    struct Stuck {
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl harness_providers::credentials::SecretStore for Stuck {
+        fn get(
+            &self,
+            _: &str,
+        ) -> Result<Option<String>, harness_providers::credentials::CredentialError> {
+            let _ = self.release.lock().unwrap().recv();
+            Ok(None)
+        }
+        fn set(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<(), harness_providers::credentials::CredentialError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<bool, harness_providers::credentials::CredentialError> {
+            Ok(false)
+        }
+        fn describe(&self) -> String {
+            "a stuck keychain".into()
+        }
+    }
+
+    // Final review minor 3: Esc stops a `/model` switch that waits on the keychain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn esc_stops_a_switch_waiting_on_the_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, workspace) = (dir.path().join("home"), dir.path().join("work"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut host = host(&home, &workspace.canonicalize().unwrap());
+        let (release, wait) = std::sync::mpsc::channel();
+        let mut setup = Arc::try_unwrap(host.setup).ok().expect("the only owner");
+        setup.credentials = Arc::new(harness_providers::credentials::Credentials::with_keychain(
+            &setup.paths.data_dir,
+            Some(Box::new(Stuck {
+                release: std::sync::Mutex::new(wait),
+            })),
+        ));
+        host.setup = Arc::new(setup);
+        let cancel = CancellationToken::new();
+        let switching = host.switch_model("openai/gpt-4o", cancel.clone());
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            stop.cancel();
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), switching)
+            .await
+            .expect("Esc stops the wait");
+        assert_eq!(result.err().as_deref(), Some("stopped"));
+        drop(release);
+    }
+
+    // Final review minor 3: a cancelled `/resume` lets go of the session before a retry opens it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // holding the turn is the point
+    async fn a_cancelled_resume_releases_the_session_before_a_retry() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let host = host(home.path(), &workspace);
+        let mut opened = open(&host, None).unwrap();
+        opened.session.append(EntryKind::Message {
+            message: Said::User {
+                content: "hello".into(),
+            },
+            display: None,
+            note: false,
+            plan: None,
+        });
+        let id = opened.session.id().to_string();
+        drop(opened);
+        // The cancelled opening is still on its thread when Esc returns, here held up by the
+        // turn it waits for; a retry must not open the session until that one has let go of it.
+        let turn = OPENING.lock().unwrap();
+        let stopped = CancellationToken::new();
+        let first = host.open_session(Some(&id), stopped.clone());
+        stopped.cancel();
+        assert_eq!(first.await.err().as_deref(), Some("stopped"));
+        let mut retry = host.open_session(Some(&id), CancellationToken::new());
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut retry).await;
+        assert!(
+            early.is_err(),
+            "the retry opened while the cancelled one was still going"
+        );
+        drop(turn);
+        let retry = retry.await;
+        assert!(retry.is_ok(), "{:?}", retry.err());
     }
 
     /// What the host opens, waited for.
@@ -473,6 +646,7 @@ pub mod tests {
             commands: Commands::default(),
             policy,
             writable,
+            unsaved_default: Default::default(),
         };
         let options = Options {
             theme: Theme::monochrome(),
@@ -685,6 +859,7 @@ pub mod tests {
             commands: Commands::default(),
             policy,
             writable,
+            unsaved_default: Default::default(),
         };
         let options = Options {
             theme: Theme::monochrome(),

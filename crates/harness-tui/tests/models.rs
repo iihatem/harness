@@ -26,6 +26,8 @@ struct Models {
     models: HashMap<String, (Arc<MockProvider>, u64)>,
     /// Switching waits until it is cancelled.
     stuck: bool,
+    /// The models the session reported as having answered.
+    answered: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Host for Models {
@@ -34,6 +36,10 @@ impl Host for Models {
     }
     fn prepare(&mut self, _typed: &str) -> Prepared {
         unreachable!()
+    }
+    fn model_answered(&self, model: &str) -> Vec<String> {
+        self.answered.lock().unwrap().push(model.to_string());
+        vec![format!("saved {model} as your default model")]
     }
     fn models(&self) -> BoxFuture<'static, Vec<String>> {
         let mut ids: Vec<String> = self.models.keys().cloned().collect();
@@ -287,5 +293,91 @@ async fn chatgpt_models_are_marked_as_such_in_the_picker() {
     assert_eq!(chatgpt.map(|i| i.detail.as_str()), Some("ChatGPT plan"));
     let current = items.iter().find(|i| i.label == "mock/m");
     assert_eq!(current.map(|i| i.detail.as_str()), Some("(current)"));
+    ui.finish().await.unwrap();
+}
+
+fn http(status: u16) -> Script {
+    Script::error(harness_core::provider::ProviderError::Http {
+        status,
+        body: "no such model".into(),
+        retry_after: None,
+    })
+}
+
+// Final review minor 1: nothing can validate a model id offline, so the first run's choice is
+// saved (by the host) only once the model has answered.
+#[tokio::test]
+async fn the_first_runs_model_is_reported_once_it_has_answered() {
+    let first = MockProvider::new(vec![Script::text("hello there")]);
+    let host = Models::default();
+    let answered = host.answered.clone();
+    let (mut ui, _log, _dir) = open(first, host);
+    ui.app_mut().set_first_run_model();
+    assert!(answered.lock().unwrap().is_empty());
+    send(&mut ui, "hi");
+    settle(&mut ui).await;
+    assert_eq!(*answered.lock().unwrap(), ["mock/m"]);
+    assert!(shows(&ui, "saved mock/m as your default model"));
+    send(&mut ui, "again");
+    settle(&mut ui).await;
+    assert_eq!(answered.lock().unwrap().len(), 1);
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_first_run_model_that_fails_is_not_saved_and_the_user_is_told_to_pick_again() {
+    let first = MockProvider::new(vec![http(404)]);
+    let host = Models::default();
+    let answered = host.answered.clone();
+    let (mut ui, _log, _dir) = open(first, host);
+    ui.app_mut().set_first_run_model();
+    send(&mut ui, "hi");
+    settle(&mut ui).await;
+    assert!(answered.lock().unwrap().is_empty());
+    assert!(
+        shows(
+            &ui,
+            "mock/m did not answer, so it is not saved as your default; /model picks another"
+        ),
+        "{:#?}",
+        screen(&ui)
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_switched_to_model_whose_request_is_refused_says_which_and_offers_the_way_back() {
+    let (first, big, host) = two_models();
+    drop(big);
+    let big = MockProvider::new(vec![http(400)]);
+    let mut host = host;
+    host.models.insert("mock/big".into(), (big, 200_000));
+    let (mut ui, _log, _dir) = open(first, host);
+    send(&mut ui, "/model mock/big");
+    settle(&mut ui).await;
+    send(&mut ui, "hi");
+    settle(&mut ui).await;
+    assert!(
+        shows(
+            &ui,
+            "mock/big did not accept the request; /model mock/m switches back"
+        ),
+        "{:#?}",
+        screen(&ui)
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_network_error_does_not_blame_the_model() {
+    let first = MockProvider::new(vec![Script::error(
+        harness_core::provider::ProviderError::Network("down".into()),
+    )]);
+    let host = Models::default();
+    let (mut ui, _log, _dir) = open(first, host);
+    ui.app_mut().set_first_run_model();
+    send(&mut ui, "hi");
+    settle(&mut ui).await;
+    assert!(!shows(&ui, "did not answer"), "{:#?}", screen(&ui));
     ui.finish().await.unwrap();
 }

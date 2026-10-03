@@ -363,3 +363,162 @@ async fn a_request_that_fails_mid_stream_keeps_the_usage_reported_before() {
     assert!(records[0].outcome.starts_with("error:"), "{:?}", records[0]);
     assert_eq!(records[0].usage.input_tokens, 900);
 }
+
+fn usage_events(input: u64) -> Vec<Result<ProviderEvent, ProviderError>> {
+    vec![Ok(ProviderEvent::Usage(Usage {
+        input_tokens: input,
+        output_tokens: 7,
+        ..Usage::default()
+    }))]
+}
+
+/// A session with one answered turn, then a compaction whose summary request is `summary`.
+/// Returns the records and how the compaction ended.
+async fn compaction_with(
+    summary: Vec<Script>,
+    cancel: Option<CancellationToken>,
+) -> (Vec<RequestRecord>, bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut script = vec![Script::text("hi")];
+    script.extend(summary);
+    let provider = MockProvider::new(script);
+    let meter = Arc::new(Recording::default());
+    let mut agent =
+        agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path()).with_meter(meter.clone());
+    run(&mut agent, "hello").await;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = agent.compact(None, &tx, cancel.unwrap_or_default()).await;
+    let records = meter.records.lock().unwrap().clone();
+    (records, result.is_ok())
+}
+
+// Final review, Important 2: a summary request is billed whatever becomes of its result.
+#[tokio::test]
+async fn a_summary_that_was_cut_off_is_metered() {
+    let mut events = vec![Ok(ProviderEvent::TextDelta("half a summ".into()))];
+    events.extend(usage_events(5_000));
+    events.push(Ok(ProviderEvent::Finished(FinishReason::Length)));
+    let (records, ok) = compaction_with(vec![Script::Reply(events)], None).await;
+    assert!(!ok);
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[1].usage.input_tokens, 5_000);
+    assert_eq!(records[1].outcome, "error:incomplete");
+}
+
+#[tokio::test]
+async fn an_empty_summary_is_metered() {
+    let mut events = usage_events(5_000);
+    events.push(Ok(ProviderEvent::Finished(FinishReason::Stop)));
+    let (records, ok) = compaction_with(vec![Script::Reply(events)], None).await;
+    assert!(!ok);
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[1].usage.input_tokens, 5_000);
+    assert_eq!(records[1].outcome, "error:incomplete");
+}
+
+#[tokio::test]
+async fn a_summary_request_that_failed_after_reporting_usage_is_metered() {
+    let mut events = usage_events(5_000);
+    events.push(Err(ProviderError::Http {
+        status: 404,
+        body: String::new(),
+        retry_after: None,
+    }));
+    let (records, ok) = compaction_with(vec![Script::Reply(events)], None).await;
+    assert!(!ok);
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[1].usage.input_tokens, 5_000);
+    assert_eq!(records[1].outcome, "error:rejected");
+}
+
+#[tokio::test]
+async fn a_summary_request_rejected_as_too_long_is_metered_with_its_usage() {
+    let mut events = usage_events(5_000);
+    events.push(Err(ProviderError::Http {
+        status: 400,
+        body: "This model's maximum context length is 8192 tokens".into(),
+        retry_after: None,
+    }));
+    let (records, ok) = compaction_with(vec![Script::Reply(events)], None).await;
+    assert!(!ok);
+    assert!(records.len() >= 2, "{records:?}");
+    assert_eq!(records[1].usage.input_tokens, 5_000);
+    assert_eq!(records[1].outcome, "error:context_overflow");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_summary_request_the_user_stopped_is_metered_with_its_usage() {
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.cancel();
+    });
+    let (records, ok) = compaction_with(
+        vec![Script::Hang(
+            usage_events(5_000)
+                .into_iter()
+                .map(Result::unwrap)
+                .collect(),
+        )],
+        Some(cancel),
+    )
+    .await;
+    assert!(!ok);
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[1].usage.input_tokens, 5_000);
+    assert_eq!(records[1].outcome, "error:interrupted");
+}
+
+// Minor 3: what an attempt reported before it was retried is its own ledger record, with the
+// outcome `error:<kind>`; the attempt that answers is the request's own record.
+#[tokio::test(start_paused = true)]
+async fn usage_an_attempt_reported_before_it_was_retried_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut failing = usage_events(300);
+    failing.push(Err(ProviderError::Http {
+        status: 503,
+        body: String::new(),
+        retry_after: None,
+    }));
+    let provider = MockProvider::new(vec![
+        Script::Reply(failing),
+        reply_with_usage(None, 100, 10),
+    ]);
+    let meter = Arc::new(Recording::default());
+    let mut agent =
+        agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path()).with_meter(meter.clone());
+    run(&mut agent, "go").await;
+    let records = meter.records.lock().unwrap().clone();
+    let seen: Vec<(&str, u64)> = records
+        .iter()
+        .map(|r| (r.outcome.as_str(), r.usage.input_tokens))
+        .collect();
+    assert_eq!(seen, [("error:unavailable", 300), ("ok", 100)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn usage_a_summary_attempt_reported_before_it_was_retried_is_recorded() {
+    let mut failing = usage_events(300);
+    failing.push(Err(ProviderError::Http {
+        status: 503,
+        body: String::new(),
+        retry_after: None,
+    }));
+    let ok = vec![
+        Ok(ProviderEvent::TextDelta("the summary".into())),
+        Ok(ProviderEvent::Usage(Usage {
+            input_tokens: 100,
+            ..Usage::default()
+        })),
+        Ok(ProviderEvent::Finished(FinishReason::Stop)),
+    ];
+    let (records, done) =
+        compaction_with(vec![Script::Reply(failing), Script::Reply(ok)], None).await;
+    assert!(done);
+    let seen: Vec<(&str, u64)> = records[1..]
+        .iter()
+        .map(|r| (r.outcome.as_str(), r.usage.input_tokens))
+        .collect();
+    assert_eq!(seen, [("error:unavailable", 300), ("ok", 100)]);
+}

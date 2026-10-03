@@ -1450,57 +1450,68 @@ impl Agent {
         let mut attempt = 1;
         let started = Instant::now();
         loop {
-            let collect = async {
-                let mut text = String::new();
-                let mut finish = None;
-                let mut usage = None;
-                let mut stream = provider.stream(request.clone());
-                while let Some(item) = stream.next().await {
-                    match item? {
-                        ProviderEvent::TextDelta(delta) => text.push_str(&delta),
-                        ProviderEvent::Finished(reason) => finish = Some(reason),
-                        // Last one wins, as for any other reply: some servers report it
-                        // cumulatively, in every chunk.
-                        ProviderEvent::Usage(reported) => usage = Some(reported),
-                        _ => {}
-                    }
-                }
-                Ok::<(String, Option<FinishReason>, Option<Usage>), ProviderError>((
-                    text, finish, usage,
-                ))
-            };
+            let attempt_started = Instant::now();
+            let mut text = String::new();
+            let mut finish = None;
+            let mut usage: Option<Usage> = None;
             let result = tokio::select! {
-                result = collect => result,
+                result = async {
+                    let mut stream = provider.stream(request.clone());
+                    while let Some(item) = stream.next().await {
+                        match item? {
+                            ProviderEvent::TextDelta(delta) => text.push_str(&delta),
+                            ProviderEvent::Finished(reason) => finish = Some(reason),
+                            // Last one wins, as for any other reply: some servers report it
+                            // cumulatively, in every chunk.
+                            ProviderEvent::Usage(reported) => usage = Some(reported),
+                            _ => {}
+                        }
+                    }
+                    Ok::<(), ProviderError>(())
+                } => result,
                 _ = cancel.cancelled() => {
-                    self.meter_request("error:interrupted".into(), Usage::default(), started, events);
+                    // What was reported before the stop is billed.
+                    self.meter_request(
+                        "error:interrupted".into(),
+                        usage.unwrap_or_default(),
+                        started,
+                        events,
+                    );
                     return Err(CompactError::Interrupted);
                 }
             };
+            // A compaction request is a paid call like any other, and often the turn's largest,
+            // so it counts towards `/usage`, the budgets and the status line's totals, whatever
+            // becomes of its result.
             match result {
-                Ok((text, _, _)) if text.trim().is_empty() => {
+                Ok(()) if text.trim().is_empty() => {
+                    self.meter_summary("error:incomplete", usage, started, events);
                     return Err(CompactError::Failed(
                         "the model returned an empty summary".into(),
                     ));
                 }
                 // The end of a summary says what remains to be done: a cut-off one is no use.
-                Ok((_, Some(FinishReason::Length), _)) => {
+                Ok(()) if finish == Some(FinishReason::Length) => {
+                    self.meter_summary("error:incomplete", usage, started, events);
                     return Err(CompactError::Failed(
                         "the summary was cut off at the model's output limit".into(),
                     ));
                 }
-                Ok((text, _, usage)) => {
-                    // A compaction request is a paid call like any other, and often the turn's
-                    // largest, so it must count towards `/usage` and the status line's totals.
-                    self.meter_request("ok".into(), usage.unwrap_or_default(), started, events);
-                    if let Some(usage) = usage {
-                        let _ = events.send(AgentEvent::Usage {
-                            model: self.model_id().to_string(),
-                            usage,
-                        });
-                    }
+                Ok(()) => {
+                    self.meter_summary("ok", usage, started, events);
                     return Ok(text.trim().to_string());
                 }
                 Err(error) if self.config.retry.retries(&error, attempt) => {
+                    // What the attempt reported before it failed is billed, as a record of its own.
+                    if usage.is_some() {
+                        let outcome = format!("error:{}", error.kind());
+                        self.meter_request(
+                            outcome,
+                            usage.unwrap_or_default(),
+                            attempt_started,
+                            events,
+                        );
+                    }
                     let delay = self.config.retry.delay(attempt, error.retry_after());
                     let _ = events.send(AgentEvent::Retrying {
                         attempt,
@@ -1509,21 +1520,46 @@ impl Agent {
                     });
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
-                        _ = cancel.cancelled() => return Err(CompactError::Interrupted),
+                        _ = cancel.cancelled() => {
+                            self.meter_request(
+                                "error:interrupted".into(),
+                                Usage::default(),
+                                started,
+                                events,
+                            );
+                            return Err(CompactError::Interrupted);
+                        }
                     }
                     attempt += 1;
                 }
-                Err(error) if error.is_context_overflow() => {
-                    let outcome = format!("error:{}", error.kind());
-                    self.meter_request(outcome, Usage::default(), started, events);
-                    return Err(CompactError::Overflow(describe(&error)));
-                }
                 Err(error) => {
                     let outcome = format!("error:{}", error.kind());
-                    self.meter_request(outcome, Usage::default(), started, events);
-                    return Err(CompactError::Failed(describe(&error)));
+                    self.meter_request(outcome, usage.unwrap_or_default(), started, events);
+                    return Err(if error.is_context_overflow() {
+                        CompactError::Overflow(describe(&error))
+                    } else {
+                        CompactError::Failed(describe(&error))
+                    });
                 }
             }
+        }
+    }
+
+    /// Meters a summary request that got an answer (`ok`, or `error:incomplete` for one that is
+    /// no use) and reports its usage.
+    fn meter_summary(
+        &self,
+        outcome: &str,
+        usage: Option<Usage>,
+        started: Instant,
+        events: &UnboundedSender<AgentEvent>,
+    ) {
+        self.meter_request(outcome.into(), usage.unwrap_or_default(), started, events);
+        if let Some(usage) = usage {
+            let _ = events.send(AgentEvent::Usage {
+                model: self.model_id().to_string(),
+                usage,
+            });
         }
     }
 
@@ -1596,6 +1632,7 @@ impl Agent {
     ) -> ModelOutcome {
         let mut attempt = 1;
         loop {
+            let attempt_started = Instant::now();
             let mut reply = ModelReply::default();
             let result = tokio::select! {
                 result = self.stream_into(&mut reply, events) => Some(result),
@@ -1611,6 +1648,11 @@ impl Agent {
                             .retry_after()
                             .is_some_and(|d| d > crate::retry::MAX_AUTOMATIC_RETRY_AFTER) =>
                 {
+                    // What the attempt reported before it failed is billed, as a record of its own.
+                    if let Some(usage) = reply.usage {
+                        let outcome = format!("error:{}", error.kind());
+                        self.meter_request(outcome, usage, attempt_started, events);
+                    }
                     let delay = self.config.retry.delay(attempt, error.retry_after());
                     self.retry_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

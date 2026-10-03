@@ -4,14 +4,17 @@ use std::sync::Arc;
 
 use harness_core::tool::ToolRegistry;
 
+pub mod apply_patch;
 pub mod bash;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod patch;
 pub mod read;
 pub mod walk;
 pub mod write;
 
+pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;

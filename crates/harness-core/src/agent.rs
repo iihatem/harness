@@ -1975,9 +1975,30 @@ impl Agent {
             ));
         }
 
-        let action = tool.action(&args, &self.ctx);
-        let mutating = self.is_mutating(&action);
-        let decision = self.policy.check(&action);
+        // A call that does several things is checked for each, and the strictest answer decides:
+        // a refusal first, then a question, and the action it is about is the one asked about.
+        let mut actions = tool.actions(&args, &self.ctx);
+        if actions.is_empty() {
+            actions.push(tool.action(&args, &self.ctx));
+        }
+        let mutating = actions.iter().any(|a| self.is_mutating(a));
+        let mut checked: Vec<(Action, Decision)> = actions
+            .into_iter()
+            .map(|a| {
+                let decision = self.policy.check(&a);
+                (a, decision)
+            })
+            .collect();
+        let at = checked
+            .iter()
+            .position(|(_, d)| matches!(d, Decision::Deny(_)))
+            .or_else(|| {
+                checked
+                    .iter()
+                    .position(|(_, d)| matches!(d, Decision::Ask(_)))
+            })
+            .unwrap_or(0);
+        let (action, decision) = checked.swap_remove(at);
         // A sandbox that can no longer run this command (Linux, git protection required, after a
         // drop to the basic tier) leaves one way to run it: outside the sandbox, if approved.
         if let (Decision::Allow | Decision::Ask(_), Action::Bash(command)) = (&decision, &action)

@@ -142,6 +142,11 @@ pub trait Tool: Send + Sync {
     /// What running this call would do, for the permission check. Called after schema validation.
     fn action(&self, args: &Value, ctx: &ToolContext) -> Action;
     async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput;
+    /// Everything running this call would do, when it is more than one thing: each is checked
+    /// on its own, and the strictest answer decides. The default is the one [`action`](Self::action).
+    fn actions(&self, args: &Value, ctx: &ToolContext) -> Vec<Action> {
+        vec![self.action(args, ctx)]
+    }
     /// The files a successful call of this tool changed, for the checks that follow an edit
     /// (verification gates, language-server diagnostics). Tools that change no file return none.
     fn changed_paths(&self, _args: &Value, _ctx: &ToolContext) -> Vec<PathBuf> {

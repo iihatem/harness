@@ -1579,8 +1579,11 @@ impl Agent {
         let outcome = self.call_model_with_retries(events, cancel).await;
         let (result, usage) = match &outcome {
             ModelOutcome::Reply(reply) => ("ok".to_string(), reply.usage),
-            ModelOutcome::Failed(error, _) => (format!("error:{}", error.kind()), None),
-            ModelOutcome::Interrupted(_) => ("error:interrupted".to_string(), None),
+            // What the provider reported before the request failed or was stopped is billed too.
+            ModelOutcome::Failed(error, partial) => {
+                (format!("error:{}", error.kind()), partial.usage)
+            }
+            ModelOutcome::Interrupted(partial) => ("error:interrupted".to_string(), partial.usage),
         };
         self.meter_request(result, usage.unwrap_or_default(), started, events);
         outcome

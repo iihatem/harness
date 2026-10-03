@@ -136,7 +136,9 @@ async fn a_reply_that_reports_no_usage_is_recorded_with_no_tokens() {
     assert_eq!(records[0].usage, Usage::default());
 }
 
-#[tokio::test]
+// Paused time: the cancel comes when the agent is waiting on the hung stream, never before it
+// has started the request, however loaded the machine is.
+#[tokio::test(start_paused = true)]
 async fn a_request_the_user_stopped_is_recorded_as_interrupted() {
     let dir = tempfile::tempdir().unwrap();
     let provider = MockProvider::new(vec![Script::Hang(vec![ProviderEvent::TextDelta(
@@ -312,4 +314,52 @@ fn a_window_snapshot_does_not_release_text_held_back_for_a_secret() {
     });
     assert_eq!(between.len(), 1, "{between:?}");
     assert!(matches!(between[0], AgentEvent::RateLimits { .. }));
+}
+
+// A4: the usage a provider reported before a request was stopped, or failed, is billed.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_request_keeps_the_usage_reported_before_it_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::Hang(vec![
+        ProviderEvent::Usage(Usage {
+            input_tokens: 700,
+            ..Usage::default()
+        }),
+        ProviderEvent::TextDelta("partial".into()),
+    ])]);
+    let meter = Arc::new(Recording::default());
+    let mut agent =
+        agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path()).with_meter(meter.clone());
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.cancel();
+    });
+    run_with(&mut agent, "go", cancel).await;
+    let records = meter.records.lock().unwrap().clone();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].outcome, "error:interrupted");
+    assert_eq!(records[0].usage.input_tokens, 700);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_that_fails_mid_stream_keeps_the_usage_reported_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::Reply(vec![
+        Ok(ProviderEvent::Usage(Usage {
+            input_tokens: 900,
+            ..Usage::default()
+        })),
+        Ok(ProviderEvent::TextDelta("partial".into())),
+        Err(ProviderError::Protocol("broken".into())),
+    ])]);
+    let meter = Arc::new(Recording::default());
+    let mut agent =
+        agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path()).with_meter(meter.clone());
+    run(&mut agent, "go").await;
+    let records = meter.records.lock().unwrap().clone();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].outcome.starts_with("error:"), "{:?}", records[0]);
+    assert_eq!(records[0].usage.input_tokens, 900);
 }

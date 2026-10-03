@@ -113,7 +113,7 @@ async fn a_completed_turn_is_recorded_with_its_counts() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn retries_and_an_interrupted_turn_are_counted() {
     let dir = tempfile::tempdir().unwrap();
     let provider = MockProvider::new(vec![

@@ -96,6 +96,7 @@ fn defaults_depend_on_whether_the_model_is_local() {
             reasoning_effort: None,
             text_tool_calls: true,
             local: true,
+            edit_format: Default::default(),
         }
     );
     let hosted = resolve("openrouter/some-new-model", false, &none);
@@ -173,4 +174,71 @@ fn a_profile_gives_the_request_options() {
             .request_options()
             .local
     );
+}
+
+mod edit_format {
+    use super::*;
+    use harness_core::edit_format::EditFormat;
+
+    fn format(format: EditFormat) -> ProfileSettings {
+        ProfileSettings {
+            edit_format: Some(format),
+            ..ProfileSettings::default()
+        }
+    }
+
+    // Spec "Edit format unset": the edit tool (`str_replace`).
+    #[test]
+    fn no_layer_setting_it_gives_str_replace() {
+        assert_eq!(
+            resolve("ollama/llama3.1", true, &BTreeMap::new()).edit_format,
+            EditFormat::StrReplace
+        );
+    }
+
+    // Spec "Edit format from a profile": the user's config sets it, a built-in profile for the
+    // same glob sets none.
+    #[test]
+    fn the_users_profile_sets_the_format_over_a_builtin_one_that_sets_none() {
+        let mine = user(&[("ollama/qwen3-coder*", format(EditFormat::ApplyPatch))]);
+        let profile = resolve("ollama/qwen3-coder:30b", true, &mine);
+        assert_eq!(profile.edit_format, EditFormat::ApplyPatch);
+        // The built-in window is still there: each setting is resolved on its own.
+        assert_eq!(profile.context_window, Some(262_144));
+    }
+
+    #[test]
+    fn the_most_specific_key_wins() {
+        let mine = user(&[
+            ("openai/*", format(EditFormat::ApplyPatch)),
+            ("openai/gpt-5*", format(EditFormat::WholeFile)),
+        ]);
+        assert_eq!(
+            resolve("openai/gpt-5", false, &mine).edit_format,
+            EditFormat::WholeFile
+        );
+        assert_eq!(
+            resolve("openai/gpt-4o", false, &mine).edit_format,
+            EditFormat::ApplyPatch
+        );
+    }
+
+    #[test]
+    fn the_format_does_not_change_the_other_settings() {
+        let profile = resolve(
+            "openai/gpt-5",
+            false,
+            &user(&[("openai/gpt-5", format(EditFormat::Hashline))]),
+        );
+        assert_eq!(profile.context_window, Some(272_000));
+    }
+
+    // Spec: a built-in profile sets `edit_format` to something other than `str_replace` only where
+    // a checked-in eval result supports it; none does yet.
+    #[test]
+    fn no_builtin_profile_changes_the_format_yet() {
+        for (key, settings) in builtin_profiles() {
+            assert_eq!(settings.edit_format, None, "{key}");
+        }
+    }
 }

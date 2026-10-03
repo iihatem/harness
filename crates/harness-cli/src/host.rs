@@ -244,6 +244,9 @@ impl Host for CliHost {
                     context_window: model.context_window,
                     request: model.request,
                     text_tool_calls: model.text_tool_calls,
+                    // The edit tool and the prompt's section follow the new model's format.
+                    tools: Some(harness_tools::builtin_for(model.edit_format)),
+                    edit_section: Some(crate::prompt::edit_section(model.edit_format)),
                 },
                 window_note: model.window_note.into(),
                 warnings,
@@ -1008,6 +1011,142 @@ pub mod tests {
             })
             .collect();
         assert_eq!(models, ["chat/small", "chat/small", "claude/opus"]);
+    }
+
+    // Spec "Switching model": the next request offers only `edit` (or the new model's tool), and
+    // the tool section of its system prompt describes it; the prompt stays the same otherwise.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_edit_tool_follows_a_model_switch() {
+        use serde_json::{Value, json};
+        use wiremock::{
+            Mock, MockServer,
+            matchers::{method, path},
+        };
+
+        let chat = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(chat_stream(&[
+                json!({"choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]}),
+            ]))
+            .mount(&chat)
+            .await;
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir(workspace.join(".git")).unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        std::fs::write(
+            home.path().join("config/config.toml"),
+            format!(
+                "[providers.chat]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n[profiles.\"chat/*\"]\ncontext_window = 32768\n[profiles.\"chat/patcher\"]\nedit_format = \"apply_patch\"\n",
+                chat.uri()
+            ),
+        )
+        .unwrap();
+        let setup = setup_in(home.path(), &workspace);
+        let mut notices = Notices::quiet(setup.redactor.clone());
+        let session = sessions::open(&setup, &Choice::New, &mut notices).unwrap();
+        let resolved =
+            registry::resolve("chat/small", &setup.config.providers, setup.keys()).unwrap();
+        let (approver, approvals) = ChannelApprover::new();
+        let Some(Started {
+            agent,
+            sandbox_session,
+            policy,
+            window_note,
+            writable,
+            meter,
+            ..
+        }) = start::start(
+            Request {
+                setup: &setup,
+                mode: Mode::Auto,
+                model: resolved,
+                session,
+                approver,
+                interactive: true,
+                run_id: start::run_id(),
+                cancel: CancellationToken::new(),
+            },
+            &mut notices,
+        )
+        .await
+        else {
+            panic!("the start was cancelled");
+        };
+        let host = CliHost {
+            setup: setup.clone(),
+            commands: Commands::default(),
+            policy,
+            writable,
+            meter,
+            unsaved_default: Default::default(),
+        };
+        let options = Options {
+            theme: Theme::monochrome(),
+            model: "chat/small".into(),
+            mode: Mode::Auto,
+            commands: Vec::new(),
+            workspace: workspace.clone(),
+            history: Vec::new(),
+            instruction_files: Vec::new(),
+            window_note: Some(window_note),
+            default_mode: Mode::Auto,
+            text_editor: None,
+            notifier: None,
+        };
+        let term = InlineTerminal::new(TestBackend::new(100, 30), 0).unwrap();
+        let mut ui = Ui::start(agent, Box::new(host), term, options, approvals)
+            .with_redactor(setup.redactor.clone());
+        ui.draw().unwrap();
+        send(&mut ui, "hello");
+        settle(&mut ui).await;
+        send(&mut ui, "again");
+        settle(&mut ui).await;
+        send(&mut ui, "/model chat/patcher");
+        settle(&mut ui).await;
+        send(&mut ui, "and now?");
+        settle(&mut ui).await;
+        send(&mut ui, "once more");
+        settle(&mut ui).await;
+        ui.finish().await.unwrap();
+        sandbox_session.end();
+
+        let bodies: Vec<Value> = chat
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 4);
+        let names = |body: &Value| -> Vec<String> {
+            body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let system = |body: &Value| body["messages"][0]["content"].as_str().unwrap().to_string();
+        assert!(names(&bodies[0]).contains(&"edit".to_string()));
+        assert!(!names(&bodies[0]).contains(&"apply_patch".to_string()));
+        assert!(names(&bodies[2]).contains(&"apply_patch".to_string()));
+        assert!(!names(&bodies[2]).contains(&"edit".to_string()));
+        // Within a model, the tools and the system prompt are byte for byte the same.
+        assert_eq!(bodies[0]["tools"], bodies[1]["tools"]);
+        assert_eq!(system(&bodies[0]), system(&bodies[1]));
+        assert_eq!(bodies[2]["tools"], bodies[3]["tools"]);
+        assert_eq!(system(&bodies[2]), system(&bodies[3]));
+        // The section is what differs in the prompt.
+        assert_ne!(system(&bodies[0]), system(&bodies[2]));
+        let before = crate::prompt::edit_section(harness_core::edit_format::EditFormat::StrReplace);
+        let after = crate::prompt::edit_section(harness_core::edit_format::EditFormat::ApplyPatch);
+        assert_eq!(
+            system(&bodies[0]).replace(&before, &after),
+            system(&bodies[2])
+        );
     }
 
     // M1's done criterion, with mock servers: ChatGPT sign-in inside the session, then a

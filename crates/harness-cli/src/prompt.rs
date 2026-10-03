@@ -1,4 +1,4 @@
-use harness_core::permission::Mode;
+use harness_core::{edit_format::EditFormat, permission::Mode};
 
 /// The base system prompt: who the agent is and what the approval mode and sandbox let it do, and
 /// whether a user can answer approvals (`interactive`). Kept short on purpose, since local models
@@ -33,6 +33,24 @@ pub fn base_prompt(mode: Mode, sandboxed: bool, interactive: bool) -> String {
          When you are done, reply with a short summary of what you changed.\n\
          Approval mode: {mode}. {rules}\n"
     )
+}
+
+/// The line of the system prompt that says how this model edits files: the tool it has for it
+/// and what that tool takes. It depends on the edit format alone, so the prompt stays byte for
+/// byte the same for as long as the model does.
+pub fn edit_section(format: EditFormat) -> String {
+    match format {
+        EditFormat::StrReplace => "Edit existing files with the `edit` tool (replace an exact string; read the file first) and create files with `write`.\n",
+        EditFormat::ApplyPatch => "Edit files with the `apply_patch` tool: a patch from `*** Begin Patch` to `*** End Patch` with `*** Add File:`, `*** Update File:` and `*** Delete File:` sections. Read a file before updating it.\n",
+        EditFormat::WholeFile => "Change files with the `write` tool, giving the complete new content; files of 400 lines or more cannot be changed this way. Read an existing file before overwriting it.\n",
+        EditFormat::Hashline => "`read` starts each line with an address (number#hash). Edit files with `hashline_edit`, naming the first and last line to replace by address, and create files with `write`.\n",
+    }
+    .to_string()
+}
+
+/// `base` with the edit section for `format` after it.
+pub fn with_edit_section(base: &str, format: EditFormat) -> String {
+    format!("{base}{}", edit_section(format))
 }
 
 #[cfg(test)]
@@ -158,5 +176,66 @@ mod tests {
             base_prompt(Mode::FullAccess, false, true),
             base_prompt(Mode::FullAccess, false, false)
         );
+    }
+
+    mod edit_formats {
+        use super::super::*;
+        use harness_core::edit_format::EditFormat;
+
+        const ALL: [EditFormat; 4] = [
+            EditFormat::StrReplace,
+            EditFormat::ApplyPatch,
+            EditFormat::WholeFile,
+            EditFormat::Hashline,
+        ];
+
+        // Spec: "the system prompt's tool section MUST describe the selected format".
+        #[test]
+        fn each_section_names_its_edit_tool_and_not_the_others() {
+            let tools = |format| match format {
+                EditFormat::StrReplace => vec!["`edit`", "`write`"],
+                EditFormat::ApplyPatch => vec!["`apply_patch`"],
+                EditFormat::WholeFile => vec!["`write`"],
+                EditFormat::Hashline => vec!["`hashline_edit`", "`write`"],
+            };
+            for format in ALL {
+                let section = edit_section(format);
+                for name in tools(format) {
+                    assert!(section.contains(name), "{format}: {section}");
+                }
+                for other in ["`edit`", "`apply_patch`", "`hashline_edit`"] {
+                    if !tools(format).contains(&other) {
+                        assert!(!section.contains(other), "{format}: {section}");
+                    }
+                }
+            }
+            assert!(edit_section(EditFormat::ApplyPatch).contains("*** Begin Patch"));
+            assert!(edit_section(EditFormat::WholeFile).contains("400"));
+            assert!(edit_section(EditFormat::Hashline).contains("number#hash"));
+        }
+
+        #[test]
+        fn the_section_is_one_line_added_after_the_base_prompt() {
+            for format in ALL {
+                let section = edit_section(format);
+                assert!(!section.trim_end().contains('\n'), "{section}");
+                let base = base_prompt(Mode::Auto, true, true);
+                let with = with_edit_section(&base, format);
+                assert_eq!(with, format!("{base}{section}"));
+                assert!(with.len() / 4 < 1000);
+            }
+        }
+
+        #[test]
+        fn the_same_format_gives_the_same_bytes() {
+            assert_eq!(
+                edit_section(EditFormat::ApplyPatch),
+                edit_section(EditFormat::ApplyPatch)
+            );
+            assert_ne!(
+                edit_section(EditFormat::ApplyPatch),
+                edit_section(EditFormat::StrReplace)
+            );
+        }
     }
 }

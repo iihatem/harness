@@ -6,6 +6,7 @@ use std::{
 use harness_core::{
     agent::DEFAULT_MAX_STEPS,
     compaction::{DEFAULT_KEEP_RECENT, DEFAULT_THRESHOLD},
+    edit_format::EditFormat,
     gate::{Gates, MAX_TIMEOUT_S},
     permission::Mode,
 };
@@ -154,6 +155,9 @@ pub struct ProfileSettings {
     pub text_tool_calls: Option<bool>,
     /// Whether the model runs on a server of the user's own.
     pub local: Option<bool>,
+    /// How the model edits files: `str_replace` (the default), `apply_patch`, `whole_file` or
+    /// `hashline`.
+    pub edit_format: Option<EditFormat>,
 }
 
 impl ProfileSettings {
@@ -170,6 +174,7 @@ impl ProfileSettings {
                 .or_else(|| self.reasoning_effort.clone()),
             text_tool_calls: other.text_tool_calls.or(self.text_tool_calls),
             local: other.local.or(self.local),
+            edit_format: other.edit_format.or(self.edit_format),
         }
     }
 
@@ -195,6 +200,9 @@ impl ProfileSettings {
         }
         if let Some(local) = self.local {
             set.push(format!("local = {local}"));
+        }
+        if let Some(format) = self.edit_format {
+            set.push(format!("edit_format = \"{format}\""));
         }
         set.join(", ")
     }

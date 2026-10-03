@@ -161,6 +161,8 @@ async fn a_model_the_user_switched_to_is_selected_by_user() {
         context_window: 32_768,
         request: Default::default(),
         text_tool_calls: false,
+        tools: None,
+        edit_section: None,
     });
     run(&mut agent, "two").await;
     let turns = meter.turns.lock().unwrap().clone();

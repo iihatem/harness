@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use globset::GlobBuilder;
 use harness_config::config::ProfileSettings;
-use harness_core::message::RequestOptions;
+use harness_core::{edit_format::EditFormat, message::RequestOptions};
 
 use crate::registry::LOCAL_PROVIDERS;
 
@@ -27,6 +27,8 @@ pub struct ModelProfile {
     pub reasoning_effort: Option<String>,
     pub text_tool_calls: bool,
     pub local: bool,
+    /// How the model edits files.
+    pub edit_format: EditFormat,
 }
 
 impl ModelProfile {
@@ -123,6 +125,10 @@ pub fn resolve(
             .find_map(|p| p.text_tool_calls)
             .unwrap_or(local),
         local,
+        edit_format: layers
+            .iter()
+            .find_map(|p| p.edit_format)
+            .unwrap_or_default(),
     }
 }
 

@@ -7,6 +7,7 @@ use std::{io::Write, path::Path, sync::Arc};
 use harness_config::config::LinuxGitProtection;
 use harness_core::{
     agent::{Agent, AgentConfig, Approver, Sandboxes},
+    edit_format::EditFormat,
     engine::{EngineConfig, PermissionEngine, RuleSet},
     message::RequestOptions,
     permission::{FsAccess, Mode},
@@ -195,12 +196,16 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         resolved.model.clone(),
         crate::context::system_prompt(
             setup,
-            &prompt::base_prompt(mode, sandboxed, interactive),
+            &prompt::with_edit_section(
+                &prompt::base_prompt(mode, sandboxed, interactive),
+                model.edit_format,
+            ),
             context_window,
             notices,
         ),
         output_dir,
     );
+    config.edit_section = Some(prompt::edit_section(model.edit_format));
     config.context_window = context_window;
     config.request = model.request;
     config.text_tool_calls = model.text_tool_calls;
@@ -235,7 +240,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     let diagnostics = crate::lsp::diagnostics(setup);
     let mut agent = Agent::new(
         resolved.provider,
-        harness_tools::builtin(),
+        harness_tools::builtin_for(model.edit_format),
         policy.clone(),
         approver,
         config,
@@ -343,6 +348,8 @@ fn write_modes(
 /// What harness knows of a model before asking it anything: its window and where that comes
 /// from, what its profile sets for requests, and what to warn about.
 pub struct ModelSetup {
+    /// How the model edits files, from its profile.
+    pub edit_format: EditFormat,
     pub context_window: u64,
     pub window_note: &'static str,
     pub request: RequestOptions,
@@ -372,6 +379,7 @@ pub async fn model_setup(
     let window_note = window_note(running.tokens(), profile.context_window);
     let window = window::effective_window(&resolved.id, &profile, running, server);
     Some(ModelSetup {
+        edit_format: profile.edit_format,
         context_window: window.tokens,
         window_note,
         request: profile.request_options(),

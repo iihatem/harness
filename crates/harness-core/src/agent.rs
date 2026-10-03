@@ -95,6 +95,9 @@ pub struct AgentConfig {
     pub request: RequestOptions,
     /// Run tool calls the model writes as text (`textcalls`): for local models.
     pub text_tool_calls: bool,
+    /// The text of the system prompt that describes how the model edits files, when the prompt
+    /// has one: a switch to a model with another edit format replaces it.
+    pub edit_section: Option<String>,
 }
 
 impl AgentConfig {
@@ -116,6 +119,7 @@ impl AgentConfig {
             compaction: CompactionConfig::default(),
             request: RequestOptions::default(),
             text_tool_calls: false,
+            edit_section: None,
         }
     }
 }
@@ -132,6 +136,10 @@ pub struct SessionModel {
     pub context_window: u64,
     pub request: RequestOptions,
     pub text_tool_calls: bool,
+    /// The tools the model is offered, when they are not the session's: its edit format's.
+    pub tools: Option<ToolRegistry>,
+    /// What the system prompt's edit section becomes for the model.
+    pub edit_section: Option<String>,
 }
 
 impl std::fmt::Debug for SessionModel {
@@ -393,15 +401,7 @@ impl Agent {
         config: AgentConfig,
         ctx: ToolContext,
     ) -> Self {
-        let validators = tools
-            .specs()
-            .into_iter()
-            .map(|spec| {
-                let validator = jsonschema::validator_for(&spec.parameters)
-                    .unwrap_or_else(|e| panic!("tool `{}` has an invalid schema: {e}", spec.name));
-                (spec.name, validator)
-            })
-            .collect();
+        let validators = validators_of(&tools);
         Agent {
             provider,
             tools,
@@ -548,6 +548,16 @@ impl Agent {
         for message in meter.take_warnings() {
             let _ = events.send(AgentEvent::Warning { message });
         }
+    }
+
+    /// The definitions of the tools the model is offered.
+    pub fn tool_specs(&self) -> Vec<crate::message::ToolSpec> {
+        self.tools.specs()
+    }
+
+    fn set_tools(&mut self, tools: ToolRegistry) {
+        self.validators = validators_of(&tools);
+        self.tools = tools;
     }
 
     /// Ensures every call in `calls` has a non-empty id not already used in this session,
@@ -1043,6 +1053,19 @@ impl Agent {
         self.config.context_window = model.context_window;
         self.config.request = model.request;
         self.config.text_tool_calls = model.text_tool_calls;
+        if let Some(tools) = model.tools {
+            self.set_tools(tools);
+        }
+        // The prompt changes only where the section is, and only when the format does: it stays
+        // byte for byte the same for as long as the model does.
+        if let Some(section) = model.edit_section {
+            if let Some(old) = self.config.edit_section.take()
+                && old != section
+            {
+                self.config.system_prompt = self.config.system_prompt.replacen(&old, &section, 1);
+            }
+            self.config.edit_section = Some(section);
+        }
         self.reported_usage = None;
         self.auto_compaction_paused = false;
         self.model_chosen_by_user = true;
@@ -2255,6 +2278,19 @@ impl Agent {
             ..first
         }
     }
+}
+
+/// The validator of each tool's arguments.
+fn validators_of(tools: &ToolRegistry) -> HashMap<String, jsonschema::Validator> {
+    tools
+        .specs()
+        .into_iter()
+        .map(|spec| {
+            let validator = jsonschema::validator_for(&spec.parameters)
+                .unwrap_or_else(|e| panic!("tool `{}` has an invalid schema: {e}", spec.name));
+            (spec.name, validator)
+        })
+        .collect()
 }
 
 /// What a shell part becomes in the user message: the command's output, or, when it did not run

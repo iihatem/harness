@@ -306,6 +306,20 @@ impl Transcript {
                     harness_core::role::switched_text(from, to, *role, *reason, detail.as_deref());
                 self.push_note(&text, width);
             }
+            AgentEvent::EscalationSuggested {
+                trigger,
+                count,
+                first_line,
+                to,
+            } => {
+                let text = harness_core::role::escalation_text(
+                    *trigger,
+                    *count,
+                    first_line.as_deref(),
+                    to,
+                );
+                self.push_note(&text, width);
+            }
             AgentEvent::HandoffReduced {
                 to,
                 history_tokens,

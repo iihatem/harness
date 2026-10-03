@@ -182,6 +182,25 @@ pub struct Handoff {
     pub window: u64,
 }
 
+/// The suggestion to escalate, for the terminal.
+pub fn escalation_text(
+    trigger: crate::event::EscalationTrigger,
+    count: u32,
+    first_line: Option<&str>,
+    to: &str,
+) -> String {
+    use crate::event::EscalationTrigger::*;
+    let what = match trigger {
+        InvalidToolCalls => format!("{count} invalid tool calls this turn"),
+        IdenticalFailures => format!("{count} identical failing tool results this turn"),
+        GateFailed => format!("the same gate failed {count} times this turn"),
+    };
+    let last = first_line
+        .map(|line| format!(" (last: {line})"))
+        .unwrap_or_default();
+    format!("escalation suggested: {what}{last}; /escalate runs the next turn on {to}")
+}
+
 /// The notice that a Build turn goes with the plan alone.
 pub fn handoff_reduced_text(to: &str, history_tokens: u64, window: u64, forced: bool) -> String {
     let what = "the system prompt, the instruction files and the approved plan";

@@ -21,7 +21,7 @@ use harness_core::{
     meter::WindowSnapshot,
     permission::Mode,
     redact::Redactor,
-    role::Role,
+    role::{Role, SwitchReason},
     session::{RewindScope, Session, SessionSummary},
     turn::{Steering, TurnInput},
 };
@@ -247,6 +247,10 @@ pub trait Host: Send {
     ) -> BoxFuture<'static, Result<ModelSwitch, String>> {
         Box::pin(async { Err("the model cannot change".into()) })
     }
+    /// The model `/escalate` switches to: `[escalation] to`, when one is configured.
+    fn escalation(&self) -> Option<String> {
+        None
+    }
     /// Whether model `id` can be used for a role: its provider and credentials are ready. Errors
     /// say why not. `cancel` stops it while a local server is asked for its window.
     fn check_model(
@@ -373,7 +377,7 @@ pub enum Action {
     /// Look for the models, for the model picker.
     ListModels,
     /// Continue on the model with this id.
-    SwitchModel(String),
+    SwitchModel { id: String, reason: SwitchReason },
     /// Run `role` on the model `id` for the session, once the host has checked it can be used.
     SetRole { role: Role, id: String },
     /// Sign in to a provider, with a device code when `device` is set.
@@ -1776,7 +1780,22 @@ impl App {
         match name {
             "quit" => return self.quit(),
             "mode" | "compact" | "rewind" | "new" | "resume" | "model" | "login" | "budget"
+            | "escalate"
                 if !self.between_turns(name) => {}
+            "escalate" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return match self.host.escalation() {
+                    Some(to) => self.switch_for(&to, SwitchReason::Escalation),
+                    None => {
+                        self.transcript.push_error(
+                            "no escalation model is configured: set `to = \"<provider>/<model>\"` under [escalation] in config.toml",
+                            width,
+                        );
+                        None
+                    }
+                };
+            }
             "budget" => {
                 let amount = args.trim().trim_start_matches('$');
                 let set = if amount.is_empty() {
@@ -2036,6 +2055,11 @@ impl App {
 
     /// Switches the session to model `id`, unless it is on it already.
     fn switch_to(&mut self, id: &str) -> Option<Action> {
+        self.switch_for(id, SwitchReason::User)
+    }
+
+    /// [`switch_to`](Self::switch_to), for `reason`.
+    fn switch_for(&mut self, id: &str, reason: SwitchReason) -> Option<Action> {
         if id == self.model {
             self.transcript
                 .push_note(&format!("already on {id}"), self.width);
@@ -2043,7 +2067,10 @@ impl App {
         }
         self.work(&format!("switching to {id}"), true);
         self.switching = Some(id.to_string());
-        Some(Action::SwitchModel(id.to_string()))
+        Some(Action::SwitchModel {
+            id: id.to_string(),
+            reason,
+        })
     }
 
     /// Opens the session picker, as `harness --resume` does when the session starts.

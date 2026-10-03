@@ -19,7 +19,7 @@ use crate::{
     checkpoint::{CheckpointError, Checkpoints},
     compaction::{self, CompactionConfig},
     diag::Diagnostics,
-    event::{AgentEvent, ErrorKind, TurnEndReason},
+    event::{AgentEvent, ErrorKind, EscalationTrigger, GateKind, TurnEndReason},
     gate::Gates,
     message::{ChatRequest, Message, RequestOptions, ToolCall, Usage},
     meter::{AccountKind, BudgetNotice, GateCounts, Meter, RequestRecord, TurnRecord},
@@ -350,6 +350,16 @@ struct Summarizer {
     window: u64,
 }
 
+/// What the current turn has counted towards a suggestion to escalate.
+#[derive(Default)]
+pub(crate) struct EscalationState {
+    suggested: HashSet<EscalationTrigger>,
+    /// How often each failing result (tool, hash of its redacted output) has come.
+    failures: HashMap<(String, String), u32>,
+    /// How often each gate failed.
+    pub(crate) gates: HashMap<GateKind, u32>,
+}
+
 pub struct Agent {
     provider: Arc<dyn Provider>,
     tools: ToolRegistry,
@@ -442,6 +452,10 @@ pub struct Agent {
     turn_handoff: Option<Handoff>,
     /// A fallback chain already moved a request of the current turn.
     fell_back: bool,
+    /// `[escalation] to`, when set.
+    escalate_to: Option<String>,
+    /// What has been suggested in the current turn, and the failures that count towards it.
+    escalation: EscalationState,
     /// The conversation before a Build message that went alone, put back when the turn ends.
     handoff_stash: Option<(Vec<Message>, Vec<String>, Message)>,
 }
@@ -506,8 +520,17 @@ impl Agent {
             last_planner: None,
             turn_handoff: None,
             fell_back: false,
+            escalate_to: None,
+            escalation: EscalationState::default(),
             handoff_stash: None,
         }
+    }
+
+    /// Suggests escalating to `to` when a turn goes badly (see
+    /// [`AgentEvent::EscalationSuggested`]); without it, nothing is suggested.
+    pub fn with_escalation(mut self, to: Option<String>) -> Self {
+        self.escalate_to = to;
+        self
     }
 
     /// Makes the models of roles ready with `resolver`.
@@ -1186,6 +1209,12 @@ impl Agent {
     /// leaves out what its provider cannot accept. The next request's size is estimated afresh,
     /// since the new model counts tokens its own way, and it is compacted against the new window.
     pub fn switch_model(&mut self, model: SessionModel) -> AgentEvent {
+        self.switch_model_as(model, SwitchReason::User)
+    }
+
+    /// [`switch_model`](Self::switch_model), for `reason`: the user's own (`User`) or an
+    /// escalation the user asked for.
+    pub fn switch_model_as(&mut self, model: SessionModel, reason: SwitchReason) -> AgentEvent {
         let from = std::mem::replace(&mut self.config.model_id, model.id.clone());
         // A turn on the model the last one used needs no announcement of its own.
         if self.last_role_model == from {
@@ -1200,12 +1229,12 @@ impl Agent {
         self.reported_usage = None;
         self.auto_compaction_paused = false;
         self.model_chosen_by_user = true;
-        self.main_reason = Some(SwitchReason::User);
+        self.main_reason = Some(reason);
         AgentEvent::ModelSwitched {
             from,
             to: self.config.model_id.clone(),
             role: Role::Main,
-            reason: SwitchReason::User,
+            reason,
             detail: None,
         }
     }
@@ -1277,6 +1306,7 @@ impl Agent {
         });
         self.turn_role = role;
         self.fell_back = false;
+        self.escalation = EscalationState::default();
         self.turn_model = None;
         let role_model = match &input.model {
             Some(_) => Ok(None),
@@ -2167,6 +2197,74 @@ impl Agent {
         true
     }
 
+    /// Counts what a finished tool call adds towards a suggestion to escalate: the third invalid
+    /// call, and the third failing result of one tool with the same redacted output (an invalid
+    /// call, or one that did not run, is not one).
+    fn watch_for_escalation(
+        &mut self,
+        call: &ToolCall,
+        output: &ToolOutput,
+        invalid_before: u32,
+        events: &UnboundedSender<AgentEvent>,
+    ) {
+        if self.escalate_to.is_none() {
+            return;
+        }
+        let first = first_line(&redacted_output(&self.redactor, &output.content));
+        if self.invalid_calls > invalid_before {
+            if self.invalid_calls >= 3 {
+                self.suggest_escalation(
+                    EscalationTrigger::InvalidToolCalls,
+                    self.invalid_calls,
+                    first,
+                    events,
+                );
+            }
+            return;
+        }
+        if !output.is_error || output.blocked {
+            return;
+        }
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            redacted_output(&self.redactor, &output.content).as_bytes(),
+        ));
+        let count = {
+            let n = self
+                .escalation
+                .failures
+                .entry((call.name.clone(), digest))
+                .or_insert(0);
+            *n += 1;
+            *n
+        };
+        if count == 3 {
+            self.suggest_escalation(EscalationTrigger::IdenticalFailures, count, first, events);
+        }
+    }
+
+    /// Says `trigger` fired, with `count` and the last failure's first line: once per trigger per
+    /// turn, and only when an escalation model is set that is not the one answering.
+    pub(crate) fn suggest_escalation(
+        &mut self,
+        trigger: EscalationTrigger,
+        count: u32,
+        first_line: Option<String>,
+        events: &UnboundedSender<AgentEvent>,
+    ) {
+        let Some(to) = self.escalate_to.clone() else {
+            return;
+        };
+        if to == self.model_id() || !self.escalation.suggested.insert(trigger) {
+            return;
+        }
+        let _ = events.send(AgentEvent::EscalationSuggested {
+            trigger,
+            count,
+            first_line,
+            to,
+        });
+    }
+
     /// The context window of the model answering the current turn.
     fn window(&self) -> u64 {
         self.turn_model
@@ -2491,7 +2589,9 @@ impl Agent {
             name: call.name.clone(),
             arguments: call.arguments.clone(),
         });
+        let invalid_before = self.invalid_calls;
         let raw = self.execute_inner(call, events).await;
+        self.watch_for_escalation(call, &raw, invalid_before, events);
         let mut content = limit_output(
             &raw.content,
             self.config.output_limit,
@@ -2839,6 +2939,22 @@ impl Agent {
             ..first
         }
     }
+}
+
+/// `text` with the secrets harness knows left out.
+pub(crate) fn redacted_output(redactor: &Option<Arc<Redactor>>, text: &str) -> String {
+    match redactor {
+        Some(redactor) => redactor.redact(text),
+        None => text.to_string(),
+    }
+}
+
+/// The first line of `text` that says something, cut to 200 characters.
+pub(crate) fn first_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(200).collect())
 }
 
 /// The validator of each tool's arguments.

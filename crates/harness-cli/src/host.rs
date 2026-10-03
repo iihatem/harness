@@ -210,6 +210,10 @@ impl Host for CliHost {
         })
     }
 
+    fn escalation(&self) -> Option<String> {
+        self.setup.config.escalation_to.clone()
+    }
+
     fn check_model(
         &self,
         id: &str,

@@ -263,6 +263,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     .with_gates(setup.config.gates.clone())
     .with_diagnostics(diagnostics.clone())
     .with_roles(setup.config.roles.clone())
+    .with_escalation(setup.config.escalation_to.clone())
     .with_resolver(resolver.clone());
     if interactive {
         agent = agent.with_sandboxes(sandboxes);

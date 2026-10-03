@@ -496,6 +496,21 @@ fn fallback_problem(chains: &BTreeMap<String, Vec<String>>) -> Option<String> {
     })
 }
 
+/// `[escalation]`: the model `/escalate` switches to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EscalationSettings {
+    pub to: Option<String>,
+}
+
+impl EscalationSettings {
+    fn problem(&self) -> Option<String> {
+        self.to.as_deref().filter(|id| !is_model_id(id)).map(|id| {
+            format!("escalation.to must be a provider/model id, such as openai/gpt-5, not {id:?}")
+        })
+    }
+}
+
 /// `[roles]`: the model of each role, and `[roles.handoff]`. A project's roles need trust: they
 /// choose where a conversation is sent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -743,6 +758,8 @@ pub struct ConfigFile {
     /// `[fallback]`: a model glob to the models a failed request on it is sent to, in order.
     #[serde(default)]
     pub fallback: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub escalation: EscalationSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -793,6 +810,8 @@ pub struct Config {
     /// The fallback chains by model-id glob: the global config's, with a trusted project's over
     /// them.
     pub fallback: BTreeMap<String, Vec<String>>,
+    /// The model `/escalate` switches to, when set: the global config's, or a trusted project's.
+    pub escalation_to: Option<String>,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -977,6 +996,10 @@ fn widening(project: &ConfigFile, baseline: Baseline) -> Widening {
     for (glob, ids) in &project.fallback {
         items.push(format!("fallback.{glob:?} = {ids:?}"));
     }
+    // And the model `/escalate` sends the conversation to.
+    if let Some(to) = &project.escalation.to {
+        items.push(format!("escalation.to = {to:?}"));
+    }
     if project.sandbox.linux_git_protection == Some(LinuxGitProtection::BestEffort)
         && baseline.linux_git_protection == LinuxGitProtection::Required
     {
@@ -1025,6 +1048,7 @@ pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening
         .or_else(|| project.lsp.problem())
         .or_else(|| project.roles.problem())
         .or_else(|| fallback_problem(&project.fallback))
+        .or_else(|| project.escalation.problem())
     {
         return Err(ConfigError::Parse { path, message });
     }
@@ -1062,6 +1086,7 @@ pub fn load(
             .or_else(|| g.lsp.problem())
             .or_else(|| g.roles.problem())
             .or_else(|| fallback_problem(&g.fallback))
+            .or_else(|| g.escalation.problem())
     }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
@@ -1091,6 +1116,7 @@ pub fn load(
         gates = global.gates;
         roles = global.roles;
         cfg.fallback = global.fallback;
+        cfg.escalation_to = global.escalation.to;
         cfg.lsp.overlaid(&global.lsp, true);
     }
     let path = project_file(workspace);
@@ -1107,6 +1133,7 @@ pub fn load(
             .or_else(|| project.lsp.problem())
             .or_else(|| project.roles.problem())
             .or_else(|| fallback_problem(&project.fallback))
+            .or_else(|| project.escalation.problem())
         {
             return Err(ConfigError::Parse { path, message });
         }
@@ -1228,6 +1255,9 @@ pub fn load(
                 gates = gates.overlaid(&project.gates);
                 roles = roles.overlaid(&project.roles);
                 cfg.fallback.extend(project.fallback.clone());
+                if project.escalation.to.is_some() {
+                    cfg.escalation_to = project.escalation.to.clone();
+                }
             } else {
                 let items: Vec<&str> = widening_items.iter().map(|item| item.as_str()).collect();
                 cfg.warnings.push(format!(

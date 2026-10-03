@@ -15,7 +15,7 @@ use harness_core::{
     meter::WindowSnapshot,
     provider::Provider,
     redact::{EventRedactor, Redactor},
-    role::Role,
+    role::{Role, SwitchReason},
     session::{RewindScope, Session},
     turn::TurnInput,
 };
@@ -106,6 +106,7 @@ enum Job {
     SwitchModel {
         model: Box<SessionModel>,
         window_note: String,
+        reason: SwitchReason,
     },
     SetRole {
         role: Role,
@@ -118,7 +119,10 @@ enum Background {
     /// The models the host found.
     Models(Vec<String>),
     /// The model to switch to, made ready, or why it could not be.
-    Switch(Result<ModelSwitch, String>),
+    Switch {
+        reason: SwitchReason,
+        result: Result<ModelSwitch, String>,
+    },
     /// Whether the model asked for a role can be used.
     RoleChecked {
         role: Role,
@@ -278,8 +282,12 @@ where
                             result: Ok(()),
                         })
                     }
-                    Job::SwitchModel { model, window_note } => {
-                        let _ = events_tx.send(agent.switch_model(*model));
+                    Job::SwitchModel {
+                        model,
+                        window_note,
+                        reason,
+                    } => {
+                        let _ = events_tx.send(agent.switch_model_as(*model, reason));
                         let view = ModelView {
                             id: agent.model_id().to_string(),
                             window_note,
@@ -493,13 +501,16 @@ where
                 });
                 Flow::Continue
             }
-            Action::SwitchModel(id) => {
+            Action::SwitchModel { id, reason } => {
                 let cancel = CancellationToken::new();
                 self.cancel = Some(cancel.clone());
                 let switch = self.app.host().switch_model(&id, cancel);
                 let tx = self.background_tx.clone();
                 tokio::spawn(async move {
-                    let _ = tx.send(Background::Switch(switch.await));
+                    let _ = tx.send(Background::Switch {
+                        reason,
+                        result: switch.await,
+                    });
                 });
                 Flow::Continue
             }
@@ -827,7 +838,10 @@ where
     fn background(&mut self, done: Background) -> io::Result<Flow> {
         match done {
             Background::Models(ids) => self.app.on_models(ids),
-            Background::Switch(Ok(switch)) => {
+            Background::Switch {
+                reason,
+                result: Ok(switch),
+            } => {
                 for message in switch.warnings {
                     self.show(AgentEvent::Warning { message });
                 }
@@ -836,6 +850,7 @@ where
                 self.send_job(Job::SwitchModel {
                     model: Box::new(switch.model),
                     window_note: switch.window_note,
+                    reason,
                 });
             }
             Background::RoleChecked {
@@ -855,7 +870,9 @@ where
                 });
                 self.next_actions()?;
             }
-            Background::Switch(Err(why)) => {
+            Background::Switch {
+                result: Err(why), ..
+            } => {
                 self.app.on_done(Done::Model(Err(why)));
                 self.next_actions()?;
             }

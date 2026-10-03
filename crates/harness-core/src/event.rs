@@ -42,13 +42,25 @@ impl TurnEndReason {
 }
 
 /// Which verification gate a result belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GateKind {
     /// The lint command run after an edit.
     AfterEdit,
     /// The test command run when a turn that changed files ends.
     Test,
+}
+
+/// What made harness suggest a stronger model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationTrigger {
+    /// Three invalid tool calls in a turn.
+    InvalidToolCalls,
+    /// Three failing tool results alike (the same tool, the same redacted output) in a turn.
+    IdenticalFailures,
+    /// The same verification gate failed twice in a turn.
+    GateFailed,
 }
 
 /// How the end-of-turn test gate found out whether the turn changed files.
@@ -201,6 +213,16 @@ pub enum AgentEvent {
     ChangesChecked {
         by: ChangeSource,
         changed: bool,
+    },
+    /// The turn is going badly in a way a stronger model might fix, and `[escalation] to` names
+    /// one: `/escalate` runs the next turn on `to`. Said once per trigger per turn; nothing
+    /// switches by itself. `first_line` is the last failure's.
+    EscalationSuggested {
+        trigger: EscalationTrigger,
+        count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_line: Option<String>,
+        to: String,
     },
     /// A Build turn on another model goes with the plan alone, not the conversation: it does not
     /// fit the build model's window (`window`, against `history_tokens`), or `[roles.handoff]

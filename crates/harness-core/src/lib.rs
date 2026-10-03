@@ -5,6 +5,7 @@ pub mod checkpoint;
 pub mod compaction;
 pub mod engine;
 pub mod event;
+pub mod gate;
 pub mod message;
 pub mod meter;
 pub mod output;

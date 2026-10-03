@@ -6,6 +6,7 @@ use std::{
 use harness_core::{
     agent::DEFAULT_MAX_STEPS,
     compaction::{DEFAULT_KEEP_RECENT, DEFAULT_THRESHOLD},
+    gate::{Gates, MAX_TIMEOUT_S},
     permission::Mode,
 };
 use serde::Deserialize;
@@ -387,6 +388,85 @@ impl Notifications {
     }
 }
 
+/// `[gates]`: checks run after edits and when a turn ends (`harness_core::gate`). A project's
+/// gates need trust: their commands run project code.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateSettings {
+    pub after_edit: Option<String>,
+    pub test: Option<String>,
+    pub timeout_s: Option<u64>,
+    pub max_retries: Option<u32>,
+    pub output_tail_lines: Option<usize>,
+}
+
+impl GateSettings {
+    /// These settings with `other`'s over them.
+    fn overlaid(&self, other: &GateSettings) -> GateSettings {
+        GateSettings {
+            after_edit: other.after_edit.clone().or_else(|| self.after_edit.clone()),
+            test: other.test.clone().or_else(|| self.test.clone()),
+            timeout_s: other.timeout_s.or(self.timeout_s),
+            max_retries: other.max_retries.or(self.max_retries),
+            output_tail_lines: other.output_tail_lines.or(self.output_tail_lines),
+        }
+    }
+
+    /// The settings with defaults filled in.
+    fn resolve(&self) -> Gates {
+        let default = Gates::default();
+        Gates {
+            after_edit: self.after_edit.clone(),
+            test: self.test.clone(),
+            timeout_s: self.timeout_s.unwrap_or(default.timeout_s),
+            max_retries: self.max_retries.unwrap_or(default.max_retries),
+            output_tail_lines: self.output_tail_lines.unwrap_or(default.output_tail_lines),
+        }
+    }
+
+    /// What is wrong with these settings, if anything.
+    fn problem(&self) -> Option<String> {
+        for (key, command) in [("after_edit", &self.after_edit), ("test", &self.test)] {
+            if command.as_deref().is_some_and(|c| c.trim().is_empty()) {
+                return Some(format!("gates.{key} must not be empty"));
+            }
+        }
+        if self
+            .timeout_s
+            .is_some_and(|s| !(1..=MAX_TIMEOUT_S).contains(&s))
+        {
+            return Some(format!(
+                "gates.timeout_s must be between 1 and {MAX_TIMEOUT_S}"
+            ));
+        }
+        if self.output_tail_lines == Some(0) {
+            return Some("gates.output_tail_lines must be at least 1".into());
+        }
+        None
+    }
+
+    /// The settings that are set, as `gates.<key> = <value>`, for listings and fingerprints.
+    fn items(&self) -> Vec<String> {
+        let mut items = Vec::new();
+        if let Some(command) = &self.after_edit {
+            items.push(format!("gates.after_edit = {command:?}"));
+        }
+        if let Some(command) = &self.test {
+            items.push(format!("gates.test = {command:?}"));
+        }
+        if let Some(seconds) = self.timeout_s {
+            items.push(format!("gates.timeout_s = {seconds}"));
+        }
+        if let Some(retries) = self.max_retries {
+            items.push(format!("gates.max_retries = {retries}"));
+        }
+        if let Some(lines) = self.output_tail_lines {
+            items.push(format!("gates.output_tail_lines = {lines}"));
+        }
+        items
+    }
+}
+
 /// One `config.toml` file as written by the user.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -414,6 +494,8 @@ pub struct ConfigFile {
     pub budgets: BudgetSettings,
     #[serde(default)]
     pub outcomes: OutcomeSettings,
+    #[serde(default)]
+    pub gates: GateSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -455,6 +537,8 @@ pub struct Config {
     /// Whether the outcome log is turned off (`[outcomes] enabled = false`; it is on by default;
     /// global config only).
     pub outcomes_disabled: bool,
+    /// The verification gates: the global config's, with a trusted project's over them.
+    pub gates: Gates,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -626,6 +710,8 @@ fn widening(project: &ConfigFile, baseline: Baseline) -> Widening {
     for (key, profile) in &project.profiles {
         items.push(format!("profiles.{key:?}: {}", profile.describe()));
     }
+    // Gate commands run project code, and the retry limit spends paid requests.
+    items.extend(project.gates.items());
     if project.sandbox.linux_git_protection == Some(LinuxGitProtection::BestEffort)
         && baseline.linux_git_protection == LinuxGitProtection::Required
     {
@@ -670,6 +756,7 @@ pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening
         .out_of_range()
         .or_else(|| global_compaction.overlaid(&project.compaction).problem())
         .or_else(|| profiles_problem(&project.profiles))
+        .or_else(|| project.gates.problem())
     {
         return Err(ConfigError::Parse { path, message });
     }
@@ -693,6 +780,7 @@ pub fn load(
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let home = home.as_deref();
     let mut cfg = Config::default();
+    let mut gates = GateSettings::default();
     let global = parse_file(global_file)?;
     let baseline = Baseline::new(global.as_ref(), workspace);
     if let Some(message) = global.as_ref().and_then(|g| {
@@ -701,6 +789,7 @@ pub fn load(
             .or_else(|| profiles_problem(&g.profiles))
             .or_else(|| pricing_problem(&g.pricing))
             .or_else(|| g.budgets.problem())
+            .or_else(|| g.gates.problem())
     }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
@@ -727,6 +816,7 @@ pub fn load(
         cfg.budgets = global.budgets;
         cfg.outcomes_disabled = global.outcomes.enabled == Some(false);
         cfg.notifications = cfg.notifications.overlaid(&global.notifications);
+        gates = global.gates;
     }
     let path = project_file(workspace);
     let project = parse_file(&path)?;
@@ -737,6 +827,7 @@ pub fn load(
             .compaction
             .out_of_range()
             .or_else(|| profiles_problem(&project.profiles))
+            .or_else(|| project.gates.problem())
         {
             return Err(ConfigError::Parse { path, message });
         }
@@ -853,6 +944,7 @@ pub fn load(
                     let merged = cfg.profiles.entry(key.clone()).or_default();
                     *merged = merged.overlaid(profile);
                 }
+                gates = gates.overlaid(&project.gates);
             } else {
                 let items: Vec<&str> = widening_items.iter().map(|item| item.as_str()).collect();
                 cfg.warnings.push(format!(
@@ -864,6 +956,7 @@ pub fn load(
             }
         }
     }
+    cfg.gates = gates.resolve();
     Ok(cfg)
 }
 

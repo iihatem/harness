@@ -78,7 +78,9 @@ impl ProviderError {
             ProviderError::Network(_) => true,
             ProviderError::NoStart { local, .. } => !local,
             ProviderError::Http { status: 429, .. }
-            | ProviderError::Reported { status: 429, .. } => !self.is_quota_exhausted(),
+            | ProviderError::Reported { status: 429, .. } => {
+                !self.is_quota_exhausted() && !self.is_spend_cap()
+            }
             ProviderError::Http { status, .. } | ProviderError::Reported { status, .. } => {
                 (500..600).contains(status)
             }
@@ -101,6 +103,20 @@ impl ProviderError {
             } => reports_quota(body),
             _ => false,
         }
+    }
+
+    /// Whether this is a 429 that reports a spend cap the account set (Anthropic's
+    /// `enforced_spend_limit_reached`, which comes without `retry-after`): waiting does not end
+    /// it, and it is not the subscription limit that a fallback or a resume answers.
+    pub fn is_spend_cap(&self) -> bool {
+        matches!(
+            self,
+            ProviderError::Http {
+                status: 429, body, ..
+            } | ProviderError::Reported {
+                status: 429, body, ..
+            } if body.contains("enforced_spend_limit_reached")
+        )
     }
 
     /// When an exhausted limit resets, in seconds since the Unix epoch, if the provider said:

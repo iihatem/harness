@@ -199,6 +199,11 @@ impl ResponsesStreamParser {
                         cached_tokens: usage["input_tokens_details"]["cached_tokens"]
                             .as_u64()
                             .unwrap_or(0),
+                        cache_write_tokens: 0,
+                        cache_write_1h_tokens: 0,
+                        reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"]
+                            .as_u64()
+                            .unwrap_or(0),
                     }));
                 }
                 self.finish = Some(match response["incomplete_details"]["reason"].as_str() {

@@ -46,6 +46,8 @@ fn text_arrives_as_deltas_and_usage_counts_cached_input() {
                 input_tokens: 2125,
                 output_tokens: 15,
                 cached_tokens: 2000,
+                cache_write_tokens: 100,
+                ..Default::default()
             }),
             ProviderEvent::Finished(FinishReason::Stop),
         ]
@@ -217,6 +219,7 @@ fn usage_is_taken_from_where_the_server_gives_it() {
             input_tokens: 6000,
             output_tokens: 20,
             cached_tokens: 1000,
+            ..Default::default()
         }]
     );
     let updated = events_of(&[
@@ -233,6 +236,8 @@ fn usage_is_taken_from_where_the_server_gives_it() {
             input_tokens: 2130,
             output_tokens: 15,
             cached_tokens: 2000,
+            cache_write_tokens: 100,
+            ..Default::default()
         }]
     );
 }
@@ -655,4 +660,40 @@ fn max_tokens_fits_the_room_left_in_the_window() {
     assert_eq!(sent(Some(4_096), Some(100_000)), 4_096);
     assert_eq!(sent(Some(4_096), Some(2_000)), 2_000);
     assert_eq!(sent(Some(512), Some(100)), 512);
+}
+
+// 1.2: Anthropic reports uncached input, cache writes (by tier) and cache reads apart; the
+// request's input is their sum, and the writes stay known so they are priced as writes.
+#[test]
+fn cache_writes_are_split_by_tier() {
+    let mut parser = MessagesStreamParser::default();
+    let mut events = Vec::new();
+    for event in [
+        start(Some(json!({
+            "input_tokens": 100,
+            "cache_creation_input_tokens": 600,
+            "cache_creation": {"ephemeral_5m_input_tokens": 200, "ephemeral_1h_input_tokens": 400},
+            "cache_read_input_tokens": 300,
+            "output_tokens": 1,
+        }))),
+        stop_with("end_turn", json!({"output_tokens": 50})),
+        json!({"type": "message_stop"}),
+    ] {
+        events.extend(parser.push(&event.to_string()).unwrap());
+    }
+    events.extend(parser.finish());
+    let usage = usage_of(&events);
+    assert_eq!(usage.len(), 1);
+    let usage = usage[0];
+    assert_eq!(usage.input_tokens, 100 + 600 + 300);
+    assert_eq!(usage.cached_tokens, 300);
+    assert_eq!(usage.cache_write_tokens, 600);
+    assert_eq!(usage.cache_write_1h_tokens, 400);
+    let buckets = usage.buckets();
+    assert_eq!(buckets.input, 100);
+    assert_eq!(buckets.cache_write, 200);
+    assert_eq!(buckets.cache_write_1h, 400);
+    assert_eq!(buckets.cache_read, 300);
+    assert_eq!(buckets.output, 50);
+    assert_eq!(buckets.reasoning, 0, "Anthropic does not report it apart");
 }

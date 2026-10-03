@@ -1473,6 +1473,9 @@ impl Agent {
             self.stats.usage.input_tokens += usage.input_tokens;
             self.stats.usage.output_tokens += usage.output_tokens;
             self.stats.usage.cached_tokens += usage.cached_tokens;
+            self.stats.usage.cache_write_tokens += usage.cache_write_tokens;
+            self.stats.usage.cache_write_1h_tokens += usage.cache_write_1h_tokens;
+            self.stats.usage.reasoning_tokens += usage.reasoning_tokens;
             let _ = events.send(AgentEvent::Usage {
                 model: self.model_id().to_string(),
                 usage,
@@ -2025,6 +2028,15 @@ fn describe(error: &ProviderError) -> String {
         };
         return format!(
             "the provider's usage limit is reached{resets}. Switch models with --model (or /model in the terminal UI). {said}"
+        );
+    }
+    if error.is_spend_cap() {
+        let said = match error {
+            ProviderError::Http { body, .. } | ProviderError::Reported { body, .. } => quoted(body),
+            _ => String::new(),
+        };
+        return format!(
+            "the account's spend limit is reached, and waiting does not end it: raise the limit with the provider, or switch models with --model (or /model in the terminal UI). {said}"
         );
     }
     if let Some(wait) = error.retry_after()

@@ -36,11 +36,65 @@ pub struct ToolSpec {
 }
 
 /// Token accounting reported by a provider.
+///
+/// `input_tokens` is everything the request sent (uncached, written to the cache, and read from
+/// it), `output_tokens` everything the model produced (reasoning included), and `cached_tokens`
+/// the part of the input read from the cache. The fields after those are the parts of the two
+/// totals a provider reports apart; `buckets` gives the disjoint counts a price applies to.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    /// The part of the input written to the prompt cache, at either tier.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    /// The part of `cache_write_tokens` written at the 1-hour tier.
+    #[serde(default)]
+    pub cache_write_1h_tokens: u64,
+    /// The part of the output that was reasoning.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
+/// A request's tokens in disjoint buckets: no token is in more than one priced bucket, and
+/// `reasoning`, a part of `output`, is for display and is never priced a second time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Buckets {
+    /// Input that was neither read from the cache nor written to it.
+    pub input: u64,
+    pub cache_read: u64,
+    /// Written to the cache at the 5-minute tier, or at a tier the provider did not state.
+    pub cache_write: u64,
+    pub cache_write_1h: u64,
+    pub output: u64,
+    pub reasoning: u64,
+}
+
+impl Buckets {
+    /// The tokens a price covers: `reasoning` is inside `output` and not added.
+    pub fn priced_total(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write + self.cache_write_1h + self.output
+    }
+}
+
+impl Usage {
+    /// The disjoint buckets of these counts. A provider whose parts add up to more than its
+    /// total leaves `input` at 0 rather than below it.
+    pub fn buckets(&self) -> Buckets {
+        let writes_1h = self.cache_write_1h_tokens.min(self.cache_write_tokens);
+        Buckets {
+            input: self
+                .input_tokens
+                .saturating_sub(self.cached_tokens)
+                .saturating_sub(self.cache_write_tokens),
+            cache_read: self.cached_tokens,
+            cache_write: self.cache_write_tokens - writes_1h,
+            cache_write_1h: writes_1h,
+            output: self.output_tokens,
+            reasoning: self.reasoning_tokens.min(self.output_tokens),
+        }
+    }
 }
 
 /// Settings a model profile gives each request. `None` leaves the provider's default.

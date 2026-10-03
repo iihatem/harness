@@ -172,6 +172,8 @@ struct PartialCall {
 struct Counts {
     input: Option<u64>,
     cache_writes: u64,
+    /// The part of `cache_writes` at the 1-hour tier, when the server says.
+    cache_writes_1h: u64,
     cache_reads: u64,
     output: u64,
 }
@@ -181,6 +183,9 @@ impl Counts {
         let count = |key: &str| usage[key].as_u64();
         self.input = count("input_tokens").or(self.input);
         self.cache_writes = count("cache_creation_input_tokens").unwrap_or(self.cache_writes);
+        self.cache_writes_1h = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_u64()
+            .unwrap_or(self.cache_writes_1h);
         self.cache_reads = count("cache_read_input_tokens").unwrap_or(self.cache_reads);
         self.output = count("output_tokens").unwrap_or(self.output);
     }
@@ -192,6 +197,9 @@ impl Counts {
             input_tokens: self.input? + self.cache_writes + self.cache_reads,
             output_tokens: self.output,
             cached_tokens: self.cache_reads,
+            cache_write_tokens: self.cache_writes,
+            cache_write_1h_tokens: self.cache_writes_1h,
+            reasoning_tokens: 0,
         })
     }
 }

@@ -136,6 +136,7 @@ fn reply_with_usage(text: &str, input: u64, output: u64, cached: u64) -> Script 
             input_tokens: input,
             output_tokens: output,
             cached_tokens: cached,
+            ..Default::default()
         })),
         Ok(ProviderEvent::Finished(FinishReason::Stop)),
     ])
@@ -168,6 +169,7 @@ fn the_status_line_shows_the_model_mode_context_and_tokens() {
             input_tokens: 12_000,
             output_tokens: 1_100,
             cached_tokens: 0,
+            ..Default::default()
         },
     );
     let line = status::status_line("mock/m", Mode::Auto, &context, &totals, &theme);

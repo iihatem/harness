@@ -48,6 +48,7 @@ fn text_arrives_as_deltas_with_usage_and_a_stop() {
                 input_tokens: 36,
                 output_tokens: 87,
                 cached_tokens: 12,
+                ..Default::default()
             }),
             ProviderEvent::Finished(FinishReason::Stop),
         ]
@@ -486,4 +487,36 @@ fn an_assistant_message_with_only_tool_calls_sends_no_empty_text() {
             .get("tools")
             .is_none()
     );
+}
+
+// 1.2: `output_tokens` includes the reasoning tokens, reported apart in `output_tokens_details`.
+#[test]
+fn reasoning_tokens_are_part_of_the_output() {
+    let mut parser = ResponsesStreamParser::default();
+    let events = parser
+        .push(
+            &json!({"type": "response.completed", "response": {
+                "usage": {"input_tokens": 10000, "output_tokens": 500,
+                    "input_tokens_details": {"cached_tokens": 8000},
+                    "output_tokens_details": {"reasoning_tokens": 200}}}})
+            .to_string(),
+        )
+        .unwrap();
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            ProviderEvent::Usage(usage) => Some(*usage),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(usage.input_tokens, 10_000);
+    assert_eq!(usage.output_tokens, 500);
+    assert_eq!(usage.cached_tokens, 8_000);
+    assert_eq!(usage.reasoning_tokens, 200);
+    let buckets = usage.buckets();
+    assert_eq!(
+        (buckets.input, buckets.cache_read, buckets.output),
+        (2_000, 8_000, 500)
+    );
+    assert_eq!(buckets.priced_total(), 10_500);
 }

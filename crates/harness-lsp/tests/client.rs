@@ -52,8 +52,8 @@ async fn it_initializes_the_server_and_answers_its_requests() {
     // Let the server's own request (progress creation) be answered, then it sees the reply.
     check(&client, &f, "fn main() {}\n", WAIT).await;
     let log = f.log();
-    assert_eq!(log[0], "args: --stdio");
-    assert_eq!(log[1], "initialize");
+    assert_eq!(log[1], "args: --stdio");
+    assert_eq!(log[2], "initialize");
     assert!(log.contains(&"initialized".to_string()), "{log:?}");
     assert!(log.contains(&"reply".to_string()), "{log:?}");
     client.shutdown().await;

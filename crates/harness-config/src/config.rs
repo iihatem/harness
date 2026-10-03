@@ -467,6 +467,125 @@ impl GateSettings {
     }
 }
 
+/// The languages `[lsp.servers]` names.
+pub const LSP_LANGUAGES: [&str; 4] = ["rust", "typescript", "python", "go"];
+
+/// The shortest and longest wait for a language server's diagnostics, in milliseconds.
+pub const LSP_WAIT_MS: std::ops::RangeInclusive<u64> = 100..=60_000;
+
+/// `[lsp]`: language servers that report the errors in edited files. Turning them off, or
+/// shortening the wait, narrows what harness does and applies from a project without trust; a
+/// command to run does not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LspSettings {
+    pub enabled: Option<bool>,
+    pub wait_ms: Option<u64>,
+    #[serde(default)]
+    pub servers: BTreeMap<String, LspServerSettings>,
+}
+
+/// `[lsp.servers.<language>]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LspServerSettings {
+    /// The command to run for the language, instead of the one looked up on `PATH`.
+    pub command: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+impl LspSettings {
+    /// What is wrong with these settings, if anything.
+    fn problem(&self) -> Option<String> {
+        if self.wait_ms.is_some_and(|ms| !LSP_WAIT_MS.contains(&ms)) {
+            return Some(format!(
+                "lsp.wait_ms must be between {} and {}",
+                LSP_WAIT_MS.start(),
+                LSP_WAIT_MS.end()
+            ));
+        }
+        for (language, server) in &self.servers {
+            if !LSP_LANGUAGES.contains(&language.as_str()) {
+                return Some(format!(
+                    "lsp.servers.{language}: unknown language (expected {})",
+                    LSP_LANGUAGES.join(", ")
+                ));
+            }
+            if server
+                .command
+                .as_deref()
+                .is_some_and(|c| c.trim().is_empty())
+            {
+                return Some(format!("lsp.servers.{language}.command must not be empty"));
+            }
+        }
+        None
+    }
+
+    /// The commands a project sets, as `lsp.servers.<language>.command = <command>`.
+    fn items(&self) -> Vec<String> {
+        self.servers
+            .iter()
+            .filter_map(|(language, server)| {
+                server
+                    .command
+                    .as_ref()
+                    .map(|command| format!("lsp.servers.{language}.command = {command:?}"))
+            })
+            .collect()
+    }
+}
+
+/// The language-server settings in effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspConfig {
+    pub enabled: bool,
+    pub wait_ms: u64,
+    pub servers: BTreeMap<String, LspServer>,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        LspConfig {
+            enabled: true,
+            wait_ms: 2_000,
+            servers: BTreeMap::new(),
+        }
+    }
+}
+
+/// One language's server setting in effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServer {
+    pub command: Option<String>,
+    pub enabled: bool,
+}
+
+impl LspConfig {
+    /// These with `settings` over them. `trusted` lets commands in; a setting can only turn a
+    /// server off, not on again.
+    fn overlaid(&mut self, settings: &LspSettings, commands: bool) {
+        if let Some(enabled) = settings.enabled {
+            self.enabled &= enabled;
+        }
+        if let Some(ms) = settings.wait_ms {
+            self.wait_ms = ms;
+        }
+        for (language, server) in &settings.servers {
+            let entry = self.servers.entry(language.clone()).or_insert(LspServer {
+                command: None,
+                enabled: true,
+            });
+            if let Some(enabled) = server.enabled {
+                entry.enabled &= enabled;
+            }
+            if commands && let Some(command) = &server.command {
+                entry.command = Some(command.clone());
+            }
+        }
+    }
+}
+
 /// One `config.toml` file as written by the user.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -496,6 +615,8 @@ pub struct ConfigFile {
     pub outcomes: OutcomeSettings,
     #[serde(default)]
     pub gates: GateSettings,
+    #[serde(default)]
+    pub lsp: LspSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -539,6 +660,8 @@ pub struct Config {
     pub outcomes_disabled: bool,
     /// The verification gates: the global config's, with a trusted project's over them.
     pub gates: Gates,
+    /// The language servers' settings: the global config's, with a project's over them.
+    pub lsp: LspConfig,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -712,6 +835,8 @@ fn widening(project: &ConfigFile, baseline: Baseline) -> Widening {
     }
     // Gate commands run project code, and the retry limit spends paid requests.
     items.extend(project.gates.items());
+    // Language-server commands run project code.
+    items.extend(project.lsp.items());
     if project.sandbox.linux_git_protection == Some(LinuxGitProtection::BestEffort)
         && baseline.linux_git_protection == LinuxGitProtection::Required
     {
@@ -757,6 +882,7 @@ pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening
         .or_else(|| global_compaction.overlaid(&project.compaction).problem())
         .or_else(|| profiles_problem(&project.profiles))
         .or_else(|| project.gates.problem())
+        .or_else(|| project.lsp.problem())
     {
         return Err(ConfigError::Parse { path, message });
     }
@@ -790,6 +916,7 @@ pub fn load(
             .or_else(|| pricing_problem(&g.pricing))
             .or_else(|| g.budgets.problem())
             .or_else(|| g.gates.problem())
+            .or_else(|| g.lsp.problem())
     }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
@@ -817,6 +944,7 @@ pub fn load(
         cfg.outcomes_disabled = global.outcomes.enabled == Some(false);
         cfg.notifications = cfg.notifications.overlaid(&global.notifications);
         gates = global.gates;
+        cfg.lsp.overlaid(&global.lsp, true);
     }
     let path = project_file(workspace);
     let project = parse_file(&path)?;
@@ -828,9 +956,12 @@ pub fn load(
             .out_of_range()
             .or_else(|| profiles_problem(&project.profiles))
             .or_else(|| project.gates.problem())
+            .or_else(|| project.lsp.problem())
         {
             return Err(ConfigError::Parse { path, message });
         }
+        // Turning servers off and the wait narrow what harness does; commands wait for trust.
+        cfg.lsp.overlaid(&project.lsp, cfg.trusted);
         cfg.notifications = cfg.notifications.overlaid(&project.notifications);
         if !project.pricing.is_empty() {
             cfg.warnings.push(format!(

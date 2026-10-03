@@ -3,8 +3,9 @@
 //! In a file's text, a line holding `ERROR` is an error at that line, `WARN` a warning, `HINT` a
 //! hint; `SLOW:<ms>` delays the publish; `NOPUBLISH` publishes nothing; `CRASH` exits at once;
 //! `TWICE` publishes a syntax pass (no diagnostics) and then the real one 50 ms later.
-//! `FAKE_LSP_LOG` names a file each received message is appended to, one line each: the method.
-//! `FAKE_LSP_ARGS` is not read: arguments of the command are logged first, as `args: ...`.
+//! Each received message is appended to a log, one line each: the method (`reply` for a reply to
+//! a request of the server's). Before them come `program: <name>` and `args: <arguments>`. The log
+//! is `FAKE_LSP_LOG`, or else `server.log` beside the directory the server was run from.
 
 use std::{
     io::{BufRead, Write},
@@ -39,8 +40,18 @@ fn send(out: &mut impl Write, message: &Value) {
     out.flush().unwrap();
 }
 
-fn log(line: &str) {
+/// Where to log: `FAKE_LSP_LOG`, else `server.log` beside the directory the server was started
+/// from (`<dir>/bin/<name>`), so each test's servers log to a file of its own.
+fn log_path() -> Option<std::path::PathBuf> {
     if let Ok(path) = std::env::var("FAKE_LSP_LOG") {
+        return Some(path.into());
+    }
+    let program = std::path::PathBuf::from(std::env::args().next()?);
+    Some(program.parent()?.parent()?.join("server.log"))
+}
+
+fn log(line: &str) {
+    if let Some(path) = log_path() {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -101,10 +112,13 @@ fn publish(out: &mut impl Write, uri: &Value, text: &str) {
 }
 
 fn main() {
+    let mut args = std::env::args();
+    let program = args.next().unwrap_or_default();
     log(&format!(
-        "args: {}",
-        std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+        "program: {}",
+        program.rsplit('/').next().unwrap_or_default()
     ));
+    log(&format!("args: {}", args.collect::<Vec<_>>().join(" ")));
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut out = std::io::stdout().lock();

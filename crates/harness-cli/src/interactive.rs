@@ -67,16 +67,26 @@ fn no_models(global: &Path) -> String {
     )
 }
 
+/// The model chosen on the first run.
+#[derive(Debug)]
+pub struct FirstChoice {
+    pub id: String,
+    /// Why it could not be saved as the default, when that failed: the choice is used for this
+    /// run all the same.
+    pub save_error: Option<String>,
+}
+
 /// The first run, with no model configured: the user chooses one of the models harness `found`
 /// in a picker on `term`, with the events `events` of the terminal's reader, and it is saved as
-/// the default model in the global config file `global`. Errors are what to print (exit code
-/// 2); so is a terminal that hung up meanwhile, which chose nothing.
+/// the default model in the global config file `global`, or, when that fails, kept for this run
+/// with the reason. Errors are what to print (exit code 2); so is a terminal that hung up
+/// meanwhile, which chose nothing.
 pub async fn choose_first_model<B, S, E>(
     global: &Path,
     found: Vec<String>,
     term: &mut InlineTerminal<B>,
     events: S,
-) -> Result<String, String>
+) -> Result<FirstChoice, String>
 where
     B: ratatui::backend::Backend,
     B::Error: Send + Sync + 'static,
@@ -100,14 +110,18 @@ where
             global.display()
         ));
     };
-    config::save_default_model(global, &id)
-        .map_err(|e| format!("cannot save the model as the default: {e}"))?;
-    Ok(id)
+    let save_error = config::save_default_model(global, &id).err().map(|e| {
+        format!(
+            "cannot save {id} as the default model in {}: {e}",
+            global.display()
+        )
+    });
+    Ok(FirstChoice { id, save_error })
 }
 
 /// How the first-run model choice went.
 enum FirstModel {
-    Chosen(String),
+    Chosen(FirstChoice),
     /// The session ended (a signal, or the terminal hung up) before a model was chosen.
     Ended(Ending),
 }
@@ -163,7 +177,7 @@ async fn first_model(setup: &Setup, notices: &mut Notices) -> Result<FirstModel,
     drop(modes);
     match chosen {
         Err(ending) => Ok(FirstModel::Ended(ending)),
-        Ok(Ok(id)) => Ok(FirstModel::Chosen(id)),
+        Ok(Ok(choice)) => Ok(FirstModel::Chosen(choice)),
         Ok(Err(message)) => Err(message),
     }
 }
@@ -232,12 +246,18 @@ pub async fn run(
     let model_id = match model_flag.or_else(|| setup.config.model.clone()) {
         Some(id) => id,
         None => match first_model(&setup, &mut notices).await {
-            Ok(FirstModel::Chosen(id)) => {
-                println!(
-                    "Saved {} as your default model in {}.",
-                    terminal_safe(&id),
-                    terminal_safe(&setup.paths.global_config_file().display().to_string())
-                );
+            Ok(FirstModel::Chosen(FirstChoice { id, save_error })) => {
+                match save_error {
+                    None => println!(
+                        "Saved {} as your default model in {}.",
+                        terminal_safe(&id),
+                        terminal_safe(&setup.paths.global_config_file().display().to_string())
+                    ),
+                    // The choice stands for this run, saved or not.
+                    Some(why) => {
+                        notices.warn(&format!("{why}; using it for this run"));
+                    }
+                }
                 id
             }
             Ok(FirstModel::Ended(ending)) => return exit_code(ending),
@@ -574,7 +594,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(chosen, "ollama/qwen3-coder:30b");
+        assert_eq!(chosen.id, "ollama/qwen3-coder:30b");
+        assert_eq!(chosen.save_error, None);
         assert_eq!(
             std::fs::read_to_string(&global).unwrap(),
             "model = \"ollama/qwen3-coder:30b\"\n"
@@ -636,11 +657,34 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(chosen, "chatgpt/gpt-5-codex");
+        assert_eq!(chosen.id, "chatgpt/gpt-5-codex");
         assert_eq!(
             std::fs::read_to_string(&global).unwrap(),
             "model = \"chatgpt/gpt-5-codex\"\n"
         );
+    }
+
+    // Review B M3: the choice is the user's even when it cannot be saved (a read-only or
+    // unwritable config directory): it is used for this run, and the failure is reported.
+    #[tokio::test]
+    async fn a_save_that_fails_keeps_the_choice_for_this_run() {
+        let home = tempfile::tempdir().unwrap();
+        let blocker = home.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let global = blocker.join("config.toml");
+        let mut term = terminal();
+        let chosen = choose_first_model(
+            &global,
+            vec!["ollama/llama3".into()],
+            &mut term,
+            keys(&[KeyCode::Enter]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(chosen.id, "ollama/llama3");
+        let why = chosen.save_error.expect("the save failed");
+        assert!(why.contains("cannot save"), "{why}");
+        assert!(why.contains("ollama/llama3"), "{why}");
     }
 
     #[test]

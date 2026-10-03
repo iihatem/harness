@@ -51,7 +51,10 @@ impl Host for Sessions {
         Ok(OpenedSession {
             session,
             checkpoints: None,
-            warnings: vec!["a warning about the file".into()],
+            warnings: vec![
+                "a warning about the file".into(),
+                "note: a note about the file".into(),
+            ],
         })
     }
 }
@@ -122,6 +125,9 @@ async fn new_starts_an_empty_conversation_in_a_new_session() {
         "started a new session; /resume goes back to another"
     ));
     assert!(shows(&ui, "warning: a warning about the file"));
+    // Review B M5: a note is shown as a note, not as a warning that starts "note:".
+    assert!(shows(&ui, "a note about the file"));
+    assert!(!shows(&ui, "warning: note:"), "{:#?}", everything(&ui));
     send(&mut ui, "a fresh start");
     settle(&mut ui).await;
     assert_eq!(user_messages(&provider), ["a fresh start"]);

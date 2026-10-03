@@ -427,7 +427,7 @@ where
                 match self.app.host().open_session(id.as_deref()) {
                     Ok(opened) => {
                         for message in opened.warnings {
-                            self.show(AgentEvent::Warning { message });
+                            self.show_notice(message);
                         }
                         self.send_job(Job::StartSession {
                             session: Box::new(opened.session),
@@ -580,6 +580,14 @@ where
         };
         for event in &shown {
             self.app.on_event(event);
+        }
+    }
+
+    /// Shows a message the host kept: a note when it starts `note: `, else a warning.
+    fn show_notice(&mut self, message: String) {
+        match message.strip_prefix("note: ") {
+            Some(note) => self.app.push_note(note),
+            None => self.show(AgentEvent::Warning { message }),
         }
     }
 

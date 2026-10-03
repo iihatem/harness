@@ -68,7 +68,8 @@ impl Host for CliHost {
         };
         // Nothing may print while the terminal UI runs: the UI shows the warnings.
         let mut notices = Notices::quiet(self.setup.redactor.clone());
-        let session = sessions::open(&self.setup, &choice, &mut notices)?;
+        let session =
+            sessions::open_listing(&self.setup, &choice, &mut notices, "`/resume` lists them")?;
         let checkpoints =
             sessions::checkpoints(&self.setup, &session, &self.writable, &mut notices);
         Ok(OpenedSession {
@@ -227,6 +228,9 @@ pub mod tests {
             panic!("an unknown session opened");
         };
         assert!(why.contains("there is no session nope"), "{why}");
+        // Review B M6: in a session, `/resume` lists the sessions, not `harness --resume`.
+        assert!(why.contains("/resume"), "{why}");
+        assert!(!why.contains("harness --resume"), "{why}");
     }
 
     // Review B I1: with ChatGPT signed in, the model list (the picker's) has ChatGPT's models,

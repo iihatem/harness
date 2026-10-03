@@ -71,6 +71,22 @@ pub fn checkpoints(
 /// Opens the session to run in, printing any warnings about its file. Errors are user-facing
 /// messages (exit code 2).
 pub fn open(setup: &Setup, choice: &Choice, notices: &mut Notices) -> Result<Session, String> {
+    open_listing(
+        setup,
+        choice,
+        notices,
+        "run `harness --resume` to list them",
+    )
+}
+
+/// [`open`], where `listing` says how to list the project's sessions to someone who named one
+/// that is not there.
+pub fn open_listing(
+    setup: &Setup,
+    choice: &Choice,
+    notices: &mut Notices,
+    listing: &str,
+) -> Result<Session, String> {
     let dir = dir(setup);
     let path = match choice {
         Choice::New => return Ok(Session::create(&dir, &setup.workspace)),
@@ -85,7 +101,7 @@ pub fn open(setup: &Setup, choice: &Choice, notices: &mut Notices) -> Result<Ses
             let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
             if !session::is_valid_id(id) || !regular {
                 return Err(format!(
-                    "there is no session {id} in this project; run `harness --resume` to list them"
+                    "there is no session {id} in this project; {listing}"
                 ));
             }
             path

@@ -733,3 +733,38 @@ fn the_documented_configuration_parses() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// B3: an invalid argument exits 2 everywhere, and nothing is deleted for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_date_that_is_not_one_exits_2_for_every_usage_command() {
+    let server = MockServer::start().await;
+    let env = ask_twice(Env::new(&server.uri(), ""), &server).await;
+    for args in [
+        vec!["usage", "forget", "--before", "not-a-date"],
+        vec!["usage", "forget", "--before", "2026-02-30"],
+        vec!["usage", "export", "--since", "not-a-date"],
+        vec!["usage", "export", "--format", "xml"],
+    ] {
+        let out = run_usage(&env, &args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        assert!(!out.stderr.is_empty(), "{args:?}");
+    }
+    assert_eq!(env.ledger().len(), 2, "nothing was deleted");
+}
+
+// B4: the report's flags belong to the report; a subcommand does not take them.
+#[test]
+fn the_reports_flags_are_refused_with_a_subcommand() {
+    let env = Env::new("http://127.0.0.1:9", "");
+    for args in [
+        vec!["usage", "--since", "2026-10-01", "export"],
+        vec!["usage", "--by", "day", "forget", "--all"],
+        vec!["usage", "--until", "2026-10-01", "export"],
+    ] {
+        let out = run_usage(&env, &args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    }
+    // The subcommands' own flags still work.
+    let ok = run_usage(&env, &["usage", "export", "--since", "2026-10-01"]);
+    assert!(ok.status.success(), "{ok:?}");
+}

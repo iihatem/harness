@@ -114,6 +114,7 @@ enum Command {
     },
     /// Report model usage and cost from the local ledger, by model, provider, day or project;
     /// `usage export` and `usage forget` handle the data
+    #[command(args_conflicts_with_subcommands = true)]
     Usage {
         #[command(subcommand)]
         command: Option<UsageCommand>,
@@ -159,7 +160,8 @@ enum UsageCommand {
         #[arg(long, default_value = "jsonl")]
         format: String,
     },
-    /// Delete the ledger and the outcome log, in a range, and rebuild the report cache
+    /// Delete the ledger, the window snapshots and the outcome log, in a range, and rebuild the
+    /// report cache
     Forget {
         /// Delete what is before this UTC date (YYYY-MM-DD)
         #[arg(long, conflicts_with = "all")]

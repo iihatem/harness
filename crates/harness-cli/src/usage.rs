@@ -60,8 +60,18 @@ pub fn session_lines(setup: &Setup, args: &str) -> Vec<String> {
     let mut words = args.split_whitespace();
     while let Some(word) = words.next() {
         match word {
-            "--since" => since = words.next().map(String::from),
-            "--until" => until = words.next().map(String::from),
+            "--since" | "--until" => {
+                // The flag's value is a date: without one, that is the mistake, as it is for
+                // `harness usage --since`.
+                let Some(value) = words.next() else {
+                    return vec![format!("/usage: {word} takes a date as YYYY-MM-DD (UTC)")];
+                };
+                if word == "--since" {
+                    since = Some(value.to_string());
+                } else {
+                    until = Some(value.to_string());
+                }
+            }
             group if !group.starts_with('-') => by = group.to_string(),
             other => {
                 return vec![format!(
@@ -134,6 +144,10 @@ pub fn export(since: Option<&str>, format: &str) -> u8 {
         eprintln!("error: --format takes jsonl or csv, not `{format}`");
         return 2;
     };
+    if let Err(message) = date("--since", since.map(String::from)) {
+        eprintln!("error: {message}");
+        return 2;
+    }
     let setup = match setup::load() {
         Ok(setup) => setup,
         Err(message) => {
@@ -144,21 +158,26 @@ pub fn export(since: Option<&str>, format: &str) -> u8 {
     let dirs = Dirs::under(&setup.paths.data_dir);
     let mut out = Vec::new();
     if let Err(e) = harness_usage::export::export(&dirs, since, format, &mut out) {
+        // The arguments were checked above: this is the ledger that could not be read.
         eprintln!("error: {}", terminal_safe(&e.to_string()));
-        return 2;
+        return 1;
     }
     // A closed pipe is the reader's choice, not an error of ours.
     let _ = std::io::Write::write_all(&mut std::io::stdout().lock(), &out);
     0
 }
 
-/// `harness usage forget`: deletes the ledger and the outcome log, in a range, and rebuilds the
-/// cache. With neither `--before` nor `--all` it deletes nothing and says so.
+/// `harness usage forget`: deletes the ledger, the window snapshots and the outcome log, in a
+/// range, and rebuilds the cache. With neither `--before` nor `--all` it deletes nothing and says so.
 pub fn forget(before: Option<&str>, all: bool) -> u8 {
     if before.is_none() && !all {
         eprintln!(
             "error: usage forget needs a range: --before DATE (UTC, YYYY-MM-DD) or --all; nothing was deleted"
         );
+        return 2;
+    }
+    if let Err(message) = date("--before", before.map(String::from)) {
+        eprintln!("error: {message}; nothing was deleted");
         return 2;
     }
     let setup = match setup::load() {

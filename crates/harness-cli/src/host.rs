@@ -415,6 +415,13 @@ pub mod tests {
         );
         let wrong = host.usage_report("colour").await.join("\n");
         assert!(wrong.contains("--by takes"), "{wrong}");
+        for args in ["--since", "day --since", "--until"] {
+            let missing = host.usage_report(args).await.join("\n");
+            assert!(
+                missing.contains("takes a date"),
+                "`/usage {args}` is an error: {missing}"
+            );
+        }
         let bad_flag = host.usage_report("--wat").await.join("\n");
         assert!(bad_flag.contains("not `--wat`"), "{bad_flag}");
     }

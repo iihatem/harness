@@ -484,10 +484,10 @@ impl Shown {
                 eprintln!("warning: {}", terminal_safe(message))
             }
             AgentEvent::BudgetWarning { notice } if !json => {
-                eprintln!("warning: {}", notice.warning_message())
+                eprintln!("warning: {}", terminal_safe(&notice.warning_message()))
             }
             AgentEvent::BudgetReached { notice } if !json => {
-                eprintln!("error: {}", notice.reached_message())
+                eprintln!("error: {}", terminal_safe(&notice.reached_message()))
             }
             AgentEvent::Compacted {
                 summary,

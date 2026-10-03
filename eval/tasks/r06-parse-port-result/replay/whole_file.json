@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "pub fn parse_port(s: &str) -> Result<u16, std::num::ParseIntError> {\n    s.trim().parse()\n}\n",
+        "path": "src/lib.rs"
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n pub fn clamp(x: i32, lo: i32, hi: i32) -> i32 {\n     if x < lo {\n-        hi\n-    } else if x > hi {\n-        lo\n+        lo\n+    } else if x > hi {\n+        hi\n     } else {\n         x\n     }\n*** End Patch\n"
+      }
+    }
+  ]
+}

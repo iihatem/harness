@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "export function last<T>(xs: T[]): T | undefined {\n  return xs[xs.length - 1];\n}",
+        "old_string": "export function last<T>(xs: T[]): T | undefined {\n  return xs[xs.length];\n}",
+        "path": "mod.ts"
+      }
+    }
+  ]
+}

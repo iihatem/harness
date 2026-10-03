@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: app.py\n@@\n def dedupe(xs):\n-    return list(set(xs))\n+    seen = set()\n+    out = []\n+    for x in xs:\n+        if x not in seen:\n+            seen.add(x)\n+            out.append(x)\n+    return out\n*** End Patch\n"
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "text.go"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: text.go\n@@\n package task\n \n func Reverse(s string) string {\n-\tb := []byte(s)\n-\tfor i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {\n-\t\tb[i], b[j] = b[j], b[i]\n-\t}\n-\treturn string(b)\n+\tr := []rune(s)\n+\tfor i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {\n+\t\tr[i], r[j] = r[j], r[i]\n+\t}\n+\treturn string(r)\n }\n*** End Patch\n"
+      }
+    }
+  ]
+}

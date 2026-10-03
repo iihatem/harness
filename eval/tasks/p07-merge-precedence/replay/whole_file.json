@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "def merge(defaults, overrides):\n    return {**defaults, **overrides}\n",
+        "path": "app.py"
+      }
+    }
+  ]
+}

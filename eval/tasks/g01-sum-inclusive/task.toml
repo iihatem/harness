@@ -1,0 +1,4 @@
+language = "go"
+title = "Sum leaves out n"
+prompt = "Sum(n) should add the numbers from 1 to n inclusive, but it stops one short. Fix it so the tests pass."
+test = "go test ./..."

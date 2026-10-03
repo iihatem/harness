@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "calc.go"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: calc.go\n@@\n \n func Sum(n int) int {\n \ttotal := 0\n-\tfor i := 1; i < n; i++ {\n+\tfor i := 1; i <= n; i++ {\n \t\ttotal += i\n \t}\n \treturn total\n*** End Patch\n"
+      }
+    }
+  ]
+}

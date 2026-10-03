@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: mod.ts\n@@\n export function isOdd(n: number): boolean {\n-  return n % 2 === 1;\n+  return Math.abs(n % 2) === 1;\n }\n*** End Patch\n"
+      }
+    }
+  ]
+}

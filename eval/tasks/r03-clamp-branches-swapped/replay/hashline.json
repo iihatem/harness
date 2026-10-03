@@ -1,0 +1,19 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "5#3de",
+        "new_text": "        lo\n    } else if x > hi {\n        hi",
+        "path": "src/lib.rs",
+        "start": "3#9ff"
+      }
+    }
+  ]
+}

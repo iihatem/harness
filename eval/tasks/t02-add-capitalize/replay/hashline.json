@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "new_text": "}\n\nexport function capitalize(s: string): string {\n  return s.charAt(0).toUpperCase() + s.slice(1);\n}",
+        "path": "mod.ts",
+        "start": "3#894"
+      }
+    }
+  ]
+}

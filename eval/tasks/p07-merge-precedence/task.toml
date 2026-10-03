@@ -1,0 +1,4 @@
+language = "python"
+title = "merge lets the wrong dict win"
+prompt = "merge(defaults, overrides) should let the values in overrides win, but the defaults win now."
+test = "python3 -m unittest -q"

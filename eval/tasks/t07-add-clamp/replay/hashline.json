@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "new_text": "}\n\nexport function clamp(x: number, lo: number, hi: number): number {\n  return Math.min(Math.max(x, lo), hi);\n}",
+        "path": "mod.ts",
+        "start": "3#894"
+      }
+    }
+  ]
+}

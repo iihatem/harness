@@ -1,0 +1,4 @@
+language = "typescript"
+title = "add capitalize"
+prompt = "Add an exported capitalize(s: string): string to mod.ts that upper-cases the first letter and leaves the rest as it is. capitalize(\"\") is \"\"."
+test = "deno test --no-check --quiet"

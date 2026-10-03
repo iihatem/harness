@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "port.go"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "package task\n\nimport \"strconv\"\n\nfunc ParsePort(s string) (int, error) {\n\tn, err := strconv.Atoi(s)\n\tif err != nil {\n\t\treturn 0, err\n\t}\n\treturn n, nil\n}\n",
+        "path": "port.go"
+      }
+    }
+  ]
+}

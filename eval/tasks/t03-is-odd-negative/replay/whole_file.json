@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "export function isOdd(n: number): boolean {\n  return Math.abs(n % 2) === 1;\n}\n",
+        "path": "mod.ts"
+      }
+    }
+  ]
+}

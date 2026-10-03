@@ -1,0 +1,4 @@
+language = "rust"
+title = "clamp returns the wrong bound"
+prompt = "clamp(x, lo, hi) returns the opposite bound when x is out of range. Fix it so the tests pass."
+test = "cargo test --quiet --offline"

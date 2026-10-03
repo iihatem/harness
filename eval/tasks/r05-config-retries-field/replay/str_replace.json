@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "    pub name: String,\n    pub retries: u32,\n}\n\nimpl Config {\n    pub fn new(name: &str, retries: u32) -> Config {\n        Config {\n            name: name.to_string(),\n            retries,\n        }",
+        "old_string": "    pub name: String,\n}\n\nimpl Config {\n    pub fn new(name: &str) -> Config {\n        Config {\n            name: name.to_string(),\n        }",
+        "path": "src/lib.rs"
+      }
+    }
+  ]
+}

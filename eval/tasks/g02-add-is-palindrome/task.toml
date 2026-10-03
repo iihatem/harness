@@ -1,0 +1,4 @@
+language = "go"
+title = "add IsPalindrome"
+prompt = "Add IsPalindrome(s string) bool to text.go: true when the string reads the same backwards."
+test = "go test ./..."

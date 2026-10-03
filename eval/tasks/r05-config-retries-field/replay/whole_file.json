@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "pub struct Config {\n    pub name: String,\n    pub retries: u32,\n}\n\nimpl Config {\n    pub fn new(name: &str, retries: u32) -> Config {\n        Config {\n            name: name.to_string(),\n            retries,\n        }\n    }\n}\n",
+        "path": "src/lib.rs"
+      }
+    }
+  ]
+}

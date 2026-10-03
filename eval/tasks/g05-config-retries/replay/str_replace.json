@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "config.go"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "type Config struct {\n\tName    string\n\tRetries int\n}\n\nfunc NewConfig(name string, retries int) Config {\n\treturn Config{Name: name, Retries: retries}\n}",
+        "old_string": "type Config struct {\n\tName string\n}\n\nfunc NewConfig(name string) Config {\n\treturn Config{Name: name}\n}",
+        "path": "config.go"
+      }
+    }
+  ]
+}

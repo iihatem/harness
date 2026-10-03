@@ -1,0 +1,4 @@
+language = "rust"
+title = "reverse breaks non-ASCII text"
+prompt = "reverse panics on text with non-ASCII characters because it reverses bytes. Reverse by characters instead."
+test = "cargo test --quiet --offline"

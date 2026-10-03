@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "calc.go"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "package task\n\nfunc Sum(n int) int {\n\ttotal := 0\n\tfor i := 1; i <= n; i++ {\n\t\ttotal += i\n\t}\n\treturn total\n}\n",
+        "path": "calc.go"
+      }
+    }
+  ]
+}

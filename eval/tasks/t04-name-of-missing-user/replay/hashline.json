@@ -1,0 +1,19 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "6#1a4",
+        "new_text": "  return user?.name ?? \"anonymous\";",
+        "path": "mod.ts",
+        "start": "6#1a4"
+      }
+    }
+  ]
+}

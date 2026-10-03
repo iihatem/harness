@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "  const out: number[] = [];\n  for (let i = a; i <= b; i++) {\n    out.push(i);",
+        "old_string": "  const out: number[] = [];\n  for (let i = a; i < b; i++) {\n    out.push(i);",
+        "path": "mod.ts"
+      }
+    }
+  ]
+}

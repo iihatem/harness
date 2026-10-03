@@ -1,0 +1,19 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "config.go"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "8#c32",
+        "new_text": "\tName    string\n\tRetries int\n}\n\nfunc NewConfig(name string, retries int) Config {\n\treturn Config{Name: name, Retries: retries}",
+        "path": "config.go",
+        "start": "4#cd8"
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "2#55b",
+        "new_text": "    s.chars().rev().collect()",
+        "path": "src/lib.rs",
+        "start": "2#55b"
+      }
+    }
+  ]
+}

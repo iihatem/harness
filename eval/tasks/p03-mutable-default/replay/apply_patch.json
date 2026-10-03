@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: app.py\n@@\n-def add_item(item, items=[]):\n+def add_item(item, items=None):\n+    if items is None:\n+        items = []\n     items.append(item)\n     return items\n*** End Patch\n"
+      }
+    }
+  ]
+}

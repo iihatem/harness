@@ -1,0 +1,4 @@
+language = "go"
+title = "Reverse breaks non-ASCII text"
+prompt = "Reverse reverses bytes, which breaks text with non-ASCII characters. Reverse by runes instead."
+test = "go test ./..."

@@ -1,0 +1,4 @@
+language = "rust"
+title = "add a retries field to Config"
+prompt = "Config needs a retries: u32 field, set by Config::new(name, retries). Update the struct and the constructor; the tests use the new signature."
+test = "cargo test --quiet --offline"

@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "pub fn parse_port(s: &str) -> Result<u16, std::num::ParseIntError> {\n    s.trim().parse()\n}",
+        "old_string": "pub fn parse_port(s: &str) -> u16 {\n    s.trim().parse().unwrap()\n}",
+        "path": "src/lib.rs"
+      }
+    }
+  ]
+}

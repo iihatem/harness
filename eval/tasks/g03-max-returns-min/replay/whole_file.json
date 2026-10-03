@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "calc.go"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "package task\n\nfunc Max(a, b int) int {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}\n",
+        "path": "calc.go"
+      }
+    }
+  ]
+}

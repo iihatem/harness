@@ -1,0 +1,19 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "hashline_edit",
+      "arguments": {
+        "end": "8#2e8",
+        "new_text": "    pub retries: u32,\n}\n\nimpl Config {\n    pub fn new(name: &str, retries: u32) -> Config {\n        Config {\n            name: name.to_string(),\n            retries,",
+        "path": "src/lib.rs",
+        "start": "3#894"
+      }
+    }
+  ]
+}

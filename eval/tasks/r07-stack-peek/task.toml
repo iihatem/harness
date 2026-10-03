@@ -1,0 +1,4 @@
+language = "rust"
+title = "add Stack::peek"
+prompt = "Add a method peek(&self) -> Option<&T> to Stack that returns the top item without removing it."
+test = "cargo test --quiet --offline"

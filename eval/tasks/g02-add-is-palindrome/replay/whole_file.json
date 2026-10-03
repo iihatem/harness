@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "text.go"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "package task\n\nfunc Reverse(s string) string {\n\tr := []rune(s)\n\tfor i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {\n\t\tr[i], r[j] = r[j], r[i]\n\t}\n\treturn string(r)\n}\n\nfunc IsPalindrome(s string) bool {\n\treturn s == Reverse(s)\n}\n",
+        "path": "text.go"
+      }
+    }
+  ]
+}

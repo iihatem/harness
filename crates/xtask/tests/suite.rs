@@ -99,3 +99,51 @@ fn a_recording_that_gives_the_wrong_result_fails_the_check() {
     let error = check(&task, EditFormat::WholeFile).unwrap_err();
     assert!(error.contains("src/lib.rs"), "{error}");
 }
+
+// Spec: "30 small tasks across Rust, Python, TypeScript and Go".
+#[test]
+fn the_suite_has_30_tasks_across_the_four_languages() {
+    let tasks = suite();
+    assert_eq!(tasks.len(), 30);
+    let count = |language: &str| tasks.iter().filter(|t| t.language == language).count();
+    assert_eq!(
+        [
+            count("rust"),
+            count("python"),
+            count("typescript"),
+            count("go")
+        ],
+        [8, 8, 7, 7]
+    );
+}
+
+// Each task has a test command and, for the formats' sake, at least one task changes several
+// files, one adds code and one fixes code.
+#[test]
+fn the_tasks_cover_new_code_fixes_and_several_files() {
+    let tasks = suite();
+    assert!(
+        tasks
+            .iter()
+            .any(|t| t.after.len() > t.before.len() || t.title.starts_with("add"))
+    );
+    assert!(tasks.iter().filter(|t| changed_files(t) >= 2).count() >= 4);
+    assert!(tasks.iter().any(|t| changed_files(t) == 1));
+}
+
+fn changed_files(task: &Task) -> usize {
+    task.after
+        .iter()
+        .filter(|(path, text)| task.before.get(*path) != Some(*text))
+        .count()
+}
+
+// The recordings of every task cover every format, and each is the full set of files changed.
+#[test]
+fn every_task_has_a_recording_in_every_format() {
+    for task in suite() {
+        for format in EditFormat::ALL {
+            assert!(recorded(&task, format).is_ok(), "{} {format}", task.id);
+        }
+    }
+}

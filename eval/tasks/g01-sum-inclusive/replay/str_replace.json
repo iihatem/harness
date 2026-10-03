@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "calc.go"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "\ttotal := 0\n\tfor i := 1; i <= n; i++ {\n\t\ttotal += i",
+        "old_string": "\ttotal := 0\n\tfor i := 1; i < n; i++ {\n\t\ttotal += i",
+        "path": "calc.go"
+      }
+    }
+  ]
+}

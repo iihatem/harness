@@ -1,0 +1,4 @@
+language = "python"
+title = "fizzbuzz stops one short"
+prompt = "fizzbuzz(n) should cover 1 through n inclusive, but it leaves out n."
+test = "python3 -m unittest -q"

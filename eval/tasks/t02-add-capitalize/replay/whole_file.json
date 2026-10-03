@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "mod.ts"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "export function lower(s: string): string {\n  return s.toLowerCase();\n}\n\nexport function capitalize(s: string): string {\n  return s.charAt(0).toUpperCase() + s.slice(1);\n}\n",
+        "path": "mod.ts"
+      }
+    }
+  ]
+}

@@ -14,6 +14,7 @@ brush-parser = "=0.4.0"
 harness-config = { path = "crates/harness-config" }
 harness-context = { path = "crates/harness-context" }
 harness-core = { path = "crates/harness-core" }
+harness-lsp = { path = "crates/harness-lsp" }
 harness-providers = { path = "crates/harness-providers", default-features = false }
 harness-sandbox = { path = "crates/harness-sandbox" }
 harness-shell = { path = "crates/harness-shell" }
@@ -34,6 +35,7 @@ landlock = "0.4.7"
 libc = "0.2"
 jsonschema = "0.57.0"
 keyring-core = "1.0.0"
+lsp-types = "0.97"
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }
 nix = { version = "0.31.3", features = ["signal", "process"] }

@@ -250,6 +250,7 @@ fn usage_ctx(baseline: Option<&str>) -> UsageContext {
     UsageContext {
         baseline: baseline.map(String::from),
         prices: "embedded 2026-10-03".into(),
+        ..UsageContext::default()
     }
 }
 

@@ -70,6 +70,11 @@ pub enum AgentEvent {
     RateLimits {
         snapshot: WindowSnapshot,
     },
+    /// A usage limit that resets at `resets_at` (seconds since the Unix epoch) ended the turn:
+    /// an interactive session can offer to resume then. Just before the error event.
+    LimitReached {
+        resets_at: u64,
+    },
     /// 80% of a money budget is spent.
     BudgetWarning {
         notice: BudgetNotice,

@@ -109,6 +109,24 @@ enum Pick {
     RewindScope(RewindPoint),
 }
 
+/// How many times the countdown to an automatic resume is armed again when the window still shows
+/// no capacity at the reset.
+const MAX_REARMS: u8 = 2;
+
+/// The message sent when the session resumes by itself.
+pub const RESUME_MESSAGE: &str = "Continue where you left off.";
+
+/// Where waiting out a subscription limit stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume {
+    /// The user is asked, once, whether to resume at the reset.
+    Asking { resets_at: u64 },
+    /// Counting down to `at`, `rearms` times armed again so far.
+    Waiting { at: u64, rearms: u8 },
+    /// At the reset: the window is being read.
+    Checking { rearms: u8 },
+}
+
 /// How work the agent did for a command ended.
 #[derive(Debug)]
 pub enum Done {
@@ -435,6 +453,12 @@ pub struct App {
     /// How far each window's warnings went: 0, 80 or 95 (percent), by window length and reset.
     window_warnings: std::collections::HashMap<(Option<u64>, Option<u64>), u8>,
     usage_context: UsageContext,
+    /// The usage limit that ended the running turn, and when it resets.
+    limit_reset: Option<u64>,
+    /// Waiting out a usage limit, if the session is.
+    resume: Option<Resume>,
+    /// The user's answer to the offer to resume automatically, for the session.
+    resume_answer: Option<bool>,
     /// The time, in seconds since the Unix epoch.
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -486,6 +510,9 @@ impl App {
             mode_note_pending: false,
             switching: None,
             usage_context: host.usage_context(),
+            limit_reset: None,
+            resume: None,
+            resume_answer: None,
             costs: Costs::default(),
             windows: None,
             window_warnings: std::collections::HashMap::new(),
@@ -571,6 +598,145 @@ impl App {
                 .collect::<Vec<_>>();
             self.transcript.push_lines(lines, width);
         }
+    }
+
+    /// A usage limit ended the turn, and resets at `resets_at`: offers to wait for it (once, then
+    /// as the user answered), unless `usage.auto_resume` is `never` or it has reset already.
+    fn limit_hit(&mut self, resets_at: u64) {
+        let now = (self.clock)();
+        if self.usage_context.auto_resume == crate::usage::AutoResume::Never || resets_at <= now {
+            return;
+        }
+        match self.resume_answer {
+            Some(false) => {}
+            Some(true) => {
+                self.resume = Some(Resume::Waiting {
+                    at: resets_at,
+                    rearms: 0,
+                })
+            }
+            None => {
+                self.resume = Some(Resume::Asking { resets_at });
+                let at = status::reset_text(resets_at, now);
+                self.transcript
+                    .push_note(&format!("Resume automatically at {at}? (y/n)"), self.width);
+            }
+        }
+    }
+
+    /// The offer's answer: `y` waits for the reset, anything else declines, for the session.
+    fn answer_resume(&mut self, accept: bool) {
+        let Some(Resume::Asking { resets_at }) = self.resume else {
+            return;
+        };
+        self.resume_answer = Some(accept);
+        if accept {
+            self.resume = Some(Resume::Waiting {
+                at: resets_at,
+                rearms: 0,
+            });
+        } else {
+            self.resume = None;
+            self.transcript
+                .push_note("not resuming automatically", self.width);
+        }
+    }
+
+    /// Whether the session counts down to an automatic resume, which the screen shows second by
+    /// second.
+    pub fn resume_waiting(&self) -> bool {
+        matches!(
+            self.resume,
+            Some(Resume::Waiting { .. } | Resume::Asking { .. })
+        )
+    }
+
+    /// Whether the reset has come: the window is to be read now (once; the answer comes to
+    /// [`on_resume_check`](Self::on_resume_check)).
+    pub fn resume_due(&mut self) -> bool {
+        match self.resume {
+            Some(Resume::Waiting { at, rearms }) if !self.busy() && (self.clock)() >= at => {
+                self.resume = Some(Resume::Checking { rearms });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The window as the provider just said it at the reset (or why it could not): with capacity,
+    /// the session continues with a fixed message; without, the countdown is armed again, at
+    /// most twice, and then stops.
+    pub fn on_resume_check(&mut self, windows: Result<WindowSnapshot, String>) -> Option<Action> {
+        let Some(Resume::Checking { rearms }) = self.resume else {
+            return None;
+        };
+        let now = (self.clock)();
+        let width = self.width;
+        let snapshot = windows.as_ref().ok().cloned();
+        let capacity = snapshot.as_ref().is_some_and(|s| {
+            s.windows.iter().any(|w| w.used_percent.is_some())
+                && s.windows
+                    .iter()
+                    .all(|w| w.used_percent.is_none_or(|u| u < 100.0))
+        });
+        if let Some(snapshot) = snapshot.clone() {
+            self.observe_windows(snapshot);
+        }
+        if capacity {
+            self.resume = None;
+            self.transcript
+                .push_note("the usage window has capacity again: continuing", width);
+            return self.send(RESUME_MESSAGE.to_string(), RESUME_MESSAGE.to_string());
+        }
+        if rearms >= MAX_REARMS {
+            self.resume = None;
+            self.transcript.push_note(
+                "the usage window is still full after waiting twice more: not resuming automatically",
+                width,
+            );
+            return None;
+        }
+        // When the full window says it resets, else a few minutes from now.
+        let next = snapshot
+            .iter()
+            .flat_map(|s| s.windows.iter())
+            .filter(|w| w.used_percent.is_some_and(|u| u >= 100.0))
+            .filter_map(|w| w.resets_at)
+            .filter(|at| *at > now)
+            .max()
+            .unwrap_or(now + 300);
+        let why = match &windows {
+            Err(why) => format!("could not read the usage window ({}); ", self.redacted(why)),
+            Ok(_) => "the usage window is still full; ".to_string(),
+        };
+        self.transcript.push_note(
+            &format!("{why}trying again at {}", status::reset_text(next, now)),
+            width,
+        );
+        self.resume = Some(Resume::Waiting {
+            at: next,
+            rearms: rearms + 1,
+        });
+        None
+    }
+
+    /// The live region's line for an offer or a countdown.
+    fn resume_line(&self, theme: &Theme) -> Option<Line<'static>> {
+        let now = (self.clock)();
+        let text = match self.resume? {
+            Resume::Asking { .. } => "answer y or n to resume automatically".to_string(),
+            Resume::Waiting { at, .. } => {
+                let left = at.saturating_sub(now);
+                format!(
+                    "Resuming automatically at {} (in {}m {:02}s) · Esc to cancel",
+                    status::reset_text(at, now),
+                    left / 60,
+                    left % 60
+                )
+            }
+            Resume::Checking { .. } => "Reading the usage window… · Esc to cancel".to_string(),
+        };
+        Some(Line::from(Span::styled(text, theme.accent())))
     }
 
     /// What `/budget` found out: the budgets and their spend, or why not.
@@ -909,6 +1075,7 @@ impl App {
             AgentEvent::TurnFinished { reason } => self.turn_ended(*reason, now),
             AgentEvent::Usage { model, usage } => self.totals.add(model, usage),
             AgentEvent::Metered { model, cost } => self.costs.add(model, cost),
+            AgentEvent::LimitReached { resets_at } => self.limit_reset = Some(*resets_at),
             AgentEvent::RateLimits { snapshot } => self.observe_windows(snapshot.clone()),
             AgentEvent::Steered { text } => {
                 if let Some(i) = self.sent_now.iter().position(|t| t == text) {
@@ -994,6 +1161,11 @@ impl App {
             });
             self.arming = Arming::default();
         }
+        if let Some(resets_at) = self.limit_reset.take()
+            && reason == TurnEndReason::Error
+        {
+            self.limit_hit(resets_at);
+        }
         let left = self.steering.take();
         self.sent_now.clear();
         if reason == TurnEndReason::Interrupted {
@@ -1031,6 +1203,8 @@ impl App {
     /// what the conversation says.
     fn run(&mut self, input: TurnInput) -> Option<Action> {
         self.running = true;
+        // What the user sends, or the resume itself, ends the wait.
+        self.resume = None;
         let plan_note = std::mem::take(&mut self.plan_note_pending) && self.mode == Mode::Plan;
         if std::mem::take(&mut self.mode_note_pending) || plan_note {
             return Some(Action::RunIn(self.mode, input));
@@ -1217,6 +1391,26 @@ impl App {
         self.hint = None;
         if key.code != KeyCode::Esc {
             self.last_esc = None;
+        }
+        // The offer to resume automatically is answered with a key, while nothing is typed.
+        if !ctrl && self.editor.is_empty() && !self.busy() {
+            match (self.resume, key.code) {
+                (Some(Resume::Asking { .. }), KeyCode::Char('y' | 'Y')) => {
+                    self.answer_resume(true);
+                    return None;
+                }
+                (Some(Resume::Asking { .. }), KeyCode::Char('n' | 'N') | KeyCode::Esc) => {
+                    self.answer_resume(false);
+                    return None;
+                }
+                (Some(Resume::Waiting { .. } | Resume::Checking { .. }), KeyCode::Esc) => {
+                    self.resume = None;
+                    self.transcript
+                        .push_note("automatic resume cancelled", self.width);
+                    return None;
+                }
+                _ => {}
+            }
         }
         if self.takes_keys_after_a_pause() {
             if self.arming.armed(now) {
@@ -1878,6 +2072,9 @@ impl App {
                 &[],
             ));
         }
+        if let Some(line) = self.resume_line(&theme) {
+            below.extend(wrap(&line, width, &[], &[]));
+        }
         below.extend(wrap(&self.status(), width, &[], &[]));
         if let Some(hint) = self
             .hint
@@ -1938,6 +2135,9 @@ impl App {
                 width,
                 &theme,
             ));
+        }
+        if let Some(line) = self.resume_line(&theme) {
+            below.extend(wrap(&line, width, &[], &[]));
         }
         below.extend(wrap(&self.status(), width, &[], &[]));
         if let Some(hint) = &self.hint {

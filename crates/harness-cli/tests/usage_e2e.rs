@@ -420,3 +420,47 @@ async fn a_headless_budget_stop_exits_4() {
     // Only the first request was sent.
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+
+// Headless runs never auto-resume: `harness ask` that hits a subscription limit exits with its M1
+// error behaviour at once and does not wait for the reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_headless_run_that_hits_a_limit_does_not_wait() {
+    let server = MockServer::start().await;
+    let reset = harness_core_now() + 3_600;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(429).set_body_json(
+                json!({"error": {"type": "usage_limit_reached", "resets_at": reset}}),
+            ),
+        )
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri(), "");
+    let started = std::time::Instant::now();
+    let (code, stdout) = tokio::task::spawn_blocking(move || {
+        let out = env
+            .cmd()
+            .args(["--model", "mock/test-model", "ask", "--json", "go"])
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    // The event is printed for scripts; nothing waits on it.
+    assert!(stdout.contains("\"type\":\"limit_reached\""), "{stdout}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+fn harness_core_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}

@@ -269,6 +269,7 @@ impl Transcript {
             | AgentEvent::Usage { .. }
             | AgentEvent::Metered { .. }
             | AgentEvent::RateLimits { .. }
+            | AgentEvent::LimitReached { .. }
             | AgentEvent::CheckpointCreated { .. } => {}
         }
     }

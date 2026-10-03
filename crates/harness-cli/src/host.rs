@@ -143,6 +143,10 @@ impl Host for CliHost {
         UsageContext {
             baseline: self.setup.config.usage.baseline.clone(),
             prices: crate::pricing::load(&self.setup).snapshot().label(),
+            auto_resume: match self.setup.config.usage.auto_resume {
+                harness_config::config::AutoResume::Ask => harness_tui::usage::AutoResume::Ask,
+                harness_config::config::AutoResume::Never => harness_tui::usage::AutoResume::Never,
+            },
         }
     }
 

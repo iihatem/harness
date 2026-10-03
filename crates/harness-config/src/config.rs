@@ -268,10 +268,25 @@ fn pricing_problem(pricing: &BTreeMap<String, PriceSettings>) -> Option<String> 
     pricing.iter().find_map(|(key, price)| price.problem(key))
 }
 
+/// `usage.auto_resume`: whether the terminal session offers to wait out a subscription limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoResume {
+    /// Offer once, when the limit is hit.
+    #[default]
+    Ask,
+    /// Never offer. (There is no "always": an unattended resume can spend quota meant for
+    /// something else.)
+    Never,
+}
+
 /// `[usage]`: how usage is shown.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageSettings {
+    /// `usage.auto_resume`: see [`AutoResume`].
+    #[serde(default)]
+    pub auto_resume: AutoResume,
     /// The `<provider>/<model>` that "avoided" cost is measured against; none means no avoided
     /// figure is shown.
     pub baseline: Option<String>,

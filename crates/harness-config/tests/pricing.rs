@@ -126,3 +126,25 @@ fn a_project_can_lower_a_budget_and_never_raise_it() {
         cfg.warnings
     );
 }
+
+// `usage.auto_resume` is `ask` (the default) or `never`; there is no `always`.
+#[test]
+fn auto_resume_asks_by_default_and_can_be_turned_off() {
+    use harness_config::config::AutoResume;
+    assert_eq!(load("", None).unwrap().usage.auto_resume, AutoResume::Ask);
+    assert_eq!(
+        load("[usage]\nauto_resume = \"never\"\n", None)
+            .unwrap()
+            .usage
+            .auto_resume,
+        AutoResume::Never
+    );
+    assert_eq!(
+        load("[usage]\nauto_resume = \"ask\"\n", None)
+            .unwrap()
+            .usage
+            .auto_resume,
+        AutoResume::Ask
+    );
+    assert!(load("[usage]\nauto_resume = \"always\"\n", None).is_err());
+}

@@ -128,6 +128,8 @@ enum Background {
     Windows(Result<WindowSnapshot, String>),
     /// What `/budget` found out.
     Budget(Result<Vec<String>, String>),
+    /// The window as the provider said it at the reset of a usage limit.
+    ResumeCheck(Result<WindowSnapshot, String>),
     /// What `/usage` asked for: the provider's windows (when it has any) and the ledger's report.
     Usage {
         windows: Option<Result<WindowSnapshot, String>>,
@@ -745,10 +747,34 @@ where
 
     /// Shows what the host has had to warn about while nothing else came.
     fn idle(&mut self) -> io::Result<Flow> {
-        if self.host_warnings() {
+        let mut changed = self.host_warnings();
+        // The reset of a usage limit: the window is read again before the session continues.
+        if self.app.resume_due() {
+            self.check_window_for_resume();
+            changed = true;
+        }
+        // The countdown shows the seconds left.
+        changed |= self.app.resume_waiting();
+        if changed {
             self.draw()?;
         }
         Ok(Flow::Continue)
+    }
+
+    /// Reads the usage window, for the automatic resume at a limit's reset.
+    fn check_window_for_resume(&self) {
+        let poll = self.provider.windows();
+        let tx = self.background_tx.clone();
+        tokio::spawn(async move {
+            let result = match poll {
+                Some(poll) => match tokio::time::timeout(POLL_WAIT, poll).await {
+                    Ok(result) => result,
+                    Err(_) => Err("it did not answer in time".to_string()),
+                },
+                None => Err("this provider has no usage windows".to_string()),
+            };
+            let _ = tx.send(Background::ResumeCheck(result));
+        });
     }
 
     /// Takes in what work in the background came back with.
@@ -794,6 +820,11 @@ where
                 self.next_actions()?;
             }
             Background::Budget(result) => self.app.on_budget(result),
+            Background::ResumeCheck(result) => {
+                if let Some(action) = self.app.on_resume_check(result) {
+                    self.dispatch(action)?;
+                }
+            }
             Background::Windows(result) => self.app.on_windows(result),
             Background::Usage { windows, ledger } => self.app.on_usage(windows, ledger),
             Background::Note(note) => self.app.push_note(&note),

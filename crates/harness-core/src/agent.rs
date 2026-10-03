@@ -1621,6 +1621,11 @@ impl Agent {
             partial.show(events);
             self.push_assistant(partial.text, Vec::new(), events);
         }
+        if error.is_quota_exhausted()
+            && let Some(resets_at) = error.resets_at()
+        {
+            let _ = events.send(AgentEvent::LimitReached { resets_at });
+        }
         let _ = events.send(AgentEvent::Error {
             kind: ErrorKind::Provider,
             message: describe(&error),

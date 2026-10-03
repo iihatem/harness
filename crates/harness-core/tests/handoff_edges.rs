@@ -228,3 +228,52 @@ async fn a_compaction_inside_a_reduced_build_turn_leaves_a_consistent_session() 
     assert!(warnings.is_empty(), "{warnings:?}");
     assert!(!reopened.messages().is_empty());
 }
+
+// A compaction inside a plan-only build turn summarizes the conversation that was set aside too:
+// the summary replaces everything before the kept part, so one that never saw it would lose the
+// planning for the next turns. The history after the turn is what it would have been with no
+// hand-off: a summary of the conversation and the build turn so far, then the rest of the turn.
+#[tokio::test]
+async fn a_compaction_inside_a_reduced_build_turn_keeps_the_set_aside_conversation() {
+    let (mut agent, main, builder, _dir) = reduced(
+        vec![
+            Script::tool_call("c1", "echo", json!({"text": "x".repeat(12_000)})),
+            Script::text("built"),
+        ],
+        vec![
+            Script::text("planned and built so far"),
+            Script::text("main again"),
+        ],
+    )
+    .await;
+    let (reason, events) = build_with(&mut agent, CancellationToken::new()).await;
+    assert_eq!(reason, TurnEndReason::Completed, "{events:?}");
+    assert_eq!(builder.requests().len(), 2);
+    // The summary request saw the planning conversation and the plan, not only the build steps.
+    let summary_request = main.requests().remove(0);
+    let Message::User { content } = &summary_request.messages[0] else {
+        panic!("{summary_request:?}");
+    };
+    assert!(content.contains("qqq"), "the question: {content:.300}");
+    assert!(content.contains("Read src/login.rs"), "the plan");
+    // The Build message as the session has it, not the plan the build model was sent in its place.
+    assert!(content.contains("Implement the plan above."), "{content}");
+    // The history is the summary, then what the compaction kept of the turn.
+    let history = agent.history();
+    assert!(matches!(
+        &history[0],
+        Message::User { content } if content.starts_with(SUMMARY_PREFIX)
+    ));
+    assert!(
+        !users(&agent).iter().any(|u| u.starts_with("qqq")),
+        "the set-aside question is in the summary, not kept whole beside it"
+    );
+    // The next turn on main is sent that history.
+    let (reply, _) = run(&mut agent, "and next?").await;
+    assert_eq!(reply, TurnEndReason::Completed);
+    let next = main.requests().pop().unwrap();
+    assert!(matches!(
+        &next.messages[0],
+        Message::User { content } if content.starts_with(SUMMARY_PREFIX)
+    ));
+}

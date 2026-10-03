@@ -1743,12 +1743,27 @@ impl Agent {
             &self.history[turn_start..],
         );
         if (turn as f64) < self.threshold_tokens()
-            && compaction::summarizes(&self.history[..turn_start])
+            && compaction::summarizes(&self.summary_part(turn_start))
         {
             turn_start
         } else {
             self.last_step_start()
         }
+    }
+
+    /// What a compaction that keeps `history[cut..]` summarizes. During a hand-off of the plan
+    /// alone, the conversation set aside is part of it: the summary replaces everything on the
+    /// branch before the kept part, so a summary that never saw it would lose it.
+    fn summary_part(&self, cut: usize) -> Vec<Message> {
+        let Some((head, _, original)) = &self.handoff_stash else {
+            return self.history[..cut].to_vec();
+        };
+        let mut part = head.clone();
+        if cut > 0 {
+            part.push(original.clone());
+            part.extend_from_slice(&self.history[1..cut]);
+        }
+        part
     }
 
     /// Replaces the older part of the conversation by a summary. The kept part fits the
@@ -1779,7 +1794,8 @@ impl Agent {
             },
             Trigger::Manual => fits.unwrap_or(self.history.len()),
         };
-        if !compaction::summarizes(&self.history[..cut]) {
+        let part = self.summary_part(cut);
+        if !compaction::summarizes(&part) {
             return Err(CompactError::NothingToCompact);
         }
         let before = self.estimated_tokens();
@@ -1797,16 +1813,22 @@ impl Agent {
                 return Err(CompactError::Failed(notice.reached_message()));
             }
         }
+        // A background model that cannot hold what is to be summarized is not asked, since a
+        // summary of only the newest part would replace the rest without having seen it. The
+        // session's own model is the exception: it is the one that is sent the conversation.
+        let to_summarize: u64 = part.iter().map(compaction::message_tokens).sum();
+        if summarizer.who.model != self.config.model_id && to_summarize > summarizer.window {
+            return Err(CompactError::Failed(format!(
+                "the background model's {}-token window is smaller than the {to_summarize} tokens to summarize",
+                summarizer.window
+            )));
+        }
         // The transcript is sized from an estimate, so the request can still be too long for the
         // model: then it is tried once more with half as much.
         let mut max_tokens = summarizer.window / 2;
         let summary = loop {
-            let mut request = compaction::summary_request(
-                &summarizer.name,
-                &self.history[..cut],
-                focus,
-                max_tokens,
-            );
+            let mut request =
+                compaction::summary_request(&summarizer.name, &part, focus, max_tokens);
             // Under the options of its profile, within the room its window leaves.
             request.options = summarizer.options.clone();
             let input =

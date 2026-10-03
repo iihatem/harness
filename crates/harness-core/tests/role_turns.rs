@@ -398,3 +398,43 @@ async fn a_billed_background_model_is_not_asked_once_a_budget_is_reached() {
         "{events:?}"
     );
 }
+
+// Spec "Background window too small": a background model whose window cannot hold what is to be
+// summarized is not asked; a warning says so and the conversation is as it was. The oldest part
+// is never silently left out of a summary.
+#[tokio::test]
+async fn a_background_window_smaller_than_the_part_to_summarize_fails_with_a_warning() {
+    let main = MockProvider::new(vec![Script::text("noted"), Script::text("answer")]);
+    let background = MockProvider::new(vec![Script::text("a summary of the tail")]);
+    let roles = RoleConfig {
+        background: Some("bg/small".into()),
+        ..RoleConfig::default()
+    };
+    let mut agent = after_a_long_turn(
+        &main,
+        roles,
+        // The part to summarize is about 2,000 tokens.
+        vec![model("bg/small", &background, 1_000)],
+        None,
+    )
+    .await;
+    let before = agent.history().to_vec();
+    let (_, events) = run(&mut agent, "short question").await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compacted { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Warning { message }
+                if message.contains("could not compact") && message.contains("window")
+        )),
+        "{events:?}"
+    );
+    assert!(background.requests().is_empty());
+    // The conversation is as it was, plus the new turn.
+    assert_eq!(&agent.history()[..before.len()], &before[..]);
+}

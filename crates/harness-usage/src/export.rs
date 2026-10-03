@@ -241,7 +241,10 @@ pub fn forget(dirs: &Dirs, before: Option<&str>) -> Result<usize> {
     drop((_outcomes_lock, _usage_lock));
     // The cache follows the ledger: files that are gone or shorter are read again or forgotten.
     if dirs.usage.exists() {
-        Store::open(dirs)?.sync()?;
+        let mut store = Store::open(dirs)?;
+        store.sync()?;
+        // Rows that were deleted must not linger in the cache file.
+        store.vacuum();
     }
     Ok(touched)
 }

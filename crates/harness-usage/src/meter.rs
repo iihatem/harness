@@ -58,8 +58,13 @@ pub struct UsageMeter {
     /// The model `usage.baseline` names, which the avoided figure is measured against.
     baseline: Option<String>,
     warnings: Mutex<Vec<String>>,
-    /// Whether the ledger failed to write already: it is said once.
-    failed: Mutex<bool>,
+    /// The kinds of problem already said (ledger, outcome log, ...): each is said once.
+    warned_kinds: Mutex<std::collections::HashSet<&'static str>>,
+    /// What this process billed, as (time, session, USD): the floor the budgets are checked
+    /// against, so they still apply when the ledger or its cache cannot be used.
+    spent_here: Mutex<Vec<(u64, String, f64)>>,
+    /// The budgets as configured, which `/new` and `/resume` return the session budget to.
+    configured: Mutex<Budgets>,
     /// The snapshot the request in flight has seen, to name in its record, and the last one
     /// written, so a snapshot repeated by every response is written once.
     window: Mutex<(Option<String>, Option<String>)>,
@@ -85,7 +90,9 @@ impl UsageMeter {
             pricing: Pricing::load(&Dirs::under(data).pricing, Vec::new()),
             baseline: None,
             warnings: Mutex::new(Vec::new()),
-            failed: Mutex::new(false),
+            warned_kinds: Mutex::new(Default::default()),
+            spent_here: Mutex::new(Vec::new()),
+            configured: Mutex::new(Budgets::default()),
             window: Mutex::new((None, None)),
             dirs: Dirs::under(data),
             outcomes: OutcomeLog::new(&Dirs::under(data).outcomes),
@@ -122,6 +129,7 @@ impl UsageMeter {
 
     /// Checks requests against `budgets`.
     pub fn with_budgets(self, budgets: Budgets) -> UsageMeter {
+        *self.configured.lock().unwrap_or_else(|e| e.into_inner()) = budgets.clone();
         *self.budgets.lock().unwrap_or_else(|e| e.into_inner()) = budgets;
         self
     }
@@ -142,6 +150,20 @@ impl UsageMeter {
             .session_usd = Some(usd);
     }
 
+    /// Returns the session budget to what is configured: a `/budget <usd>` figure applies to the
+    /// session it was given in, not to the next one (`/new`, `/resume`).
+    pub fn reset_session_budget(&self) {
+        let configured = self
+            .configured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session_usd;
+        self.budgets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session_usd = configured;
+    }
+
     /// What each budget allows and what is spent against it, for `session` today and this month.
     pub fn budget_report(&self, session: &str) -> Vec<BudgetLine> {
         let budgets = self.budgets();
@@ -150,7 +172,7 @@ impl UsageMeter {
             .map(|&kind| BudgetLine {
                 budget: kind,
                 limit_usd: budgets.limit(kind),
-                spent_usd: self.spent(kind, session).unwrap_or(0.0),
+                spent_usd: self.spent_or_here(kind, session).0,
             })
             .collect()
     }
@@ -168,6 +190,32 @@ impl UsageMeter {
             BudgetKind::Session => store.session_spent(session),
             BudgetKind::Daily => store.day_spent(&day),
             BudgetKind::Monthly => store.month_spent(&day[..7]),
+        }
+    }
+
+    /// What this process has billed against `kind`.
+    fn spent_by_this_process(&self, kind: BudgetKind, session: &str) -> f64 {
+        let day = civil_date((self.clock)());
+        self.spent_here
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(t, s, _)| match kind {
+                BudgetKind::Session => s == session,
+                BudgetKind::Daily => civil_date(*t) == day,
+                BudgetKind::Monthly => civil_date(*t)[..7] == day[..7],
+            })
+            .map(|(_, _, usd)| usd)
+            .sum()
+    }
+
+    /// What was billed against `kind`: the ledger's figure, but never less than this process's
+    /// own spending. When the ledger cannot be read, this process's figure alone, and the error.
+    fn spent_or_here(&self, kind: BudgetKind, session: &str) -> (f64, Option<crate::error::Error>) {
+        let here = self.spent_by_this_process(kind, session);
+        match self.spent(kind, session) {
+            Ok(spent) => (spent.max(here), None),
+            Err(e) => (here, Some(e)),
         }
     }
 
@@ -212,14 +260,23 @@ impl UsageMeter {
         )
     }
 
-    fn warn(&self, message: String) {
-        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
-        if !*failed {
-            *failed = true;
-            self.warnings
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(message);
+    /// Says `message` once for the `kind` of problem it is about.
+    fn warn(&self, kind: &'static str, message: String) {
+        let first = self
+            .warned_kinds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(kind);
+        if first {
+            self.warn_now(message);
+        }
+    }
+
+    /// Says `message` now, and again on every call: a problem that goes on mattering.
+    fn warn_now(&self, message: String) {
+        let mut warnings = self.warnings.lock().unwrap_or_else(|e| e.into_inner());
+        if !warnings.contains(&message) {
+            warnings.push(message);
         }
     }
 }
@@ -255,11 +312,20 @@ impl Meter for UsageMeter {
                 .0
                 .take(),
         };
+        if let Some(usd) = cost.billed_usd.filter(|usd| *usd > 0.0) {
+            self.spent_here
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((record.t, record.session.clone(), usd));
+        }
         if let Err(e) = self.ledger.append(&record) {
-            self.warn(format!(
-                "cannot write the usage ledger in {}: {e}; requests are no longer recorded",
-                self.ledger.dir().display()
-            ));
+            self.warn(
+                "ledger",
+                format!(
+                    "cannot write the usage ledger in {}: {e}; requests are no longer recorded",
+                    self.ledger.dir().display()
+                ),
+            );
         }
         cost
     }
@@ -267,17 +333,26 @@ impl Meter for UsageMeter {
     fn record_window(&self, snapshot: &WindowSnapshot) {
         let id = snapshot.id();
         let mut window = self.window.lock().unwrap_or_else(|e| e.into_inner());
-        window.0 = Some(id.clone());
         if window.1.as_deref() == Some(id.as_str()) {
+            window.0 = Some(id);
             return;
         }
-        window.1 = Some(id);
-        drop(window);
-        if let Err(e) = self.ledger.append_window(snapshot) {
-            self.warn(format!(
-                "cannot write the usage ledger in {}: {e}; requests are no longer recorded",
-                self.ledger.dir().display()
-            ));
+        match self.ledger.append_window(snapshot) {
+            Ok(()) => {
+                window.0 = Some(id.clone());
+                window.1 = Some(id);
+            }
+            Err(e) => {
+                // Not written, so no record names it, and it is tried again when seen again.
+                drop(window);
+                self.warn(
+                    "ledger",
+                    format!(
+                        "cannot write the usage ledger in {}: {e}; requests are no longer recorded",
+                        self.ledger.dir().display()
+                    ),
+                );
+            }
         }
     }
 
@@ -287,10 +362,13 @@ impl Meter for UsageMeter {
         }
         let record = OutcomeRecord::of(turn, &self.project);
         if let Err(e) = self.outcomes.append(&record) {
-            self.warn(format!(
-                "cannot write the outcome log in {}: {e}",
-                self.dirs.outcomes.display()
-            ));
+            self.warn(
+                "outcomes",
+                format!(
+                    "cannot write the outcome log in {}: {e}",
+                    self.dirs.outcomes.display()
+                ),
+            );
         }
     }
 
@@ -299,10 +377,13 @@ impl Meter for UsageMeter {
             return;
         }
         if let Err(e) = self.outcomes.mark_rewound(session, turns, (self.clock)()) {
-            self.warn(format!(
-                "cannot update the outcome log in {}: {e}",
-                self.dirs.outcomes.display()
-            ));
+            self.warn(
+                "outcomes-update",
+                format!(
+                    "cannot update the outcome log in {}: {e}",
+                    self.dirs.outcomes.display()
+                ),
+            );
         }
     }
 
@@ -313,13 +394,15 @@ impl Meter for UsageMeter {
             let Some(limit) = budgets.limit(kind) else {
                 continue;
             };
-            let spent = match self.spent(kind, session) {
-                Ok(spent) => spent,
-                Err(e) => {
-                    self.warn(format!("cannot check the budgets: {e}"));
-                    return BudgetStatus::default();
-                }
-            };
+            let (spent, failed) = self.spent_or_here(kind, session);
+            if let Some(e) = failed {
+                // Every turn, until the ledger can be read again; meanwhile only what this
+                // process has spent counts.
+                self.warn_now(format!(
+                    "cannot check the {} budget: {e}; counting only what this run has spent",
+                    kind.name()
+                ));
+            }
             let notice = BudgetNotice {
                 budget: kind,
                 spent_usd: spent,

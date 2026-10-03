@@ -240,6 +240,14 @@ pub fn trim_models_dev(api_json: &str, date: &str) -> Result<PriceTable> {
         let mut priced = BTreeMap::new();
         for (id, model) in models {
             let cost = &model["cost"];
+            // A negative price is bad data whether or not the model has both prices.
+            if ["input", "output", "cache_read", "cache_write"]
+                .iter()
+                .filter_map(|field| cost[*field].as_f64())
+                .any(|p| !p.is_finite() || p < 0.0)
+            {
+                return Err(invalid(&format!("{provider}/{id} has a negative price")));
+            }
             let (Some(input), Some(output)) = (cost["input"].as_f64(), cost["output"].as_f64())
             else {
                 continue;
@@ -348,11 +356,16 @@ pub async fn update(url: &str, dest: &Path, today: &str) -> Result<Updated> {
     {
         return Err(Error(format!("the data from {host} is too large")));
     }
-    let bytes = response.bytes().await.map_err(fetch_error)?;
-    if bytes.len() > MAX_BYTES {
-        return Err(Error(format!("the data from {host} is too large")));
+    // Read in pieces and stop at the cap, so a body with no Content-Length cannot fill memory.
+    let mut response = response;
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(fetch_error)? {
+        if bytes.len() + chunk.len() > MAX_BYTES {
+            return Err(Error(format!("the data from {host} is too large")));
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    let text = String::from_utf8(bytes.to_vec())
+    let text = String::from_utf8(bytes)
         .map_err(|_| Error("that is not pricing data: it is not text".into()))?;
     let table = trim_models_dev(&text, today)?;
     let json = serde_json::to_string(&table).map_err(|e| Error(e.to_string()))?;

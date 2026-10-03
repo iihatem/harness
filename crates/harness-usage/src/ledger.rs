@@ -1,10 +1,7 @@
 //! The ledger: one JSON line for every model request, appended to a file for each month, with
 //! counts and ids only: never prompt text, model output, file paths or command lines.
 
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use harness_core::{meter::AccountKind, time::civil_date};
 use serde::{Deserialize, Serialize};
@@ -75,17 +72,11 @@ impl Ledger {
     /// needed. One `write` of the whole line, so records from two processes do not mix, under the
     /// directory's lock taken shared (`forget` holds it exclusive while it rewrites).
     pub fn append(&self, record: &LedgerRecord) -> std::io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
         let _lock = crate::lock::shared(&self.dir)?;
         let path = self.file_for(record.t);
         let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
         line.push('\n');
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(line.as_bytes())
+        crate::paths::append_lines(&path, &line)
     }
 
     /// Appends `snapshot` to its month's window file, `windows-YYYY-MM.jsonl` (0600): its id, when
@@ -94,7 +85,6 @@ impl Ledger {
         &self,
         snapshot: &harness_core::meter::WindowSnapshot,
     ) -> std::io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
         let _lock = crate::lock::shared(&self.dir)?;
         let windows: Vec<serde_json::Value> = snapshot
             .windows
@@ -118,12 +108,7 @@ impl Ledger {
         let path = self
             .dir
             .join(format!("windows-{}.jsonl", month_of(snapshot.observed_at)));
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(line.as_bytes())
+        crate::paths::append_lines(&path, &line)
     }
 
     /// The file for the month of `t`.

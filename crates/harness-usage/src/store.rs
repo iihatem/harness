@@ -150,10 +150,14 @@ impl Store {
         let path = dirs.usage.join("index.sqlite");
         let db = match open_db(&path) {
             Ok(db) => db,
-            Err(_) => {
+            // Only a file that is not a usable cache is replaced: a second process holding the
+            // database (BUSY) or a full disk is not a reason to delete a cache another process
+            // is using.
+            Err(OpenError::Unusable) => {
                 remove_cache(&path);
-                open_db(&path)?
+                open_db(&path).map_err(OpenError::into_error)?
             }
+            Err(e) => return Err(e.into_error()),
         };
         Ok(Store {
             db,
@@ -177,7 +181,11 @@ impl Store {
     }
 
     fn rebuild(&mut self) -> Result<()> {
-        let tx = self.db.transaction()?;
+        // Immediate: it will write, and a read lock upgraded later fails at once when another
+        // process holds one too, where taking the write lock first waits its turn.
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch("DELETE FROM requests; DELETE FROM files;")?;
         tx.commit()?;
         Ok(())
@@ -189,7 +197,11 @@ impl Store {
             .iter()
             .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
             .collect();
-        let tx = self.db.transaction()?;
+        // Immediate: it will write, and a read lock upgraded later fails at once when another
+        // process holds one too, where taking the write lock first waits its turn.
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Files that are gone.
         let known: Vec<String> = {
             let mut stmt = tx.prepare("SELECT name FROM files")?;
@@ -241,6 +253,16 @@ impl Store {
         }
         tx.commit()?;
         Ok(added)
+    }
+
+    /// Compacts the file, so that rows that were deleted leave nothing in it (`forget`). When
+    /// that cannot be done the cache is deleted instead, since it can be built again.
+    pub fn vacuum(self) {
+        let Store { db, path, .. } = self;
+        if db.execute_batch("VACUUM").is_err() {
+            drop(db);
+            remove_cache(&path);
+        }
     }
 
     /// The report for `query`, from what the cache holds (call [`sync`](Self::sync) first).
@@ -350,13 +372,17 @@ impl Store {
 
     /// What was billed in the UTC month `month` (`YYYY-MM`).
     pub fn month_spent(&self, month: &str) -> Result<f64> {
-        self.spent("substr(day, 1, 7) = ?1", month)
+        // A range on `day`, so the index serves it.
+        let sql = spent_sql("day >= ?1 AND day <= ?2");
+        Ok(self
+            .db
+            .query_row(&sql, [format!("{month}-01"), format!("{month}-31")], |r| {
+                r.get(0)
+            })?)
     }
 
     fn spent(&self, filter: &str, value: &str) -> Result<f64> {
-        let sql = format!(
-            "SELECT COALESCE(SUM(billed), 0) FROM requests WHERE account = 'api_key' AND {filter}"
-        );
+        let sql = spent_sql(filter);
         Ok(self.db.query_row(&sql, [value], |r| r.get(0))?)
     }
 
@@ -366,8 +392,60 @@ impl Store {
     }
 }
 
+fn spent_sql(filter: &str) -> String {
+    format!("SELECT COALESCE(SUM(billed), 0) FROM requests WHERE account = 'api_key' AND {filter}")
+}
+
+/// Why the cache could not be opened.
+enum OpenError {
+    /// The file is not a database of this layout: it can be replaced.
+    Unusable,
+    /// Anything else (busy, a full disk, no permission): the file is left alone.
+    Other(Error),
+}
+
+impl OpenError {
+    fn into_error(self) -> Error {
+        match self {
+            OpenError::Unusable => Error("the usage cache is not usable".into()),
+            OpenError::Other(e) => e,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for OpenError {
+    fn from(e: rusqlite::Error) -> Self {
+        if is_unusable(&e) {
+            OpenError::Unusable
+        } else {
+            OpenError::Other(e.into())
+        }
+    }
+}
+
+impl From<std::io::Error> for OpenError {
+    fn from(e: std::io::Error) -> Self {
+        OpenError::Other(e.into())
+    }
+}
+
+/// Whether `e` says the file is not a database, is corrupt, or lacks the tables of this layout
+/// (as opposed to being busy, read-only or out of space).
+pub(crate) fn is_unusable(e: &rusqlite::Error) -> bool {
+    use rusqlite::ErrorCode::{DatabaseCorrupt, NotADatabase};
+    match e {
+        rusqlite::Error::SqliteFailure(failure, message) => {
+            matches!(failure.code, DatabaseCorrupt | NotADatabase)
+                // The layout check reads a table that is not there.
+                || (failure.code == rusqlite::ErrorCode::Unknown
+                    && message.as_deref().is_some_and(|m| m.contains("no such table")))
+        }
+        _ => false,
+    }
+}
+
 /// Opens (making it when missing, private) and prepares the database at `path`.
-fn open_db(path: &std::path::Path) -> Result<Connection> {
+fn open_db(path: &std::path::Path) -> std::result::Result<Connection, OpenError> {
     use std::os::unix::fs::OpenOptionsExt;
     // Made private before SQLite opens it.
     std::fs::OpenOptions::new()
@@ -375,12 +453,17 @@ fn open_db(path: &std::path::Path) -> Result<Connection> {
         .append(true)
         .mode(0o600)
         .open(path)?;
-    let db = Connection::open(path)?;
+    let mut db = Connection::open(path)?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version != SCHEMA {
-        db.execute_batch(
-            "DROP TABLE IF EXISTS requests; DROP TABLE IF EXISTS files;
+        // One transaction that takes the write lock first, so two processes opening a new cache
+        // do not drop each other's tables; the second finds the layout made and leaves it.
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version != SCHEMA {
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS requests; DROP TABLE IF EXISTS files;
              CREATE TABLE requests (
                  file TEXT NOT NULL, t INTEGER NOT NULL, day TEXT NOT NULL,
                  session TEXT NOT NULL, project TEXT NOT NULL, role TEXT NOT NULL,
@@ -394,8 +477,10 @@ fn open_db(path: &std::path::Path) -> Result<Connection> {
              CREATE INDEX requests_day ON requests (day);
              CREATE INDEX requests_session ON requests (session);
              CREATE TABLE files (name TEXT PRIMARY KEY, offset INTEGER NOT NULL);",
-        )?;
-        db.pragma_update(None, "user_version", SCHEMA)?;
+            )?;
+            tx.pragma_update(None, "user_version", SCHEMA)?;
+        }
+        tx.commit()?;
     }
     // Reading the tables proves the file is a database of this layout.
     db.query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))?;
@@ -530,5 +615,55 @@ pub fn avoided_line(baseline: &str, avoided: &Avoided) -> Option<String> {
                 unknown: 0
             })
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::{Error as E, ErrorCode, ffi};
+
+    fn failure(code: i32, message: Option<&str>) -> E {
+        E::SqliteFailure(ffi::Error::new(code), message.map(String::from))
+    }
+
+    #[test]
+    fn only_a_file_that_is_not_a_cache_is_replaced() {
+        assert!(is_unusable(&failure(ffi::SQLITE_NOTADB, None)));
+        assert!(is_unusable(&failure(ffi::SQLITE_CORRUPT, None)));
+        assert!(is_unusable(&failure(
+            ffi::SQLITE_ERROR,
+            Some("no such table: files")
+        )));
+        // Busy, locked, a full disk and a read-only file are not corruption.
+        for code in [
+            ffi::SQLITE_BUSY,
+            ffi::SQLITE_LOCKED,
+            ffi::SQLITE_FULL,
+            ffi::SQLITE_READONLY,
+            ffi::SQLITE_IOERR,
+            ffi::SQLITE_CANTOPEN,
+        ] {
+            assert!(!is_unusable(&failure(code, None)), "{code}");
+        }
+        let _ = ErrorCode::Unknown;
+    }
+
+    #[test]
+    fn the_month_query_uses_the_day_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir.path().join("i.sqlite")).ok().unwrap();
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            spent_sql("day >= ?1 AND day <= ?2")
+        );
+        let plan: Vec<String> = db
+            .prepare(&sql)
+            .unwrap()
+            .query_map(["2026-10-01", "2026-10-31"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(plan.iter().any(|p| p.contains("requests_day")), "{plan:?}");
     }
 }

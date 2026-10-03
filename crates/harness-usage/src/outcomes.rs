@@ -3,7 +3,6 @@
 
 use std::{
     collections::HashMap,
-    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -109,16 +108,13 @@ impl OutcomeLog {
 
     /// Appends `record` to its month's file, creating it (0600) and the directory (0700).
     pub fn append(&self, record: &OutcomeRecord) -> std::io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
         let _lock = crate::lock::shared(&self.dir)?;
         let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
         line.push('\n');
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(self.dir.join(format!("{}.jsonl", month_of(record.t))))?;
-        file.write_all(line.as_bytes())
+        crate::paths::append_lines(
+            &self.dir.join(format!("{}.jsonl", month_of(record.t))),
+            &line,
+        )
     }
 
     /// The files of the log, oldest month first.
@@ -144,7 +140,6 @@ impl OutcomeLog {
     /// current month's file (0600). The records are not rewritten; readers apply the latest
     /// signal for a turn (see `read`).
     pub fn mark_rewound(&self, session: &str, turns: &[String], now: u64) -> std::io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
         if turns.is_empty() {
             return Ok(());
         }
@@ -163,12 +158,7 @@ impl OutcomeLog {
             );
             lines.push('\n');
         }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(self.dir.join(format!("{}.jsonl", month_of(now))))?;
-        file.write_all(lines.as_bytes())
+        crate::paths::append_lines(&self.dir.join(format!("{}.jsonl", month_of(now))), &lines)
     }
 
     /// Every turn's record, oldest month first, each with the latest signal said for it: an

@@ -89,9 +89,23 @@ impl Provider for Account {
     }
 }
 
-struct NoCommands;
+struct NoCommands(std::path::PathBuf);
 
 impl Host for NoCommands {
+    fn open_session(
+        &self,
+        _id: Option<&str>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> BoxFuture<'static, Result<harness_tui::app::OpenedSession, String>> {
+        let dir = self.0.clone();
+        Box::pin(async move {
+            Ok(harness_tui::app::OpenedSession {
+                session: harness_core::session::Session::create(&dir, &dir),
+                checkpoints: None,
+                warnings: Vec::new(),
+            })
+        })
+    }
     fn is_command(&self, _name: &str) -> bool {
         false
     }
@@ -122,7 +136,11 @@ fn session(polls: Vec<f64>, auto_resume: AutoResume) -> Session {
     let agent = agent(account.clone(), dir.path(), Mode::Auto);
     let mut options = options(dir.path(), Mode::Auto);
     options.model = "chatgpt/gpt-5".into();
-    let (mut ui, _) = start(agent, Box::new(NoCommands), options);
+    let (mut ui, _) = start(
+        agent,
+        Box::new(NoCommands(dir.path().join("sessions"))),
+        options,
+    );
     let clock = Arc::new(AtomicU64::new(NOW));
     let reader = clock.clone();
     ui.app_mut()
@@ -476,4 +494,59 @@ async fn an_open_offer_is_not_a_reason_to_redraw() {
     assert!(!s.ui.app().resume_waiting());
     s.answer(KeyCode::Char('y')).await;
     assert!(s.ui.app().resume_waiting());
+}
+
+// Final review, Important 1: what was offered, answered or counted down belongs to the session
+// it came in; `/new` and `/resume` end it, so nothing is sent into the other session.
+impl Session {
+    async fn command(&mut self, text: &str) {
+        type_text(&mut self.ui, text);
+        press(&mut self.ui, KeyCode::Enter);
+        self.ui.settle().await.unwrap();
+        self.ui.draw().unwrap();
+    }
+}
+
+async fn a_command_ends_the_wait(command: &str, answer: Option<KeyCode>) {
+    let mut s = session(vec![0.0, 0.0, 0.0], AutoResume::Ask);
+    s.limit_ends_a_turn(RESET);
+    if let Some(code) = answer {
+        s.answer(code).await;
+        s.ui.draw().unwrap();
+        assert!(s.shows("Esc to cancel"), "{:#?}", screen(&s.ui));
+    }
+    s.command(command).await;
+    s.clock.store(RESET + 10, Ordering::SeqCst);
+    s.run_for(2_000).await;
+    assert!(!s.shows("Esc to cancel"), "{:#?}", screen(&s.ui));
+    assert_eq!(s.account.requests.load(Ordering::SeqCst), 0);
+    assert!(!s.shows("Continue where you left off."));
+    assert!(!s.ui.app().busy());
+    // The answer went with the session: a limit in the new one asks again.
+    s.limit_ends_a_turn(RESET + 18_000);
+    assert!(
+        s.shows("Resume automatically at 19:30 UTC? (y/n)"),
+        "{:#?}",
+        everything(&s.ui)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn new_ends_a_countdown_and_forgets_the_answer() {
+    a_command_ends_the_wait("/new", Some(KeyCode::Char('y'))).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn new_ends_a_pending_offer() {
+    a_command_ends_the_wait("/new", None).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn resume_ends_a_countdown_and_forgets_the_answer() {
+    a_command_ends_the_wait("/resume another-session", Some(KeyCode::Char('y'))).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn resume_ends_a_pending_offer() {
+    a_command_ends_the_wait("/resume another-session", None).await;
 }

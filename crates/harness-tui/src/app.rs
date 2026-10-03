@@ -923,6 +923,9 @@ impl App {
                     Ok(view) => {
                         self.transcript
                             .push_note(&format!("switched to {}", view.id), width);
+                        // The countdown reads the windows of the provider it began with.
+                        self.resume = None;
+                        self.limit_reset = None;
                         let previous = std::mem::replace(&mut self.model, view.id.clone());
                         self.unproven = Some(Unproven {
                             id: view.id,
@@ -1297,6 +1300,11 @@ impl App {
         self.session_id = view.id.clone();
         self.last_reply.clear();
         self.drop_pending_input();
+        // The offer to resume at a limit's reset, the countdown and the answer belong to the
+        // session they came in: nothing may be sent into this one.
+        self.resume = None;
+        self.limit_reset = None;
+        self.resume_answer = None;
         // Up recalls this session's messages.
         let inputs = self.rewind_points.iter().map(|p| p.text.clone()).collect();
         self.editor.set_history(inputs);

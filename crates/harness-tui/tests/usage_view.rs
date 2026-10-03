@@ -421,3 +421,29 @@ async fn the_windows_are_asked_for_once_when_the_session_starts() {
     ui.draw().unwrap();
     assert!(status_row(&ui).contains("7d 12%"), "{}", status_row(&ui));
 }
+
+// B-minor 1: when the provider is asked, the windows are shown once (what it answered), not once
+// from what the session knew and again after.
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_shows_the_windows_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = agent(Arc::new(Polled), dir.path(), Mode::Auto);
+    let mut options = options(dir.path(), Mode::Auto);
+    options.model = "chatgpt/gpt-5".into();
+    let (mut ui, _) = start(agent, Box::new(WithLedger), options);
+    ui.app_mut().set_clock(Arc::new(|| NOW));
+    type_text(&mut ui, "/usage");
+    press(&mut ui, ratatui::crossterm::event::KeyCode::Enter);
+    for _ in 0..50 {
+        if shows(&ui, "ledger report for") && shows(&ui, "12% used") {
+            break;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(100), ui.next()).await;
+    }
+    let blocks = everything(&ui)
+        .iter()
+        .filter(|r| r.contains("Subscription windows"))
+        .count();
+    assert_eq!(blocks, 1, "{:#?}", everything(&ui));
+    assert!(!shows(&ui, "window unknown"), "{:#?}", everything(&ui));
+}

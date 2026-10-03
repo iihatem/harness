@@ -216,6 +216,9 @@ pub trait Host: Send {
     ) -> BoxFuture<'static, Result<OpenedSession, String>> {
         Box::pin(async { Err("this session cannot change".to_string()) })
     }
+    /// The session the agent continues in changed (`/new`, `/resume`): what was set for the
+    /// session alone, such as a figure given with `/budget`, is returned to what is configured.
+    fn session_changed(&self) {}
     /// The first run's model answered a request, so it can be kept as the default (what it
     /// saved, or why it could not, is returned as notes to show).
     fn model_answered(&self, _model: &str) -> Vec<String> {
@@ -391,6 +394,9 @@ pub struct App {
     prompt: Option<Prompt>,
     /// When the approval or the plan choice shown starts to take keys.
     arming: Arming,
+    /// Whether `arming` is the offer to resume automatically's: it starts afresh when the offer
+    /// becomes the thing that asks (a picker or an approval that was in front of it closed).
+    offer_owns_arming: bool,
     /// The mode chosen while a turn runs, to switch to when it ends.
     pending_mode: Option<Mode>,
     /// Input to send when the running turn ends: as shown, and in full.
@@ -481,6 +487,7 @@ impl App {
             window_note: options.window_note,
             prompt: None,
             arming: Arming::default(),
+            offer_owns_arming: false,
             pending_mode: None,
             queued: VecDeque::new(),
             steering: Steering::new(),
@@ -568,6 +575,17 @@ impl App {
         self.windows = Some(snapshot);
     }
 
+    /// `/usage` when the provider cannot be asked for its windows: the ones the session last
+    /// saw, or that they are unknown. (When it can be asked, they come with
+    /// [`on_usage`](Self::on_usage), once.)
+    pub fn show_known_windows(&mut self) {
+        if self.model.starts_with("chatgpt/") || self.windows.is_some() {
+            let (now, width, theme) = ((self.clock)(), self.width, self.theme());
+            let lines = status::window_lines(self.windows.as_ref(), now, &theme);
+            self.transcript.push_lines(lines, width);
+        }
+    }
+
     /// The usage windows the provider just gave when asked, and the ledger's report, for
     /// `/usage`.
     pub fn on_usage(
@@ -647,8 +665,43 @@ impl App {
     pub fn resume_waiting(&self) -> bool {
         matches!(
             self.resume,
-            Some(Resume::Waiting { .. } | Resume::Asking { .. })
+            Some(Resume::Waiting { .. } | Resume::Checking { .. })
         )
+    }
+
+    /// Whether the offer to resume automatically is what asks now: nothing in front of it (an
+    /// approval, a plan choice, a picker) and no turn running. It takes keys only after a pause,
+    /// like those do ([`Arming`]).
+    fn offer_active(&self) -> bool {
+        matches!(self.resume, Some(Resume::Asking { .. }))
+            && !self.busy()
+            && self.prompt.is_none()
+            && self.plan_choice.is_none()
+            && self.picker.is_none()
+    }
+
+    /// Starts the pause afresh when the offer has just become what asks, or has stopped being.
+    fn sync_offer_arming(&mut self) {
+        let active = self.offer_active();
+        if active != self.offer_owns_arming {
+            self.arming = Arming::default();
+            self.offer_owns_arming = active;
+        }
+    }
+
+    /// A key for the offer, once it takes keys: `y` and `n` with nothing typed, Esc always.
+    /// Whether the key answered it.
+    fn offer_key(&mut self, key: KeyEvent) -> bool {
+        let plain = !key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.answer_resume(false),
+            KeyCode::Char('y' | 'Y') if plain && self.editor.is_empty() => self.answer_resume(true),
+            KeyCode::Char('n' | 'N') if plain && self.editor.is_empty() => {
+                self.answer_resume(false)
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Whether the reset has come: the window is to be read now (once; the answer comes to
@@ -974,6 +1027,7 @@ impl App {
     /// time takes keys once the user has paused for
     /// [`ARMING_DELAY`](crate::approval::ARMING_DELAY) since then.
     pub fn drawn(&mut self, now: Instant) {
+        self.sync_offer_arming();
         if self.takes_keys_after_a_pause() {
             self.arming.drawn(now);
         }
@@ -997,7 +1051,10 @@ impl App {
     /// Whether an approval, a plan choice or a picker waits for an answer: it takes keys only
     /// once the user has paused ([`Arming`]), so keys typed ahead never answer it.
     fn takes_keys_after_a_pause(&self) -> bool {
-        self.prompt.is_some() || self.plan_choice.is_some() || self.picker.is_some()
+        self.prompt.is_some()
+            || self.plan_choice.is_some()
+            || self.picker.is_some()
+            || self.offer_active()
     }
 
     /// Denies the approval waiting, if any, as the session ends: the turn stops.
@@ -1352,12 +1409,13 @@ impl App {
     /// Takes in a paste read at `now`. One that goes to the input while a prompt waits counts as
     /// typing: the prompt waits for a pause after it.
     pub fn on_paste_at(&mut self, text: &str, now: Instant) {
+        self.sync_offer_arming();
         if let Some(prompt) = &mut self.prompt
             && prompt.paste(text)
         {
             return;
         }
-        if self.takes_keys_after_a_pause() && !self.arming.armed(now) {
+        if self.takes_keys_after_a_pause() && (!self.arming.armed(now) || self.offer_active()) {
             self.arming.typed(now);
         }
         if !self.editor.paste(text) {
@@ -1392,29 +1450,36 @@ impl App {
         if key.code != KeyCode::Esc {
             self.last_esc = None;
         }
-        // The offer to resume automatically is answered with a key, while nothing is typed.
-        if !ctrl && self.editor.is_empty() && !self.busy() {
-            match (self.resume, key.code) {
-                (Some(Resume::Asking { .. }), KeyCode::Char('y' | 'Y')) => {
-                    self.answer_resume(true);
-                    return None;
-                }
-                (Some(Resume::Asking { .. }), KeyCode::Char('n' | 'N') | KeyCode::Esc) => {
-                    self.answer_resume(false);
-                    return None;
-                }
-                (Some(Resume::Waiting { .. } | Resume::Checking { .. }), KeyCode::Esc) => {
-                    self.resume = None;
-                    self.transcript
-                        .push_note("automatic resume cancelled", self.width);
-                    return None;
-                }
-                _ => {}
-            }
+        self.sync_offer_arming();
+        // Esc cancels a countdown whatever the input holds (its other meanings, clearing the
+        // input and the double Esc, apply when no countdown runs). An approval, a plan choice or
+        // a picker in front of it takes Esc first.
+        if !ctrl
+            && key.code == KeyCode::Esc
+            && !self.busy()
+            && self.prompt.is_none()
+            && self.plan_choice.is_none()
+            && self.picker.is_none()
+            && matches!(
+                self.resume,
+                Some(Resume::Waiting { .. } | Resume::Checking { .. })
+            )
+        {
+            self.resume = None;
+            self.transcript
+                .push_note("automatic resume cancelled", self.width);
+            return None;
         }
         if self.takes_keys_after_a_pause() {
             if self.arming.armed(now) {
-                return self.prompt_key(key);
+                if !self.offer_active() {
+                    return self.prompt_key(key);
+                }
+                if self.offer_key(key) {
+                    return None;
+                }
+                // Any other key is typed for the input: the offer waits for a pause after it.
+                self.arming.typed(now);
             }
             // Esc stops the turn, as it does without the prompt: the approval is denied.
             if key.code == KeyCode::Esc && self.prompt.is_some() {
@@ -1774,12 +1839,8 @@ impl App {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
                 let theme = self.theme();
-                let now = (self.clock)();
                 let mut lines = self.totals.report(&theme);
                 lines.extend(status::cost_lines(&self.costs, &self.usage_context, &theme));
-                if self.model.starts_with("chatgpt/") || self.windows.is_some() {
-                    lines.extend(status::window_lines(self.windows.as_ref(), now, &theme));
-                }
                 if !self.usage_context.prices.is_empty() {
                     lines.push(Line::from(Span::styled(
                         format!("price snapshot: {}", sanitize(&self.usage_context.prices)),
@@ -2064,7 +2125,9 @@ impl App {
         let theme = self.theme();
         let width = self.width;
         let mut below: Vec<Line<'static>> = Vec::new();
-        if (self.prompt.is_some() || self.plan_choice.is_some()) && self.arming.typed_past() {
+        if (self.prompt.is_some() || self.plan_choice.is_some() || self.offer_active())
+            && self.arming.typed_past()
+        {
             below.extend(wrap(
                 &Line::from(Span::styled(TYPED_PAST, theme.dim())),
                 width,

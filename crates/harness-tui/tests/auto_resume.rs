@@ -27,7 +27,10 @@ use harness_tui::{
     ui::Ui,
     usage::{AutoResume, UsageContext},
 };
-use ratatui::{backend::TestBackend, crossterm::event::KeyCode};
+use ratatui::{
+    backend::TestBackend,
+    crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
+};
 
 /// 2026-10-02 14:00:00 UTC; the limit resets at 14:30.
 const NOW: u64 = 1_790_949_600;
@@ -95,6 +98,15 @@ impl Host for NoCommands {
     fn prepare(&mut self, _typed: &str) -> Prepared {
         unreachable!()
     }
+    fn sessions(&self) -> Vec<harness_core::session::SessionSummary> {
+        vec![harness_core::session::SessionSummary {
+            id: "another-session".into(),
+            path: std::path::PathBuf::new(),
+            started_at: "2026-10-01T10:00:00Z".into(),
+            first_message: Some("an older conversation".into()),
+            modified: std::time::SystemTime::now(),
+        }]
+    }
 }
 
 struct Session {
@@ -147,6 +159,16 @@ impl Session {
         press(&mut self.ui, code);
     }
 
+    /// Answers the offer once it takes keys, after the typing pause every prompt waits for.
+    async fn answer(&mut self, code: KeyCode) {
+        // The key is read at the moment the offer starts to take keys (the session's own
+        // clock is paused here, so the time is given).
+        let at = self.ui.app().armed_at().expect("the offer was drawn");
+        self.ui
+            .handle_at(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), at)
+            .unwrap();
+    }
+
     /// Lets the session run for `ms` of (paused) time, taking in what comes.
     async fn run_for(&mut self, ms: u64) {
         let until = tokio::time::Instant::now() + Duration::from_millis(ms);
@@ -173,7 +195,7 @@ async fn the_offer_names_the_reset_time_and_is_answered_with_y_or_n() {
     );
     // Nothing is waiting until the user answers.
     assert!(!s.shows("Resuming automatically"));
-    s.key(KeyCode::Char('n'));
+    s.answer(KeyCode::Char('n')).await;
     assert!(!s.shows("Resuming automatically"));
     s.ui.draw().unwrap();
     // Remembered for the session: no second offer.
@@ -191,7 +213,7 @@ async fn an_accepted_offer_counts_down_and_resumes_when_the_window_has_capacity(
     // The first answer is for the poll as the session starts, the second for the reset.
     let mut s = session(vec![0.0, 0.0], AutoResume::Ask);
     s.limit_ends_a_turn(RESET);
-    s.key(KeyCode::Char('y'));
+    s.answer(KeyCode::Char('y')).await;
     s.ui.draw().unwrap();
     assert!(
         s.shows("Resuming automatically at 14:30 UTC"),
@@ -225,7 +247,7 @@ async fn an_accepted_offer_counts_down_and_resumes_when_the_window_has_capacity(
 async fn esc_during_the_countdown_cancels_it_and_nothing_is_sent() {
     let mut s = session(vec![0.0], AutoResume::Ask);
     s.limit_ends_a_turn(RESET);
-    s.key(KeyCode::Char('y'));
+    s.answer(KeyCode::Char('y')).await;
     s.key(KeyCode::Esc);
     s.ui.draw().unwrap();
     assert!(!s.shows("Esc to cancel"), "{:#?}", screen(&s.ui));
@@ -242,7 +264,7 @@ async fn esc_during_the_countdown_cancels_it_and_nothing_is_sent() {
 async fn a_window_that_is_still_full_re_arms_twice_and_then_gives_up() {
     let mut s = session(vec![0.0, 100.0, 100.0, 100.0], AutoResume::Ask);
     s.limit_ends_a_turn(RESET);
-    s.key(KeyCode::Char('y'));
+    s.answer(KeyCode::Char('y')).await;
     let mut at = RESET;
     for _ in 0..3 {
         s.clock.store(at, Ordering::SeqCst);
@@ -266,7 +288,7 @@ async fn a_window_that_is_still_full_re_arms_twice_and_then_gives_up() {
 async fn a_window_that_is_full_at_first_and_free_on_a_re_arm_resumes() {
     let mut s = session(vec![0.0, 100.0, 5.0], AutoResume::Ask);
     s.limit_ends_a_turn(RESET);
-    s.key(KeyCode::Char('y'));
+    s.answer(KeyCode::Char('y')).await;
     s.clock.store(RESET, Ordering::SeqCst);
     s.run_for(1_000).await;
     assert_eq!(s.account.requests.load(Ordering::SeqCst), 0);
@@ -288,7 +310,7 @@ async fn with_never_no_offer_is_made() {
 async fn an_answer_of_yes_is_remembered_and_the_next_limit_counts_down_at_once() {
     let mut s = session(vec![0.0, 0.0, 0.0], AutoResume::Ask);
     s.limit_ends_a_turn(RESET);
-    s.key(KeyCode::Char('y'));
+    s.answer(KeyCode::Char('y')).await;
     s.clock.store(RESET, Ordering::SeqCst);
     s.run_for(1_000).await;
     s.ui.settle().await.unwrap();
@@ -311,7 +333,7 @@ async fn an_answer_of_yes_is_remembered_and_the_next_limit_counts_down_at_once()
 async fn sending_a_message_cancels_the_countdown() {
     let mut s = session(vec![0.0], AutoResume::Ask);
     s.limit_ends_a_turn(RESET);
-    s.key(KeyCode::Char('y'));
+    s.answer(KeyCode::Char('y')).await;
     type_text(&mut s.ui, "something else");
     press(&mut s.ui, KeyCode::Enter);
     s.ui.settle().await.unwrap();
@@ -335,4 +357,123 @@ async fn a_limit_with_nothing_to_wait_for_makes_no_offer() {
     });
     s.ui.draw().unwrap();
     assert!(!s.shows("Resume automatically"));
+}
+
+// B1: the offer takes keys only after a pause: a `y` typed ahead goes to the input, and the offer
+// stays open.
+#[tokio::test(start_paused = true)]
+async fn a_y_typed_ahead_does_not_answer_the_offer() {
+    let mut s = session(vec![0.0], AutoResume::Ask);
+    s.limit_ends_a_turn(RESET);
+    // Typing has begun when the offer appears.
+    s.key(KeyCode::Char('y'));
+    s.ui.draw().unwrap();
+    assert!(
+        !s.shows("Resuming automatically at"),
+        "{:#?}",
+        screen(&s.ui)
+    );
+    assert!(s.ui.app().editor().text().contains('y'));
+    // Still asking; and once the user pauses, `y` answers: with the draft in the input it does
+    // not (it is typed), so clear it first.
+    assert!(s.shows("(y/n)"), "{:#?}", everything(&s.ui));
+    press(&mut s.ui, KeyCode::Backspace);
+    s.answer(KeyCode::Char('y')).await;
+    s.ui.draw().unwrap();
+    assert!(
+        s.shows("Resuming automatically at 14:30 UTC"),
+        "{:#?}",
+        screen(&s.ui)
+    );
+}
+
+// B1: an `n` pressed while the offer has not taken keys yet is the user's typing.
+#[tokio::test(start_paused = true)]
+async fn an_n_before_the_pause_is_typing_and_the_offer_waits() {
+    let mut s = session(vec![0.0], AutoResume::Ask);
+    s.limit_ends_a_turn(RESET);
+    s.key(KeyCode::Char('n'));
+    s.ui.draw().unwrap();
+    assert_eq!(s.ui.app().editor().text(), "n");
+    assert!(!s.shows("not resuming automatically"));
+    s.key(KeyCode::Backspace);
+    s.answer(KeyCode::Char('n')).await;
+    assert!(
+        s.shows("not resuming automatically"),
+        "{:#?}",
+        everything(&s.ui)
+    );
+}
+
+// B1: with a picker open, `n` and Esc belong to the picker; the offer waits behind it.
+#[tokio::test(start_paused = true)]
+async fn a_picker_in_front_of_the_offer_gets_the_keys() {
+    let mut s = session(vec![0.0], AutoResume::Ask);
+    s.limit_ends_a_turn(RESET);
+    s.ui.app_mut().open_session_picker();
+    s.ui.draw().unwrap();
+    assert!(s.ui.app().picker().is_some());
+    let armed = s.ui.app().armed_at().unwrap();
+    s.ui.handle_at(
+        Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+        armed,
+    )
+    .unwrap();
+    assert!(
+        !s.shows("not resuming automatically"),
+        "{:#?}",
+        everything(&s.ui)
+    );
+    // Esc is the picker's (it clears the filter, then closes it).
+    for step in 1..=3u64 {
+        if s.ui.app().picker().is_none() {
+            break;
+        }
+        s.ui.handle_at(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            armed + Duration::from_millis(step * 10),
+        )
+        .unwrap();
+    }
+    assert!(s.ui.app().picker().is_none(), "Esc closed the picker");
+    assert!(!s.shows("not resuming automatically"));
+    // The offer is still open, and takes keys after a fresh pause.
+    s.ui.draw().unwrap();
+    press(&mut s.ui, KeyCode::Char('y'));
+    assert!(!s.shows("Resuming automatically at"));
+    press(&mut s.ui, KeyCode::Backspace);
+    s.answer(KeyCode::Char('y')).await;
+    s.ui.draw().unwrap();
+    assert!(
+        s.shows("Resuming automatically at 14:30 UTC"),
+        "{:#?}",
+        screen(&s.ui)
+    );
+}
+
+// B2: Esc cancels the countdown even with a draft in the input, and the draft stays.
+#[tokio::test(start_paused = true)]
+async fn esc_cancels_the_countdown_with_text_in_the_input() {
+    let mut s = session(vec![0.0], AutoResume::Ask);
+    s.limit_ends_a_turn(RESET);
+    s.answer(KeyCode::Char('y')).await;
+    type_text(&mut s.ui, "half a thought");
+    press(&mut s.ui, KeyCode::Esc);
+    s.ui.draw().unwrap();
+    assert!(!s.shows("Esc to cancel"), "{:#?}", screen(&s.ui));
+    assert!(s.shows("automatic resume cancelled"));
+    assert_eq!(s.ui.app().editor().text(), "half a thought");
+    s.clock.store(RESET + 10, Ordering::SeqCst);
+    s.run_for(2_000).await;
+    assert_eq!(s.account.requests.load(Ordering::SeqCst), 0);
+}
+
+// B-minor 2: an offer that waits for an answer does not redraw the screen every 250 ms.
+#[tokio::test(start_paused = true)]
+async fn an_open_offer_is_not_a_reason_to_redraw() {
+    let mut s = session(vec![0.0], AutoResume::Ask);
+    s.limit_ends_a_turn(RESET);
+    assert!(!s.ui.app().resume_waiting());
+    s.answer(KeyCode::Char('y')).await;
+    assert!(s.ui.app().resume_waiting());
 }

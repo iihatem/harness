@@ -139,6 +139,11 @@ impl Host for CliHost {
         vec![self.setup.redactor.redact(&note)]
     }
 
+    fn session_changed(&self) {
+        // A figure given with `/budget <usd>` was for the session it was given in.
+        self.meter.reset_session_budget();
+    }
+
     fn usage_context(&self) -> UsageContext {
         UsageContext {
             baseline: self.setup.config.usage.baseline.clone(),
@@ -441,6 +446,9 @@ pub mod tests {
         assert!(raised.contains("session budget set to $2.00"), "{raised}");
         assert!(raised.contains("of $2.00"), "{raised}");
         assert_eq!(host.meter.budgets().session_usd, Some(2.0));
+        // `/new` and `/resume` return it to the configured figure (none, for this host's meter).
+        host.session_changed();
+        assert_eq!(host.meter.budgets().session_usd, None);
     }
 
     /// A keychain that does not answer until `release` is dropped or sent to.

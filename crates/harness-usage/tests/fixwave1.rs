@@ -413,3 +413,26 @@ fn opening_a_new_cache_from_several_threads_at_once_works() {
         assert_eq!(handle.join().unwrap(), 1);
     }
 }
+
+// B6: `/budget <usd>` is for one session; the next one starts from the configured figure.
+#[test]
+fn the_session_budget_returns_to_the_configured_figure() {
+    let data = tempfile::tempdir().unwrap();
+    let m = meter(
+        data.path(),
+        Budgets {
+            session_usd: Some(1.0),
+            daily_usd: Some(7.0),
+            ..Budgets::default()
+        },
+    );
+    m.set_session_budget(5.0);
+    assert_eq!(m.budgets().session_usd, Some(5.0));
+    m.reset_session_budget();
+    assert_eq!(m.budgets().session_usd, Some(1.0));
+    assert_eq!(m.budgets().daily_usd, Some(7.0));
+    let unset = meter(data.path(), Budgets::default());
+    unset.set_session_budget(5.0);
+    unset.reset_session_budget();
+    assert_eq!(unset.budgets().session_usd, None);
+}

@@ -17,7 +17,10 @@ use harness_tui::app::{Host, Prepared};
 use ratatui::{backend::TestBackend, crossterm::event::KeyCode};
 
 #[derive(Default)]
-struct Calls(Mutex<Vec<(String, Option<f64>)>>);
+struct Calls(
+    Mutex<Vec<(String, Option<f64>)>>,
+    std::sync::atomic::AtomicUsize,
+);
 
 struct Budgets(Arc<Calls>);
 
@@ -27,6 +30,23 @@ impl Host for Budgets {
     }
     fn prepare(&mut self, _typed: &str) -> Prepared {
         unreachable!()
+    }
+    fn open_session(
+        &self,
+        _id: Option<&str>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> BoxFuture<'static, Result<harness_tui::app::OpenedSession, String>> {
+        let dir = tempfile::tempdir().unwrap().keep();
+        Box::pin(async move {
+            Ok(harness_tui::app::OpenedSession {
+                session: harness_core::session::Session::create(&dir, &dir),
+                checkpoints: None,
+                warnings: Vec::new(),
+            })
+        })
+    }
+    fn session_changed(&self) {
+        self.0.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     fn budget(
         &self,
@@ -161,4 +181,24 @@ async fn a_budget_warning_and_a_stop_say_which_budget_and_how_to_raise_it() {
     assert!(shows_wrapped(&ui, "session_usd"), "{:#?}", everything(&ui));
     // The session accepts a new message after a budget stop.
     assert!(!ui.app().busy());
+}
+
+// B6: a figure given with `/budget <usd>` is for the session it was given in: the host is told
+// when `/new` or `/resume` moves to another, to return to the configured one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_session_tells_the_host_so_the_budget_can_be_reset() {
+    let (_dir, mut ui, calls) = session(vec![]);
+    type_text(&mut ui, "/budget 5");
+    press(&mut ui, KeyCode::Enter);
+    wait_for(&mut ui, "session budget set to $5.00").await;
+    assert_eq!(calls.1.load(std::sync::atomic::Ordering::SeqCst), 0);
+    type_text(&mut ui, "/new");
+    press(&mut ui, KeyCode::Enter);
+    for _ in 0..50 {
+        if calls.1.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            break;
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), ui.next()).await;
+    }
+    assert_eq!(calls.1.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

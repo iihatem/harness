@@ -426,6 +426,9 @@ where
             }
             Action::Usage(args) => {
                 let poll = self.provider.windows();
+                if poll.is_none() {
+                    self.app.show_known_windows();
+                }
                 let ledger = self.app.host().usage_report(&args);
                 let tx = self.background_tx.clone();
                 tokio::spawn(async move {
@@ -803,6 +806,7 @@ where
                 for message in opened.warnings {
                     self.show_notice(message);
                 }
+                self.app.host().session_changed();
                 self.send_job(Job::StartSession {
                     session: Box::new(opened.session),
                     checkpoints: opened.checkpoints,

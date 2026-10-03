@@ -1,0 +1,32 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "calc.go"
+      }
+    },
+    {
+      "name": "read",
+      "arguments": {
+        "path": "run.go"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "\nfunc Double(x int) int {\n\treturn x * 2",
+        "old_string": "\nfunc Calc(x int) int {\n\treturn x * 2",
+        "path": "calc.go"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "func Run() int {\n\treturn Double(21)\n}",
+        "old_string": "func Run() int {\n\treturn Calc(21)\n}",
+        "path": "run.go"
+      }
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "app.py"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "def average(xs):\n    if not xs:\n        return 0.0\n    return sum(xs) / len(xs)\n",
+        "path": "app.py"
+      }
+    }
+  ]
+}

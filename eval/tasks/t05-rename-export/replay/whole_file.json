@@ -1,0 +1,30 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "cart.ts"
+      }
+    },
+    {
+      "name": "read",
+      "arguments": {
+        "path": "price.ts"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "import { formatPrice } from \"./price.ts\";\n\nexport function total(items: number[]): string {\n  return formatPrice(items.reduce((a, b) => a + b, 0));\n}\n",
+        "path": "cart.ts"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "export function formatPrice(cents: number): string {\n  return `$${(cents / 100).toFixed(2)}`;\n}\n",
+        "path": "price.ts"
+      }
+    }
+  ]
+}

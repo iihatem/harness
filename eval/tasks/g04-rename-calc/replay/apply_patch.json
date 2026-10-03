@@ -1,0 +1,22 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "calc.go"
+      }
+    },
+    {
+      "name": "read",
+      "arguments": {
+        "path": "run.go"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: calc.go\n@@\n package task\n \n-func Calc(x int) int {\n+func Double(x int) int {\n \treturn x * 2\n }\n*** Update File: run.go\n@@\n package task\n \n func Run() int {\n-\treturn Calc(21)\n+\treturn Double(21)\n }\n*** End Patch\n"
+      }
+    }
+  ]
+}

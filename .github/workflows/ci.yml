@@ -49,6 +49,18 @@ jobs:
         env:
           HARNESS_REQUIRE_LINUX_SANDBOX: ${{ runner.os == 'Linux' && '1' || '0' }}
           HARNESS_EXPECT_LINUX_TIER: ${{ runner.os == 'Linux' && (matrix.tier == 'full' && 'full' || 'basic') || '' }}
+  eval-replay:
+    # The edit-format eval suite in replay mode: recorded model outputs applied to every task in
+    # every format, with no model. The task tests (the oracles) need four toolchains, so they are
+    # not run here.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: eval
+      - run: cargo xtask eval replay
   deny:
     runs-on: ubuntu-latest
     steps:

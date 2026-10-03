@@ -1,0 +1,4 @@
+language = "rust"
+title = "add is_palindrome"
+prompt = "Add a function is_palindrome(s: &str) -> bool to src/lib.rs that is true when the string reads the same backwards. The tests in tests/pal.rs use it."
+test = "cargo test --quiet --offline"

@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "pub fn reverse(s: &str) -> String {\n    s.chars().rev().collect()\n}\n\npub fn is_palindrome(s: &str) -> bool {\n    s == reverse(s)\n}\n",
+        "path": "src/lib.rs"
+      }
+    }
+  ]
+}

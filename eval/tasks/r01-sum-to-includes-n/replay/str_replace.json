@@ -1,0 +1,18 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "edit",
+      "arguments": {
+        "new_string": "pub fn sum_to(n: u32) -> u32 {\n    (1..=n).sum()\n}",
+        "old_string": "pub fn sum_to(n: u32) -> u32 {\n    (1..n).sum()\n}",
+        "path": "src/lib.rs"
+      }
+    }
+  ]
+}

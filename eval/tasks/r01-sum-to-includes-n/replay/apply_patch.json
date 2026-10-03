@@ -1,0 +1,16 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "apply_patch",
+      "arguments": {
+        "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n pub fn sum_to(n: u32) -> u32 {\n-    (1..n).sum()\n+    (1..=n).sum()\n }\n*** End Patch\n"
+      }
+    }
+  ]
+}

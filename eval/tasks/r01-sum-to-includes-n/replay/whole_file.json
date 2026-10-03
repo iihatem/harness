@@ -1,0 +1,17 @@
+{
+  "calls": [
+    {
+      "name": "read",
+      "arguments": {
+        "path": "src/lib.rs"
+      }
+    },
+    {
+      "name": "write",
+      "arguments": {
+        "content": "pub fn sum_to(n: u32) -> u32 {\n    (1..=n).sum()\n}\n",
+        "path": "src/lib.rs"
+      }
+    }
+  ]
+}

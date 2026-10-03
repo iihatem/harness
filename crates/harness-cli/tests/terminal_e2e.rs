@@ -584,7 +584,8 @@ fn typing_through_an_approval_leaves_it_waiting_until_a_pause() {
     std::thread::sleep(Duration::from_millis(200));
     let shown = session.shown();
     assert!(!env.ws.path().join("ran").exists(), "{shown}");
-    for answer in ["approved", "denied", "tell the model why"] {
+    // The answer lines, not the bare words: the basic tier's warning says "Permission denied".
+    for answer in ["✓ approved: ", "✗ denied: ", "tell the model why"] {
         assert!(!shown.contains(answer), "{answer}:\n{shown}");
     }
     assert!(shown.contains(TYPED_PAST), "{shown}");

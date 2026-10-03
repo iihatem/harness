@@ -18,6 +18,7 @@ use harness_core::{
     checkpoint::Checkpoints,
     event::{AgentEvent, TurnEndReason},
     message::Message,
+    meter::WindowSnapshot,
     permission::Mode,
     redact::Redactor,
     session::{RewindScope, Session, SessionSummary},
@@ -38,10 +39,11 @@ use crate::{
     notify::{self, Notify},
     picker::{Item, Picked, Picker, model_item},
     plan::{Choice, PlanChoice, TextEditor},
-    status::{self, Totals},
+    status::{self, Costs, Totals},
     style::Theme,
     text::{sanitize, wrap},
     transcript::Transcript,
+    usage::UsageContext,
 };
 
 /// Ctrl+C twice within this long exits.
@@ -105,6 +107,24 @@ enum Pick {
     Model(Vec<String>),
     /// What to restore to before this message.
     RewindScope(RewindPoint),
+}
+
+/// How many times the countdown to an automatic resume is armed again when the window still shows
+/// no capacity at the reset.
+const MAX_REARMS: u8 = 2;
+
+/// The message sent when the session resumes by itself.
+pub const RESUME_MESSAGE: &str = "Continue where you left off.";
+
+/// Where waiting out a subscription limit stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume {
+    /// The user is asked, once, whether to resume at the reset.
+    Asking { resets_at: u64 },
+    /// Counting down to `at`, `rearms` times armed again so far.
+    Waiting { at: u64, rearms: u8 },
+    /// At the reset: the window is being read.
+    Checking { rearms: u8 },
 }
 
 /// How work the agent did for a command ended.
@@ -196,6 +216,9 @@ pub trait Host: Send {
     ) -> BoxFuture<'static, Result<OpenedSession, String>> {
         Box::pin(async { Err("this session cannot change".to_string()) })
     }
+    /// The session the agent continues in changed (`/new`, `/resume`): what was set for the
+    /// session alone, such as a figure given with `/budget`, is returned to what is configured.
+    fn session_changed(&self) {}
     /// The first run's model answered a request, so it can be kept as the default (what it
     /// saved, or why it could not, is returned as notes to show).
     fn model_answered(&self, _model: &str) -> Vec<String> {
@@ -215,6 +238,24 @@ pub trait Host: Send {
         _cancel: CancellationToken,
     ) -> BoxFuture<'static, Result<ModelSwitch, String>> {
         Box::pin(async { Err("the model cannot change".into()) })
+    }
+    /// The settings `/usage` shows beside what the session knows.
+    fn usage_context(&self) -> UsageContext {
+        UsageContext::default()
+    }
+    /// The ledger's report for `/usage <args>` (a group, `model`, `provider`, `day` or `project`,
+    /// and a period), as lines; none when there is no ledger to report.
+    fn usage_report(&self, _args: &str) -> BoxFuture<'static, Vec<String>> {
+        Box::pin(async { Vec::new() })
+    }
+    /// The budgets with what is spent against them, in `session`; with `set`, first sets the
+    /// session budget to that many USD (for this session only). Errors say why not.
+    fn budget(
+        &self,
+        _session: &str,
+        _set: Option<f64>,
+    ) -> BoxFuture<'static, Result<Vec<String>, String>> {
+        Box::pin(async { Err("there are no budgets here".to_string()) })
     }
     /// Signs in to `provider`, with a device code when `device` is set: what the user must do
     /// (the address to open, the code) goes to `notes` as it comes, and `cancel` stops it. Ok:
@@ -307,6 +348,11 @@ pub enum Action {
     UndoRewind,
     /// Continue in a new session (`None`), or in this project's session with this id.
     OpenSession(Option<String>),
+    /// Ask the provider where its usage windows stand, and the host for the ledger's report, for
+    /// `/usage` with these arguments.
+    Usage(String),
+    /// Show the budgets, or raise the session's (`/budget <usd>`), in this session.
+    Budget { session: String, set: Option<f64> },
     /// Look for the models, for the model picker.
     ListModels,
     /// Continue on the model with this id.
@@ -348,6 +394,9 @@ pub struct App {
     prompt: Option<Prompt>,
     /// When the approval or the plan choice shown starts to take keys.
     arming: Arming,
+    /// Whether `arming` is the offer to resume automatically's: it starts afresh when the offer
+    /// becomes the thing that asks (a picker or an approval that was in front of it closed).
+    offer_owns_arming: bool,
     /// The mode chosen while a turn runs, to switch to when it ends.
     pending_mode: Option<Mode>,
     /// Input to send when the running turn ends: as shown, and in full.
@@ -403,6 +452,21 @@ pub struct App {
     mode_note_pending: bool,
     /// The model being switched to.
     switching: Option<String>,
+    /// What the session's requests cost, from the runtime's metered events.
+    costs: Costs,
+    /// Where the subscription's usage windows stand, as last said.
+    windows: Option<WindowSnapshot>,
+    /// How far each window's warnings went: 0, 80 or 95 (percent), by window length and reset.
+    window_warnings: std::collections::HashMap<(Option<u64>, Option<u64>), u8>,
+    usage_context: UsageContext,
+    /// The usage limit that ended the running turn, and when it resets.
+    limit_reset: Option<u64>,
+    /// Waiting out a usage limit, if the session is.
+    resume: Option<Resume>,
+    /// The user's answer to the offer to resume automatically, for the session.
+    resume_answer: Option<bool>,
+    /// The time, in seconds since the Unix epoch.
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl App {
@@ -412,7 +476,6 @@ impl App {
             editor: Editor::new(options.history),
             completer: Completer::new(options.commands, &options.workspace),
             completion: None,
-            host,
             model: options.model,
             mode: options.mode,
             hint: None,
@@ -424,6 +487,7 @@ impl App {
             window_note: options.window_note,
             prompt: None,
             arming: Arming::default(),
+            offer_owns_arming: false,
             pending_mode: None,
             queued: VecDeque::new(),
             steering: Steering::new(),
@@ -452,6 +516,305 @@ impl App {
             start_mode: options.mode,
             mode_note_pending: false,
             switching: None,
+            usage_context: host.usage_context(),
+            limit_reset: None,
+            resume: None,
+            resume_answer: None,
+            costs: Costs::default(),
+            windows: None,
+            window_warnings: std::collections::HashMap::new(),
+            clock: Arc::new(harness_core::time::now_unix),
+            host,
+        }
+    }
+
+    /// Reads the time from `clock`, for the windows' staleness and reset times.
+    pub fn set_clock(&mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.clock = clock;
+    }
+
+    /// Sets what `/usage` shows beside the session's own figures.
+    pub fn set_usage_context(&mut self, context: UsageContext) {
+        self.usage_context = context;
+    }
+
+    /// Whether the usage windows are known.
+    pub fn has_windows(&self) -> bool {
+        self.windows.is_some()
+    }
+
+    /// Where the usage windows stand, as the provider said: shown in the status line, and a
+    /// warning once as each window crosses 80% and once as it crosses 95%. Nothing here
+    /// delays or refuses a request.
+    fn observe_windows(&mut self, snapshot: WindowSnapshot) {
+        let now = (self.clock)();
+        for window in &snapshot.windows {
+            let Some(used) = window.used_percent else {
+                continue;
+            };
+            let key = (window.window_minutes, window.resets_at);
+            let reached = self.window_warnings.entry(key).or_insert(0);
+            let level = if used >= 95.0 {
+                95
+            } else if used >= 80.0 {
+                80
+            } else {
+                0
+            };
+            if level > *reached {
+                *reached = level;
+                let resets = window.resets_at.map_or(String::new(), |r| {
+                    format!(", resets {}", status::reset_text(r, now))
+                });
+                self.transcript.push_warning(
+                    &format!("{} window at {used:.0}% used{resets}", window.label()),
+                    self.width,
+                );
+            }
+        }
+        self.windows = Some(snapshot);
+    }
+
+    /// `/usage` when the provider cannot be asked for its windows: the ones the session last
+    /// saw, or that they are unknown. (When it can be asked, they come with
+    /// [`on_usage`](Self::on_usage), once.)
+    pub fn show_known_windows(&mut self) {
+        if self.model.starts_with("chatgpt/") || self.windows.is_some() {
+            let (now, width, theme) = ((self.clock)(), self.width, self.theme());
+            let lines = status::window_lines(self.windows.as_ref(), now, &theme);
+            self.transcript.push_lines(lines, width);
+        }
+    }
+
+    /// The usage windows the provider just gave when asked, and the ledger's report, for
+    /// `/usage`.
+    pub fn on_usage(
+        &mut self,
+        windows: Option<Result<WindowSnapshot, String>>,
+        ledger: Vec<String>,
+    ) {
+        let width = self.width;
+        let theme = self.theme();
+        match windows {
+            Some(Ok(snapshot)) => {
+                self.observe_windows(snapshot);
+                let now = (self.clock)();
+                let lines = status::window_lines(self.windows.as_ref(), now, &theme);
+                self.transcript.push_lines(lines, width);
+            }
+            Some(Err(why)) => {
+                let why = self.redacted(&why);
+                self.transcript
+                    .push_note(&format!("could not read the usage windows: {why}"), width);
+            }
+            None => {}
+        }
+        if !ledger.is_empty() {
+            let lines = ledger
+                .iter()
+                .map(|l| Line::from(sanitize(l)))
+                .collect::<Vec<_>>();
+            self.transcript.push_lines(lines, width);
+        }
+    }
+
+    /// A usage limit ended the turn, and resets at `resets_at`: offers to wait for it (once, then
+    /// as the user answered), unless `usage.auto_resume` is `never` or it has reset already.
+    fn limit_hit(&mut self, resets_at: u64) {
+        let now = (self.clock)();
+        if self.usage_context.auto_resume == crate::usage::AutoResume::Never || resets_at <= now {
+            return;
+        }
+        match self.resume_answer {
+            Some(false) => {}
+            Some(true) => {
+                self.resume = Some(Resume::Waiting {
+                    at: resets_at,
+                    rearms: 0,
+                })
+            }
+            None => {
+                self.resume = Some(Resume::Asking { resets_at });
+                let at = status::reset_text(resets_at, now);
+                self.transcript
+                    .push_note(&format!("Resume automatically at {at}? (y/n)"), self.width);
+            }
+        }
+    }
+
+    /// The offer's answer: `y` waits for the reset, anything else declines, for the session.
+    fn answer_resume(&mut self, accept: bool) {
+        let Some(Resume::Asking { resets_at }) = self.resume else {
+            return;
+        };
+        self.resume_answer = Some(accept);
+        if accept {
+            self.resume = Some(Resume::Waiting {
+                at: resets_at,
+                rearms: 0,
+            });
+        } else {
+            self.resume = None;
+            self.transcript
+                .push_note("not resuming automatically", self.width);
+        }
+    }
+
+    /// Whether the session counts down to an automatic resume, which the screen shows second by
+    /// second.
+    pub fn resume_waiting(&self) -> bool {
+        matches!(
+            self.resume,
+            Some(Resume::Waiting { .. } | Resume::Checking { .. })
+        )
+    }
+
+    /// Whether the offer to resume automatically is what asks now: nothing in front of it (an
+    /// approval, a plan choice, a picker) and no turn running. It takes keys only after a pause,
+    /// like those do ([`Arming`]).
+    fn offer_active(&self) -> bool {
+        matches!(self.resume, Some(Resume::Asking { .. }))
+            && !self.busy()
+            && self.prompt.is_none()
+            && self.plan_choice.is_none()
+            && self.picker.is_none()
+    }
+
+    /// Starts the pause afresh when the offer has just become what asks, or has stopped being.
+    fn sync_offer_arming(&mut self) {
+        let active = self.offer_active();
+        if active != self.offer_owns_arming {
+            self.arming = Arming::default();
+            self.offer_owns_arming = active;
+        }
+    }
+
+    /// A key for the offer, once it takes keys: `y` and `n` with nothing typed, Esc always.
+    /// Whether the key answered it.
+    fn offer_key(&mut self, key: KeyEvent) -> bool {
+        let plain = !key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.answer_resume(false),
+            KeyCode::Char('y' | 'Y') if plain && self.editor.is_empty() => self.answer_resume(true),
+            KeyCode::Char('n' | 'N') if plain && self.editor.is_empty() => {
+                self.answer_resume(false)
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether the reset has come: the window is to be read now (once; the answer comes to
+    /// [`on_resume_check`](Self::on_resume_check)).
+    pub fn resume_due(&mut self) -> bool {
+        match self.resume {
+            Some(Resume::Waiting { at, rearms }) if !self.busy() && (self.clock)() >= at => {
+                self.resume = Some(Resume::Checking { rearms });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The window as the provider just said it at the reset (or why it could not): with capacity,
+    /// the session continues with a fixed message; without, the countdown is armed again, at
+    /// most twice, and then stops.
+    pub fn on_resume_check(&mut self, windows: Result<WindowSnapshot, String>) -> Option<Action> {
+        let Some(Resume::Checking { rearms }) = self.resume else {
+            return None;
+        };
+        let now = (self.clock)();
+        let width = self.width;
+        let snapshot = windows.as_ref().ok().cloned();
+        let capacity = snapshot.as_ref().is_some_and(|s| {
+            s.windows.iter().any(|w| w.used_percent.is_some())
+                && s.windows
+                    .iter()
+                    .all(|w| w.used_percent.is_none_or(|u| u < 100.0))
+        });
+        if let Some(snapshot) = snapshot.clone() {
+            self.observe_windows(snapshot);
+        }
+        if capacity {
+            self.resume = None;
+            self.transcript
+                .push_note("the usage window has capacity again: continuing", width);
+            return self.send(RESUME_MESSAGE.to_string(), RESUME_MESSAGE.to_string());
+        }
+        if rearms >= MAX_REARMS {
+            self.resume = None;
+            self.transcript.push_note(
+                "the usage window is still full after waiting twice more: not resuming automatically",
+                width,
+            );
+            return None;
+        }
+        // When the full window says it resets, else a few minutes from now.
+        let next = snapshot
+            .iter()
+            .flat_map(|s| s.windows.iter())
+            .filter(|w| w.used_percent.is_some_and(|u| u >= 100.0))
+            .filter_map(|w| w.resets_at)
+            .filter(|at| *at > now)
+            .max()
+            .unwrap_or(now + 300);
+        let why = match &windows {
+            Err(why) => format!("could not read the usage window ({}); ", self.redacted(why)),
+            Ok(_) => "the usage window is still full; ".to_string(),
+        };
+        self.transcript.push_note(
+            &format!("{why}trying again at {}", status::reset_text(next, now)),
+            width,
+        );
+        self.resume = Some(Resume::Waiting {
+            at: next,
+            rearms: rearms + 1,
+        });
+        None
+    }
+
+    /// The live region's line for an offer or a countdown.
+    fn resume_line(&self, theme: &Theme) -> Option<Line<'static>> {
+        let now = (self.clock)();
+        let text = match self.resume? {
+            Resume::Asking { .. } => "answer y or n to resume automatically".to_string(),
+            Resume::Waiting { at, .. } => {
+                let left = at.saturating_sub(now);
+                format!(
+                    "Resuming automatically at {} (in {}m {:02}s) · Esc to cancel",
+                    status::reset_text(at, now),
+                    left / 60,
+                    left % 60
+                )
+            }
+            Resume::Checking { .. } => "Reading the usage window… · Esc to cancel".to_string(),
+        };
+        Some(Line::from(Span::styled(text, theme.accent())))
+    }
+
+    /// What `/budget` found out: the budgets and their spend, or why not.
+    pub fn on_budget(&mut self, result: Result<Vec<String>, String>) {
+        let width = self.width;
+        match result {
+            Ok(lines) => {
+                let lines = lines
+                    .iter()
+                    .map(|l| Line::from(sanitize(l)))
+                    .collect::<Vec<_>>();
+                self.transcript.push_lines(lines, width);
+            }
+            Err(why) => {
+                let why = self.redacted(&why);
+                self.transcript.push_error(&why, width);
+            }
+        }
+    }
+
+    /// The windows the provider gave when the session asked at its start (or after a model
+    /// switch). One that could not be read says nothing: `/usage` says why.
+    pub fn on_windows(&mut self, windows: Result<WindowSnapshot, String>) {
+        if let Ok(snapshot) = windows {
+            self.observe_windows(snapshot);
         }
     }
 
@@ -560,6 +923,9 @@ impl App {
                     Ok(view) => {
                         self.transcript
                             .push_note(&format!("switched to {}", view.id), width);
+                        // The countdown reads the windows of the provider it began with.
+                        self.resume = None;
+                        self.limit_reset = None;
                         let previous = std::mem::replace(&mut self.model, view.id.clone());
                         self.unproven = Some(Unproven {
                             id: view.id,
@@ -664,6 +1030,7 @@ impl App {
     /// time takes keys once the user has paused for
     /// [`ARMING_DELAY`](crate::approval::ARMING_DELAY) since then.
     pub fn drawn(&mut self, now: Instant) {
+        self.sync_offer_arming();
         if self.takes_keys_after_a_pause() {
             self.arming.drawn(now);
         }
@@ -687,7 +1054,10 @@ impl App {
     /// Whether an approval, a plan choice or a picker waits for an answer: it takes keys only
     /// once the user has paused ([`Arming`]), so keys typed ahead never answer it.
     fn takes_keys_after_a_pause(&self) -> bool {
-        self.prompt.is_some() || self.plan_choice.is_some() || self.picker.is_some()
+        self.prompt.is_some()
+            || self.plan_choice.is_some()
+            || self.picker.is_some()
+            || self.offer_active()
     }
 
     /// Denies the approval waiting, if any, as the session ends: the turn stops.
@@ -764,6 +1134,9 @@ impl App {
             AgentEvent::ToolCallRequested { .. } => self.ran_tools = true,
             AgentEvent::TurnFinished { reason } => self.turn_ended(*reason, now),
             AgentEvent::Usage { model, usage } => self.totals.add(model, usage),
+            AgentEvent::Metered { model, cost } => self.costs.add(model, cost),
+            AgentEvent::LimitReached { resets_at } => self.limit_reset = Some(*resets_at),
+            AgentEvent::RateLimits { snapshot } => self.observe_windows(snapshot.clone()),
             AgentEvent::Steered { text } => {
                 if let Some(i) = self.sent_now.iter().position(|t| t == text) {
                     self.sent_now.remove(i);
@@ -830,6 +1203,7 @@ impl App {
                 TurnEndReason::Completed => Some("the turn finished"),
                 TurnEndReason::Error => Some("the turn stopped with an error"),
                 TurnEndReason::StepLimit => Some("the turn stopped at the step limit"),
+                TurnEndReason::Budget => Some("the turn stopped at its budget"),
                 TurnEndReason::Interrupted => None,
             };
             if let Some(how) = how.filter(|_| took >= notify::LONG_TURN) {
@@ -846,6 +1220,11 @@ impl App {
                 edited: false,
             });
             self.arming = Arming::default();
+        }
+        if let Some(resets_at) = self.limit_reset.take()
+            && reason == TurnEndReason::Error
+        {
+            self.limit_hit(resets_at);
         }
         let left = self.steering.take();
         self.sent_now.clear();
@@ -884,6 +1263,8 @@ impl App {
     /// what the conversation says.
     fn run(&mut self, input: TurnInput) -> Option<Action> {
         self.running = true;
+        // What the user sends, or the resume itself, ends the wait.
+        self.resume = None;
         let plan_note = std::mem::take(&mut self.plan_note_pending) && self.mode == Mode::Plan;
         if std::mem::take(&mut self.mode_note_pending) || plan_note {
             return Some(Action::RunIn(self.mode, input));
@@ -919,6 +1300,11 @@ impl App {
         self.session_id = view.id.clone();
         self.last_reply.clear();
         self.drop_pending_input();
+        // The offer to resume at a limit's reset, the countdown and the answer belong to the
+        // session they came in: nothing may be sent into this one.
+        self.resume = None;
+        self.limit_reset = None;
+        self.resume_answer = None;
         // Up recalls this session's messages.
         let inputs = self.rewind_points.iter().map(|p| p.text.clone()).collect();
         self.editor.set_history(inputs);
@@ -1031,12 +1417,13 @@ impl App {
     /// Takes in a paste read at `now`. One that goes to the input while a prompt waits counts as
     /// typing: the prompt waits for a pause after it.
     pub fn on_paste_at(&mut self, text: &str, now: Instant) {
+        self.sync_offer_arming();
         if let Some(prompt) = &mut self.prompt
             && prompt.paste(text)
         {
             return;
         }
-        if self.takes_keys_after_a_pause() && !self.arming.armed(now) {
+        if self.takes_keys_after_a_pause() && (!self.arming.armed(now) || self.offer_active()) {
             self.arming.typed(now);
         }
         if !self.editor.paste(text) {
@@ -1071,9 +1458,36 @@ impl App {
         if key.code != KeyCode::Esc {
             self.last_esc = None;
         }
+        self.sync_offer_arming();
+        // Esc cancels a countdown whatever the input holds (its other meanings, clearing the
+        // input and the double Esc, apply when no countdown runs). An approval, a plan choice or
+        // a picker in front of it takes Esc first.
+        if !ctrl
+            && key.code == KeyCode::Esc
+            && !self.busy()
+            && self.prompt.is_none()
+            && self.plan_choice.is_none()
+            && self.picker.is_none()
+            && matches!(
+                self.resume,
+                Some(Resume::Waiting { .. } | Resume::Checking { .. })
+            )
+        {
+            self.resume = None;
+            self.transcript
+                .push_note("automatic resume cancelled", self.width);
+            return None;
+        }
         if self.takes_keys_after_a_pause() {
             if self.arming.armed(now) {
-                return self.prompt_key(key);
+                if !self.offer_active() {
+                    return self.prompt_key(key);
+                }
+                if self.offer_key(key) {
+                    return None;
+                }
+                // Any other key is typed for the input: the offer waits for a pause after it.
+                self.arming.typed(now);
             }
             // Esc stops the turn, as it does without the prompt: the approval is denied.
             if key.code == KeyCode::Esc && self.prompt.is_some() {
@@ -1319,8 +1733,35 @@ impl App {
         let width = self.width;
         match name {
             "quit" => return self.quit(),
-            "mode" | "compact" | "rewind" | "new" | "resume" | "model" | "login"
+            "mode" | "compact" | "rewind" | "new" | "resume" | "model" | "login" | "budget"
                 if !self.between_turns(name) => {}
+            "budget" => {
+                let amount = args.trim().trim_start_matches('$');
+                let set = if amount.is_empty() {
+                    None
+                } else {
+                    match amount.parse::<f64>() {
+                        Ok(usd) if usd.is_finite() && usd > 0.0 => Some(usd),
+                        _ => {
+                            self.editor.submit();
+                            self.transcript.push_user(full, width);
+                            self.transcript.push_error(
+                                &format!(
+                                    "/budget takes an amount in USD above 0, such as /budget 2.00, not `{args}`"
+                                ),
+                                width,
+                            );
+                            return None;
+                        }
+                    }
+                };
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return Some(Action::Budget {
+                    session: self.session_id.clone(),
+                    set,
+                });
+            }
             "login" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
@@ -1390,21 +1831,32 @@ impl App {
                 self.transcript.push_user(full, width);
                 self.help();
             }
-            "context" | "usage" => {
+            "context" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
                 let theme = self.theme();
-                let lines = if name == "context" {
-                    status::context_report(
-                        &self.context,
-                        &self.instruction_files,
-                        self.window_note.as_deref(),
-                        &theme,
-                    )
-                } else {
-                    self.totals.report(&theme)
-                };
+                let lines = status::context_report(
+                    &self.context,
+                    &self.instruction_files,
+                    self.window_note.as_deref(),
+                    &theme,
+                );
                 self.transcript.push_lines(lines, width);
+            }
+            "usage" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                let theme = self.theme();
+                let mut lines = self.totals.report(&theme);
+                lines.extend(status::cost_lines(&self.costs, &self.usage_context, &theme));
+                if !self.usage_context.prices.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("price snapshot: {}", sanitize(&self.usage_context.prices)),
+                        theme.dim(),
+                    )));
+                }
+                self.transcript.push_lines(lines, width);
+                return Some(Action::Usage(args.to_string()));
             }
             _ => {
                 self.transcript.push_error(
@@ -1650,11 +2102,20 @@ impl App {
 
     /// The status line.
     fn status(&self) -> Line<'static> {
-        let mut line = status::status_line(
+        let extras = status::Extras {
+            cost: self.costs.status(),
+            // Only a subscription provider has windows: others show none.
+            window: self
+                .model
+                .starts_with("chatgpt/")
+                .then(|| status::window_segment(self.windows.as_ref(), (self.clock)())),
+        };
+        let mut line = status::status_line_with(
             &self.model,
             self.mode,
             &self.context,
             &self.totals,
+            &extras,
             &self.theme(),
         );
         if let Some(next) = self.pending_mode {
@@ -1672,13 +2133,18 @@ impl App {
         let theme = self.theme();
         let width = self.width;
         let mut below: Vec<Line<'static>> = Vec::new();
-        if (self.prompt.is_some() || self.plan_choice.is_some()) && self.arming.typed_past() {
+        if (self.prompt.is_some() || self.plan_choice.is_some() || self.offer_active())
+            && self.arming.typed_past()
+        {
             below.extend(wrap(
                 &Line::from(Span::styled(TYPED_PAST, theme.dim())),
                 width,
                 &[],
                 &[],
             ));
+        }
+        if let Some(line) = self.resume_line(&theme) {
+            below.extend(wrap(&line, width, &[], &[]));
         }
         below.extend(wrap(&self.status(), width, &[], &[]));
         if let Some(hint) = self
@@ -1740,6 +2206,9 @@ impl App {
                 width,
                 &theme,
             ));
+        }
+        if let Some(line) = self.resume_line(&theme) {
+            below.extend(wrap(&line, width, &[], &[]));
         }
         below.extend(wrap(&self.status(), width, &[], &[]));
         if let Some(hint) = &self.hint {

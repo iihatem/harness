@@ -44,6 +44,7 @@ fn async_stream()
                 input_tokens: 1_000,
                 output_tokens: 50,
                 cached_tokens: 800,
+                ..Default::default()
             }),
             3 => ProviderEvent::Finished(FinishReason::Stop),
             _ => return None,
@@ -78,6 +79,7 @@ impl Provider for SlowToolCall {
                         input_tokens: 10,
                         output_tokens: 88,
                         cached_tokens: 0,
+                        ..Default::default()
                     }),
                     3 => ProviderEvent::Finished(FinishReason::ToolCalls),
                     _ => return None,
@@ -91,6 +93,7 @@ impl Provider for SlowToolCall {
                     input_tokens: 5,
                     output_tokens: 5,
                     cached_tokens: 0,
+                    ..Default::default()
                 })),
                 Ok(ProviderEvent::Finished(FinishReason::Stop)),
             ]))
@@ -196,6 +199,7 @@ async fn stats_add_up_the_turns_model_calls() {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            ..Default::default()
         }))
     };
     let provider = MockProvider::new(vec![
@@ -248,6 +252,7 @@ async fn a_reply_with_usage_in_every_chunk_is_counted_once_with_the_last_chunks_
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            ..Default::default()
         }))
     };
     let provider = MockProvider::new(vec![Script::Reply(vec![
@@ -272,6 +277,7 @@ async fn a_reply_with_usage_in_every_chunk_is_counted_once_with_the_last_chunks_
             input_tokens: 1_000,
             output_tokens: 20,
             cached_tokens: 0,
+            ..Default::default()
         }],
         "{events:#?}"
     );
@@ -301,6 +307,7 @@ async fn context_usage_splits_the_next_request() {
             input_tokens: 700,
             output_tokens: 2,
             cached_tokens: 0,
+            ..Default::default()
         })),
         Ok(ProviderEvent::Finished(FinishReason::Stop)),
     ])]);

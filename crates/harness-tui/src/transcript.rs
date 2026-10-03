@@ -235,7 +235,8 @@ impl Transcript {
                     TurnEndReason::StepLimit => {
                         self.push_error("stopped after reaching the step limit", width)
                     }
-                    TurnEndReason::Completed | TurnEndReason::Error => {}
+                    // The budget event just before said which budget, and how to raise it.
+                    TurnEndReason::Completed | TurnEndReason::Error | TurnEndReason::Budget => {}
                 }
             }
             AgentEvent::TurnStats {
@@ -258,8 +259,17 @@ impl Transcript {
                 self.gap();
                 self.push_lines(vec![line], width);
             }
+            AgentEvent::BudgetWarning { notice } => {
+                self.push_warning(&notice.warning_message(), width);
+            }
+            AgentEvent::BudgetReached { notice } => {
+                self.push_error(&notice.reached_message(), width);
+            }
             AgentEvent::ApprovalNeeded { .. }
             | AgentEvent::Usage { .. }
+            | AgentEvent::Metered { .. }
+            | AgentEvent::RateLimits { .. }
+            | AgentEvent::LimitReached { .. }
             | AgentEvent::CheckpointCreated { .. } => {}
         }
     }

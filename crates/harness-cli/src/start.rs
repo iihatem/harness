@@ -50,6 +50,8 @@ pub struct Started {
     pub write_mode_warning: Option<String>,
     /// Where sandboxed commands can write, which a session's checkpoints must stay out of.
     pub writable: Vec<std::path::PathBuf>,
+    /// Keeps the usage ledger and the budgets.
+    pub meter: Arc<harness_usage::meter::UsageMeter>,
 }
 
 /// A new run's id: its start time and the process id.
@@ -216,6 +218,18 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     );
     let checkpoints = crate::sessions::checkpoints(setup, &session, &writable, notices);
     let writable_roots = writable;
+    let budgets = &setup.config.budgets;
+    let meter = Arc::new(
+        harness_usage::meter::UsageMeter::open(&setup.paths.data_dir, &setup.workspace)
+            .with_pricing(crate::pricing::load(setup))
+            .with_baseline(setup.config.usage.baseline.clone())
+            .with_outcomes(!setup.config.outcomes_disabled)
+            .with_budgets(harness_usage::budget::Budgets {
+                session_usd: budgets.session_usd,
+                daily_usd: budgets.daily_usd,
+                monthly_usd: budgets.monthly_usd,
+            }),
+    );
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin(),
@@ -226,7 +240,8 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     )
     .with_redactor(setup.redactor.clone())
     .with_session(session)
-    .with_checkpoints(checkpoints);
+    .with_checkpoints(checkpoints)
+    .with_meter(meter.clone());
     if interactive {
         agent = agent.with_sandboxes(sandboxes);
     }
@@ -237,6 +252,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         window_note: model.window_note.into(),
         write_mode_warning,
         writable: writable_roots,
+        meter,
     })
 }
 

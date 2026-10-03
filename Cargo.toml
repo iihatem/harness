@@ -19,6 +19,7 @@ harness-sandbox = { path = "crates/harness-sandbox" }
 harness-shell = { path = "crates/harness-shell" }
 harness-tools = { path = "crates/harness-tools" }
 harness-tui = { path = "crates/harness-tui" }
+harness-usage = { path = "crates/harness-usage" }
 async-stream = "0.3"
 base64 = "0.23.1"
 async-trait = "0.1.92"
@@ -40,6 +41,8 @@ nucleo-matcher = "0.3.1"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 regex = "1"
+# Bundled SQLite for the usage report cache (`harness-usage`): nothing needs installing.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls"] }
 seccompiler = "=0.5.0"
 serde = { version = "1.0.229", features = ["derive"] }

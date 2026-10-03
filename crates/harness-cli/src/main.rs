@@ -7,6 +7,7 @@ mod interactive;
 mod login;
 mod models;
 mod notices;
+mod pricing;
 mod prompt;
 mod sandbox;
 mod sessions;
@@ -15,6 +16,7 @@ mod slash;
 mod start;
 mod term;
 mod trust;
+mod usage;
 
 use std::{io::IsTerminal, process::ExitCode};
 
@@ -105,6 +107,27 @@ enum Command {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+    /// Update the price table the cost figures use (the only time harness connects to models.dev)
+    Pricing {
+        #[command(subcommand)]
+        command: PricingCommand,
+    },
+    /// Report model usage and cost from the local ledger, by model, provider, day or project;
+    /// `usage export` and `usage forget` handle the data
+    #[command(args_conflicts_with_subcommands = true)]
+    Usage {
+        #[command(subcommand)]
+        command: Option<UsageCommand>,
+        /// What to group by: model, provider, day or project
+        #[arg(long, default_value = "model")]
+        by: String,
+        /// Only requests on or after this UTC date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Only requests on or before this UTC date (YYYY-MM-DD)
+        #[arg(long)]
+        until: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -124,6 +147,35 @@ enum AuthCommand {
         /// The account profile
         profile: String,
     },
+}
+
+#[derive(Subcommand)]
+enum UsageCommand {
+    /// Write the ledger's records to standard output
+    Export {
+        /// Only requests on or after this UTC date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// jsonl (the default) or csv
+        #[arg(long, default_value = "jsonl")]
+        format: String,
+    },
+    /// Delete the ledger, the window snapshots and the outcome log, in a range, and rebuild the
+    /// report cache
+    Forget {
+        /// Delete what is before this UTC date (YYYY-MM-DD)
+        #[arg(long, conflicts_with = "all")]
+        before: Option<String>,
+        /// Delete all of it
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PricingCommand {
+    /// Fetch the current prices from models.dev, validate them, and store them
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -181,6 +233,8 @@ fn command_line(command: &Command) -> &'static str {
         Command::Logout { .. } => "harness logout",
         Command::Trust { .. } => "harness trust",
         Command::Sandbox { .. } => "harness sandbox doctor",
+        Command::Usage { .. } => "harness usage",
+        Command::Pricing { .. } => "harness pricing update",
     }
 }
 
@@ -294,6 +348,23 @@ fn main() -> ExitCode {
             Some(Command::Sandbox {
                 command: SandboxCommand::Doctor,
             }) => doctor::run(),
+            Some(Command::Usage {
+                command: None,
+                by,
+                since,
+                until,
+            }) => usage::report(&by, since, until),
+            Some(Command::Usage {
+                command: Some(UsageCommand::Export { since, format }),
+                ..
+            }) => usage::export(since.as_deref(), &format),
+            Some(Command::Usage {
+                command: Some(UsageCommand::Forget { before, all }),
+                ..
+            }) => usage::forget(before.as_deref(), all),
+            Some(Command::Pricing {
+                command: PricingCommand::Update,
+            }) => pricing::update().await,
             None => {
                 let pick_session = matches!(cli.resume, Some(None));
                 interactive::run(cli.model, cli.mode, session, pick_session).await

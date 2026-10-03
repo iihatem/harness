@@ -407,8 +407,11 @@ impl EventRedactor {
             AgentEvent::ReasoningDelta { text } => delta(self.reasoning.push(&text), |text| {
                 AgentEvent::ReasoningDelta { text }
             }),
-            // Some servers report usage with every chunk: it does not end the reply.
-            usage @ AgentEvent::Usage { .. } => vec![self.redactor.redact_event(&usage)],
+            // Some servers report usage with every chunk: it does not end the reply. Nor do window
+            // snapshots, which arrive with the response's headers, before its text.
+            usage @ (AgentEvent::Usage { .. } | AgentEvent::RateLimits { .. }) => {
+                vec![self.redactor.redact_event(&usage)]
+            }
             other => {
                 let mut shown = self.finish();
                 shown.push(self.redactor.redact_event(&other));

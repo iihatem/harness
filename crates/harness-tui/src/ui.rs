@@ -12,6 +12,8 @@ use harness_core::{
     agent::{Agent, ContextUsage, RewindError, RewindPoint, SessionModel},
     checkpoint::Checkpoints,
     event::AgentEvent,
+    meter::WindowSnapshot,
+    provider::Provider,
     redact::{EventRedactor, Redactor},
     session::{RewindScope, Session},
     turn::TurnInput,
@@ -36,6 +38,9 @@ pub const HOST_WARNINGS_EVERY: Duration = Duration::from_millis(250);
 /// While the agent's events stream, the screen is redrawn at most this often; keys redraw at
 /// once.
 pub const REDRAW_EVERY: Duration = Duration::from_millis(30);
+
+/// How long `/usage` waits for the provider to say where its usage windows stand.
+pub const POLL_WAIT: Duration = Duration::from_secs(5);
 
 /// How long the terminal's input is given to end after a write to the terminal failed.
 const GONE_WAIT: Duration = Duration::from_secs(1);
@@ -118,6 +123,18 @@ enum Background {
     Note(String),
     /// How a sign-in ended.
     Login(Result<String, String>),
+    /// What the provider said of its usage windows when the session asked as it started, or
+    /// after a model switch.
+    Windows(Result<WindowSnapshot, String>),
+    /// What `/budget` found out.
+    Budget(Result<Vec<String>, String>),
+    /// The window as the provider said it at the reset of a usage limit.
+    ResumeCheck(Result<WindowSnapshot, String>),
+    /// What `/usage` asked for: the provider's windows (when it has any) and the ledger's report.
+    Usage {
+        windows: Option<Result<WindowSnapshot, String>>,
+        ledger: Vec<String>,
+    },
 }
 
 /// What the task that owns the agent says after each job: where the context goes now, and how
@@ -161,6 +178,8 @@ pub struct Ui<B: Backend> {
     /// What work in the background comes back with.
     background_tx: mpsc::UnboundedSender<Background>,
     background: mpsc::UnboundedReceiver<Background>,
+    /// The provider the session's model runs on, asked where its usage windows stand.
+    provider: Arc<dyn Provider>,
 }
 
 impl<B> Ui<B>
@@ -185,6 +204,7 @@ where
         let (background_tx, background) = mpsc::unbounded_channel();
         let width = term.width() as usize;
         let mut app = App::new(options, host, width);
+        let provider = agent.provider();
         let agent = agent.with_steering(app.steering());
         app.set_context(agent.context_usage());
         app.set_rewind(agent.rewind_points(), agent.can_undo_rewind());
@@ -245,7 +265,7 @@ where
                 });
             }
         });
-        Ui {
+        let ui = Ui {
             app,
             term,
             jobs: Some(jobs),
@@ -264,7 +284,26 @@ where
             cursor_query: None,
             background_tx,
             background,
-        }
+            provider,
+        };
+        // A subscription's windows are asked for once as the session starts, never on a timer.
+        ui.poll_windows();
+        ui
+    }
+
+    /// Asks the provider where its usage windows stand, when it has any, in the background.
+    fn poll_windows(&self) {
+        let Some(poll) = self.provider.windows() else {
+            return;
+        };
+        let tx = self.background_tx.clone();
+        tokio::spawn(async move {
+            let result = match tokio::time::timeout(POLL_WAIT, poll).await {
+                Ok(result) => result,
+                Err(_) => Err("it did not answer in time".to_string()),
+            };
+            let _ = tx.send(Background::Windows(result));
+        });
     }
 
     /// After a resize, asks the terminal where its cursor is with `query`, through the thread
@@ -383,6 +422,36 @@ where
             }
             Action::UndoRewind => {
                 self.send_job(Job::UndoRewind);
+                Flow::Continue
+            }
+            Action::Usage(args) => {
+                let poll = self.provider.windows();
+                if poll.is_none() {
+                    self.app.show_known_windows();
+                }
+                let ledger = self.app.host().usage_report(&args);
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let windows = match poll {
+                        Some(poll) => Some(match tokio::time::timeout(POLL_WAIT, poll).await {
+                            Ok(result) => result,
+                            Err(_) => Err("it did not answer in time".to_string()),
+                        }),
+                        None => None,
+                    };
+                    let ledger = ledger.await;
+                    if windows.is_some() || !ledger.is_empty() {
+                        let _ = tx.send(Background::Usage { windows, ledger });
+                    }
+                });
+                Flow::Continue
+            }
+            Action::Budget { session, set } => {
+                let budget = self.app.host().budget(&session, set);
+                let tx = self.background_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(Background::Budget(budget.await));
+                });
                 Flow::Continue
             }
             Action::ListModels => {
@@ -681,10 +750,34 @@ where
 
     /// Shows what the host has had to warn about while nothing else came.
     fn idle(&mut self) -> io::Result<Flow> {
-        if self.host_warnings() {
+        let mut changed = self.host_warnings();
+        // The reset of a usage limit: the window is read again before the session continues.
+        if self.app.resume_due() {
+            self.check_window_for_resume();
+            changed = true;
+        }
+        // The countdown shows the seconds left.
+        changed |= self.app.resume_waiting();
+        if changed {
             self.draw()?;
         }
         Ok(Flow::Continue)
+    }
+
+    /// Reads the usage window, for the automatic resume at a limit's reset.
+    fn check_window_for_resume(&self) {
+        let poll = self.provider.windows();
+        let tx = self.background_tx.clone();
+        tokio::spawn(async move {
+            let result = match poll {
+                Some(poll) => match tokio::time::timeout(POLL_WAIT, poll).await {
+                    Ok(result) => result,
+                    Err(_) => Err("it did not answer in time".to_string()),
+                },
+                None => Err("this provider has no usage windows".to_string()),
+            };
+            let _ = tx.send(Background::ResumeCheck(result));
+        });
     }
 
     /// Takes in what work in the background came back with.
@@ -695,6 +788,8 @@ where
                 for message in switch.warnings {
                     self.show(AgentEvent::Warning { message });
                 }
+                self.provider = switch.model.provider.clone();
+                self.poll_windows();
                 self.send_job(Job::SwitchModel {
                     model: Box::new(switch.model),
                     window_note: switch.window_note,
@@ -711,6 +806,7 @@ where
                 for message in opened.warnings {
                     self.show_notice(message);
                 }
+                self.app.host().session_changed();
                 self.send_job(Job::StartSession {
                     session: Box::new(opened.session),
                     checkpoints: opened.checkpoints,
@@ -727,6 +823,14 @@ where
                 });
                 self.next_actions()?;
             }
+            Background::Budget(result) => self.app.on_budget(result),
+            Background::ResumeCheck(result) => {
+                if let Some(action) = self.app.on_resume_check(result) {
+                    self.dispatch(action)?;
+                }
+            }
+            Background::Windows(result) => self.app.on_windows(result),
+            Background::Usage { windows, ledger } => self.app.on_usage(windows, ledger),
             Background::Note(note) => self.app.push_note(&note),
             Background::Login(result) => {
                 self.app.on_done(Done::LoggedIn(result));

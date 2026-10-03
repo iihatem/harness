@@ -11,7 +11,10 @@ use harness_core::{
     session::{self, SessionSummary},
 };
 use harness_providers::registry;
-use harness_tui::app::{Host, ModelSwitch, OpenedSession, Prepared};
+use harness_tui::{
+    app::{Host, ModelSwitch, OpenedSession, Prepared},
+    usage::UsageContext,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -33,6 +36,8 @@ pub struct CliHost {
     pub writable: Vec<PathBuf>,
     /// The first run's model, to be saved as the default once it has answered.
     pub unsaved_default: std::sync::Mutex<Option<String>>,
+    /// Keeps the budgets, which `/budget` shows and raises.
+    pub meter: Arc<harness_usage::meter::UsageMeter>,
 }
 
 impl Host for CliHost {
@@ -132,6 +137,53 @@ impl Host for CliHost {
             ),
         };
         vec![self.setup.redactor.redact(&note)]
+    }
+
+    fn session_changed(&self) {
+        // A figure given with `/budget <usd>` was for the session it was given in.
+        self.meter.reset_session_budget();
+    }
+
+    fn usage_context(&self) -> UsageContext {
+        UsageContext {
+            baseline: self.setup.config.usage.baseline.clone(),
+            prices: crate::pricing::load(&self.setup).snapshot().label(),
+            auto_resume: match self.setup.config.usage.auto_resume {
+                harness_config::config::AutoResume::Ask => harness_tui::usage::AutoResume::Ask,
+                harness_config::config::AutoResume::Never => harness_tui::usage::AutoResume::Never,
+            },
+        }
+    }
+
+    fn budget(
+        &self,
+        session: &str,
+        set: Option<f64>,
+    ) -> BoxFuture<'static, Result<Vec<String>, String>> {
+        let (meter, session) = (self.meter.clone(), session.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut lines = Vec::new();
+                if let Some(usd) = set {
+                    meter.set_session_budget(usd);
+                    lines.push(format!("session budget set to ${usd:.2} for this session"));
+                }
+                lines.extend(crate::usage::budget_lines(&meter.budget_report(&session)));
+                Ok(lines)
+            })
+            .await
+            .map_err(|e| format!("reading the budgets failed: {e}"))?
+        })
+    }
+
+    fn usage_report(&self, args: &str) -> BoxFuture<'static, Vec<String>> {
+        let (setup, args) = (self.setup.clone(), args.to_string());
+        // The cache is SQLite, which blocks.
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || crate::usage::session_lines(&setup, &args))
+                .await
+                .unwrap_or_default()
+        })
     }
 
     fn models(&self) -> BoxFuture<'static, Vec<String>> {
@@ -267,7 +319,16 @@ pub mod tests {
             policy,
             writable: Vec::new(),
             unsaved_default: Default::default(),
+            meter: Arc::new(harness_usage::meter::UsageMeter::open(
+                &paths_data(home),
+                workspace,
+            )),
         }
+    }
+
+    /// Where harness's data lives under `home`.
+    fn paths_data(home: &Path) -> std::path::PathBuf {
+        home.join("data")
     }
 
     // Final review minor 1: the first run's choice becomes the default only once it has answered.
@@ -294,6 +355,107 @@ pub mod tests {
         );
         // Once.
         assert!(host.model_answered("ollama/llama3").is_empty());
+    }
+
+    // `/usage` in the terminal reports the ledger, and says so when it is empty.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn usage_reports_the_ledger_from_the_session() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        std::fs::write(
+            home.path().join("config/config.toml"),
+            "[usage]\nbaseline = \"openai/gpt-5\"\n",
+        )
+        .unwrap();
+        let host = host(home.path(), &workspace);
+        let context = host.usage_context();
+        assert_eq!(context.baseline.as_deref(), Some("openai/gpt-5"));
+        assert!(
+            context.prices.starts_with("embedded 20"),
+            "{}",
+            context.prices
+        );
+        let empty = host.usage_report("").await.join("\n");
+        assert!(empty.contains("M1 sessions is not included"), "{empty}");
+        // Another ledger writer: the host's own session, here a plain append.
+        let ledger = harness_usage::ledger::Ledger::new(
+            &harness_usage::paths::Dirs::under(&host.setup.paths.data_dir).usage,
+        );
+        ledger
+            .append(&harness_usage::ledger::LedgerRecord {
+                v: 1,
+                t: 1_790_942_400,
+                session: "s".into(),
+                project: "p".into(),
+                role: "main".into(),
+                model: "ollama/qwen3-coder".into(),
+                account: harness_core::meter::AccountKind::Local,
+                input: 1_000_000,
+                cache_read: 0,
+                cache_write: 0,
+                cache_write_1h: 0,
+                output: 0,
+                reasoning: 0,
+                billed_usd: Some(0.0),
+                list_usd: Some(0.0),
+                price: None,
+                ms: 1,
+                outcome: "ok".into(),
+                window: None,
+            })
+            .unwrap();
+        let report = host.usage_report("provider").await.join("\n");
+        assert!(report.starts_with("Usage by provider"), "{report}");
+        assert!(report.contains("ollama"), "{report}");
+        assert!(
+            report.contains("Avoided vs openai/gpt-5: $1.25"),
+            "{report}"
+        );
+        let wrong = host.usage_report("colour").await.join("\n");
+        assert!(wrong.contains("--by takes"), "{wrong}");
+        for args in ["--since", "day --since", "--until"] {
+            let missing = host.usage_report(args).await.join("\n");
+            assert!(
+                missing.contains("takes a date"),
+                "`/usage {args}` is an error: {missing}"
+            );
+        }
+        let bad_flag = host.usage_report("--wat").await.join("\n");
+        assert!(bad_flag.contains("not `--wat`"), "{bad_flag}");
+    }
+
+    // `/budget` shows each budget with its spend, and `/budget <usd>` raises the session's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn budget_shows_the_budgets_and_raises_the_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        std::fs::write(
+            home.path().join("config/config.toml"),
+            "[budgets]\nsession_usd = 1.0\n",
+        )
+        .unwrap();
+        let host = host(home.path(), &workspace);
+        // This host's meter is built by the test, without the configuration's budgets.
+        let shown = host.budget("s1", None).await.unwrap().join("\n");
+        assert!(
+            shown.contains("session") && shown.contains("no limit"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("API key") && shown.contains("local models go on"),
+            "/budget says what a reached budget pauses: {shown}"
+        );
+        let raised = host.budget("s1", Some(2.0)).await.unwrap().join("\n");
+        assert!(raised.contains("session budget set to $2.00"), "{raised}");
+        assert!(raised.contains("of $2.00"), "{raised}");
+        assert_eq!(host.meter.budgets().session_usd, Some(2.0));
+        // `/new` and `/resume` return it to the configured figure (none, for this host's meter).
+        host.session_changed();
+        assert_eq!(host.meter.budgets().session_usd, None);
     }
 
     /// A keychain that does not answer until `release` is dropped or sent to.
@@ -561,6 +723,125 @@ pub mod tests {
             .unwrap();
     }
 
+    /// The ledger's records, parsed, of the run with harness's files under `home`.
+    fn ledger_records(home: &Path) -> Vec<serde_json::Value> {
+        let dir = home.join("data/usage");
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        files.sort();
+        files
+            .iter()
+            .flat_map(|f| {
+                std::fs::read_to_string(f)
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect::<Vec<serde_json::Value>>()
+            })
+            .collect()
+    }
+
+    // The ledger is written the same way by the terminal session as by `harness ask`: the same
+    // start, the same meter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_terminal_session_writes_the_same_ledger_as_ask() {
+        use serde_json::json;
+        use wiremock::{
+            Mock, MockServer,
+            matchers::{method, path},
+        };
+
+        let chat = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(chat_stream(&[
+                json!({"choices": [{"index": 0, "delta": {"content": "Hello."}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 5}}),
+            ]))
+            .mount(&chat)
+            .await;
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir(workspace.join(".git")).unwrap();
+        std::fs::create_dir_all(home.path().join("config")).unwrap();
+        std::fs::write(
+            home.path().join("config/config.toml"),
+            format!(
+                "[providers.chat]\nprotocol = \"openai-chat\"\nbase_url = \"{}/v1\"\n[profiles.\"chat/*\"]\ncontext_window = 32768\n",
+                chat.uri()
+            ),
+        )
+        .unwrap();
+        let setup = setup_in(home.path(), &workspace);
+        let mut notices = Notices::quiet(setup.redactor.clone());
+        let session = sessions::open(&setup, &Choice::New, &mut notices).unwrap();
+        let resolved =
+            registry::resolve("chat/small", &setup.config.providers, setup.keys()).unwrap();
+        let (approver, approvals) = ChannelApprover::new();
+        let Some(Started {
+            agent,
+            sandbox_session,
+            policy,
+            window_note,
+            writable,
+            meter,
+            ..
+        }) = start::start(
+            Request {
+                setup: &setup,
+                mode: Mode::Auto,
+                model: resolved,
+                session,
+                approver,
+                interactive: true,
+                run_id: start::run_id(),
+                cancel: CancellationToken::new(),
+            },
+            &mut notices,
+        )
+        .await
+        else {
+            panic!("the start was cancelled");
+        };
+        let host = CliHost {
+            setup: setup.clone(),
+            commands: Commands::default(),
+            policy,
+            writable,
+            unsaved_default: Default::default(),
+            meter: meter.clone(),
+        };
+        let options = Options {
+            theme: Theme::monochrome(),
+            model: "chat/small".into(),
+            mode: Mode::Auto,
+            commands: Vec::new(),
+            workspace: workspace.clone(),
+            history: Vec::new(),
+            instruction_files: Vec::new(),
+            window_note: Some(window_note),
+            default_mode: Mode::Auto,
+            text_editor: None,
+            notifier: None,
+        };
+        let term = InlineTerminal::new(TestBackend::new(100, 30), 0).unwrap();
+        let mut ui = Ui::start(agent, Box::new(host), term, options, approvals)
+            .with_redactor(setup.redactor.clone());
+        ui.draw().unwrap();
+        send(&mut ui, "say hello");
+        settle(&mut ui).await;
+        ui.finish().await.unwrap();
+        sandbox_session.end();
+        let records = ledger_records(home.path());
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["model"], "chat/small");
+        assert_eq!(records[0]["account"], "local");
+        assert_eq!(records[0]["input"], 50);
+        assert_eq!(records[0]["outcome"], "ok");
+    }
+
     // M1's done criterion, with mock servers: a conversation held on a Chat Completions model
     // continues on an Anthropic model after `/model`. The tool call's id and the reply that was
     // only whitespace, which the Messages API would reject, reach it in a form it takes.
@@ -623,6 +904,7 @@ pub mod tests {
             policy,
             window_note,
             writable,
+            meter,
             ..
         }) = start::start(
             Request {
@@ -647,6 +929,7 @@ pub mod tests {
             policy,
             writable,
             unsaved_default: Default::default(),
+            meter: meter.clone(),
         };
         let options = Options {
             theme: Theme::monochrome(),
@@ -836,6 +1119,7 @@ pub mod tests {
             policy,
             window_note,
             writable,
+            meter,
             ..
         }) = start::start(
             Request {
@@ -860,6 +1144,7 @@ pub mod tests {
             policy,
             writable,
             unsaved_default: Default::default(),
+            meter: meter.clone(),
         };
         let options = Options {
             theme: Theme::monochrome(),

@@ -18,6 +18,7 @@ use crate::{
     compaction::{self, CompactionConfig},
     event::{AgentEvent, ErrorKind, TurnEndReason},
     message::{ChatRequest, Message, RequestOptions, ToolCall, Usage},
+    meter::{AccountKind, GateCounts, MAIN_ROLE, Meter, RequestRecord, TurnRecord},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
     permission::{Action, Decision, FsAccess, Mode, PermissionPolicy},
     provider::{FinishReason, Provider, ProviderError, ProviderEvent},
@@ -235,6 +236,8 @@ struct Stats {
     time_to_first_token: Option<Duration>,
     generation: Duration,
     usage: Usage,
+    /// Tool calls run in the turn.
+    tool_calls: u32,
 }
 
 /// What one model call produced so far. Kept outside the stream future so partial output survives.
@@ -355,6 +358,16 @@ pub struct Agent {
     sandboxes: Option<Sandboxes>,
     /// Input the user sends while a turn runs.
     steering: Option<Steering>,
+    /// Told about every model request, for the usage ledger.
+    meter: Option<Arc<dyn Meter>>,
+    /// The current turn: when it started (for its duration, and as seconds since the epoch), and
+    /// its user message's entry.
+    turn_started: Option<(Instant, u64)>,
+    turn_entry: String,
+    /// Retries made in the current turn.
+    retry_count: std::sync::atomic::AtomicU32,
+    /// Whether the user switched the session's model with `/model`.
+    model_chosen_by_user: bool,
 }
 
 impl Agent {
@@ -401,6 +414,120 @@ impl Agent {
             stats: Stats::default(),
             sandboxes: None,
             steering: None,
+            meter: None,
+            turn_started: None,
+            turn_entry: String::new(),
+            retry_count: std::sync::atomic::AtomicU32::new(0),
+            model_chosen_by_user: false,
+        }
+    }
+
+    /// Reports every model request to `meter`: the turn's requests, a failed or stopped one, and
+    /// the summary requests of compaction.
+    pub fn with_meter(mut self, meter: Arc<dyn Meter>) -> Self {
+        self.meter = Some(meter);
+        self
+    }
+
+    /// Tells the meter that the turn ended as `reason`, with `stats`.
+    fn meter_turn(&self, reason: TurnEndReason, stats: &Stats) {
+        let Some(meter) = &self.meter else {
+            return;
+        };
+        let (started, started_at) = self
+            .turn_started
+            .unwrap_or_else(|| (Instant::now(), crate::time::now_unix()));
+        meter.record_turn(&TurnRecord {
+            session: self.session.id().to_string(),
+            turn: self.turn_entry.clone(),
+            role: MAIN_ROLE.to_string(),
+            model: self.model_id().to_string(),
+            selected_by: if self.model_chosen_by_user {
+                "user"
+            } else {
+                "config"
+            }
+            .to_string(),
+            input_tokens: stats.usage.input_tokens,
+            output_tokens: stats.usage.output_tokens,
+            first_token_ms: stats.time_to_first_token.map(|d| d.as_millis() as u64),
+            duration_ms: started.elapsed().as_millis() as u64,
+            tool_calls: stats.tool_calls,
+            invalid_calls: self.invalid_calls,
+            retries: self.retry_count.load(std::sync::atomic::Ordering::Relaxed),
+            finish_reason: reason.as_str().to_string(),
+            started_at,
+            ended_at: crate::time::now_unix(),
+            gates: GateCounts::default(),
+        });
+    }
+
+    /// Asks the meter whether the budgets allow the next request: says each 80% warning, and
+    /// whether one is reached (said as an event too).
+    fn budget_reached(&self, events: &UnboundedSender<AgentEvent>, said_paused: &mut bool) -> bool {
+        let Some(meter) = &self.meter else {
+            return false;
+        };
+        let local = match &self.turn_model {
+            Some(turn) => turn.options().local,
+            None => self.config.request.local,
+        };
+        let account = AccountKind::of(self.model_id(), local);
+        let status = meter.check_budget(self.session.id(), account);
+        for notice in status.warnings {
+            let _ = events.send(AgentEvent::BudgetWarning { notice });
+        }
+        for message in meter.take_warnings() {
+            let _ = events.send(AgentEvent::Warning { message });
+        }
+        if let Some(notice) = status.paused
+            && !std::mem::replace(said_paused, true)
+        {
+            let _ = events.send(AgentEvent::Warning {
+                message: notice.paused_message(),
+            });
+        }
+        match status.stop {
+            Some(notice) => {
+                let _ = events.send(AgentEvent::BudgetReached { notice });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Tells the meter, if there is one, that a model request ended as `outcome` (`ok`, or
+    /// `error:<kind>`) with `usage`, `started` being when it was sent. What the meter could not
+    /// keep is shown as warnings.
+    fn meter_request(
+        &self,
+        outcome: String,
+        usage: Usage,
+        started: Instant,
+        events: &UnboundedSender<AgentEvent>,
+    ) {
+        let Some(meter) = &self.meter else {
+            return;
+        };
+        let local = match &self.turn_model {
+            Some(turn) => turn.options().local,
+            None => self.config.request.local,
+        };
+        let cost = meter.record_request(&RequestRecord {
+            session: self.session.id().to_string(),
+            role: MAIN_ROLE.to_string(),
+            model: self.model_id().to_string(),
+            local,
+            usage,
+            duration: started.elapsed(),
+            outcome,
+        });
+        let _ = events.send(AgentEvent::Metered {
+            model: self.model_id().to_string(),
+            cost,
+        });
+        for message in meter.take_warnings() {
+            let _ = events.send(AgentEvent::Warning { message });
         }
     }
 
@@ -653,6 +780,24 @@ impl Agent {
             },
         );
         self.after_session_change();
+        // The turns from that message on are the ones undone.
+        if let Some(meter) = &self.meter {
+            let undone: Vec<String> = branch[position..]
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.kind,
+                        EntryKind::Message {
+                            message: Message::User { .. },
+                            note: false,
+                            ..
+                        }
+                    )
+                })
+                .map(|e| e.id.clone())
+                .collect();
+            meter.turns_rewound(self.session.id(), &undone);
+        }
         Ok(())
     }
 
@@ -810,7 +955,7 @@ impl Agent {
         display: Option<String>,
         note: bool,
         plan: Option<String>,
-    ) {
+    ) -> String {
         let id = self.session.append(EntryKind::Message {
             message: message.clone(),
             display,
@@ -818,8 +963,9 @@ impl Agent {
             plan,
         });
         self.history.push(message);
-        self.history_ids.push(id);
+        self.history_ids.push(id.clone());
         self.note_save_error();
+        id
     }
 
     pub fn config_mut(&mut self) -> &mut AgentConfig {
@@ -858,6 +1004,7 @@ impl Agent {
         self.config.text_tool_calls = model.text_tool_calls;
         self.reported_usage = None;
         self.auto_compaction_paused = false;
+        self.model_chosen_by_user = true;
     }
 
     /// Switches the approval mode between turns, and with [`with_sandboxes`](Self::with_sandboxes)
@@ -892,6 +1039,9 @@ impl Agent {
         self.ctx.cancel = cancel.clone();
         self.invalid_calls = 0;
         self.stats = Stats::default();
+        self.retry_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.turn_started = Some((Instant::now(), crate::time::now_unix()));
         self.turn_checkpointed = false;
         // Settings that apply to this turn only.
         self.turn_model = input.model.clone();
@@ -916,7 +1066,8 @@ impl Agent {
         let _ = events.send(AgentEvent::TurnStarted);
         self.message_recorded = false;
         let content = self.user_message(input.parts, events).await;
-        self.record_entry(Message::User { content }, input.display, false, input.plan);
+        self.turn_entry =
+            self.record_entry(Message::User { content }, input.display, false, input.plan);
         self.message_recorded = true;
         for kind in std::mem::take(&mut self.held_entries) {
             self.append_turn_entry(kind);
@@ -926,7 +1077,12 @@ impl Agent {
         }
 
         let mut auto_compaction_failed = false;
+        let mut said_paused = false;
         for _ in 0..self.config.max_steps {
+            // Before each request, not each turn: a turn with many tool calls can overrun.
+            if self.budget_reached(events, &mut said_paused) {
+                return self.finish(TurnEndReason::Budget, events);
+            }
             if !auto_compaction_failed {
                 auto_compaction_failed = !self.compact_automatically(events, &cancel).await;
             }
@@ -994,6 +1150,7 @@ impl Agent {
                     }
                     return self.finish(TurnEndReason::Interrupted, events);
                 }
+                self.stats.tool_calls += 1;
                 let output = self.execute(call, events).await;
                 let message = Message::Tool {
                     call_id: call.id.clone(),
@@ -1291,54 +1448,70 @@ impl Agent {
             .map_or(&self.provider, |m| &m.provider)
             .clone();
         let mut attempt = 1;
+        let started = Instant::now();
         loop {
-            let collect = async {
-                let mut text = String::new();
-                let mut finish = None;
-                let mut usage = None;
-                let mut stream = provider.stream(request.clone());
-                while let Some(item) = stream.next().await {
-                    match item? {
-                        ProviderEvent::TextDelta(delta) => text.push_str(&delta),
-                        ProviderEvent::Finished(reason) => finish = Some(reason),
-                        // Last one wins, as for any other reply: some servers report it
-                        // cumulatively, in every chunk.
-                        ProviderEvent::Usage(reported) => usage = Some(reported),
-                        _ => {}
-                    }
-                }
-                Ok::<(String, Option<FinishReason>, Option<Usage>), ProviderError>((
-                    text, finish, usage,
-                ))
-            };
+            let attempt_started = Instant::now();
+            let mut text = String::new();
+            let mut finish = None;
+            let mut usage: Option<Usage> = None;
             let result = tokio::select! {
-                result = collect => result,
-                _ = cancel.cancelled() => return Err(CompactError::Interrupted),
+                result = async {
+                    let mut stream = provider.stream(request.clone());
+                    while let Some(item) = stream.next().await {
+                        match item? {
+                            ProviderEvent::TextDelta(delta) => text.push_str(&delta),
+                            ProviderEvent::Finished(reason) => finish = Some(reason),
+                            // Last one wins, as for any other reply: some servers report it
+                            // cumulatively, in every chunk.
+                            ProviderEvent::Usage(reported) => usage = Some(reported),
+                            _ => {}
+                        }
+                    }
+                    Ok::<(), ProviderError>(())
+                } => result,
+                _ = cancel.cancelled() => {
+                    // What was reported before the stop is billed.
+                    self.meter_request(
+                        "error:interrupted".into(),
+                        usage.unwrap_or_default(),
+                        started,
+                        events,
+                    );
+                    return Err(CompactError::Interrupted);
+                }
             };
+            // A compaction request is a paid call like any other, and often the turn's largest,
+            // so it counts towards `/usage`, the budgets and the status line's totals, whatever
+            // becomes of its result.
             match result {
-                Ok((text, _, _)) if text.trim().is_empty() => {
+                Ok(()) if text.trim().is_empty() => {
+                    self.meter_summary("error:incomplete", usage, started, events);
                     return Err(CompactError::Failed(
                         "the model returned an empty summary".into(),
                     ));
                 }
                 // The end of a summary says what remains to be done: a cut-off one is no use.
-                Ok((_, Some(FinishReason::Length), _)) => {
+                Ok(()) if finish == Some(FinishReason::Length) => {
+                    self.meter_summary("error:incomplete", usage, started, events);
                     return Err(CompactError::Failed(
                         "the summary was cut off at the model's output limit".into(),
                     ));
                 }
-                Ok((text, _, usage)) => {
-                    // A compaction request is a paid call like any other, and often the turn's
-                    // largest, so it must count towards `/usage` and the status line's totals.
-                    if let Some(usage) = usage {
-                        let _ = events.send(AgentEvent::Usage {
-                            model: self.model_id().to_string(),
-                            usage,
-                        });
-                    }
+                Ok(()) => {
+                    self.meter_summary("ok", usage, started, events);
                     return Ok(text.trim().to_string());
                 }
                 Err(error) if self.config.retry.retries(&error, attempt) => {
+                    // What the attempt reported before it failed is billed, as a record of its own.
+                    if usage.is_some() {
+                        let outcome = format!("error:{}", error.kind());
+                        self.meter_request(
+                            outcome,
+                            usage.unwrap_or_default(),
+                            attempt_started,
+                            events,
+                        );
+                    }
                     let delay = self.config.retry.delay(attempt, error.retry_after());
                     let _ = events.send(AgentEvent::Retrying {
                         attempt,
@@ -1347,15 +1520,46 @@ impl Agent {
                     });
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
-                        _ = cancel.cancelled() => return Err(CompactError::Interrupted),
+                        _ = cancel.cancelled() => {
+                            self.meter_request(
+                                "error:interrupted".into(),
+                                Usage::default(),
+                                started,
+                                events,
+                            );
+                            return Err(CompactError::Interrupted);
+                        }
                     }
                     attempt += 1;
                 }
-                Err(error) if error.is_context_overflow() => {
-                    return Err(CompactError::Overflow(describe(&error)));
+                Err(error) => {
+                    let outcome = format!("error:{}", error.kind());
+                    self.meter_request(outcome, usage.unwrap_or_default(), started, events);
+                    return Err(if error.is_context_overflow() {
+                        CompactError::Overflow(describe(&error))
+                    } else {
+                        CompactError::Failed(describe(&error))
+                    });
                 }
-                Err(error) => return Err(CompactError::Failed(describe(&error))),
             }
+        }
+    }
+
+    /// Meters a summary request that got an answer (`ok`, or `error:incomplete` for one that is
+    /// no use) and reports its usage.
+    fn meter_summary(
+        &self,
+        outcome: &str,
+        usage: Option<Usage>,
+        started: Instant,
+        events: &UnboundedSender<AgentEvent>,
+    ) {
+        self.meter_request(outcome.into(), usage.unwrap_or_default(), started, events);
+        if let Some(usage) = usage {
+            let _ = events.send(AgentEvent::Usage {
+                model: self.model_id().to_string(),
+                usage,
+            });
         }
     }
 
@@ -1388,6 +1592,11 @@ impl Agent {
         }
     }
 
+    /// The provider the session's model runs on, to ask it where a subscription's windows stand.
+    pub fn provider(&self) -> Arc<dyn Provider> {
+        self.provider.clone()
+    }
+
     /// The id of the model answering the current turn: between turns, the session's.
     pub fn model_id(&self) -> &str {
         self.turn_model
@@ -1395,14 +1604,35 @@ impl Agent {
             .map_or(&self.config.model_id, |model| &model.id)
     }
 
-    /// One model call with retries for transient errors. Never retries once output reached the user.
+    /// One model call with retries for transient errors, reported to the meter. Never retries
+    /// once output reached the user.
     async fn call_model(
+        &self,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> ModelOutcome {
+        let started = Instant::now();
+        let outcome = self.call_model_with_retries(events, cancel).await;
+        let (result, usage) = match &outcome {
+            ModelOutcome::Reply(reply) => ("ok".to_string(), reply.usage),
+            // What the provider reported before the request failed or was stopped is billed too.
+            ModelOutcome::Failed(error, partial) => {
+                (format!("error:{}", error.kind()), partial.usage)
+            }
+            ModelOutcome::Interrupted(partial) => ("error:interrupted".to_string(), partial.usage),
+        };
+        self.meter_request(result, usage.unwrap_or_default(), started, events);
+        outcome
+    }
+
+    async fn call_model_with_retries(
         &self,
         events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> ModelOutcome {
         let mut attempt = 1;
         loop {
+            let attempt_started = Instant::now();
             let mut reply = ModelReply::default();
             let result = tokio::select! {
                 result = self.stream_into(&mut reply, events) => Some(result),
@@ -1418,7 +1648,14 @@ impl Agent {
                             .retry_after()
                             .is_some_and(|d| d > crate::retry::MAX_AUTOMATIC_RETRY_AFTER) =>
                 {
+                    // What the attempt reported before it failed is billed, as a record of its own.
+                    if let Some(usage) = reply.usage {
+                        let outcome = format!("error:{}", error.kind());
+                        self.meter_request(outcome, usage, attempt_started, events);
+                    }
                     let delay = self.config.retry.delay(attempt, error.retry_after());
+                    self.retry_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let _ = events.send(AgentEvent::Retrying {
                         attempt,
                         reason: error.to_string(),
@@ -1473,6 +1710,9 @@ impl Agent {
             self.stats.usage.input_tokens += usage.input_tokens;
             self.stats.usage.output_tokens += usage.output_tokens;
             self.stats.usage.cached_tokens += usage.cached_tokens;
+            self.stats.usage.cache_write_tokens += usage.cache_write_tokens;
+            self.stats.usage.cache_write_1h_tokens += usage.cache_write_1h_tokens;
+            self.stats.usage.reasoning_tokens += usage.reasoning_tokens;
             let _ = events.send(AgentEvent::Usage {
                 model: self.model_id().to_string(),
                 usage,
@@ -1489,6 +1729,7 @@ impl Agent {
             let _ = events.send(AgentEvent::Warning { message });
         }
         let stats = std::mem::take(&mut self.stats);
+        self.meter_turn(reason, &stats);
         if let Some(model) = stats.model {
             let _ = events.send(AgentEvent::TurnStats {
                 model,
@@ -1512,6 +1753,11 @@ impl Agent {
         if !partial.text.is_empty() {
             partial.show(events);
             self.push_assistant(partial.text, Vec::new(), events);
+        }
+        if error.is_quota_exhausted()
+            && let Some(resets_at) = error.resets_at()
+        {
+            let _ = events.send(AgentEvent::LimitReached { resets_at });
         }
         let _ = events.send(AgentEvent::Error {
             kind: ErrorKind::Provider,
@@ -1588,6 +1834,12 @@ impl Agent {
                 // servers send it cumulatively, in every chunk, and counting each would
                 // over-count both `/usage` and the status line's session totals.
                 ProviderEvent::Usage(usage) => reply.usage = Some(usage),
+                ProviderEvent::RateLimits(snapshot) => {
+                    if let Some(meter) = &self.meter {
+                        meter.record_window(&snapshot);
+                    }
+                    let _ = events.send(AgentEvent::RateLimits { snapshot });
+                }
                 ProviderEvent::Finished(reason) => reply.finish = Some(reason),
             }
         }
@@ -2025,6 +2277,15 @@ fn describe(error: &ProviderError) -> String {
         };
         return format!(
             "the provider's usage limit is reached{resets}. Switch models with --model (or /model in the terminal UI). {said}"
+        );
+    }
+    if error.is_spend_cap() {
+        let said = match error {
+            ProviderError::Http { body, .. } | ProviderError::Reported { body, .. } => quoted(body),
+            _ => String::new(),
+        };
+        return format!(
+            "the account's spend limit is reached, and waiting does not end it: raise the limit with the provider, or switch models with --model (or /model in the terminal UI). {said}"
         );
     }
     if let Some(wait) = error.retry_after()

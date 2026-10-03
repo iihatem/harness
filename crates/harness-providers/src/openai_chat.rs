@@ -152,6 +152,14 @@ impl ChatStreamParser {
                 cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
                     .as_u64()
                     .unwrap_or(0),
+                // OpenRouter reports what a request wrote to the cache; most servers say nothing.
+                cache_write_tokens: usage["prompt_tokens_details"]["cache_write_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+                cache_write_1h_tokens: 0,
+                reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
             }));
         }
         Ok(out)

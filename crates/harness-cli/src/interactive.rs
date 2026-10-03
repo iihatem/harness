@@ -277,6 +277,7 @@ pub async fn run(
         window_note,
         write_mode_warning,
         writable,
+        meter,
     }) = start::start(
         Request {
             setup: &setup,
@@ -320,6 +321,7 @@ pub async fn run(
         policy,
         writable,
         unsaved_default: std::sync::Mutex::new(unsaved_default),
+        meter,
     };
     let notifications = setup.config.notifications;
     let redactor = setup.redactor.clone();
@@ -526,6 +528,10 @@ mod tests {
             policy,
             writable: Vec::new(),
             unsaved_default: Default::default(),
+            meter: Arc::new(harness_usage::meter::UsageMeter::open(
+                std::path::Path::new("/nonexistent"),
+                std::path::Path::new("/"),
+            )),
         };
         assert!(host.is_command("deploy"));
         let prepared = host.prepare("/deploy");

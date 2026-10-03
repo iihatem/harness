@@ -1,9 +1,12 @@
 use std::time::Duration;
 
-use futures::stream::BoxStream;
+use futures::{future::BoxFuture, stream::BoxStream};
 use serde::{Deserialize, Serialize};
 
-use crate::message::{ChatRequest, ToolCall, Usage};
+use crate::{
+    message::{ChatRequest, ToolCall, Usage},
+    meter::WindowSnapshot,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +29,9 @@ pub enum ProviderEvent {
     ReasoningDelta(String),
     ToolCall(ToolCall),
     Usage(Usage),
+    /// The provider said where a subscription's usage windows stand (response headers, or an event
+    /// in the stream).
+    RateLimits(WindowSnapshot),
     Finished(FinishReason),
 }
 
@@ -78,7 +84,9 @@ impl ProviderError {
             ProviderError::Network(_) => true,
             ProviderError::NoStart { local, .. } => !local,
             ProviderError::Http { status: 429, .. }
-            | ProviderError::Reported { status: 429, .. } => !self.is_quota_exhausted(),
+            | ProviderError::Reported { status: 429, .. } => {
+                !self.is_quota_exhausted() && !self.is_spend_cap()
+            }
             ProviderError::Http { status, .. } | ProviderError::Reported { status, .. } => {
                 (500..600).contains(status)
             }
@@ -101,6 +109,20 @@ impl ProviderError {
             } => reports_quota(body),
             _ => false,
         }
+    }
+
+    /// Whether this is a 429 that reports a spend cap the account set (Anthropic's
+    /// `enforced_spend_limit_reached`, which comes without `retry-after`): waiting does not end
+    /// it, and it is not the subscription limit that a fallback or a resume answers.
+    pub fn is_spend_cap(&self) -> bool {
+        matches!(
+            self,
+            ProviderError::Http {
+                status: 429, body, ..
+            } | ProviderError::Reported {
+                status: 429, body, ..
+            } if body.contains("enforced_spend_limit_reached")
+        )
     }
 
     /// When an exhausted limit resets, in seconds since the Unix epoch, if the provider said:
@@ -157,6 +179,34 @@ impl ProviderError {
         .any(|phrase| text.contains(phrase))
     }
 
+    /// What kind of failure this is, in the word the usage ledger records after `error:`:
+    /// `unavailable` (a 5xx, or a network error), `rate_limited`, `quota`, `spend_cap`, `auth`,
+    /// `context_overflow`, `rejected` (another 4xx) or `protocol`.
+    pub fn kind(&self) -> &'static str {
+        if self.is_spend_cap() {
+            return "spend_cap";
+        }
+        if self.is_quota_exhausted() {
+            return "quota";
+        }
+        if self.is_context_overflow() {
+            return "context_overflow";
+        }
+        match self {
+            ProviderError::Network(_) | ProviderError::NoStart { .. } => "unavailable",
+            ProviderError::Http { status, .. } | ProviderError::Reported { status, .. } => {
+                match status {
+                    429 => "rate_limited",
+                    401 | 403 => "auth",
+                    500..=599 => "unavailable",
+                    _ => "rejected",
+                }
+            }
+            ProviderError::KeyRefused { .. } => "auth",
+            ProviderError::Protocol(_) | ProviderError::InStream(_) => "protocol",
+        }
+    }
+
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             ProviderError::Http { retry_after, .. }
@@ -202,4 +252,10 @@ pub type ProviderStream = BoxStream<'static, Result<ProviderEvent, ProviderError
 /// A model backend: translates a [`ChatRequest`] to a wire protocol and streams events back.
 pub trait Provider: Send + Sync {
     fn stream(&self, request: ChatRequest) -> ProviderStream;
+
+    /// Asks the provider where the account's usage windows stand, when it has any (a ChatGPT
+    /// subscription's); `None` for a provider with none. Called on demand, never on a timer.
+    fn windows(&self) -> Option<BoxFuture<'static, Result<WindowSnapshot, String>>> {
+        None
+    }
 }

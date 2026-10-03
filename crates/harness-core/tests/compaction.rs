@@ -212,6 +212,7 @@ async fn reported_usage_counts_toward_the_threshold() {
                 input_tokens: 3_900,
                 output_tokens: 10,
                 cached_tokens: 0,
+                ..Default::default()
             })),
             Ok(ProviderEvent::Finished(FinishReason::Stop)),
         ]),
@@ -244,6 +245,7 @@ async fn compaction_reports_the_summary_calls_usage() {
                 input_tokens: 5_000,
                 output_tokens: 40,
                 cached_tokens: 0,
+                ..Default::default()
             })),
             Ok(ProviderEvent::Finished(FinishReason::Stop)),
         ]),
@@ -277,6 +279,7 @@ async fn compaction_reports_the_summary_calls_usage() {
                 input_tokens: 5_000,
                 output_tokens: 40,
                 cached_tokens: 0,
+                ..Default::default()
             }
         )),
         "{events:#?}"
@@ -620,6 +623,7 @@ async fn reported_output_tokens_do_not_count_toward_the_threshold() {
                 input_tokens: 1_000,
                 output_tokens: 25_500,
                 cached_tokens: 0,
+                ..Default::default()
             })),
             Ok(ProviderEvent::Finished(FinishReason::Stop)),
         ]),

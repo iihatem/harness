@@ -30,7 +30,8 @@ fn text_usage_and_finish() {
             ProviderEvent::Usage(Usage {
                 input_tokens: 12,
                 output_tokens: 2,
-                cached_tokens: 8
+                cached_tokens: 8,
+                ..Default::default()
             }),
             ProviderEvent::Finished(FinishReason::Stop),
         ]
@@ -283,4 +284,38 @@ fn profile_options_reach_the_chat_request() {
     assert_eq!(body["max_tokens"], 2048);
     assert_eq!(body["temperature"], 0.2);
     assert_eq!(body["reasoning_effort"], "low");
+}
+
+// 1.2: the reasoning tokens a Chat Completions server reports are part of `completion_tokens`,
+// and a cache write (OpenRouter reports one) is part of `prompt_tokens`.
+#[test]
+fn reasoning_and_cache_write_tokens_are_kept_beside_the_totals() {
+    let events = parse(&[
+        r#"{"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}]}"#,
+        r#"{"choices":[],"usage":{"prompt_tokens":10000,"completion_tokens":500,"prompt_tokens_details":{"cached_tokens":8000,"cache_write_tokens":500},"completion_tokens_details":{"reasoning_tokens":200}}}"#,
+        "[DONE]",
+    ]);
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            ProviderEvent::Usage(usage) => Some(*usage),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        usage,
+        Usage {
+            input_tokens: 10_000,
+            output_tokens: 500,
+            cached_tokens: 8_000,
+            cache_write_tokens: 500,
+            cache_write_1h_tokens: 0,
+            reasoning_tokens: 200,
+        }
+    );
+    let buckets = usage.buckets();
+    assert_eq!(
+        (buckets.input, buckets.cache_read, buckets.cache_write),
+        (1_500, 8_000, 500)
+    );
 }

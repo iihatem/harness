@@ -228,6 +228,128 @@ fn profiles_problem(profiles: &BTreeMap<String, ProfileSettings>) -> Option<Stri
         .find_map(|(key, profile)| profile.problem(key))
 }
 
+/// `[pricing."<glob>"]`: a model's prices in USD per million tokens, over the price tables', for
+/// the models whose ids match the glob. Fields left out come from the table below.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceSettings {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+    pub cache_write_1h: Option<f64>,
+}
+
+impl PriceSettings {
+    /// What is wrong with the prices under `key`, if anything.
+    fn problem(&self, key: &str) -> Option<String> {
+        if let Err(e) = globset::Glob::new(key) {
+            return Some(format!("pricing.{key:?} is not a valid glob: {e}"));
+        }
+        for (name, value) in [
+            ("input", self.input),
+            ("output", self.output),
+            ("cache_read", self.cache_read),
+            ("cache_write", self.cache_write),
+            ("cache_write_1h", self.cache_write_1h),
+        ] {
+            if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
+                return Some(format!(
+                    "pricing.{key:?}: {name} must be a price in USD per million tokens, not below 0"
+                ));
+            }
+        }
+        None
+    }
+}
+
+/// The first problem with any of `pricing`.
+fn pricing_problem(pricing: &BTreeMap<String, PriceSettings>) -> Option<String> {
+    pricing.iter().find_map(|(key, price)| price.problem(key))
+}
+
+/// `usage.auto_resume`: whether the terminal session offers to wait out a subscription limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoResume {
+    /// Offer once, when the limit is hit.
+    #[default]
+    Ask,
+    /// Never offer. (There is no "always": an unattended resume can spend quota meant for
+    /// something else.)
+    Never,
+}
+
+/// `[usage]`: how usage is shown.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageSettings {
+    /// `usage.auto_resume`: see [`AutoResume`].
+    #[serde(default)]
+    pub auto_resume: AutoResume,
+    /// The `<provider>/<model>` that "avoided" cost is measured against; none means no avoided
+    /// figure is shown.
+    pub baseline: Option<String>,
+}
+
+/// `[outcomes]`: the per-turn outcome log, on unless `enabled = false`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeSettings {
+    pub enabled: Option<bool>,
+}
+
+/// `[budgets]`: money limits on billed cost, in USD. A budget that is not set has no limit.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetSettings {
+    pub session_usd: Option<f64>,
+    pub daily_usd: Option<f64>,
+    pub monthly_usd: Option<f64>,
+}
+
+impl BudgetSettings {
+    fn named(&self) -> [(&'static str, Option<f64>); 3] {
+        [
+            ("session_usd", self.session_usd),
+            ("daily_usd", self.daily_usd),
+            ("monthly_usd", self.monthly_usd),
+        ]
+    }
+
+    /// What is wrong with these budgets, if anything: a limit must be above 0.
+    fn problem(&self) -> Option<String> {
+        self.named().into_iter().find_map(|(name, value)| {
+            value
+                .is_some_and(|v| !v.is_finite() || v <= 0.0)
+                .then(|| format!("budgets.{name} must be an amount in USD above 0"))
+        })
+    }
+
+    /// These budgets with `project`'s: it may lower a limit or set one where there was none, and
+    /// never raise one. The keys it tried to raise are returned.
+    fn tightened_by(&self, project: &BudgetSettings) -> (BudgetSettings, Vec<&'static str>) {
+        let mut raised = Vec::new();
+        let mut pick =
+            |name: &'static str, global: Option<f64>, project: Option<f64>| match (global, project)
+            {
+                (Some(g), Some(p)) if p > g => {
+                    raised.push(name);
+                    Some(g)
+                }
+                (Some(g), Some(p)) => Some(g.min(p)),
+                (None, Some(p)) => Some(p),
+                (g, None) => g,
+            };
+        let merged = BudgetSettings {
+            session_usd: pick("session_usd", self.session_usd, project.session_usd),
+            daily_usd: pick("daily_usd", self.daily_usd, project.daily_usd),
+            monthly_usd: pick("monthly_usd", self.monthly_usd, project.monthly_usd),
+        };
+        (merged, raised)
+    }
+}
+
 /// `[notifications]`: what the interactive session does when a long turn ends or an approval
 /// waits. A project may set it without trust: it changes nothing the agent may do.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -284,6 +406,14 @@ pub struct ConfigFile {
     pub profiles: BTreeMap<String, ProfileSettings>,
     #[serde(default)]
     pub notifications: NotificationSettings,
+    #[serde(default)]
+    pub pricing: BTreeMap<String, PriceSettings>,
+    #[serde(default)]
+    pub usage: UsageSettings,
+    #[serde(default)]
+    pub budgets: BudgetSettings,
+    #[serde(default)]
+    pub outcomes: OutcomeSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -315,6 +445,16 @@ pub struct Config {
     /// Model profiles by model-id glob: the global config's, with a trusted project's over them.
     pub profiles: BTreeMap<String, ProfileSettings>,
     pub notifications: Notifications,
+    /// The user's prices by model-id glob (global config only: a project cannot make a model
+    /// look free).
+    pub pricing: BTreeMap<String, PriceSettings>,
+    /// `[usage]` (global config only).
+    pub usage: UsageSettings,
+    /// `[budgets]`: the global config's, which a project may only lower.
+    pub budgets: BudgetSettings,
+    /// Whether the outcome log is turned off (`[outcomes] enabled = false`; it is on by default;
+    /// global config only).
+    pub outcomes_disabled: bool,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -559,6 +699,8 @@ pub fn load(
         g.compaction
             .problem()
             .or_else(|| profiles_problem(&g.profiles))
+            .or_else(|| pricing_problem(&g.pricing))
+            .or_else(|| g.budgets.problem())
     }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
@@ -580,6 +722,10 @@ pub fn load(
         cfg.allow_localhost = global.sandbox.allow_localhost.unwrap_or(false);
         cfg.linux_git_protection = global.sandbox.linux_git_protection.unwrap_or_default();
         cfg.profiles = global.profiles;
+        cfg.pricing = global.pricing;
+        cfg.usage = global.usage;
+        cfg.budgets = global.budgets;
+        cfg.outcomes_disabled = global.outcomes.enabled == Some(false);
         cfg.notifications = cfg.notifications.overlaid(&global.notifications);
     }
     let path = project_file(workspace);
@@ -595,6 +741,35 @@ pub fn load(
             return Err(ConfigError::Parse { path, message });
         }
         cfg.notifications = cfg.notifications.overlaid(&project.notifications);
+        if !project.pricing.is_empty() {
+            cfg.warnings.push(format!(
+                "{}: ignoring [pricing]: prices are read from the global config only, so a cloned repository cannot make a model look free",
+                path.display()
+            ));
+        }
+        if let Some(message) = project.budgets.problem() {
+            return Err(ConfigError::Parse { path, message });
+        }
+        let (budgets, raised) = cfg.budgets.tightened_by(&project.budgets);
+        cfg.budgets = budgets;
+        for name in raised {
+            cfg.warnings.push(format!(
+                "{}: ignoring budgets.{name}: a project may lower a budget but not raise it",
+                project_file(workspace).display()
+            ));
+        }
+        if project.outcomes != OutcomeSettings::default() {
+            cfg.warnings.push(format!(
+                "{}: ignoring [outcomes]: it is read from the global config only",
+                path.display()
+            ));
+        }
+        if project.usage != UsageSettings::default() {
+            cfg.warnings.push(format!(
+                "{}: ignoring [usage]: it is read from the global config only",
+                path.display()
+            ));
+        }
         cfg.deny.extend(project.permissions.deny.iter().cloned());
         cfg.confirm
             .extend(project.permissions.confirm.iter().cloned());

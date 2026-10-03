@@ -112,11 +112,11 @@ Project-level `.harness/config.toml` settings that widen what the agent may do (
 | M4 Ecosystem | Hooks, MCP, Agent Skills, ACP server |
 | M5 Distribution | Installers, native Windows |
 
-Design and specifications: [`openspec/changes/add-core-agent/`](openspec/changes/add-core-agent/). Claude subscriptions are only ever used through the official `claude` binary; harness never reads or reuses Claude credentials.
+Claude subscriptions are only ever used through the official `claude` binary; harness never reads or reuses Claude credentials.
 
 ## Contributing
 
-Development follows the spec-driven workflow in [`AGENTS.md`](AGENTS.md): OpenSpec proposals for non-trivial changes, then plan → tests first → review.
+Development is spec-driven: a written proposal for each non-trivial change, then a plan, tests first, and review.
 
 ## License
 

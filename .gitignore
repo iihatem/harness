@@ -1,2 +1,8 @@
 /target
 .DS_Store
+
+# Kept locally, not published: the OpenSpec specs, the implementation plans and the agent instructions.
+/openspec/
+/docs/superpowers/plans/
+/AGENTS.md
+/CLAUDE.md

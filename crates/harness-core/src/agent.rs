@@ -13,10 +13,13 @@ use serde_json::{Value, json};
 use tokio::{sync::mpsc::UnboundedSender, time::Instant};
 use tokio_util::sync::CancellationToken;
 
+mod gates;
+
 use crate::{
     checkpoint::{CheckpointError, Checkpoints},
     compaction::{self, CompactionConfig},
     event::{AgentEvent, ErrorKind, TurnEndReason},
+    gate::Gates,
     message::{ChatRequest, Message, RequestOptions, ToolCall, Usage},
     meter::{AccountKind, GateCounts, MAIN_ROLE, Meter, RequestRecord, TurnRecord},
     output::{DEFAULT_OUTPUT_LIMIT, limit_output},
@@ -368,6 +371,12 @@ pub struct Agent {
     retry_count: std::sync::atomic::AtomicU32,
     /// Whether the user switched the session's model with `/model`.
     model_chosen_by_user: bool,
+    /// The verification gates; none runs unless one is configured.
+    gates: Gates,
+    /// Whether an edit tool changed a file in the current turn.
+    turn_changed: bool,
+    /// Gate commands run so far, for their call ids.
+    gate_calls: u64,
 }
 
 impl Agent {
@@ -419,6 +428,9 @@ impl Agent {
             turn_entry: String::new(),
             retry_count: std::sync::atomic::AtomicU32::new(0),
             model_chosen_by_user: false,
+            gates: Gates::default(),
+            turn_changed: false,
+            gate_calls: 0,
         }
     }
 
@@ -628,6 +640,12 @@ impl Agent {
 
     /// Gives the model what the user sends through `steering` while a turn runs, with the
     /// results of the next tool calls.
+    /// Runs `gates`: the after-edit command after each successful edit.
+    pub fn with_gates(mut self, gates: Gates) -> Self {
+        self.gates = gates;
+        self
+    }
+
     pub fn with_steering(mut self, steering: Steering) -> Self {
         self.steering = Some(steering);
         self
@@ -1043,6 +1061,7 @@ impl Agent {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.turn_started = Some((Instant::now(), crate::time::now_unix()));
         self.turn_checkpointed = false;
+        self.turn_changed = false;
         // Settings that apply to this turn only.
         self.turn_model = input.model.clone();
         self.policy.set_turn_rules(Some(input.rules.clone()));
@@ -1858,13 +1877,21 @@ impl Agent {
             arguments: call.arguments.clone(),
         });
         let raw = self.execute_inner(call, events).await;
-        let content = limit_output(
+        let mut content = limit_output(
             &raw.content,
             self.config.output_limit,
             &self.config.output_dir,
             &call.id,
             self.redactor.as_deref(),
         );
+        // What the checks after an edit found goes in the same result, after the limit, which
+        // would cut into it.
+        if !raw.is_error
+            && let Some(checks) = self.after_edit(call, events).await
+        {
+            content.push('\n');
+            content.push_str(&checks);
+        }
         let output = ToolOutput { content, ..raw };
         let _ = events.send(AgentEvent::ToolCallFinished {
             id: call.id.clone(),
@@ -1950,7 +1977,7 @@ impl Agent {
         }
         match decision {
             Decision::Allow => {}
-            Decision::Deny(reason) => return ToolOutput::error(format!("denied: {reason}")),
+            Decision::Deny(reason) => return ToolOutput::refused(format!("denied: {reason}")),
             Decision::Ask(reason) => {
                 let request = ApprovalRequest {
                     call_id: call.id.clone(),
@@ -1978,17 +2005,17 @@ impl Agent {
                     ApprovalDecision::Deny {
                         feedback: Some(note),
                     } => {
-                        return ToolOutput::error(format!("the user denied this action: {note}"));
+                        return ToolOutput::refused(format!("the user denied this action: {note}"));
                     }
                     ApprovalDecision::Deny { feedback: None } => {
-                        return ToolOutput::error("the user denied this action");
+                        return ToolOutput::refused("the user denied this action");
                     }
                     ApprovalDecision::Unavailable => {
                         let _ = events.send(AgentEvent::ActionBlocked {
                             id: call.id.clone(),
                             reason: reason.clone(),
                         });
-                        return ToolOutput::error(format!(
+                        return ToolOutput::refused(format!(
                             "blocked: {reason} needs approval and no user is available to approve it"
                         ));
                     }
@@ -2099,11 +2126,11 @@ impl Agent {
             }
             ApprovalDecision::Deny {
                 feedback: Some(note),
-            } => ToolOutput::error(format!(
+            } => ToolOutput::refused(format!(
                 "the user declined to run it without the sandbox: {note}"
             )),
             ApprovalDecision::Deny { feedback: None } => {
-                ToolOutput::error("the user declined to run it without the sandbox")
+                ToolOutput::refused("the user declined to run it without the sandbox")
             }
             ApprovalDecision::Unavailable => {
                 let blocked = format!(
@@ -2113,7 +2140,7 @@ impl Agent {
                     id: call.id.clone(),
                     reason: blocked.clone(),
                 });
-                ToolOutput::error(format!("blocked: {blocked}"))
+                ToolOutput::refused(format!("blocked: {blocked}"))
             }
         }
     }
@@ -2192,7 +2219,7 @@ fn shell_part_text(command: &str, output: &ToolOutput) -> String {
 
 /// The result of a tool call the user stopped the turn before, while harness waited to ask or
 /// for the answer.
-const STOPPED_BEFORE_RUNNING: &str = "interrupted by the user before this tool ran";
+pub(crate) const STOPPED_BEFORE_RUNNING: &str = "interrupted by the user before this tool ran";
 
 /// The result given to a tool call that a stopped run left without one.
 fn stopped_result(call_id: String) -> Message {

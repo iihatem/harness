@@ -23,6 +23,9 @@ pub struct ToolOutput {
     /// The sandbox's git-metadata guard undid something this command did. The command counts as
     /// blocked, and it must never be re-run outside the sandbox.
     pub guard_blocked: bool,
+    /// The call did not run: a rule denied it, it needed an approval it did not get, or the user
+    /// refused it.
+    pub blocked: bool,
 }
 
 impl ToolOutput {
@@ -32,6 +35,7 @@ impl ToolOutput {
             is_error: false,
             sandbox_denied: false,
             guard_blocked: false,
+            blocked: false,
         }
     }
 
@@ -41,6 +45,15 @@ impl ToolOutput {
             is_error: true,
             sandbox_denied: false,
             guard_blocked: false,
+            blocked: false,
+        }
+    }
+
+    /// An error for a call that did not run because it was denied, or not approved.
+    pub fn refused(content: impl Into<String>) -> Self {
+        ToolOutput {
+            blocked: true,
+            ..ToolOutput::error(content)
         }
     }
 }
@@ -129,6 +142,11 @@ pub trait Tool: Send + Sync {
     /// What running this call would do, for the permission check. Called after schema validation.
     fn action(&self, args: &Value, ctx: &ToolContext) -> Action;
     async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput;
+    /// The files a successful call of this tool changed, for the checks that follow an edit
+    /// (verification gates, language-server diagnostics). Tools that change no file return none.
+    fn changed_paths(&self, _args: &Value, _ctx: &ToolContext) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 /// What a [`CommandGuard`] did around one command, for the tool output.

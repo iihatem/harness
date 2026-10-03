@@ -113,3 +113,78 @@ fn npm_scripts(text: &str) -> Option<Proposal> {
         test,
     })
 }
+
+/// The last `lines` lines of `output`, and how many earlier lines were left out.
+pub fn tail(output: &str, lines: usize) -> (String, usize) {
+    let all: Vec<&str> = output.lines().collect();
+    let omitted = all.len().saturating_sub(lines);
+    let mut kept = all[omitted..].join("\n");
+    if !kept.is_empty() {
+        kept.push('\n');
+    }
+    (kept, omitted)
+}
+
+/// How a gate command ended, read from what the bash tool reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    pub status: crate::event::GateStatus,
+    pub exit_code: Option<i32>,
+    /// What the command printed (what a timeout left of it included).
+    pub output: String,
+    /// The turn was stopped while the command ran, or before it did.
+    pub interrupted: bool,
+    /// Why it did not run, when it did not.
+    pub refusal: Option<String>,
+}
+
+/// Reads the result of a `bash` tool call that ran a gate command.
+pub fn outcome(result: &crate::tool::ToolOutput) -> Outcome {
+    use crate::event::GateStatus;
+    let content = result.content.as_str();
+    let outcome = |status, exit_code, output: &str| Outcome {
+        status,
+        exit_code,
+        output: output.to_string(),
+        interrupted: false,
+        refusal: None,
+    };
+    if result.blocked {
+        return Outcome {
+            refusal: Some(content.to_string()),
+            ..outcome(GateStatus::Blocked, None, "")
+        };
+    }
+    if let Some(rest) = content.strip_prefix("command timed out after ") {
+        let output = rest.split_once('\n').map_or("", |(_, output)| output);
+        return outcome(GateStatus::TimedOut, None, output);
+    }
+    if content.starts_with("command interrupted by the user")
+        || content == crate::agent::STOPPED_BEFORE_RUNNING
+    {
+        return Outcome {
+            interrupted: true,
+            ..outcome(GateStatus::Failed, None, "")
+        };
+    }
+    if let Some(rest) = content.strip_prefix("exit code ") {
+        let (code, output) = rest.split_once('\n').unwrap_or((rest, ""));
+        let code = code.trim().parse::<i32>().ok();
+        let status = if result.is_error {
+            GateStatus::Failed
+        } else {
+            GateStatus::Passed
+        };
+        return outcome(status, code, output);
+    }
+    // The tool failed before the command ran (the shell could not start, say).
+    outcome(
+        if result.is_error {
+            GateStatus::Failed
+        } else {
+            GateStatus::Passed
+        },
+        None,
+        content,
+    )
+}

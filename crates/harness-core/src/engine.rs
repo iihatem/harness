@@ -733,6 +733,10 @@ impl PermissionPolicy for PermissionEngine {
         self.sandbox_available.store(available, Ordering::SeqCst);
     }
 
+    fn mode(&self) -> Option<Mode> {
+        Some(PermissionEngine::mode(self))
+    }
+
     fn set_turn_rules(&self, rules: Option<RuleSet>) {
         let rules = rules.unwrap_or_default();
         let home = home_dir();

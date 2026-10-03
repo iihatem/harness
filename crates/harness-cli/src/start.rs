@@ -241,7 +241,8 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     .with_redactor(setup.redactor.clone())
     .with_session(session)
     .with_checkpoints(checkpoints)
-    .with_meter(meter.clone());
+    .with_meter(meter.clone())
+    .with_gates(setup.config.gates.clone());
     if interactive {
         agent = agent.with_sandboxes(sandboxes);
     }

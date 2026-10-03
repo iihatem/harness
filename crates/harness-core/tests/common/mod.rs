@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod gates;
+
 use std::{path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;

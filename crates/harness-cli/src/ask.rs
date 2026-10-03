@@ -477,6 +477,24 @@ impl Shown {
                     terminal_safe(reason)
                 );
             }
+            AgentEvent::GateResult {
+                gate,
+                command,
+                status,
+                exit_code,
+                tail,
+            } if !json => {
+                let (line, _) = harness_tui::transcript::gate_line(
+                    *gate,
+                    command.as_deref(),
+                    *status,
+                    *exit_code,
+                );
+                eprintln!("{}", terminal_safe(&line));
+                if let Some(tail) = tail {
+                    eprintln!("{}", terminal_safe_text(tail.trim_end()));
+                }
+            }
             AgentEvent::Error { message, .. } if !json => {
                 eprintln!("error: {}", terminal_safe(message))
             }

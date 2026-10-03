@@ -195,4 +195,9 @@ pub trait PermissionPolicy: Send + Sync {
     /// Adds rules for the current turn only, or with `None` removes them. They never override
     /// deny rules, destructive-command confirmation or the sandbox.
     fn set_turn_rules(&self, _rules: Option<RuleSet>) {}
+
+    /// The approval mode now in effect, for policies that have modes.
+    fn mode(&self) -> Option<Mode> {
+        None
+    }
 }

@@ -36,6 +36,29 @@ impl TurnEndReason {
     }
 }
 
+/// Which verification gate a result belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    /// The lint command run after an edit.
+    AfterEdit,
+    /// The test command run when a turn that changed files ends.
+    Test,
+}
+
+/// How a gate command ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateStatus {
+    Passed,
+    Failed,
+    TimedOut,
+    /// It did not run: a rule denied it, or it needed an approval it did not get.
+    Blocked,
+    /// It did not run: the mode is `plan` or `read-only`.
+    Skipped,
+}
+
 /// Everything observable about a turn. Frontends render these; `harness ask --json` prints one per line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -132,6 +155,15 @@ pub enum AgentEvent {
         input_tokens: u64,
         output_tokens: u64,
         cached_tokens: u64,
+    },
+    /// A verification gate ran, or was skipped. `tail` is the last lines of a failing command's
+    /// output, as the model got them.
+    GateResult {
+        gate: GateKind,
+        command: Option<String>,
+        status: GateStatus,
+        exit_code: Option<i32>,
+        tail: Option<String>,
     },
     TurnFinished {
         reason: TurnEndReason,

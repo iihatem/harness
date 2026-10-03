@@ -1255,6 +1255,11 @@ impl Agent {
             }
             self.deliver_steering(events);
         }
+        // The steps ran out while the latest test run was a failure the model was sent to fix:
+        // that is what the turn ends on, not the limit.
+        if self.gate_turn.failed_and_continued {
+            return self.finish(TurnEndReason::GateFailed, events);
+        }
         self.finish(TurnEndReason::StepLimit, events)
     }
 

@@ -134,7 +134,9 @@ impl Agent {
             // Esc does not wait for a language server.
             let said = tokio::select! {
                 said = diagnostics.after_edit(&edited) => said,
-                () = self.ctx.cancel.cancelled() => None,
+                () = self.ctx.cancel.cancelled() => {
+                    Some("[diagnostics pending: stopped before the language server answered]".to_string())
+                }
             };
             if let Some(said) = said {
                 checks.push(said);
@@ -230,6 +232,8 @@ pub(super) struct GateTurn {
     last_failure: Option<(Option<i32>, String)>,
     /// The test command was blocked, and the model was told.
     blocked: bool,
+    /// The latest test run failed and the model was sent on to fix it.
+    pub(super) failed_and_continued: bool,
 }
 
 /// What happens when the model ends its turn.
@@ -291,6 +295,7 @@ impl Agent {
                 self.turn_changed = false;
                 self.remember_tested_tree(cancel).await;
                 self.gate_turn.last_failure = None;
+                self.gate_turn.failed_and_continued = false;
                 if self.deliver_steering(events) {
                     return EndOfTurn::Continue;
                 }
@@ -300,6 +305,7 @@ impl Agent {
             // change; it is no test failure.
             GateStatus::Blocked | GateStatus::Skipped => {
                 self.gate_turn.blocked = true;
+                self.gate_turn.failed_and_continued = false;
                 self.tell_gate_result(&run);
                 self.deliver_steering(events);
                 EndOfTurn::Continue
@@ -316,6 +322,7 @@ impl Agent {
                     return EndOfTurn::Finish(TurnEndReason::GateFailed);
                 }
                 self.gate_turn.retries += 1;
+                self.gate_turn.failed_and_continued = true;
                 self.deliver_steering(events);
                 EndOfTurn::Continue
             }

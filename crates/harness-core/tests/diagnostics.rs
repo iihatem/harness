@@ -227,6 +227,9 @@ async fn stopping_the_turn_does_not_wait_for_a_language_server() {
     let (reason, events) = common::run_with(&mut agent, "edit", cancel).await;
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(reason, harness_core::event::TurnEndReason::Interrupted);
-    // The edit itself was done, and its result says no more.
-    assert_eq!(finished_outputs(&events)[0].0, "edited");
+    // The edit itself was done, and its result says the diagnostics did not come, not that the
+    // file is clean.
+    let output = &finished_outputs(&events)[0].0;
+    assert!(output.starts_with("edited"), "{output}");
+    assert!(output.contains("[diagnostics pending"), "{output}");
 }

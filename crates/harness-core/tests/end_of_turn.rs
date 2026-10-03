@@ -195,6 +195,39 @@ async fn the_model_gets_max_retries_continuations_and_then_the_turn_fails() {
     assert_eq!(last, "four\n");
 }
 
+// Final review, M3: a turn that runs out of steps while its latest test run failed, with retries
+// left, ends `gate_failed` (exit 5), not `step_limit`.
+#[tokio::test]
+async fn running_out_of_steps_after_a_failed_test_ends_gate_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bash, _) = ScriptedBash::new(vec![(TEST, vec![failing(1, "one\n")])]);
+    let provider = MockProvider::new(vec![edit("e1"), Script::text("a"), Script::text("b")]);
+    let mut agent = agent(provider.clone(), dir.path(), bash, setup(3));
+    // The edit, then the reply the test fails on: the last step there is.
+    agent.config_mut().max_steps = 2;
+    let (reason, events) = run(&mut agent, "change it").await;
+    assert_eq!(reason, TurnEndReason::GateFailed);
+    assert_eq!(provider.requests().len(), 2);
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnFinished {
+            reason: TurnEndReason::GateFailed
+        })
+    ));
+}
+
+// Without a failed test run, running out of steps is still `step_limit`.
+#[tokio::test]
+async fn running_out_of_steps_with_passing_tests_is_still_the_step_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bash, _) = ScriptedBash::new(vec![]);
+    let provider = MockProvider::new(vec![edit("e1"), edit("e2"), Script::text("a")]);
+    let mut agent = agent(provider, dir.path(), bash, setup(3));
+    agent.config_mut().max_steps = 2;
+    let (reason, _) = run(&mut agent, "change it").await;
+    assert_eq!(reason, TurnEndReason::StepLimit);
+}
+
 // Spec "Identical failure": the second identical failure ends the turn at once.
 #[tokio::test]
 async fn an_identical_failure_ends_the_turn_without_another_continuation() {

@@ -140,6 +140,7 @@ pub struct Store {
     db: Connection,
     ledger: Ledger,
     path: PathBuf,
+    syncs: usize,
 }
 
 impl Store {
@@ -163,13 +164,20 @@ impl Store {
             db,
             ledger: Ledger::new(&dirs.usage),
             path,
+            syncs: 0,
         })
+    }
+
+    /// How many times the cache was brought up to date.
+    pub fn syncs(&self) -> usize {
+        self.syncs
     }
 
     /// Brings the cache up to date with the ledger: reads each file from where the cache stopped,
     /// forgets files that are gone or that shrank, and returns how many records it added. A last
     /// line without its newline is left for the next call.
     pub fn sync(&mut self) -> Result<usize> {
+        self.syncs += 1;
         match self.sync_inner() {
             Ok(added) => Ok(added),
             Err(Error(_)) => {
@@ -217,13 +225,13 @@ impl Store {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let offset: i64 = tx
+            let known_offset: Option<i64> = tx
                 .query_row("SELECT offset FROM files WHERE name = ?1", [name], |r| {
                     r.get(0)
                 })
-                .unwrap_or(0);
+                .ok();
             let len = std::fs::metadata(path)?.len() as i64;
-            let mut offset = offset;
+            let mut offset = known_offset.unwrap_or(0);
             if len < offset {
                 // The file was rewritten shorter than what was read: read it again from its start.
                 tx.execute("DELETE FROM requests WHERE file = ?1", [name])?;
@@ -245,11 +253,14 @@ impl Store {
                 }
                 offset += whole as i64;
             }
-            tx.execute(
-                "INSERT INTO files (name, offset) VALUES (?1, ?2)
-                 ON CONFLICT(name) DO UPDATE SET offset = excluded.offset",
-                params![name, offset],
-            )?;
+            // Nothing to write when the file stopped where the cache already had it.
+            if known_offset != Some(offset) {
+                tx.execute(
+                    "INSERT INTO files (name, offset) VALUES (?1, ?2)
+                     ON CONFLICT(name) DO UPDATE SET offset = excluded.offset",
+                    params![name, offset],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(added)

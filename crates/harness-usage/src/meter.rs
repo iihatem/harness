@@ -167,18 +167,20 @@ impl UsageMeter {
     /// What each budget allows and what is spent against it, for `session` today and this month.
     pub fn budget_report(&self, session: &str) -> Vec<BudgetLine> {
         let budgets = self.budgets();
+        let spent = self.spent_or_here(&KINDS, session);
         KINDS
             .iter()
-            .map(|&kind| BudgetLine {
+            .zip(spent)
+            .map(|(&kind, (spent, _))| BudgetLine {
                 budget: kind,
                 limit_usd: budgets.limit(kind),
-                spent_usd: self.spent_or_here(kind, session).0,
+                spent_usd: spent,
             })
             .collect()
     }
 
-    /// What was billed against `kind`, from the ledger.
-    fn spent(&self, kind: BudgetKind, session: &str) -> crate::error::Result<f64> {
+    /// What the ledger says was billed against each of `kinds`, after one sync of the cache.
+    fn ledger_spent(&self, kinds: &[BudgetKind], session: &str) -> crate::error::Result<Vec<f64>> {
         let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         if store.is_none() {
             *store = Some(Store::open(&self.dirs)?);
@@ -186,11 +188,23 @@ impl UsageMeter {
         let store = store.as_mut().expect("opened above");
         store.sync()?;
         let day = civil_date((self.clock)());
-        match kind {
-            BudgetKind::Session => store.session_spent(session),
-            BudgetKind::Daily => store.day_spent(&day),
-            BudgetKind::Monthly => store.month_spent(&day[..7]),
-        }
+        kinds
+            .iter()
+            .map(|kind| match kind {
+                BudgetKind::Session => store.session_spent(session),
+                BudgetKind::Daily => store.day_spent(&day),
+                BudgetKind::Monthly => store.month_spent(&day[..7]),
+            })
+            .collect()
+    }
+
+    /// How many times the cache of the ledger was brought up to date (for tests).
+    pub fn cache_syncs(&self) -> usize {
+        self.store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, Store::syncs)
     }
 
     /// What this process has billed against `kind`.
@@ -209,13 +223,25 @@ impl UsageMeter {
             .sum()
     }
 
-    /// What was billed against `kind`: the ledger's figure, but never less than this process's
-    /// own spending. When the ledger cannot be read, this process's figure alone, and the error.
-    fn spent_or_here(&self, kind: BudgetKind, session: &str) -> (f64, Option<crate::error::Error>) {
-        let here = self.spent_by_this_process(kind, session);
-        match self.spent(kind, session) {
-            Ok(spent) => (spent.max(here), None),
-            Err(e) => (here, Some(e)),
+    /// What was billed against each of `kinds`: the ledger's figure, but never less than this
+    /// process's own spending, and read with one sync. When the ledger cannot be read, this
+    /// process's figure alone, and the error.
+    fn spent_or_here(
+        &self,
+        kinds: &[BudgetKind],
+        session: &str,
+    ) -> Vec<(f64, Option<crate::error::Error>)> {
+        let here = |kind| self.spent_by_this_process(kind, session);
+        match self.ledger_spent(kinds, session) {
+            Ok(spent) => kinds
+                .iter()
+                .zip(spent)
+                .map(|(&kind, spent)| (spent.max(here(kind)), None))
+                .collect(),
+            Err(e) => kinds
+                .iter()
+                .map(|&kind| (here(kind), Some(e.clone())))
+                .collect(),
         }
     }
 
@@ -390,11 +416,17 @@ impl Meter for UsageMeter {
     fn check_budget(&self, session: &str, account: AccountKind) -> BudgetStatus {
         let budgets = self.budgets();
         let mut status = BudgetStatus::default();
-        for kind in KINDS {
-            let Some(limit) = budgets.limit(kind) else {
-                continue;
-            };
-            let (spent, failed) = self.spent_or_here(kind, session);
+        // One read of the ledger for all the budgets that are set, and none when none is.
+        let set: Vec<BudgetKind> = KINDS
+            .into_iter()
+            .filter(|&kind| budgets.limit(kind).is_some())
+            .collect();
+        if set.is_empty() {
+            return status;
+        }
+        let figures = self.spent_or_here(&set, session);
+        for (kind, (spent, failed)) in set.into_iter().zip(figures) {
+            let limit = budgets.limit(kind).expect("only set budgets are checked");
             if let Some(e) = failed {
                 // Every turn, until the ledger can be read again; meanwhile only what this
                 // process has spent counts.

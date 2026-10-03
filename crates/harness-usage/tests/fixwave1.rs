@@ -436,3 +436,24 @@ fn the_session_budget_returns_to_the_configured_figure() {
     unset.reset_session_budget();
     assert_eq!(unset.budgets().session_usd, None);
 }
+
+// Final review, Minor 2: one check of the budgets brings the cache up to date once, however many
+// budgets are set.
+#[test]
+fn a_budget_check_syncs_the_cache_once_for_all_the_budgets() {
+    let data = tempfile::tempdir().unwrap();
+    let m = meter(
+        data.path(),
+        Budgets {
+            session_usd: Some(100.0),
+            daily_usd: Some(100.0),
+            monthly_usd: Some(100.0),
+        },
+    );
+    spend(&m, 1);
+    assert_eq!(m.cache_syncs(), 0);
+    m.check_budget("s", AccountKind::ApiKey);
+    assert_eq!(m.cache_syncs(), 1);
+    m.check_budget("s", AccountKind::ApiKey);
+    assert_eq!(m.cache_syncs(), 2);
+}

@@ -195,6 +195,31 @@ async fn a_model_that_cannot_be_used_leaves_the_session_as_it_was() {
 }
 
 #[tokio::test]
+async fn a_switch_error_is_shown_with_secrets_replaced() {
+    let (first, _big, host) = two_models();
+    let dir = tempfile::tempdir().unwrap();
+    let redactor = Arc::new(harness_core::redact::Redactor::default());
+    redactor.add("sk-leaky-secret-123456");
+    let (ui, _log) = start(
+        agent(first, dir.path(), Mode::Auto),
+        Box::new(host),
+        options(dir.path(), Mode::Auto),
+    );
+    let mut ui = ui.with_redactor(redactor);
+    send(&mut ui, "/model sk-leaky-secret-123456/x");
+    settle(&mut ui).await;
+    assert!(shows(&ui, "could not switch to"), "{:#?}", screen(&ui));
+    assert!(
+        !screen(&ui)
+            .iter()
+            .any(|r| r.starts_with("error:") && r.contains("sk-leaky-secret")),
+        "{:#?}",
+        screen(&ui)
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
 async fn esc_stops_a_switch_that_waits() {
     let (first, _big, mut host) = two_models();
     host.stuck = true;

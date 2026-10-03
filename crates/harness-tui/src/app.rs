@@ -519,9 +519,10 @@ impl App {
                         self.model = view.id;
                         self.window_note = Some(view.window_note);
                     }
-                    Err(why) => self
-                        .transcript
-                        .push_error(&format!("could not switch to {wanted}: {why}"), width),
+                    Err(why) => {
+                        let text = self.redacted(&format!("could not switch to {wanted}: {why}"));
+                        self.transcript.push_error(&text, width);
+                    }
                 }
             }
             Done::UndidRewind(Ok(())) => self.transcript.push_note("undid the last rewind", width),
@@ -545,11 +546,16 @@ impl App {
     /// Shows `text`, something the host says, as a note, with the secrets harness knows
     /// replaced.
     pub fn push_note(&mut self, text: &str) {
-        let text = match &self.redactor {
+        let text = self.redacted(text);
+        self.transcript.push_note(&text, self.width);
+    }
+
+    /// `text` with the secrets harness knows replaced.
+    fn redacted(&self, text: &str) -> String {
+        match &self.redactor {
             Some(redactor) => redactor.redact(text),
             None => text.to_string(),
-        };
-        self.transcript.push_note(&text, self.width);
+        }
     }
 
     /// What the CLI provides.

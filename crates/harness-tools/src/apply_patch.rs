@@ -20,6 +20,8 @@ struct Planned {
     /// What it will hold, `None` to delete it.
     after: Option<String>,
     summary: String,
+    /// The permissions to give the file once written: a moved file keeps its old ones.
+    mode: Option<u32>,
 }
 
 /// The paths a patch writes: for each file the one it ends up at, and a moved file's old one too.
@@ -124,9 +126,27 @@ fn refused(message: &str) -> ToolOutput {
 /// contents. Writes nothing.
 async fn plan(ops: &[FileOp], ctx: &ToolContext) -> Result<Vec<Planned>, String> {
     let mut planned: Vec<Planned> = Vec::new();
+    // Every file a patch names, as the disk sees it: two operations on one file would lose a
+    // change, however the path is spelled (`a.rs`, `./a.rs`), or whether it is moved onto.
+    let mut named: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for op in ops {
         let name = op.path();
         let path = ctx.resolve(name);
+        if !named.insert(path.clone()) {
+            return Err(format!(
+                "{name} appears twice in the patch (a path may be named once, as a file or a move's target); put its changes in one section"
+            ));
+        }
+        if let FileOp::Update {
+            move_to: Some(target),
+            ..
+        } = op
+            && !named.insert(ctx.resolve(target))
+        {
+            return Err(format!(
+                "{target} appears twice in the patch (a path may be named once, as a file or a move's target)"
+            ));
+        }
         let existing = match tokio::fs::read(&path).await {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -142,6 +162,7 @@ async fn plan(ops: &[FileOp], ctx: &ToolContext) -> Result<Vec<Planned>, String>
                     before: None,
                     after: Some(content.clone()),
                     summary: format!("added {name} ({} lines)", content.lines().count()),
+                    mode: None,
                 });
             }
             FileOp::Delete { .. } => {
@@ -154,6 +175,7 @@ async fn plan(ops: &[FileOp], ctx: &ToolContext) -> Result<Vec<Planned>, String>
                     before: Some(bytes),
                     after: None,
                     summary: format!("deleted {name}"),
+                    mode: None,
                 });
             }
             FileOp::Update { move_to, hunks, .. } => {
@@ -163,7 +185,9 @@ async fn plan(ops: &[FileOp], ctx: &ToolContext) -> Result<Vec<Planned>, String>
                     .map_err(|e| format!("{name}: {e}"))?;
                 let text = String::from_utf8(bytes.clone())
                     .map_err(|_| format!("{name} is not valid UTF-8"))?;
-                let updated = patch::apply_hunks(name, &text, hunks).map_err(|e| e.to_string())?;
+                let (updated, notes) =
+                    patch::apply_hunks_noted(name, &text, hunks).map_err(|e| e.to_string())?;
+                let notes: String = notes.iter().map(|n| format!("; {n}")).collect();
                 let changed = format!(
                     "(+{} -{})",
                     hunks
@@ -182,24 +206,32 @@ async fn plan(ops: &[FileOp], ctx: &ToolContext) -> Result<Vec<Planned>, String>
                         path,
                         before: Some(bytes),
                         after: Some(updated),
-                        summary: format!("updated {name} {changed}"),
+                        summary: format!("updated {name} {changed}{notes}"),
+                        mode: None,
                     }),
                     Some(target) => {
                         let target_path = ctx.resolve(target);
                         if tokio::fs::try_exists(&target_path).await.unwrap_or(true) {
                             return Err(format!("cannot move {name} to {target}: it exists"));
                         }
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode = tokio::fs::metadata(&path)
+                            .await
+                            .ok()
+                            .map(|m| m.permissions().mode());
                         planned.push(Planned {
                             path: target_path,
                             before: None,
                             after: Some(updated),
-                            summary: format!("moved {name} to {target} {changed}"),
+                            summary: format!("moved {name} to {target} {changed}{notes}"),
+                            mode,
                         });
                         planned.push(Planned {
                             path,
                             before: Some(bytes),
                             after: None,
                             summary: String::new(),
+                            mode: None,
                         });
                     }
                 }
@@ -235,7 +267,14 @@ async fn write_one(file: &Planned) -> Result<(), String> {
             }
             tokio::fs::write(&file.path, text)
                 .await
-                .map_err(|e| format!("cannot write {name}: {e}"))
+                .map_err(|e| format!("cannot write {name}: {e}"))?;
+            if let Some(mode) = file.mode {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&file.path, std::fs::Permissions::from_mode(mode))
+                    .await
+                    .map_err(|e| format!("cannot set the permissions of {name}: {e}"))?;
+            }
+            Ok(())
         }
         None => tokio::fs::remove_file(&file.path)
             .await

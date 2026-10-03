@@ -172,6 +172,84 @@ async fn a_move_onto_an_existing_file_is_an_error() {
     assert_eq!(read(&ctx, "a.rs"), "x\n");
 }
 
+// Two operations on one file lose a change silently, so they are refused before anything is
+// written, however the path is spelled.
+#[tokio::test]
+async fn two_operations_on_one_file_are_refused_whatever_the_spelling() {
+    for (name, body) in [
+        (
+            "the same file spelled twice",
+            "*** Update File: a.rs\n@@\n-x\n+y\n*** Update File: ./a.rs\n@@\n-x\n+z\n",
+        ),
+        (
+            "two moves to one path",
+            "*** Update File: a.rs\n*** Move to: n.rs\n@@\n-x\n+y\n*** Update File: c.rs\n*** Move to: ./n.rs\n@@\n-p\n+q\n",
+        ),
+        (
+            "an add and a move to the same path",
+            "*** Add File: b.rs\n+new\n*** Update File: a.rs\n*** Move to: b.rs\n@@\n-x\n+y\n",
+        ),
+        (
+            "an update and a move onto it",
+            "*** Update File: c.rs\n@@\n-p\n+q\n*** Update File: a.rs\n*** Move to: sub/../c.rs\n@@\n-x\n+y\n",
+        ),
+    ] {
+        let (_dir, ctx) = setup();
+        put(&ctx, "a.rs", "x\n");
+        put(&ctx, "c.rs", "p\n");
+        mark_read(&ctx, "a.rs");
+        mark_read(&ctx, "c.rs");
+        let out = apply(&ctx, &wrap(body)).await;
+        assert!(out.is_error, "{name}: {}", out.content);
+        assert!(out.content.contains("twice"), "{name}: {}", out.content);
+        assert_eq!(read(&ctx, "a.rs"), "x\n", "{name}");
+        assert_eq!(read(&ctx, "c.rs"), "p\n", "{name}");
+        assert!(!ctx.workspace.join("b.rs").exists(), "{name}");
+        assert!(!ctx.workspace.join("n.rs").exists(), "{name}");
+    }
+}
+
+// A moved file keeps its permissions: an executable stays one.
+#[tokio::test]
+async fn a_moved_file_keeps_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, ctx) = setup();
+    put(&ctx, "run.sh", "echo x\n");
+    std::fs::set_permissions(
+        ctx.workspace.join("run.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    mark_read(&ctx, "run.sh");
+    let out = apply(
+        &ctx,
+        &wrap("*** Update File: run.sh\n*** Move to: bin/run.sh\n@@\n-echo x\n+echo y\n"),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    let mode = std::fs::metadata(ctx.workspace.join("bin/run.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755);
+}
+
+// A hunk placed by ignoring indentation says so in the result.
+#[tokio::test]
+async fn the_result_says_where_a_hunk_matched_loosely() {
+    let (_dir, ctx) = setup();
+    put(&ctx, "a.py", "def f():\n        return 1\n");
+    mark_read(&ctx, "a.py");
+    let out = apply(
+        &ctx,
+        &wrap("*** Update File: a.py\n@@\n-    return 1\n+    return 2\n"),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("indentation"), "{}", out.content);
+    assert!(out.content.contains("line 2"), "{}", out.content);
+}
+
 // Spec "malformed patches leaving files untouched".
 #[tokio::test]
 async fn a_malformed_patch_changes_nothing() {

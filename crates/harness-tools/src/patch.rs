@@ -139,7 +139,12 @@ pub fn parse(patch: &str) -> Result<Vec<FileOp>, PatchError> {
                     .any(|d| l.starts_with(d))
             })
             .map_or(body.len(), |n| i + n);
-        let section = &body[i..section_end];
+        // A blank line before the next file's directive is the model's spacing, not a line of
+        // this file's section.
+        let mut section = &body[i..section_end];
+        while section.last().is_some_and(|l| l.is_empty()) {
+            section = &section[..section.len() - 1];
+        }
         i = section_end;
         ops.push(match kind {
             "Add File" => add_file(path, section)?,
@@ -290,8 +295,8 @@ fn find(lines: &[&str], wanted: &[&str], from: usize, at_end: bool) -> Option<(u
     None
 }
 
-/// The line ending a file is written back with: `\r\n` when every line break in it is one, else
-/// `\n` (a file of mixed endings gets plain ones).
+/// The line ending added lines are written with: `\r\n` when every line break in the file is one,
+/// else `\n`. Lines the file already has keep their own endings, mixed or not.
 pub fn line_ending(text: &str) -> &'static str {
     let breaks = text.matches('\n').count();
     if breaks > 0 && text.matches("\r\n").count() == breaks {
@@ -308,9 +313,44 @@ fn indent(line: &str) -> &str {
 /// `original` with `hunks` applied. Each hunk is looked for after the one before it; its context
 /// lines keep the file's own text. An error names `path` and the hunk, and nothing is changed.
 pub fn apply_hunks(path: &str, original: &str, hunks: &[Hunk]) -> Result<String, PatchError> {
+    apply_hunks_noted(path, original, hunks).map(|(text, _)| text)
+}
+
+/// [`apply_hunks`], and a note for each hunk that was placed by comparing less strictly than
+/// exactly (ignoring trailing whitespace, or indentation), for the caller to show.
+pub fn apply_hunks_noted(
+    path: &str,
+    original: &str,
+    hunks: &[Hunk],
+) -> Result<(String, Vec<String>), PatchError> {
     let lines: Vec<&str> = original.lines().collect();
+    // Each line's own ending: `\n`, `\r\n`, or none for an unterminated last line.
+    let endings: Vec<&str> = original
+        .split_inclusive('\n')
+        .map(|l| {
+            if l.ends_with("\r\n") {
+                "\r\n"
+            } else if l.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            }
+        })
+        .collect();
+    let default_eol = line_ending(original);
     let ends_with_newline = original.is_empty() || original.ends_with('\n');
-    let mut out: Vec<String> = Vec::new();
+    // The lines written, each with its ending (`None`: one for an added line, taken from the line
+    // before it).
+    let mut out: Vec<(String, Option<&str>)> = Vec::new();
+    let copy = |out: &mut Vec<(String, Option<&str>)>, range: std::ops::Range<usize>| {
+        out.extend(range.map(|i| {
+            (
+                lines[i].to_string(),
+                Some(endings.get(i).copied().unwrap_or("")),
+            )
+        }));
+    };
+    let mut notes = Vec::new();
     let mut pos = 0;
     for (index, hunk) in hunks.iter().enumerate() {
         let number = index + 1;
@@ -324,7 +364,7 @@ pub fn apply_hunks(path: &str, original: &str, hunks: &[Hunk]) -> Result<String,
                 )));
             };
             // The header line stays; the hunk starts after it.
-            out.extend(lines[pos..=at].iter().map(|l| l.to_string()));
+            copy(&mut out, pos..at + 1);
             pos = at + 1;
         }
         let wanted: Vec<&str> = hunk
@@ -344,6 +384,17 @@ pub fn apply_hunks(path: &str, original: &str, hunks: &[Hunk]) -> Result<String,
         } else {
             match find(&lines, &wanted, pos, hunk.at_eof) {
                 Some((at, level)) => {
+                    if level > 0 {
+                        notes.push(format!(
+                            "hunk {number} matched at line {} ignoring {}: check that it is the place meant",
+                            at + 1,
+                            if level == 1 {
+                                "trailing whitespace"
+                            } else {
+                                "indentation"
+                            }
+                        ));
+                    }
                     // Matched only by ignoring indentation: the patch lost the file's, which
                     // its added lines get back.
                     if level == 2 {
@@ -367,26 +418,40 @@ pub fn apply_hunks(path: &str, original: &str, hunks: &[Hunk]) -> Result<String,
                 }
             }
         };
-        out.extend(lines[pos..start].iter().map(|l| l.to_string()));
+        copy(&mut out, pos..start);
         let mut at = start;
         for (kind, text) in &hunk.lines {
             match kind {
                 LineKind::Context => {
-                    out.push(lines[at].to_string());
+                    copy(&mut out, at..at + 1);
                     at += 1;
                 }
                 LineKind::Remove => at += 1,
-                LineKind::Add if text.is_empty() => out.push(String::new()),
-                LineKind::Add => out.push(format!("{added_indent}{text}")),
+                LineKind::Add if text.is_empty() => out.push((String::new(), None)),
+                LineKind::Add => out.push((format!("{added_indent}{text}"), None)),
             }
         }
         pos = at;
     }
-    out.extend(lines[pos..].iter().map(|l| l.to_string()));
-    let eol = line_ending(original);
-    let mut text = out.join(eol);
-    if ends_with_newline && !out.is_empty() {
-        text.push_str(eol);
+    copy(&mut out, pos..lines.len());
+    let count = out.len();
+    let mut text = String::new();
+    let mut previous: Option<&str> = None;
+    for (i, (line, ending)) in out.into_iter().enumerate() {
+        text.push_str(&line);
+        // An added line ends as the line before it did; the last line ends the file as the
+        // original ended.
+        let mut ending = match ending {
+            Some(own) if !own.is_empty() => own,
+            _ => previous.unwrap_or(default_eol),
+        };
+        if i + 1 == count && !ends_with_newline {
+            ending = "";
+        }
+        text.push_str(ending);
+        if !ending.is_empty() {
+            previous = Some(ending);
+        }
     }
-    Ok(text)
+    Ok((text, notes))
 }

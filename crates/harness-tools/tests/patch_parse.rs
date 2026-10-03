@@ -247,7 +247,50 @@ fn a_crlf_file_keeps_its_line_endings() {
     assert_eq!(applied("a\r\nb", "@@\n-b\n+B\n").unwrap(), "a\r\nB");
 }
 
+// Lines the patch did not touch keep the ending they had, mixed or not; an added line ends like
+// the line before it (the first line of a file, like the file's if it is uniform).
 #[test]
-fn a_file_of_mixed_line_endings_is_written_with_plain_ones() {
-    assert_eq!(applied("a\r\nb\nc\n", "@@\n-b\n+B\n").unwrap(), "a\nB\nc\n");
+fn a_file_of_mixed_line_endings_keeps_the_endings_of_the_lines_it_does_not_change() {
+    assert_eq!(
+        applied("a\r\nb\nc\r\nd\n", "@@\n-b\n+B\n").unwrap(),
+        "a\r\nB\r\nc\r\nd\n"
+    );
+    assert_eq!(
+        applied("a\r\nb\nc\r\nd\n", "@@\n c\n-d\n+D\n").unwrap(),
+        "a\r\nb\nc\r\nD\r\n"
+    );
+    // Nothing else is rewritten.
+    assert_eq!(
+        applied("a\nb\r\nc\n", "@@\n-a\n+A\n").unwrap(),
+        "A\nb\r\nc\n"
+    );
+}
+
+// A match below the exact level is said so, for the model to check.
+#[test]
+fn a_hunk_placed_by_ignoring_whitespace_is_noted() {
+    let hunks = update("@@\n-  b\n+  B\n");
+    let (text, notes) = harness_tools::patch::apply_hunks_noted("f", "a\n    b\n", &hunks).unwrap();
+    assert_eq!(text, "a\n    B\n");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("hunk 1") && notes[0].contains("indentation"),
+        "{notes:?}"
+    );
+    let exact = harness_tools::patch::apply_hunks_noted("f", "a\n  b\n", &hunks).unwrap();
+    assert!(exact.1.is_empty(), "{:?}", exact.1);
+}
+
+// A blank line between two file sections is the model's spacing, not a context line.
+#[test]
+fn blank_lines_before_the_next_file_are_not_part_of_the_section() {
+    let ops = parse(
+        "*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\n\n*** Add File: b.rs\n+z\n\n*** Delete File: c.rs\n*** End Patch\n",
+    )
+    .unwrap();
+    let FileOp::Update { hunks, .. } = &ops[0] else {
+        panic!("{ops:?}")
+    };
+    assert_eq!(hunks[0].lines.len(), 2, "{hunks:?}");
+    assert_eq!(ops.len(), 3);
 }

@@ -207,7 +207,8 @@ pub fn exit_code(reason: TurnEndReason, blocked: bool) -> u8 {
         TurnEndReason::Completed => 0,
         TurnEndReason::Interrupted => 130,
         TurnEndReason::Budget => 4,
-        TurnEndReason::StepLimit | TurnEndReason::Error | TurnEndReason::GateFailed => 1,
+        TurnEndReason::StepLimit | TurnEndReason::Error => 1,
+        TurnEndReason::GateFailed => 5,
     }
 }
 
@@ -612,7 +613,7 @@ mod tests {
         assert_eq!(exit_code(TurnEndReason::Completed, true), 3);
         assert_eq!(exit_code(TurnEndReason::Error, false), 1);
         assert_eq!(exit_code(TurnEndReason::StepLimit, false), 1);
-        assert_eq!(exit_code(TurnEndReason::GateFailed, false), 1);
+        assert_eq!(exit_code(TurnEndReason::GateFailed, false), 5);
         assert_eq!(exit_code(TurnEndReason::Interrupted, false), 130);
     }
 }

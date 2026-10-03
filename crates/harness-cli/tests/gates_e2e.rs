@@ -184,7 +184,7 @@ async fn a_headless_run_that_ends_on_a_gate_failure_says_gate_failed() {
                 .as_str()
                 .is_some_and(|t| t.contains("1 test failed"))
     }));
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(5));
 }
 
 // Spec "No gates configured": a finished turn runs no gate command.

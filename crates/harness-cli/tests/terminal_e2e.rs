@@ -65,6 +65,30 @@ impl Reply {
             .collect();
         Reply::Text(pieces)
     }
+
+    /// `NUM-001` to `NUM-<count>` as in [`numbered`](Self::numbered), but after every `block`
+    /// numbers the stream rests for `rest`: harness has drawn them all and is idle, so a test
+    /// can change the window's size between two draws, not in the middle of one.
+    fn numbered_in_blocks(
+        count: usize,
+        block: usize,
+        piece: usize,
+        every: Duration,
+        rest: Duration,
+    ) -> Reply {
+        let mut pieces = Vec::new();
+        for first in (1..=count).step_by(block) {
+            let text: String = (first..(first + block).min(count + 1))
+                .map(|i| format!("NUM-{i:03}\n\n"))
+                .collect();
+            let chunks: Vec<&[u8]> = text.as_bytes().chunks(piece).collect();
+            for (n, chunk) in chunks.iter().enumerate() {
+                let pause = if n + 1 == chunks.len() { rest } else { every };
+                pieces.push((String::from_utf8(chunk.to_vec()).unwrap(), pause));
+            }
+        }
+        Reply::Text(pieces)
+    }
 }
 
 /// An OpenAI-compatible chat endpoint on 127.0.0.1 that answers requests with its script, in
@@ -723,7 +747,17 @@ fn resizes_never_end_the_session() {
 // lines.
 #[test]
 fn resizing_while_a_reply_streams_loses_no_line() {
-    let provider = Provider::start(vec![Reply::numbered(110, 20, Duration::from_millis(25))]);
+    // The reply rests after every eight numbers, and the window is resized then, once harness
+    // has been quiet for a good part of the rest: a resize that landed while harness was still
+    // writing a draw reached the terminal's screen in the middle of it, which lost lines (one run
+    // in 20 without the rests, one in a CI run).
+    let provider = Provider::start(vec![Reply::numbered_in_blocks(
+        110,
+        8,
+        20,
+        Duration::from_millis(25),
+        Duration::from_millis(400),
+    )]);
     let env = Env::new(&provider);
     let mut session = Session::start(
         &env,
@@ -739,7 +773,7 @@ fn resizing_while_a_reply_streams_loses_no_line() {
     let sizes = [(40, 20), (60, 10), (70, 16)];
     for i in 0..12 {
         session.wait_for(&format!("NUM-{:03}", 8 * (i + 1)), Duration::from_secs(20));
-        session.wait_quiet(Duration::from_millis(5));
+        session.wait_quiet(Duration::from_millis(100));
         let (cols, rows) = sizes[i % sizes.len()];
         session.resize(cols, rows);
     }

@@ -88,7 +88,7 @@ pub fn child_env(
 ) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = parent
         .into_iter()
-        .filter(|(name, _)| !name.to_str().is_some_and(|n| is_removed(n)))
+        .filter(|(name, _)| !name.to_str().is_some_and(is_removed))
         .collect();
     if let AuthMode::ApiKey(key) = auth {
         let name = match kind {

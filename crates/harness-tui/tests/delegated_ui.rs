@@ -43,6 +43,8 @@ impl Host for NoCommands {
 /// Asks to write `a.txt`, then shows a tool row and a message; or hangs until interrupted.
 struct Child {
     hang: bool,
+    /// Set once the child is running, for a test to wait on.
+    started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait]
@@ -63,6 +65,8 @@ impl DelegateTurns for Child {
         events: &UnboundedSender<AgentEvent>,
         cancel: CancellationToken,
     ) -> DelegatedOutcome {
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if self.hang {
             cancel.cancelled().await;
             return DelegatedOutcome::ended(TurnEndReason::Interrupted);
@@ -183,7 +187,13 @@ fn send(ui: &mut Ui<TestBackend>, text: &str) {
 #[tokio::test]
 async fn the_childs_approval_is_asked_in_the_normal_prompt_and_its_rows_draw_like_any_turn() {
     let dir = tempfile::tempdir().unwrap();
-    let mut ui = start(dir.path(), Child { hang: false });
+    let mut ui = start(
+        dir.path(),
+        Child {
+            hang: false,
+            started: Arc::default(),
+        },
+    );
     send(&mut ui, "write it");
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -212,10 +222,24 @@ async fn the_childs_approval_is_asked_in_the_normal_prompt_and_its_rows_draw_lik
 #[tokio::test]
 async fn esc_interrupts_a_delegated_turn() {
     let dir = tempfile::tempdir().unwrap();
-    let mut ui = start(dir.path(), Child { hang: true });
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut ui = start(
+        dir.path(),
+        Child {
+            hang: true,
+            started: started.clone(),
+        },
+    );
     send(&mut ui, "go");
-    // Let the turn start, then Esc.
-    let _ = tokio::time::timeout(Duration::from_millis(300), ui.settle()).await;
+    // Wait until the child is running, then Esc.
+    let begun = tokio::time::Instant::now();
+    while !started.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            begun.elapsed() < Duration::from_secs(10),
+            "the child never started"
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(20), ui.settle()).await;
+    }
     press(&mut ui, KeyCode::Esc);
     tokio::time::timeout(Duration::from_secs(10), ui.settle())
         .await

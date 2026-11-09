@@ -365,14 +365,17 @@ impl Prompt {
                     "claude-code will use your Claude subscription".to_string(),
                 )
             }
-            Answered::Decided(_) | Answered::Interrupt
-                if self.request.kind == ApprovalKind::DelegateOptIn =>
-            {
-                (
-                    "✗",
-                    "claude-code will use your Anthropic API key, if there is one".to_string(),
-                )
-            }
+            // Esc answers nothing: the turn stops and the question comes again at the next one.
+            Answered::Interrupt if self.request.kind == ApprovalKind::DelegateOptIn => (
+                "✗",
+                "no answer, and the turn stopped: claude-code asks again at the next turn"
+                    .to_string(),
+            ),
+            Answered::Decided(_) if self.request.kind == ApprovalKind::DelegateOptIn => (
+                "✗",
+                "claude-code will use your Anthropic API key, if there is one (this answer is kept; [delegate.claude] use_subscription in the global config changes it)"
+                    .to_string(),
+            ),
             Answered::Decided(ApprovalDecision::Approve)
                 if self.request.kind == ApprovalKind::DelegateFullAccess =>
             {

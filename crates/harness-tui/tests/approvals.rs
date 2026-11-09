@@ -1696,6 +1696,33 @@ fn delegate_question(dir: &Path, kind: ApprovalKind, text: &str) -> Asked {
     (ui, answer, requests)
 }
 
+// Esc is no answer: the outcome says the question comes again, not that the key will be used.
+#[tokio::test]
+async fn esc_on_the_opt_in_says_it_will_be_asked_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut answer, _requests) = delegate_question(
+        dir.path(),
+        ApprovalKind::DelegateOptIn,
+        "Use your Claude subscription for claude-code models?",
+    );
+    until_server_question(&mut ui).await;
+    press(&mut ui, KeyCode::Esc);
+    assert_eq!(
+        answer.try_recv(),
+        Ok(ApprovalDecision::Deny {
+            feedback: Some(harness_core::agent::STOPPED_BY_USER.into())
+        })
+    );
+    ui.draw().unwrap();
+    let shown = screen(&ui).join("\n");
+    assert!(shown.contains("asks again at the next turn"), "{shown}");
+    assert!(
+        !shown.contains("will use your Anthropic API key"),
+        "{shown}"
+    );
+    ui.finish().await.unwrap();
+}
+
 // Both are plain yes or no questions: no "approve?" lead, no "for this session" key, `y` is yes,
 // `n` and Enter are no at once, and the outcome says what the answer means.
 #[tokio::test]

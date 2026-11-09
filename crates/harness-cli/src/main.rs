@@ -63,6 +63,18 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum WorktreesCommand {
+    /// Remove the worktrees and branches harness made that have nothing left to review: finished
+    /// agents that changed nothing, and those of a harness that died. Results not applied stay;
+    /// a running agent's, and anything harness did not make, are never touched
+    Clean {
+        /// Also remove results that were not applied or kept (their branches are deleted)
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Run one prompt to completion without interaction; piped stdin is appended to the prompt
     Ask {
@@ -112,6 +124,12 @@ enum Command {
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommand,
+    },
+    /// List the git worktrees harness made for agents, with their state; `worktrees clean`
+    /// removes the ones that are finished and have nothing to review
+    Worktrees {
+        #[command(subcommand)]
+        command: Option<WorktreesCommand>,
     },
     /// Update the price table the cost figures use (the only time harness connects to models.dev)
     Pricing {
@@ -241,6 +259,7 @@ fn command_line(command: &Command) -> &'static str {
         Command::Sandbox { .. } => "harness sandbox doctor",
         Command::Usage { .. } => "harness usage",
         Command::Pricing { .. } => "harness pricing update",
+        Command::Worktrees { .. } => "harness worktrees",
     }
 }
 
@@ -368,6 +387,10 @@ fn main() -> ExitCode {
                 command: Some(UsageCommand::Forget { before, all }),
                 ..
             }) => usage::forget(before.as_deref(), all),
+            Some(Command::Worktrees { command: None }) => worktrees::list(),
+            Some(Command::Worktrees {
+                command: Some(WorktreesCommand::Clean { all }),
+            }) => worktrees::clean(all),
             Some(Command::Pricing {
                 command: PricingCommand::Update,
             }) => pricing::update().await,

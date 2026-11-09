@@ -289,15 +289,13 @@ impl Worktrees {
     pub fn reconcile(&self) -> Vec<String> {
         use crate::agents::AgentStatus;
         let mut fixed = Vec::new();
+        // Locks of harness processes that are gone, whether or not a record says why.
+        self.release_stale_locks();
         let orphans: Vec<Record> = self
             .records()
             .into_iter()
             .filter(|r| !r.status.is_final() && !process_alive(r.pid))
             .collect();
-        if orphans.is_empty() {
-            return fixed;
-        }
-        self.release_stale_locks();
         for record in orphans {
             let mut outcome = None;
             if record.path.exists() && self.is_marked(&record.path) {

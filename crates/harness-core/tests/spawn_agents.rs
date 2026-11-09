@@ -137,7 +137,7 @@ fn rig(
         },
         tx,
     );
-    let tool = SpawnAgentsTool::new(supervisor.clone(), Arc::new(definitions), settings);
+    let tool = SpawnAgentsTool::new(&supervisor, Arc::new(definitions), settings);
     Rig {
         _dir: dir,
         factory,
@@ -205,6 +205,32 @@ fn the_tool_names_every_agent_and_says_how_many_it_may_start_and_stays_the_same(
     let names = &spec.parameters["properties"]["agents"]["items"]["properties"]["agent"]["enum"];
     assert_eq!(names, &json!(["explore", "review", "general"]));
     assert_eq!(rig.tool.spec(), spec, "the description is stable");
+}
+
+#[tokio::test]
+async fn a_tool_does_not_keep_its_supervisor_alive_and_says_so_when_it_is_gone() {
+    let Rig {
+        tool,
+        supervisor,
+        factory,
+        workspace,
+        ..
+    } = rig(defs(), settings(3), says("x"));
+    let weak = Arc::downgrade(&supervisor);
+    drop(supervisor);
+    assert!(weak.upgrade().is_none(), "the tool kept the supervisor");
+    let out = tool
+        .run(
+            json!({"agents": [entry("explore", "x")]}),
+            &ToolContext::new(&workspace),
+        )
+        .await;
+    assert!(
+        out.is_error && out.content.contains("ending"),
+        "{}",
+        out.content
+    );
+    assert!(factory.specs.lock().unwrap().is_empty());
 }
 
 #[test]

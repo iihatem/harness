@@ -70,6 +70,8 @@ pub struct ChildKit {
     session_id: String,
     workspace: std::path::PathBuf,
     limits: harness_core::agents::Limits,
+    /// The definitions the model may start, and the limits on starting them.
+    subagents: crate::subagents::Subagents,
 }
 
 impl Started {
@@ -101,9 +103,31 @@ impl Started {
     }
 }
 
-/// `agent` keeping the records `supervisor` makes of its children in its session.
-pub fn with_supervisor(agent: Agent, supervisor: &harness_core::agents::Supervisor) -> Agent {
-    agent.with_child_records(supervisor.records())
+impl Started {
+    /// The tool that lets the model start subagents under `supervisor`.
+    pub fn spawn_tool(
+        &self,
+        supervisor: &Arc<harness_core::agents::Supervisor>,
+    ) -> Arc<dyn harness_core::tool::Tool> {
+        let subagents = &self.children.subagents;
+        harness_core::agents::SpawnAgentsTool::new(
+            supervisor,
+            subagents.definitions.clone(),
+            subagents.settings.clone(),
+        )
+    }
+}
+
+/// `agent` keeping the records `supervisor` makes of its children in its session, and offering
+/// the model `spawn` (from [`Started::spawn_tool`]) to start them.
+pub fn with_supervisor(
+    agent: Agent,
+    supervisor: &harness_core::agents::Supervisor,
+    spawn: Arc<dyn harness_core::tool::Tool>,
+) -> Agent {
+    agent
+        .with_child_records(supervisor.records())
+        .with_extra_tool(spawn)
 }
 
 /// The model a session starts on when it is not chosen another way: the `--model` flag, then
@@ -294,6 +318,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     );
     let diagnostics = crate::lsp::diagnostics(setup, interactive.then(|| approver.clone()));
     let resolver = crate::routes::CliResolver::new(setup.clone());
+    let subagents = crate::subagents::load(setup, notices);
     let children = ChildKit {
         factory: crate::children::CliFactory::new(
             setup.clone(),
@@ -324,6 +349,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
                 total: a.max_total as usize,
             }
         },
+        subagents,
     };
     let mut agent = Agent::new(
         resolved.provider,

@@ -154,13 +154,14 @@ pub async fn run(
     let rx = with_credential_warnings(rx, setup.credentials.clone());
     let (envelopes, rx) = wrap_main(rx);
     let supervisor = started.supervisor(envelopes.clone(), cancel.clone());
+    let spawn = started.spawn_tool(&supervisor);
     let Started {
         agent,
         sandbox_session,
         policy,
         ..
     } = started;
-    let mut agent = start::with_supervisor(agent, &supervisor);
+    let mut agent = start::with_supervisor(agent, &supervisor, spawn);
     // `with_piped_stdin` returns the prompt with any piped text appended.
     let turn = crate::slash::turn_input(
         &typed,

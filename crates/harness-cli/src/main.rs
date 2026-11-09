@@ -18,6 +18,7 @@ mod sessions;
 mod setup;
 mod slash;
 mod start;
+mod subagents;
 mod term;
 mod trust;
 mod usage;

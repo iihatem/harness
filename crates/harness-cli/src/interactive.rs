@@ -303,6 +303,7 @@ pub async fn run(
     // the input and their approvals in the queue.
     let (child_events, _) = tokio::sync::mpsc::unbounded_channel();
     let supervisor = started.supervisor(child_events, CancellationToken::new());
+    let spawn = started.spawn_tool(&supervisor);
     let Started {
         agent,
         sandbox_session,
@@ -315,7 +316,7 @@ pub async fn run(
         resolver,
         ..
     } = started;
-    let agent = start::with_supervisor(agent, &supervisor);
+    let agent = start::with_supervisor(agent, &supervisor, spawn);
     let unsaved_default = first_run.then(|| model.clone());
     let history = agent.rewind_points().into_iter().map(|p| p.text).collect();
     let options = Options {

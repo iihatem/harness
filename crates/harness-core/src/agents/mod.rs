@@ -10,6 +10,7 @@ pub mod perm;
 pub mod records;
 pub mod report;
 pub mod sched;
+pub mod spawn;
 pub mod supervisor;
 pub mod workspace;
 
@@ -20,6 +21,7 @@ pub use model::{CurrentModel, ParentModel};
 pub use records::AgentRecords;
 pub use report::{AgentReport, ReportFlag, ReportUsage, ToolLog, UsageTally};
 pub use sched::{Endpoint, Limits};
+pub use spawn::{SPAWN_TOOL, SpawnAgentsTool, SpawnSettings};
 pub use supervisor::{
     AgentFactory, AgentHandle, AgentInfo, AgentSpec, ChildSetup, ParentContext, Supervisor,
 };

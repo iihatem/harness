@@ -45,6 +45,7 @@ pub mod detect;
 pub mod driver;
 pub mod env;
 pub mod event;
+pub mod models;
 pub mod redact;
 
 pub use backend::{

@@ -9,7 +9,7 @@ use harness_core::{
     message::Buckets,
     meter::{
         AccountKind, AgentScope, Avoided, BudgetKind, BudgetNotice, BudgetStatus, Meter,
-        RequestCost, RequestRecord, TurnRecord, WindowSnapshot,
+        RequestCost, RequestDetail, RequestRecord, TurnRecord, WindowSnapshot,
     },
     time::civil_date,
     time::now_unix,
@@ -269,23 +269,28 @@ impl UsageMeter {
         model: &str,
         account: AccountKind,
         buckets: &Buckets,
+        estimated_usd: Option<f64>,
     ) -> (RequestCost, Option<String>) {
         let none_sent = buckets.priced_total() == 0;
         let priced = self.pricing.price_of(model);
+        // A delegated program's own estimate stands in for the table's price: the program knows
+        // what its own requests were, and the table does not know its models.
+        let estimated = estimated_usd.filter(|usd| usd.is_finite() && *usd >= 0.0);
         let list = match account {
             AccountKind::Local => Some(0.0),
+            _ if estimated.is_some() => estimated,
             _ if none_sent => Some(0.0),
             _ => priced.as_ref().and_then(|(price, _)| price.cost(buckets)),
         };
         let billed = match account {
             AccountKind::ApiKey => list,
-            AccountKind::Subscription | AccountKind::Local => Some(0.0),
+            AccountKind::Subscription | AccountKind::Local | AccountKind::Delegated => Some(0.0),
         };
         let avoided = match (&self.baseline, account) {
             (Some(_), AccountKind::ApiKey) | (None, _) => Avoided::NotApplicable,
             (Some(baseline), _) => avoided_for(&self.pricing, baseline, buckets),
         };
-        let source = (account != AccountKind::Local && !none_sent)
+        let source = (account != AccountKind::Local && !none_sent && estimated.is_none())
             .then(|| priced.map(|(_, source)| source.label()))
             .flatten();
         (
@@ -348,9 +353,20 @@ impl Meter for UsageMeter {
         request: &RequestRecord,
         scope: Option<&AgentScope>,
     ) -> RequestCost {
-        let account = AccountKind::of(&request.model, request.local);
+        self.record_request_detailed(request, scope, &RequestDetail::default())
+    }
+
+    fn record_request_detailed(
+        &self,
+        request: &RequestRecord,
+        scope: Option<&AgentScope>,
+        detail: &RequestDetail,
+    ) -> RequestCost {
+        let account = detail
+            .account
+            .unwrap_or_else(|| AccountKind::of(&request.model, request.local));
         let buckets = request.usage.buckets();
-        let (cost, price) = self.cost_of(&request.model, account, &buckets);
+        let (cost, price) = self.cost_of(&request.model, account, &buckets, detail.estimated_usd);
         let record = LedgerRecord {
             v: VERSION,
             t: (self.clock)(),

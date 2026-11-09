@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::{sync::mpsc::UnboundedSender, time::Instant};
 use tokio_util::sync::CancellationToken;
 
+mod delegated;
 mod gates;
 
 use crate::{
@@ -102,6 +103,9 @@ pub struct AgentConfig {
     /// The text of the system prompt that describes how the model edits files, when the prompt
     /// has one: a switch to a model with another edit format replaces it.
     pub edit_section: Option<String>,
+    /// The project's instruction files as harness loaded them, for a model that runs in another
+    /// agent program (which gets them in a file of its own, not in harness's system prompt).
+    pub instructions: Option<String>,
 }
 
 impl AgentConfig {
@@ -124,6 +128,7 @@ impl AgentConfig {
             request: RequestOptions::default(),
             text_tool_calls: false,
             edit_section: None,
+            instructions: None,
         }
     }
 }
@@ -188,6 +193,26 @@ pub enum ApprovalKind {
     /// yes or no, kept with the workspace's trust record, so it is asked once. The request's
     /// `reason` is the question.
     StartServers,
+    /// Whether `claude-code/*` models may run on the user's Claude subscription (through the
+    /// `claude` program the user signed in to) rather than on an API key. The request's `reason`
+    /// is the disclosure and the question. Yes or no.
+    DelegateOptIn,
+    /// Whether a delegated agent may run in `full-access` mode in this session: with no approvals
+    /// and no sandbox of its own. Asked once per session. The request's `reason` is the question.
+    DelegateFullAccess,
+}
+
+impl ApprovalKind {
+    /// Whether the approval is a plain question (yes, or no with no reason asked for) rather than
+    /// a request to run an action.
+    pub fn is_question(self) -> bool {
+        matches!(
+            self,
+            ApprovalKind::StartServers
+                | ApprovalKind::DelegateOptIn
+                | ApprovalKind::DelegateFullAccess
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +498,8 @@ pub struct Agent {
     child_records: Option<crate::agents::AgentRecords>,
     /// Where the model the agent answers with now is published, for children to be built from.
     model_cell: Option<crate::agents::ParentModel>,
+    /// Whether the user confirmed `full-access` for delegated agents in this session.
+    full_access_confirmed: bool,
 }
 
 impl Agent {
@@ -544,6 +571,7 @@ impl Agent {
             keep_tool_log: false,
             child_records: None,
             model_cell: None,
+            full_access_confirmed: false,
         }
     }
 
@@ -1652,11 +1680,14 @@ impl Agent {
         let _ = events.send(AgentEvent::TurnStarted);
         self.message_recorded = false;
         let content = self.user_message(input.parts, events).await;
+        let delegate = self.active_delegate();
+        let task = delegate.as_ref().map(|_| content.clone());
         let plan = input.plan.clone();
         let attribution = self.turn_handoff.map(|handoff| Attribution {
             role: Role::Build,
             switch_reason: None,
             handoff: Some(handoff),
+            delegate: None,
         });
         self.turn_entry = self.record_entry(
             Message::User { content },
@@ -1672,6 +1703,10 @@ impl Agent {
         }
         if cancel.is_cancelled() {
             return self.finish(TurnEndReason::Interrupted, events);
+        }
+        // A model that runs in another agent program does not go through the request loop.
+        if let (Some(delegate), Some(task)) = (delegate, task) {
+            return self.delegated_turn(delegate, task, events, cancel).await;
         }
 
         let mut auto_compaction_failed = false;
@@ -2722,6 +2757,7 @@ impl Agent {
             role: self.turn_role,
             switch_reason: self.turn_reason,
             handoff: None,
+            delegate: None,
         };
         self.record_entry(message, None, false, None, Some(attribution));
     }

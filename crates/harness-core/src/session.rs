@@ -161,7 +161,7 @@ impl EntryKind {
 
 /// Which role an assistant message was written for, and why its model is not the one that role is
 /// configured to use; for a Build message, its hand-off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attribution {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +169,24 @@ pub struct Attribution {
     /// On the message that asks to build a plan: how the turn got the conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<Handoff>,
+    /// On an assistant message written by an external agent program: which one, and its own
+    /// session, so the next turn can continue it. A harness that does not know the field ignores
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate: Option<Box<DelegateMark>>,
+}
+
+/// An external agent's session, as recorded on the assistant message it wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateMark {
+    /// `<provider>/<model>` it answered as.
+    pub model: String,
+    /// Its own id for the session.
+    pub session: String,
+    /// Its running cost total for the session so far, an estimate in millionths of a US dollar
+    /// (the baseline of the next turn's cost).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_total_micros: Option<u64>,
 }
 
 /// What a rewind restores.
@@ -509,6 +527,45 @@ impl Session {
     /// Warnings about saving the session (such as a file that cannot be locked), each once.
     pub fn take_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.warnings)
+    }
+
+    /// The external agent session the next turn on `model` may continue: the one named on the last
+    /// assistant message of the active branch, when that message was written by `model` and the
+    /// file has no rewind after it (a rewind restores files the child's context still assumes
+    /// are changed).
+    pub fn delegate_resume(&self, model: &str) -> Option<DelegateMark> {
+        let branch = self.branch();
+        let last = branch.iter().rev().find(|entry| {
+            matches!(
+                &entry.kind,
+                EntryKind::Message {
+                    message: Message::Assistant { .. },
+                    ..
+                }
+            )
+        })?;
+        let EntryKind::Message {
+            attribution:
+                Some(Attribution {
+                    delegate: Some(mark),
+                    ..
+                }),
+            ..
+        } = &last.kind
+        else {
+            return None;
+        };
+        if mark.model != model {
+            return None;
+        }
+        let at = *self.index.get(&last.id)?;
+        let rewound = self.entries[at + 1..].iter().any(|entry| {
+            matches!(
+                entry.kind,
+                EntryKind::Rewind { .. } | EntryKind::UndoRewind { .. }
+            )
+        });
+        (!rewound).then(|| (**mark).clone())
     }
 
     /// The entries from the session's first line to the leaf.

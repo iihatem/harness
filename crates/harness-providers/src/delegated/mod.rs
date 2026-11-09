@@ -37,6 +37,16 @@ pub trait OptInStore: Send + Sync {
     fn set(&self, yes: bool) -> Result<(), String>;
 }
 
+/// What every model of a program shares while a question about it is asked.
+#[derive(Default)]
+pub struct OptInShared {
+    /// Held while the opt-in is asked: children on any model of the program that ask at once ask
+    /// it once, the others take the answer.
+    pub(crate) asking: tokio::sync::Mutex<()>,
+    /// What was answered this session, kept or not.
+    pub(crate) answer: std::sync::Mutex<Option<bool>>,
+}
+
 /// What the registry needs to make a delegated provider, from the configuration and the
 /// credential store.
 #[derive(Clone, Default)]
@@ -51,6 +61,8 @@ pub struct DelegateSettings {
     /// The program to run instead of the one on `PATH`: for tests only (debug builds).
     pub claude_binary: Option<PathBuf>,
     pub codex_binary: Option<PathBuf>,
+    /// The question's state, shared by every provider made from these settings (clones share it).
+    pub shared: Arc<OptInShared>,
 }
 
 impl std::fmt::Debug for DelegateSettings {

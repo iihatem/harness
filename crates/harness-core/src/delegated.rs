@@ -145,6 +145,12 @@ pub trait ApprovalGate: Send + Sync {
     fn stopped(&self) -> bool {
         false
     }
+
+    /// Resolves when the turn this gate belongs to is cancelled: for a wait that has to end with
+    /// it (never, by default).
+    async fn cancelled(&self) {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// An agent program driven for a whole turn.

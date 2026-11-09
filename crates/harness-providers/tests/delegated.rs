@@ -116,6 +116,8 @@ struct Gate {
     esc: bool,
     /// How long a question waits for its answer.
     delay: Duration,
+    /// Cancels the child this gate belongs to.
+    cancel: CancellationToken,
 }
 
 impl Gate {
@@ -128,6 +130,7 @@ impl Gate {
             yes: Some(true),
             esc: false,
             delay: Duration::ZERO,
+            cancel: CancellationToken::new(),
         }
     }
 }
@@ -147,7 +150,10 @@ impl ApprovalGate for Gate {
         self.yes
     }
     fn stopped(&self) -> bool {
-        self.esc
+        self.esc || self.cancel.is_cancelled()
+    }
+    async fn cancelled(&self) {
+        self.cancel.cancelled().await;
     }
 }
 
@@ -824,4 +830,64 @@ async fn where_nobody_can_be_asked_an_undecided_claude_without_a_key_says_so_up_
         .delegated()
         .unwrap();
     assert!(codex.unusable_unasked().is_none());
+}
+
+#[tokio::test]
+async fn children_on_two_models_of_the_program_ask_the_opt_in_once() {
+    // `claude-code/sonnet` and `claude-code/opus` are two providers made from one set of
+    // settings; asked at once they put one question, and the answer decides both.
+    let settings = DelegateSettings::default();
+    let make = |model: &str| {
+        DelegatedProvider::new("claude-code", model, settings.clone(), Some(api_key()))
+            .unwrap()
+            .delegated()
+            .unwrap()
+    };
+    let (a, b) = (make("sonnet"), make("opus"));
+    let mut gate = Gate::new(GateAnswer::Allow);
+    gate.delay = Duration::from_millis(100);
+    let (first, second) = tokio::join!(a.prepare(&gate), b.prepare(&gate));
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(gate.confirmed.lock().unwrap().len(), 1, "asked twice");
+    assert_eq!(a.account(), AccountKind::Delegated);
+    assert_eq!(b.account(), AccountKind::Delegated);
+}
+
+#[tokio::test]
+async fn a_child_waiting_for_the_question_another_asks_stops_when_it_alone_is_cancelled() {
+    let settings = DelegateSettings::default();
+    let make = |model: &str| {
+        DelegatedProvider::new("claude-code", model, settings.clone(), Some(api_key()))
+            .unwrap()
+            .delegated()
+            .unwrap()
+    };
+    let (holder, waiter) = (make("sonnet"), make("opus"));
+    let mut asking = Gate::new(GateAnswer::Allow);
+    asking.delay = Duration::from_secs(30);
+    let asking = Arc::new(asking);
+    let waiting = Gate::new(GateAnswer::Allow);
+    let cancel = waiting.cancel.clone();
+    let first = {
+        let asking = asking.clone();
+        tokio::spawn(async move { holder.prepare(&*asking).await })
+    };
+    // The holder's question is put; the other child waits behind it.
+    while asking.confirmed.lock().unwrap().is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let second = tokio::spawn(async move { waiter.prepare(&waiting).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!second.is_finished(), "it waits behind the question");
+    cancel.cancel();
+    let ended = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("the waiting child stopped when it alone was cancelled")
+        .unwrap();
+    assert!(ended.is_err());
+    // The question of the first is still open, and asked once.
+    assert!(!first.is_finished());
+    assert_eq!(asking.confirmed.lock().unwrap().len(), 1);
+    first.abort();
 }

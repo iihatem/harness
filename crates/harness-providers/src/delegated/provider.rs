@@ -49,9 +49,6 @@ struct Inner {
     unasked: AtomicBool,
     /// Why the answer to the question could not be kept, said at the next run.
     unkept: Mutex<Option<String>>,
-    /// Held while the opt-in is asked: children running at once ask it once, the others take the
-    /// answer.
-    asking: tokio::sync::Mutex<()>,
 }
 
 /// A model that runs in `claude` or `codex`.
@@ -102,7 +99,6 @@ impl DelegatedProvider {
                 said: AtomicBool::new(false),
                 unasked: AtomicBool::new(false),
                 unkept: Mutex::new(None),
-                asking: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -224,9 +220,31 @@ impl DelegateTurns for Inner {
     }
 
     async fn prepare(&self, gate: &dyn ApprovalGate) -> Result<(), String> {
-        let _asking = self.asking.lock().await;
+        let undecided = matches!(
+            &*self.auth.lock().expect("auth lock"),
+            Auth::Undecided { .. }
+        );
+        // One question at a time for the whole program, whatever model a child is on; a child
+        // that waits for it ends when it is cancelled, whoever holds the question.
+        let _asking = if undecided {
+            let shared = &self.settings.shared;
+            tokio::select! {
+                asking = shared.asking.lock() => Some(asking),
+                () = gate.cancelled() => {
+                    return Err("stopped while waiting for the question about your Claude subscription".into());
+                }
+            }
+        } else {
+            None
+        };
         // An answer given since this model was made (by another child) decides.
-        if let Some(yes) = self.settings.store.as_ref().and_then(|store| store.get()) {
+        let answered = self
+            .settings
+            .store
+            .as_ref()
+            .and_then(|store| store.get())
+            .or(*self.settings.shared.answer.lock().expect("answer lock"));
+        if let Some(yes) = answered {
             let mut auth = self.auth.lock().expect("auth lock");
             if let Auth::Undecided { key } = &*auth {
                 *auth = optin::claude_auth(Some(yes), key.clone());
@@ -243,6 +261,7 @@ impl DelegateTurns for Inner {
         let mut auth = self.auth.lock().expect("auth lock");
         match answer {
             Some(yes) => {
+                *self.settings.shared.answer.lock().expect("answer lock") = Some(yes);
                 if let Some(store) = &self.settings.store {
                     // An answer that cannot be kept is still used for this session, and the
                     // run says it was not kept.

@@ -7,7 +7,7 @@ use harness_delegate::{
     BackendKind,
     models::{self, ListOptions},
 };
-use harness_providers::delegated::{CLAUDE_CODE, CODEX, DelegateSettings, OptInStore};
+use harness_providers::delegated::{CLAUDE_CODE, CODEX, DelegateSettings, OptInShared, OptInStore};
 
 use crate::setup::Setup;
 
@@ -61,8 +61,24 @@ pub fn settings(setup: &Setup) -> DelegateSettings {
             .or_else(|| store.get()),
         store: Some(store),
         allow_untested: setup.config.delegate.allow_untested,
+        // One question for every model of the program in this run: `keys()` makes settings each
+        // time, so the shared state is kept by where the answer is kept.
+        shared: shared_for(&setup.paths.data_dir),
         ..DelegateSettings::default()
     }
+}
+
+/// The state of the Claude question for the answers kept in `data_dir`.
+fn shared_for(data_dir: &std::path::Path) -> Arc<OptInShared> {
+    static SHARED: std::sync::Mutex<Vec<(PathBuf, Arc<OptInShared>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut all = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, shared)) = all.iter().find(|(dir, _)| dir == data_dir) {
+        return shared.clone();
+    }
+    let shared = Arc::new(OptInShared::default());
+    all.push((data_dir.to_path_buf(), shared.clone()));
+    shared
 }
 
 /// The delegated models that can be used now, as ids, and why the ones that cannot are missing

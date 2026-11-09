@@ -186,6 +186,10 @@ impl ApprovalGate for AgentGate {
     fn stopped(&self) -> bool {
         self.cancel.is_cancelled() || self.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    async fn cancelled(&self) {
+        self.cancel.cancelled().await;
+    }
 }
 
 /// The earlier conversation as text, newest messages kept when it is long. `None` when nothing

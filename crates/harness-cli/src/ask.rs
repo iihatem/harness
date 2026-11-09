@@ -8,6 +8,7 @@ use std::{
 use harness_config::config;
 use harness_core::{
     agent::NonInteractive,
+    agents::{AgentEnvelope, AgentId},
     event::{AgentEvent, TurnEndReason},
     permission::Mode,
     redact::{EventRedactor, Redactor},
@@ -165,6 +166,9 @@ pub async fn run(
 
     let (tx, rx) = mpsc::unbounded_channel();
     let rx = with_credential_warnings(rx, setup.credentials.clone());
+    // The main agent's events, and those of any child a supervisor runs, reach the renderer in
+    // one stream of envelopes.
+    let (envelopes, rx) = wrap_main(rx);
     let renderer = tokio::spawn(render(
         rx,
         json,
@@ -175,6 +179,7 @@ pub async fn run(
     ));
     let reason = agent.run_turn(turn, &tx, cancel).await;
     drop(tx);
+    drop(envelopes);
     let (final_text, blocked) = renderer.await.unwrap_or_default();
     if !json && !final_text.is_empty() {
         // A closed stdout pipe must not panic (and so must not lose `blocked`/the exit code). The
@@ -315,6 +320,25 @@ async fn with_piped_stdin(
     }
 }
 
+/// Wraps the main agent's events as envelopes, in a stream children's envelopes can join through
+/// the returned sender. The stream ends when both the main agent's events and every clone of the
+/// sender are gone.
+fn wrap_main(
+    mut events: mpsc::UnboundedReceiver<AgentEvent>,
+) -> (
+    mpsc::UnboundedSender<AgentEnvelope>,
+    mpsc::UnboundedReceiver<AgentEnvelope>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let out = tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let _ = out.send(AgentEnvelope::main(event));
+        }
+    });
+    (tx, rx)
+}
+
 /// How often what the credential store warns about is looked for while no event comes.
 const CREDENTIAL_WARNINGS_EVERY: Duration = Duration::from_millis(250);
 
@@ -382,7 +406,7 @@ fn open_log(
 /// `stdout_broken` and cancels the run so it stops promptly, but keeps draining events (so `blocked`
 /// is still tracked correctly) until the channel closes.
 async fn render(
-    mut rx: mpsc::UnboundedReceiver<AgentEvent>,
+    mut rx: mpsc::UnboundedReceiver<AgentEnvelope>,
     json: bool,
     cancel: CancellationToken,
     redactor: Arc<Redactor>,
@@ -398,7 +422,9 @@ async fn render(
             );
         }
     }
-    let mut events = EventRedactor::new(redactor.clone());
+    // One redactor for each agent: streamed text of agents that run at once does not mix.
+    let mut redactors: std::collections::HashMap<Option<AgentId>, EventRedactor> =
+        std::collections::HashMap::new();
     let mut shown = Shown {
         json,
         cancel,
@@ -409,13 +435,19 @@ async fn render(
         writes: std::collections::HashMap::new(),
         stdout_broken: false,
     };
-    while let Some(event) = rx.recv().await {
-        for event in events.push(event) {
-            shown.show(event);
+    while let Some(envelope) = rx.recv().await {
+        let AgentEnvelope { agent, event } = envelope;
+        let redactor = redactors
+            .entry(agent.clone())
+            .or_insert_with(|| EventRedactor::new(shown.redactor.clone()));
+        for event in redactor.push(event) {
+            shown.show(&agent, event);
         }
     }
-    for event in events.finish() {
-        shown.show(event);
+    for (agent, mut redactor) in redactors {
+        for event in redactor.finish() {
+            shown.show(&agent, event);
+        }
     }
     (shown.last_text, shown.blocked)
 }
@@ -434,16 +466,39 @@ struct Shown {
 }
 
 impl Shown {
-    /// Shows `event`, already redacted: as a line of NDJSON and of the log, or on the terminal.
-    fn show(&mut self, event: AgentEvent) {
+    /// Shows `event` of `agent` (`None`: the main agent), already redacted: as a line of NDJSON
+    /// and of the log, or on the terminal. Only the main agent's events decide the answer and the
+    /// exit code: a child's blocked action fails the child, and its parent hears of it.
+    fn show(&mut self, agent: &Option<AgentId>, event: AgentEvent) {
         let json = self.json;
-        let line = serde_json::to_string(&event).expect("events serialize");
+        let envelope = AgentEnvelope {
+            agent: agent.clone(),
+            event,
+        };
+        let line = serde_json::to_string(&envelope).expect("events serialize");
+        let AgentEnvelope { event, .. } = envelope;
         if let Some(file) = self.log.as_mut() {
             let _ = writeln!(file, "{line}");
         }
         if json && !self.stdout_broken && writeln!(std::io::stdout().lock(), "{line}").is_err() {
             self.stdout_broken = true;
             self.cancel.cancel();
+        }
+        if let Some(agent) = agent {
+            if !json {
+                match &event {
+                    AgentEvent::AgentStarted { label, model } => eprintln!(
+                        "agent {agent} ({}) started on {}",
+                        terminal_safe(label),
+                        terminal_safe(model)
+                    ),
+                    AgentEvent::AgentFinished { status, .. } => {
+                        eprintln!("agent {agent} {}", status.as_str())
+                    }
+                    _ => {}
+                }
+            }
+            return;
         }
         match &event {
             AgentEvent::AssistantMessage { content, .. } if !content.is_empty() => {
@@ -639,6 +694,62 @@ mod tests {
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&state.path().join("logs")), 0o700);
         assert_eq!(mode(&path), 0o600);
+    }
+
+    async fn rendered(envelopes: Vec<AgentEnvelope>) -> (String, bool) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for envelope in envelopes {
+            tx.send(envelope).unwrap();
+        }
+        drop(tx);
+        render(
+            rx,
+            false,
+            CancellationToken::new(),
+            Arc::new(Redactor::default()),
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    fn assistant(content: &str) -> AgentEvent {
+        AgentEvent::AssistantMessage {
+            content: content.into(),
+            model: "m/x".into(),
+            role: harness_core::role::Role::Main,
+            switch_reason: None,
+        }
+    }
+
+    // M3a: a child's events do not decide the answer or the exit code.
+    #[tokio::test]
+    async fn a_childs_blocked_action_and_text_do_not_change_the_mains_result() {
+        let child = AgentId("a1".into());
+        let (text, blocked) = rendered(vec![
+            AgentEnvelope::main(assistant("main answer")),
+            AgentEnvelope::child(&child, assistant("child answer")),
+            AgentEnvelope::child(
+                &child,
+                AgentEvent::ActionBlocked {
+                    id: "c".into(),
+                    reason: "needs approval".into(),
+                },
+            ),
+        ])
+        .await;
+        assert_eq!(text, "main answer");
+        assert!(!blocked, "exit 3 is for the main agent's blocked actions");
+    }
+
+    #[tokio::test]
+    async fn the_mains_blocked_action_still_counts() {
+        let (_, blocked) = rendered(vec![AgentEnvelope::main(AgentEvent::ActionBlocked {
+            id: "c".into(),
+            reason: "r".into(),
+        })])
+        .await;
+        assert!(blocked);
     }
 
     #[test]

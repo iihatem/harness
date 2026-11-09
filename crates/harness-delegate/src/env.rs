@@ -3,10 +3,7 @@
 //! in the environment never silently bills an account the user believes is a subscription (or
 //! the reverse), and no other provider's key reaches a program that talks to a different one.
 
-use std::{
-    ffi::{OsStr, OsString},
-    fmt,
-};
+use std::{ffi::OsString, fmt};
 
 use crate::BackendKind;
 
@@ -57,25 +54,28 @@ const FOREIGN: [&str; 14] = [
     "HF_TOKEN",
 ];
 
-const CLAUDE_OWN: [&str; 6] = [
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-];
-
-const CODEX_OWN: [&str; 3] = ["OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"];
-
-/// The variables `kind`'s child must not inherit: its own credential and routing variables (set
-/// again from `auth` where the mode says so) and the other agent's.
-fn removed(kind: BackendKind) -> impl Iterator<Item = &'static str> {
-    let (own, other): (&[&str], &[&str]) = match kind {
-        BackendKind::Claude => (&CLAUDE_OWN, &CODEX_OWN),
-        BackendKind::Codex => (&CODEX_OWN, &CLAUDE_OWN),
-    };
-    own.iter().chain(other).chain(FOREIGN.iter()).copied()
+/// Whether `kind`'s child must not inherit `name`: a credential, a route to another provider or
+/// account, or a variable of the other agent. Matched by prefix as well as by name, so a variable
+/// a newer release reads is covered before this list knows it (a deny-list by pattern, not an
+/// allow-list: a child needs the user's proxy, certificate, `git` and `ssh` settings, which no
+/// fixed list could name). harness may itself run inside Claude Code, whose environment holds
+/// `ANTHROPIC_BASE_URL`, `CLAUDECODE` and many `CLAUDE_CODE_*` names: none of them may steer a
+/// delegate.
+fn is_removed(name: &str) -> bool {
+    if FOREIGN.contains(&name) {
+        return true;
+    }
+    let claude_side = name.starts_with("ANTHROPIC_")
+        || name.starts_with("CLAUDE_CODE_")
+        || name == "CLAUDECODE"
+        || name == "AWS_BEARER_TOKEN_BEDROCK";
+    // The user's own Codex settings (where its home is, a certificate), not credentials.
+    let codex_settings = ["CODEX_HOME", "CODEX_SQLITE_HOME", "CODEX_CA_CERTIFICATE"];
+    let codex_side = name.starts_with("OPENAI_")
+        || (name.starts_with("CODEX_") && !codex_settings.contains(&name));
+    // Both agents' variables go from both children: each child loses its own credentials (set
+    // again from `auth` where the mode says so) and the other agent's.
+    claude_side || codex_side
 }
 
 /// The environment for `kind`'s child: `parent` without the variables above, plus the key for
@@ -86,10 +86,9 @@ pub fn child_env(
     auth: &AuthMode,
     parent: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
-    let gone: Vec<&str> = removed(kind).collect();
     let mut env: Vec<(OsString, OsString)> = parent
         .into_iter()
-        .filter(|(name, _)| !gone.iter().any(|g| OsStr::new(g) == name.as_os_str()))
+        .filter(|(name, _)| !name.to_str().is_some_and(|n| is_removed(n)))
         .collect();
     if let AuthMode::ApiKey(key) = auth {
         let name = match kind {

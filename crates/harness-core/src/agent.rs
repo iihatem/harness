@@ -465,6 +465,12 @@ pub struct Agent {
     /// The plan the user approved, while the Build turn that implements it runs: a compaction
     /// summarizes around it and keeps it as written.
     turn_plan: Option<String>,
+    /// What the tools called since the log was last taken did, for a child's report.
+    tool_log: crate::agents::ToolLog,
+    /// Whether `tool_log` is kept: only an agent whose log is taken keeps it.
+    keep_tool_log: bool,
+    /// Records of child agents to save in the session, from the supervisor.
+    child_records: Option<crate::agents::AgentRecords>,
 }
 
 impl Agent {
@@ -532,6 +538,85 @@ impl Agent {
             escalation: EscalationState::default(),
             handoff_stash: None,
             turn_plan: None,
+            tool_log: crate::agents::ToolLog::default(),
+            keep_tool_log: false,
+            child_records: None,
+        }
+    }
+
+    /// Saves the records of child agents that `records` holds in the session, beside the
+    /// conversation, at the end of each tool call and each turn.
+    pub fn with_child_records(mut self, records: crate::agents::AgentRecords) -> Self {
+        self.child_records = Some(records);
+        self
+    }
+
+    /// Starts keeping the tool log, for [`take_tool_log`](Self::take_tool_log). An agent that
+    /// does not keep it (the main agent) holds nothing for its calls.
+    pub fn keep_tool_log(&mut self) {
+        self.keep_tool_log = true;
+    }
+
+    /// What the tools called since this was last taken did: how many calls, which files they
+    /// changed, which commands ran. A child's report is made from it.
+    pub fn take_tool_log(&mut self) -> crate::agents::ToolLog {
+        std::mem::take(&mut self.tool_log)
+    }
+
+    /// Notes one tool call in the log.
+    fn log_call(&mut self, call: &ToolCall, raw: &ToolOutput) {
+        if !self.keep_tool_log {
+            return;
+        }
+        self.tool_log.calls += 1;
+        if raw.blocked {
+            return;
+        }
+        let Some(tool) = self.tools.get(&call.name) else {
+            return;
+        };
+        let text = if call.arguments.trim().is_empty() {
+            "{}"
+        } else {
+            call.arguments.as_str()
+        };
+        let Ok(args) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        if let Action::Bash(command) = tool.action(&args, &self.ctx) {
+            self.tool_log.commands.push(command);
+        }
+        if !raw.is_error {
+            for path in tool.changed_paths(&args, &self.ctx) {
+                if !self.tool_log.files_changed.contains(&path) {
+                    self.tool_log.files_changed.push(path);
+                }
+            }
+        }
+    }
+
+    /// Saves the child records waiting for the session.
+    fn flush_child_records(&mut self) {
+        let Some(records) = &self.child_records else {
+            return;
+        };
+        for record in records.take() {
+            let text = match record.kind {
+                crate::session::AgentRecordKind::Spawned => {
+                    format!("[agent {} ({}) started]", record.agent, record.label)
+                }
+                crate::session::AgentRecordKind::Reported => {
+                    format!("[agent {} ({}) reported]", record.agent, record.label)
+                }
+            };
+            self.session.append_aside(EntryKind::Message {
+                message: Message::User { content: text },
+                display: None,
+                note: true,
+                plan: None,
+                attribution: None,
+                agent_record: Some(record),
+            });
         }
     }
 
@@ -2595,6 +2680,7 @@ impl Agent {
         events: &UnboundedSender<AgentEvent>,
     ) -> TurnEndReason {
         self.end_handoff();
+        self.flush_child_records();
         for message in self.warnings.drain(..) {
             let _ = events.send(AgentEvent::Warning { message });
         }
@@ -2734,6 +2820,7 @@ impl Agent {
         });
         let invalid_before = self.invalid_calls;
         let raw = self.execute_inner(call, events).await;
+        self.log_call(call, &raw);
         self.watch_for_escalation(call, &raw, invalid_before, events);
         let mut content = limit_output(
             &raw.content,
@@ -2756,6 +2843,7 @@ impl Agent {
             output: output.content.clone(),
             is_error: output.is_error,
         });
+        self.flush_child_records();
         output
     }
 

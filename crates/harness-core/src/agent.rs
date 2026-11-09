@@ -473,6 +473,10 @@ pub struct Agent {
     child_records: Option<crate::agents::AgentRecords>,
     /// Where the model the agent answers with now is published, for children to be built from.
     model_cell: Option<crate::agents::ParentModel>,
+    /// Tools this agent has besides its model's: they stay when a model switch changes the rest.
+    extra_tools: Vec<Arc<dyn Tool>>,
+    /// Counts the user turns run, for [`ToolContext::turn`].
+    turn_serial: u64,
 }
 
 impl Agent {
@@ -544,6 +548,8 @@ impl Agent {
             keep_tool_log: false,
             child_records: None,
             model_cell: None,
+            extra_tools: Vec::new(),
+            turn_serial: 0,
         }
     }
 
@@ -590,10 +596,27 @@ impl Agent {
             request,
             text_tool_calls,
             local,
-            tools: self.tools.clone(),
+            // Without the extra tools: what a child is built from is not given them.
+            tools: self.tools.clone().without(
+                &self
+                    .extra_tools
+                    .iter()
+                    .map(|tool| tool.spec().name)
+                    .collect::<Vec<_>>(),
+            ),
             system_prompt: self.config.system_prompt.clone(),
             edit_section: self.config.edit_section.clone(),
         });
+    }
+
+    /// Offers `tool` besides the model's own tools, through model switches and turns on other
+    /// models. Children made from this agent's model are not given it.
+    pub fn with_extra_tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.extra_tools.push(tool);
+        let tools = self.tools.clone();
+        self.set_tools(tools);
+        self.publish_model();
+        self
     }
 
     /// Saves the records of child agents that `records` holds in the session, beside the
@@ -898,6 +921,10 @@ impl Agent {
     }
 
     fn set_tools(&mut self, tools: ToolRegistry) {
+        let tools = self
+            .extra_tools
+            .iter()
+            .fold(tools, |tools, tool| tools.with(tool.clone()));
         self.validators = validators_of(&tools);
         self.tools = tools;
     }
@@ -1478,6 +1505,8 @@ impl Agent {
     ) -> TurnEndReason {
         let input = input.into();
         self.ctx.cancel = cancel.clone();
+        self.turn_serial += 1;
+        self.ctx.turn = self.turn_serial;
         self.invalid_calls = 0;
         self.stats = Stats::default();
         self.retry_count

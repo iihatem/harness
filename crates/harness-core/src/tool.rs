@@ -109,6 +109,9 @@ pub struct ToolContext {
     pub access: FsAccess,
     /// Set by the agent for a user-approved re-run outside the sandbox.
     pub unsandboxed: bool,
+    /// Which of its user turns the agent is in: the same for every call of a turn, different
+    /// for each turn (a tool that limits what one turn may do counts by it). 0 outside a turn.
+    pub turn: u64,
 }
 
 impl ToolContext {
@@ -122,6 +125,7 @@ impl ToolContext {
             sandbox: None,
             access: FsAccess::WorkspaceWrite,
             unsandboxed: false,
+            turn: 0,
         }
     }
 
@@ -270,5 +274,19 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.iter().find(|t| t.spec().name == name).cloned()
+    }
+
+    /// These tools and `tool` after them; unchanged when one of that name is there already.
+    pub fn with(mut self, tool: Arc<dyn Tool>) -> Self {
+        if self.get(&tool.spec().name).is_none() {
+            self.tools.push(tool);
+        }
+        self
+    }
+
+    /// These tools without the ones named `names`.
+    pub fn without(mut self, names: &[String]) -> Self {
+        self.tools.retain(|t| !names.contains(&t.spec().name));
+        self
     }
 }

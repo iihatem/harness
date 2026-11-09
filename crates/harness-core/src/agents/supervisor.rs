@@ -45,6 +45,10 @@ pub struct AgentSpec {
     pub task: String,
     /// Its system prompt, when it is not the factory's default.
     pub system_prompt: Option<String>,
+    /// Guidance added after its base system prompt (the parent's, as the factory builds it): what
+    /// a definition says of the agent. Unlike `system_prompt`, it keeps the rest of the prompt
+    /// (the edit tool's section, the project's instructions).
+    pub instructions: Option<String>,
     /// The `<provider>/<model>` it runs on, when it is not its parent's or its role's.
     pub model: Option<String>,
     /// The tools it is offered, by name; `None` is all of its parent's.

@@ -57,6 +57,8 @@ struct Factory {
     make: Box<Make>,
     dir: PathBuf,
     specs: Mutex<Vec<AgentSpec>>,
+    /// Models that cannot be used, and why (what the CLI says of a missing program).
+    unusable: Mutex<Vec<(String, String)>>,
 }
 
 #[async_trait]
@@ -65,7 +67,21 @@ impl AgentFactory for Factory {
         Endpoint {
             key: spec.model.clone().unwrap_or_else(|| "mock".into()),
             local: false,
-            delegated: false,
+            delegated: harness_core::agents::is_delegated_model(
+                spec.model.as_deref().unwrap_or_default(),
+            ),
+        }
+    }
+    async fn usable(&self, model: &str) -> Result<(), String> {
+        match self
+            .unusable
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(m, _)| m == model)
+        {
+            Some((_, why)) => Err(why.clone()),
+            None => Ok(()),
         }
     }
     async fn build(&self, setup: ChildSetup) -> Result<Agent, String> {
@@ -120,6 +136,7 @@ fn rig_in(
         make: Box::new(make),
         dir: workspace.clone(),
         specs: Mutex::new(Vec::new()),
+        unusable: Mutex::new(Vec::new()),
     });
     let config = EngineConfig {
         mode,
@@ -909,31 +926,13 @@ async fn an_agent_that_inherits_runs_on_the_parents_model_not_the_background_rol
     assert_eq!(specs[1].model.as_deref(), Some("ollama/small"));
 }
 
-// ---- delegated models (Claude Code and Codex) are not subagent models yet -------------------------
-
-fn refused_for_delegation(out: &ToolOutput, rig: &Rig, model: &str) {
-    assert!(out.is_error, "{}", out.content);
-    assert!(
-        out.content
-            .contains("delegating a sub-task to Claude Code or Codex comes later"),
-        "{}",
-        out.content
-    );
-    assert!(out.content.contains(model), "{}", out.content);
-    assert!(
-        out.content.contains("Nothing was started"),
-        "{}",
-        out.content
-    );
-    assert!(rig.specs().is_empty());
-}
+// ---- Claude Code and Codex as subagent models ------------------------------------------------
 
 #[tokio::test]
-async fn an_entry_naming_a_delegated_model_is_refused_even_when_the_session_runs_on_it() {
+async fn an_entry_may_name_a_delegated_model_the_session_uses() {
     let cell = ParentModel::default();
     let dir = tempfile::tempdir().unwrap();
     let _agent = parent_agent(&cell, RoleConfig::default(), dir.path());
-    // The model is one the session uses (so the model rule alone would allow it).
     let rig = rig(
         defs(),
         in_play_settings(&cell, &["claude-code/sonnet", "codex/gpt"]),
@@ -943,33 +942,57 @@ async fn an_entry_naming_a_delegated_model_is_refused_even_when_the_session_runs
         let out = rig
             .call(
                 1,
-                json!({"agents": [
-                    {"agent": "explore", "task": "a"},
-                    {"agent": "general", "task": "b", "model": model},
-                ]}),
+                json!({"agents": [{"agent": "explore", "task": "look", "model": model}]}),
             )
             .await;
-        refused_for_delegation(&out, &rig, model);
+        assert!(!out.is_error, "{}", out.content);
     }
+    let specs = rig.specs();
+    assert_eq!(specs[0].model.as_deref(), Some("claude-code/sonnet"));
+    assert_eq!(specs[1].model.as_deref(), Some("codex/gpt"));
 }
 
 #[tokio::test]
-async fn a_definition_or_the_background_role_naming_a_delegated_model_refuses_the_call() {
+async fn the_in_play_rule_still_holds_for_a_delegated_model_nobody_uses() {
+    let cell = ParentModel::default();
+    let dir = tempfile::tempdir().unwrap();
+    let _agent = parent_agent(&cell, RoleConfig::default(), dir.path());
+    let rig = rig(defs(), in_play_settings(&cell, &["codex/gpt"]), says("ok"));
+    let out = rig
+        .call(
+            1,
+            json!({"agents": [{"agent": "explore", "task": "a", "model": "claude-code/opus"}]}),
+        )
+        .await;
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("not one this session uses"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("codex/gpt"),
+        "the list now has it: {}",
+        out.content
+    );
+    assert!(rig.specs().is_empty());
+}
+
+#[tokio::test]
+async fn a_definition_or_the_background_role_naming_a_delegated_model_runs_on_it() {
     let pinned = file(
         "pinned",
         Some("codex/gpt"),
-        None,
+        Some(&["read"]),
         DefinitionSource::User("/u/pinned.md".into()),
     );
     let rig_def = rig(Definitions::new(vec![pinned]), settings(10), says("ok"));
     let out = rig_def
-        .call(
-            1,
-            json!({"agents": [entry("explore", "a"), entry("pinned", "b")]}),
-        )
+        .call(1, json!({"agents": [entry("pinned", "b")]}))
         .await;
-    refused_for_delegation(&out, &rig_def, "codex/gpt");
-    // A read-only agent runs on the background role's model: delegated, so refused too.
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(rig_def.specs()[0].model.as_deref(), Some("codex/gpt"));
+    // A read-only agent runs on the background role's model.
     let rig_bg = rig(
         defs(),
         SpawnSettings {
@@ -981,11 +1004,105 @@ async fn a_definition_or_the_background_role_naming_a_delegated_model_refuses_th
     let out = rig_bg
         .call(1, json!({"agents": [entry("explore", "a")]}))
         .await;
-    refused_for_delegation(&out, &rig_bg, "claude-code/haiku");
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        rig_bg.specs()[0].model.as_deref(),
+        Some("claude-code/haiku")
+    );
 }
 
 #[tokio::test]
-async fn an_agent_that_would_run_on_a_delegated_parents_model_is_refused_and_it_is_never_listed() {
+async fn an_agent_whose_tools_could_not_write_runs_read_only_on_a_program() {
+    // `tools: read` cannot narrow Claude Code's or Codex's own tools, but it says the agent is
+    // not meant to change anything: it runs read-only (never wider than its parent).
+    let reader = file(
+        "reader",
+        Some("codex/gpt"),
+        Some(&["read", "grep"]),
+        DefinitionSource::User("/u/reader.md".into()),
+    );
+    let rig = rig(Definitions::new(vec![reader]), settings(10), says("ok"));
+    let out = rig.call(1, json!({"agents": [entry("reader", "a")]})).await;
+    assert!(!out.is_error, "{}", out.content);
+    let spec = &rig.specs()[0];
+    assert_eq!(spec.mode, Some(Mode::ReadOnly));
+    assert!(!spec.isolation);
+    // An in-process agent with the same tools keeps its own mode (None).
+    let plain = file(
+        "plain",
+        None,
+        Some(&["read"]),
+        DefinitionSource::User("/u/p.md".into()),
+    );
+    let rig = rig_in_defs(plain);
+    rig.call(1, json!({"agents": [entry("plain", "a")]})).await;
+    assert_eq!(rig.specs()[0].mode, None);
+}
+
+fn rig_in_defs(def: AgentDefinition) -> Rig {
+    rig(Definitions::new(vec![def]), settings(10), says("ok"))
+}
+
+#[tokio::test]
+async fn an_agent_that_can_edit_on_a_program_needs_a_repository_for_its_worktree() {
+    // This rig has no worktrees: an editing agent on a program is refused before anything starts.
+    let writer = file(
+        "writer",
+        Some("codex/gpt"),
+        None,
+        DefinitionSource::User("/u/writer.md".into()),
+    );
+    let rig = rig(Definitions::new(vec![writer]), settings(10), says("ok"));
+    let out = rig
+        .call(
+            1,
+            json!({"agents": [entry("explore", "a"), entry("writer", "b")]}),
+        )
+        .await;
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("worktree") && out.content.contains("Nothing was started"),
+        "{}",
+        out.content
+    );
+    assert!(rig.specs().is_empty());
+}
+
+#[tokio::test]
+async fn a_delegated_model_that_cannot_be_used_refuses_the_call_with_the_reason() {
+    let pinned = file(
+        "pinned",
+        Some("codex/gpt"),
+        Some(&["read"]),
+        DefinitionSource::User("/u/pinned.md".into()),
+    );
+    let rig = rig(Definitions::new(vec![pinned]), settings(10), says("ok"));
+    rig.factory.unusable.lock().unwrap().push((
+        "codex/gpt".into(),
+        "codex 0.1.0 is outside the tested range".into(),
+    ));
+    let out = rig
+        .call(
+            1,
+            json!({"agents": [entry("explore", "a"), entry("pinned", "b")]}),
+        )
+        .await;
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("codex/gpt") && out.content.contains("outside the tested range"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("Nothing was started"),
+        "{}",
+        out.content
+    );
+    assert!(rig.specs().is_empty());
+}
+
+#[tokio::test]
+async fn a_delegated_parents_model_is_checked_for_an_agent_that_inherits_it() {
     let cell = ParentModel::default();
     let dir = tempfile::tempdir().unwrap();
     let config = AgentConfig::new(
@@ -994,7 +1111,7 @@ async fn an_agent_that_would_run_on_a_delegated_parents_model_is_refused_and_it_
         "p",
         dir.path().join(".spill"),
     );
-    let mut engine = EngineConfig {
+    let engine = EngineConfig {
         mode: Mode::Auto,
         workspace: dir.path().to_path_buf(),
         read_dirs: vec![],
@@ -1002,7 +1119,6 @@ async fn an_agent_that_would_run_on_a_delegated_parents_model_is_refused_and_it_
         sandbox_available: true,
         writes_need_approval: false,
     };
-    engine.sandbox_available = true;
     let _agent = Agent::new(
         MockProvider::new(vec![]),
         ToolRegistry::new(vec![]),
@@ -1012,21 +1128,14 @@ async fn an_agent_that_would_run_on_a_delegated_parents_model_is_refused_and_it_
         ToolContext::new(dir.path()),
     )
     .with_model_cell(cell.clone());
-    let rig = rig(defs(), in_play_settings(&cell, &["ok/model"]), says("ok"));
-    let out = rig
-        .call(1, json!({"agents": [entry("general", "a")]}))
-        .await;
-    refused_for_delegation(&out, &rig, "claude-code/sonnet");
-    // The list of models an entry may name has no delegated one.
-    let out = rig
-        .call(
-            1,
-            json!({"agents": [{"agent": "general", "task": "a", "model": "paid/big"}]}),
-        )
-        .await;
-    assert!(out.content.contains("ok/model"), "{}", out.content);
+    let rig = rig(defs(), in_play_settings(&cell, &[]), says("ok"));
+    rig.factory.unusable.lock().unwrap().push((
+        "claude-code/sonnet".into(),
+        "claude-code is not allowed to use your subscription".into(),
+    ));
+    let out = rig.call(1, json!({"agents": [entry("review", "a")]})).await;
     assert!(
-        !out.content.contains("claude-code/sonnet"),
+        out.is_error && out.content.contains("not allowed"),
         "{}",
         out.content
     );

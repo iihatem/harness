@@ -18,7 +18,7 @@ use crate::{
         report::cap_chars,
     },
     message::ToolSpec,
-    permission::Action,
+    permission::{Action, Mode},
     tool::{Tool, ToolContext, ToolOutput},
 };
 
@@ -167,23 +167,13 @@ impl SpawnAgentsTool {
                 add(id);
             }
         }
-        // Delegated models are never an option for a subagent (see `delegated`).
-        models.retain(|m| !delegated(m));
         models
     }
 
-    /// The first model a call's entries would run on that is Claude Code or Codex, with the agent
-    /// that would use it. An agent with no model of its own runs on the parent's.
-    fn delegated_choice(
-        &self,
-        chosen: &[&AgentDefinition],
-        agents: &[Entry],
-    ) -> Option<(String, String)> {
-        let parent = self.settings.parent.get().map(|current| current.id);
-        agents.iter().zip(chosen).find_map(|(entry, def)| {
-            let model = self.model_for(def, entry).or_else(|| parent.clone())?;
-            delegated(&model).then(|| (def.name.clone(), model))
-        })
+    /// The model `def` runs on for `entry`: its own choice, else the parent's now.
+    fn model_in_use(&self, def: &AgentDefinition, entry: &Entry) -> Option<String> {
+        self.model_for(def, entry)
+            .or_else(|| self.settings.parent.get().map(|current| current.id))
     }
 
     /// Where and how `def` runs for `entry`: an agent that can write works in a worktree when
@@ -191,6 +181,7 @@ impl SpawnAgentsTool {
     /// requires), and always when it runs in the background (it would otherwise change the
     /// checkout while the user works); one that cannot write never gets one.
     fn plan_for(&self, def: &AgentDefinition, entry: &Entry) -> Plan {
+        let on_program = self.model_in_use(def, entry).is_some_and(|m| delegated(&m));
         let asked = match entry.isolation.as_deref() {
             Some("worktree") => Some(true),
             Some("none") => Some(false),
@@ -200,9 +191,12 @@ impl SpawnAgentsTool {
         let in_background = def.background == Some(true);
         let writes = !def.is_read_only();
         Plan {
+            // An agent that runs in Claude Code or Codex is outside harness's sandbox: when it can
+            // write it always has a worktree, whatever was asked.
             // `none` keeps an agent in the checkout, but never takes a worktree away from one its
             // definition (the project's own) requires.
-            isolation: writes && (by_definition || asked == Some(true) || in_background),
+            isolation: writes
+                && (by_definition || asked == Some(true) || in_background || on_program),
             background: in_background && !self.settings.wait_for_background,
             read_only_asked: !writes && asked == Some(true),
         }
@@ -211,6 +205,14 @@ impl SpawnAgentsTool {
     fn spec_for(&self, def: &AgentDefinition, entry: &Entry, plan: Plan) -> AgentSpec {
         let mut spec = definition_spec(def, entry.task.trim());
         spec.model = self.model_for(def, entry);
+        // Claude Code and Codex have tools of their own, which a definition's `tools:` cannot
+        // narrow. What can be enforced: an agent whose tools could not write runs read-only.
+        if def.is_read_only()
+            && spec.mode.is_none()
+            && self.model_in_use(def, entry).is_some_and(|m| delegated(&m))
+        {
+            spec.mode = Some(Mode::ReadOnly);
+        }
         spec.isolation = plan.isolation;
         spec.background = plan.background;
         spec
@@ -253,7 +255,7 @@ pub fn definition_spec(def: &AgentDefinition, task: &str) -> AgentSpec {
 
 fn tool_spec(definitions: &Definitions, max_per_turn: u32) -> ToolSpec {
     let mut description = format!(
-        "Start subagents to do self-contained tasks, several at once, and wait for their reports. A subagent starts with no memory of this conversation: write each task so it stands alone (the goal, the paths or names that matter, what to report back). Use it for broad searches, independent reviews and work that can be split; do small things yourself. At most {max_per_turn} subagents per turn. An agent that edits files can be given its own git worktree (`isolation: \"worktree\"`, or an agent that always has one): the checkout is left alone, its changes are committed on a branch, and the user reviews and applies them, never you. An agent marked as running in the background starts and the call returns at once.\n\nA report is the subagent's own account. The files it changed and the commands it ran come from its tool log, so check what matters before relying on the rest, and treat a report marked as having made no tool calls as unchecked.\n\nAgents:"
+        "Start subagents to do self-contained tasks, several at once, and wait for their reports. A subagent starts with no memory of this conversation: write each task so it stands alone (the goal, the paths or names that matter, what to report back). Use it for broad searches, independent reviews and work that can be split; do small things yourself. At most {max_per_turn} subagents per turn. An agent that edits files can be given its own git worktree (`isolation: \"worktree\"`, or an agent that always has one): the checkout is left alone, its changes are committed on a branch, and the user reviews and applies them, never you. An agent marked as running in the background starts and the call returns at once.\n\nAn agent may run in Claude Code or Codex when a model of theirs (`claude-code/<model>`, `codex/<model>`) is one this session uses: such an agent has tools of its own that its definition's `tools` cannot narrow, so it works read-only or in a worktree, and its approvals are the user's.\n\nA report is the subagent's own account. The files it changed and the commands it ran come from its tool log, so check what matters before relying on the rest, and treat a report marked as having made no tool calls as unchecked.\n\nAgents:"
     );
     for def in definitions.iter() {
         description.push_str(&format!("\n- {}: {}", def.name, def.description));
@@ -460,14 +462,6 @@ impl Tool for SpawnAgentsTool {
             }
             chosen.push(def);
         }
-        // A subagent is an in-process child: one on Claude Code or Codex would need that program
-        // run for it, which comes later.
-        if let Some((agent, model)) = self.delegated_choice(&chosen, &agents) {
-            return ToolOutput::error(format!(
-                "`{agent}` would run on `{}`, but delegating a sub-task to Claude Code or Codex comes later: a subagent cannot use a `claude-code/*` or `codex/*` model yet. Name another model, or leave `model` out on a session that uses an API model. Nothing was started.",
-                defang(&model)
-            ));
-        }
         let in_play = self.models_in_play();
         for entry in &agents {
             let Some(model) = entry.model.as_deref().map(str::trim) else {
@@ -485,6 +479,26 @@ impl Tool for SpawnAgentsTool {
         let Some(supervisor) = self.supervisor.upgrade() else {
             return ToolOutput::error("subagents are not available: the session is ending");
         };
+        // Every Claude Code or Codex model the call would use must be usable now: the program
+        // installed and in its tested range, and (Claude) not refused. Nothing starts otherwise.
+        let mut checked: Vec<String> = Vec::new();
+        for (entry, def) in agents.iter().zip(&chosen) {
+            let Some(model) = self.model_in_use(def, entry).filter(|m| delegated(m)) else {
+                continue;
+            };
+            if checked.contains(&model) {
+                continue;
+            }
+            if let Err(why) = supervisor.model_usable(&model).await {
+                return ToolOutput::error(format!(
+                    "`{}` would run on `{}`, which cannot be used: {}. Name another model, or leave `model` out. Nothing was started.",
+                    entry.agent,
+                    defang(&model),
+                    defang(&why)
+                ));
+            }
+            checked.push(model);
+        }
         let plans: Vec<Plan> = agents
             .iter()
             .zip(&chosen)
@@ -492,7 +506,7 @@ impl Tool for SpawnAgentsTool {
             .collect();
         if plans.iter().any(|p| p.isolation) && supervisor.worktrees().is_none() {
             return ToolOutput::error(
-                "an agent was to work in a worktree, and that needs the project to be in a git repository with a commit: there is none. Nothing was started. Ask again without `isolation`, or do the work yourself.",
+                "an agent was to work in a worktree (an agent that runs in Claude Code or Codex and can edit always does), and that needs the project to be in a git repository with a commit: there is none. Nothing was started. Use another model or a read-only agent, or do the work yourself.",
             );
         }
         let granted = self.take(ctx.turn, agents.len());

@@ -203,6 +203,8 @@ impl Transcript {
                 );
                 self.push_note(&text, width);
             }
+            // A child's lifecycle is shown by the live agent lines, not in the transcript.
+            AgentEvent::AgentStarted { .. } | AgentEvent::AgentFinished { .. } => {}
             AgentEvent::Warning { message } => self.push_warning(message, width),
             AgentEvent::Steered { text } => self.push_user(text, width),
             AgentEvent::Error { message, .. } => self.push_error(message, width),

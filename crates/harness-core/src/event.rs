@@ -240,4 +240,14 @@ pub enum AgentEvent {
         kind: ErrorKind,
         message: String,
     },
+    /// A child agent started (sent in its own envelope).
+    AgentStarted {
+        label: String,
+        model: String,
+    },
+    /// A child agent ended: `summary` is the start of its report.
+    AgentFinished {
+        status: crate::agents::AgentStatus,
+        summary: String,
+    },
 }

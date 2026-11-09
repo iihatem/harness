@@ -153,6 +153,7 @@ fn request() -> ApprovalRequest {
         reason: "run `cargo test`".into(),
         kind: ApprovalKind::Action,
         kept_for_session: true,
+        agent: None,
     }
 }
 

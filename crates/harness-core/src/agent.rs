@@ -203,6 +203,8 @@ pub struct ApprovalRequest {
     /// Whether approving it for the session would be kept. When it would not (destructive
     /// commands, and others the policy always asks about), such an approval applies once.
     pub kept_for_session: bool,
+    /// The child agent that asks, when it is not the main agent: its id and the name shown for it.
+    pub agent: Option<crate::agents::AgentTag>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2860,6 +2862,7 @@ impl Agent {
                     tool: call.name.clone(),
                     arguments: args.clone(),
                     kept_for_session: self.policy.can_remember(&action),
+                    agent: None,
                     action,
                     reason: reason.clone(),
                     kind: ApprovalKind::Action,
@@ -2987,6 +2990,7 @@ impl Agent {
             reason,
             kind: ApprovalKind::RunUnsandboxed,
             kept_for_session: false,
+            agent: None,
         };
         let Some(decision) = self.ask(&request, events).await else {
             return ToolOutput::error(STOPPED_BEFORE_RUNNING);
@@ -3041,6 +3045,7 @@ impl Agent {
             reason,
             kind: ApprovalKind::RunUnsandboxed,
             kept_for_session: false,
+            agent: None,
         };
         let Some(decision) = self.ask(&request, events).await else {
             return ToolOutput {

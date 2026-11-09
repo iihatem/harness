@@ -196,6 +196,7 @@ fn request(command: &str) -> ApprovalRequest {
         reason: format!("run `{command}`"),
         kind: ApprovalKind::Action,
         kept_for_session: true,
+        agent: None,
     }
 }
 
@@ -1030,6 +1031,7 @@ fn servers_request(dir: &Path) -> ApprovalRequest {
         reason: SERVERS_QUESTION.into(),
         kind: ApprovalKind::StartServers,
         kept_for_session: false,
+        agent: None,
     }
 }
 

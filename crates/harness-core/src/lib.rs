@@ -1,6 +1,7 @@
 //! Core agent runtime for harness: provider-neutral messages, events, permissions, and the agent loop.
 
 pub mod agent;
+pub mod agents;
 pub mod checkpoint;
 pub mod compaction;
 pub mod diag;

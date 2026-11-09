@@ -206,3 +206,20 @@ fn a_build_from_before_m3a_reads_parent_and_child_files_without_skipping_a_line(
     assert!(matches!(header.kind, EntryKind::Session { version: 2, .. }));
     let _ = (&parent, &child);
 }
+
+#[test]
+fn an_m2_build_reads_a_record_that_ends_the_file_as_a_note_on_the_branch() {
+    // Documented, not hidden: a build before M3a takes the last entry of a file as the leaf, so a
+    // record flushed at the end of a turn is, to it, a note (`[agent a1 (x) reported]`) after the
+    // conversation. It parses, it is a note, and nothing else changes.
+    let dir = tempfile::tempdir().unwrap();
+    let mut parent = Session::create(dir.path(), Path::new("/w"));
+    user(&mut parent, "build it");
+    parent.append_aside(record(AgentRecordKind::Reported));
+    let text = std::fs::read_to_string(parent.path().unwrap()).unwrap();
+    let m2_leaf: m2::Entry = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert!(
+        matches!(m2_leaf.kind, m2::EntryKind::Message { note: true, .. }),
+        "{m2_leaf:?}"
+    );
+}

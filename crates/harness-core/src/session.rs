@@ -68,8 +68,9 @@ pub enum EntryKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attribution: Option<Attribution>,
         /// Set on a record of a child agent kept beside the conversation (see
-        /// [`Session::append_aside`]). A harness that does not know the field reads it as a note
-        /// that is on no branch.
+        /// [`Session::append_aside`]). A harness that does not know the field reads it as the
+        /// note it also is (`[agent a1 (x) reported]`, a user message): harmless, but on the
+        /// branch of a build before M3a if it is the last entry of the file.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_record: Option<AgentRecord>,
     },

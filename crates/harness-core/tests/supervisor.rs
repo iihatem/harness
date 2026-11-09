@@ -938,3 +938,159 @@ async fn ending_a_child_never_ends_the_sandbox_session_its_parent_and_siblings_s
 
 #[allow(dead_code)]
 fn unused(_: PathBuf) {}
+
+// ---- a child that panics, is cancelled while it starts, or waits for an answer ---------------
+
+#[tokio::test]
+async fn a_child_that_panics_ends_failed_and_its_parent_hears_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let factory = factory(|_| panic!("the factory broke"));
+    let p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
+    let (sup, mut rx) = supervisor(factory, p.ctx);
+    let report = wait(sup.spawn(spec("x"))).await;
+    assert_eq!(report.status, AgentStatus::Failed);
+    assert!(report.error.unwrap().contains("crashed"));
+    // The registry no longer says it works, the lifecycle ends, and the record is kept.
+    assert_eq!(statuses(&sup), vec![AgentStatus::Failed]);
+    assert!(!sup.cancel(&AgentId("a1".into())));
+    assert!(matches!(
+        drain(&mut rx).last().map(|e| &e.event),
+        Some(AgentEvent::AgentFinished {
+            status: AgentStatus::Failed,
+            ..
+        })
+    ));
+    assert!(
+        sup.records()
+            .take()
+            .iter()
+            .any(|r| { matches!(r.kind, harness_core::session::AgentRecordKind::Reported) })
+    );
+}
+
+/// A factory whose children never finish being built.
+struct Never;
+
+#[async_trait]
+impl AgentFactory for Never {
+    fn endpoint(&self, _spec: &AgentSpec) -> Endpoint {
+        Endpoint {
+            key: "mock".into(),
+            local: true,
+        }
+    }
+    async fn build(&self, _setup: ChildSetup) -> Result<Agent, String> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_child_that_is_still_being_built_ends_it_and_frees_its_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let sup = Supervisor::new(Limits::default(), Arc::new(Never), p.ctx, tx);
+    let handle = sup.spawn(spec("slow"));
+    until("it is being built", || {
+        statuses(&sup) == vec![AgentStatus::Working]
+    })
+    .await;
+    assert!(sup.cancel(&handle.tag.id));
+    assert_eq!(wait(handle).await.status, AgentStatus::Cancelled);
+    // Its place on the one local server is free: the next child is not left waiting.
+    let next = sup.spawn(spec("next"));
+    until("the next one has its place", || {
+        statuses(&sup)[1] == AgentStatus::Working
+    })
+    .await;
+    sup.cancel_all();
+    wait(next).await;
+}
+
+#[tokio::test]
+async fn cancelling_the_parent_while_a_child_waits_for_an_approval_ends_it_and_drops_the_question()
+{
+    struct Forever {
+        asked: Notify,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    struct OnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    #[async_trait]
+    impl Approver for Forever {
+        async fn decide(&self, _r: &ApprovalRequest) -> ApprovalDecision {
+            let _guard = OnDrop(self.dropped.clone());
+            self.asked.notify_one();
+            std::future::pending().await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let approver = Arc::new(Forever {
+        asked: Notify::new(),
+        dropped: Arc::default(),
+    });
+    let factory = scripted(
+        dir.path(),
+        vec![vec![put("c1", "f.txt"), Script::text("ok")]],
+    );
+    let p = parent(dir.path(), Mode::Ask, approver.clone());
+    let cancel = p.ctx.cancel.clone();
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    let handle = sup.spawn(spec("writer"));
+    approver.asked.notified().await;
+    assert_eq!(statuses(&sup), vec![AgentStatus::NeedsInput]);
+    cancel.cancel();
+    let report = wait(handle).await;
+    assert_eq!(report.status, AgentStatus::Cancelled);
+    assert!(approver.dropped.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!dir.path().join("f.txt").exists());
+}
+
+#[tokio::test]
+async fn a_budget_stop_ends_a_child_as_failed_and_says_which_budget() {
+    use harness_core::meter::{BudgetKind, BudgetNotice};
+    #[derive(Default)]
+    struct Stopped {
+        asked: Mutex<Vec<String>>,
+    }
+    impl Meter for Stopped {
+        fn record_request(&self, _r: &RequestRecord) -> RequestCost {
+            RequestCost {
+                account: AccountKind::ApiKey,
+                billed_usd: Some(0.0),
+                list_usd: Some(0.0),
+                avoided: harness_core::meter::Avoided::NotApplicable,
+            }
+        }
+        fn check_budget(&self, session: &str, _a: AccountKind) -> BudgetStatus {
+            self.asked.lock().unwrap().push(session.into());
+            BudgetStatus {
+                stop: Some(BudgetNotice {
+                    budget: BudgetKind::Session,
+                    spent_usd: 1.0,
+                    limit_usd: 1.0,
+                }),
+                ..BudgetStatus::default()
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![Script::text("never sent")]);
+    let seen = provider.clone();
+    let d = dir.path().to_path_buf();
+    let factory = factory(move |setup| Ok(child_agent(setup, provider.clone(), &d)));
+    let meter = Arc::new(Stopped::default());
+    let mut p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
+    p.ctx.meter = Some(meter.clone());
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    let report = wait(sup.spawn(spec("spender"))).await;
+    assert_eq!(report.status, AgentStatus::Failed);
+    assert!(report.error.unwrap().contains("budget"));
+    // The request was not sent, and the question was about the parent's session.
+    assert!(seen.requests().is_empty());
+    assert_eq!(*meter.asked.lock().unwrap(), vec!["parent-session"]);
+}

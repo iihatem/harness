@@ -315,8 +315,33 @@ impl Supervisor {
         let (done, report) = watch::channel(None);
         let inner = self.inner.clone();
         let task_tag = tag.clone();
+        let workspace = spec.workspace.resolve(&lock(&self.inner.parent).workspace);
+        let task = tokio::spawn(run_child(inner.clone(), task_tag.clone(), spec, cancel));
+        // A child that panics still ends: the registry says so, and its parent hears of it.
         tokio::spawn(async move {
-            let report = run_child(inner, task_tag, spec, cancel).await;
+            let report = match task.await {
+                Ok(report) => report,
+                Err(why) => {
+                    let mut report = AgentReport::build(
+                        task_tag.id.as_str(),
+                        &task_tag.label,
+                        AgentStatus::Failed,
+                        "",
+                        &ToolLog::default(),
+                        &workspace,
+                    );
+                    report.error = Some(if why.is_panic() {
+                        "the agent crashed".into()
+                    } else {
+                        "the agent was stopped".into()
+                    });
+                    if inner.status(&task_tag.id).is_some_and(|s| !s.is_final()) {
+                        finish_child(&inner, &task_tag, report, None)
+                    } else {
+                        report
+                    }
+                }
+            };
             let _ = done.send(Some(report));
         });
         AgentHandle { tag, report }
@@ -330,6 +355,33 @@ struct Seen {
     error: Option<String>,
 }
 
+/// Ends a child: its status, its `AgentFinished` event and the record its parent keeps.
+fn finish_child(
+    inner: &Inner,
+    tag: &AgentTag,
+    mut report: AgentReport,
+    session: Option<String>,
+) -> AgentReport {
+    let id = &tag.id;
+    report.session = session.clone();
+    inner.update(id, |info| info.status = report.status);
+    let _ = inner.events.send(AgentEnvelope::child(
+        id,
+        AgentEvent::AgentFinished {
+            status: report.status,
+            summary: crate::agents::report::cap_chars(&report.summary, 200).0,
+        },
+    ));
+    inner.records.push(AgentRecord {
+        agent: id.to_string(),
+        label: tag.label.clone(),
+        kind: AgentRecordKind::Reported,
+        session,
+        report: serde_json::to_value(&report).ok(),
+    });
+    report
+}
+
 async fn run_child(
     inner: Arc<Inner>,
     tag: AgentTag,
@@ -338,24 +390,8 @@ async fn run_child(
 ) -> AgentReport {
     let parent = lock(&inner.parent).clone();
     let id = tag.id.clone();
-    let finish = |inner: &Inner, mut report: AgentReport, session: Option<String>| {
-        report.session = session.clone();
-        inner.update(&id, |info| info.status = report.status);
-        let _ = inner.events.send(AgentEnvelope::child(
-            &id,
-            AgentEvent::AgentFinished {
-                status: report.status,
-                summary: crate::agents::report::cap_chars(&report.summary, 200).0,
-            },
-        ));
-        inner.records.push(AgentRecord {
-            agent: id.to_string(),
-            label: tag.label.clone(),
-            kind: AgentRecordKind::Reported,
-            session,
-            report: serde_json::to_value(&report).ok(),
-        });
-        report
+    let finish = |inner: &Inner, report: AgentReport, session: Option<String>| {
+        finish_child(inner, &tag, report, session)
     };
     let workspace = spec.workspace.resolve(&parent.workspace);
     let empty = |status, error: Option<String>| {
@@ -430,9 +466,10 @@ async fn run_child(
         session: Some(session_id.clone()),
         report: None,
     });
-    let built = inner
-        .factory
-        .build(ChildSetup {
+    // Cancelled while it is being built (a model's server may take a while to answer): it ends
+    // here, and its place is free again.
+    let built = tokio::select! {
+        built = inner.factory.build(ChildSetup {
             tag: tag.clone(),
             spec: spec.clone(),
             policy,
@@ -440,8 +477,16 @@ async fn run_child(
             approver,
             meter,
             session,
-        })
-        .await;
+        }) => built,
+        _ = cancel.cancelled() => {
+            drop(permit);
+            return finish(
+                &inner,
+                empty(AgentStatus::Cancelled, Some("cancelled while it started".into())),
+                Some(session_id),
+            );
+        }
+    };
     let mut agent = match built {
         Ok(agent) => agent,
         Err(why) => {

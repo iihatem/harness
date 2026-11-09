@@ -112,6 +112,8 @@ struct Gate {
     seen: Mutex<Vec<GateRequest>>,
     confirmed: Mutex<Vec<(ApprovalKind, String)>>,
     yes: Option<bool>,
+    /// Whether a `None` answer is the user's Esc.
+    esc: bool,
 }
 
 impl Gate {
@@ -122,6 +124,7 @@ impl Gate {
             seen: Mutex::new(Vec::new()),
             confirmed: Mutex::new(Vec::new()),
             yes: Some(true),
+            esc: false,
         }
     }
 }
@@ -138,6 +141,9 @@ impl ApprovalGate for Gate {
     async fn confirm(&self, kind: ApprovalKind, question: String) -> Option<bool> {
         self.confirmed.lock().unwrap().push((kind, question));
         self.yes
+    }
+    fn stopped(&self) -> bool {
+        self.esc
     }
 }
 
@@ -312,7 +318,7 @@ async fn a_missing_program_ends_the_turn_with_why() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::Error { message, .. } if !message.is_empty()))
+            .any(|e| matches!(e, AgentEvent::Error { message, .. } if message.starts_with("claude-code cannot be used: ")))
     );
 }
 
@@ -383,6 +389,40 @@ fn files_and_reads_map_to_the_engines_actions() {
         panic!()
     };
     assert_eq!(r.actions, [Action::Bash("ls".into())]);
+}
+
+#[test]
+fn a_codex_grant_root_is_checked_as_a_write_too_and_named_in_the_reason() {
+    let change = approval(
+        "file_change",
+        DelegateApprovalKind::FileChange {
+            paths: vec!["src/a.rs".into()],
+        },
+        json!({"paths": ["src/a.rs"], "grantRoot": "/etc"}),
+    );
+    let Step::Ask(r) = approve::map(BackendKind::Codex, &change, Path::new("/w"), Mode::Ask) else {
+        panic!()
+    };
+    assert_eq!(
+        r.actions,
+        [
+            Action::Write("/w/src/a.rs".into()),
+            Action::Write("/etc".into())
+        ]
+    );
+    assert!(r.reason.contains("/etc"), "{}", r.reason);
+    // No grant root, as in every recorded request: nothing is added.
+    let plain = approval(
+        "file_change",
+        DelegateApprovalKind::FileChange {
+            paths: vec!["src/a.rs".into()],
+        },
+        json!({"paths": ["src/a.rs"], "grantRoot": null}),
+    );
+    let Step::Ask(r) = approve::map(BackendKind::Codex, &plain, Path::new("/w"), Mode::Ask) else {
+        panic!()
+    };
+    assert_eq!(r.actions.len(), 1);
 }
 
 #[test]
@@ -601,4 +641,112 @@ mod resolve {
             assert!(!profile.local);
         }
     }
+}
+
+#[tokio::test]
+async fn esc_on_the_opt_in_leaves_it_unanswered_and_the_next_turn_asks_again() {
+    let store = Arc::new(Store::default());
+    let mut gate = Gate::new(GateAnswer::Allow);
+    gate.yes = None;
+    gate.esc = true;
+    let settings = DelegateSettings {
+        store: Some(store.clone()),
+        ..DelegateSettings::default()
+    };
+    // There is a key: Esc must not pick it.
+    let p = DelegatedProvider::new("claude-code", "sonnet", settings, Some(api_key())).unwrap();
+    let delegate = p.delegated().unwrap();
+    assert!(delegate.prepare(&gate).await.is_err());
+    assert_eq!(
+        delegate.account(),
+        AccountKind::Delegated,
+        "no account was chosen"
+    );
+    assert_eq!(store.get(), None);
+    // The second turn asks again, and a "yes" then is used.
+    gate.esc = false;
+    gate.yes = Some(true);
+    delegate.prepare(&gate).await.unwrap();
+    assert_eq!(gate.confirmed.lock().unwrap().len(), 2);
+    assert_eq!(store.get(), Some(true));
+}
+
+#[tokio::test]
+async fn with_nobody_to_ask_the_key_is_used_and_the_run_says_so() {
+    let script = format!("expect user\nemit {INIT}\nemit {ASSISTANT}\nemit {RESULT}\n");
+    let fake = Fake::new(VERSION, &script);
+    let ws = tempfile::tempdir().unwrap();
+    let mut gate = Gate::new(GateAnswer::Allow);
+    gate.yes = None;
+    let p = provider(
+        &fake,
+        Auth::Undecided {
+            key: Some(api_key()),
+        },
+    );
+    p.delegated().unwrap().prepare(&gate).await.unwrap();
+    let (_, events) = run(&p, &gate, turn(ws.path()), CancellationToken::new()).await;
+    let said = events.iter().any(|e| {
+        matches!(e, AgentEvent::Warning { message } if message.contains("nobody could be asked"))
+    });
+    assert!(said, "{events:?}");
+}
+
+#[test]
+fn only_codex_has_usage_windows_to_show() {
+    let claude =
+        DelegatedProvider::new("claude-code", "sonnet", DelegateSettings::default(), None).unwrap();
+    assert!(claude.windows().is_none());
+    let codex =
+        DelegatedProvider::new("codex", "gpt-5", DelegateSettings::default(), None).unwrap();
+    assert!(codex.windows().is_some());
+}
+
+#[tokio::test]
+async fn text_streamed_and_never_closed_into_a_message_is_still_what_the_child_said() {
+    let delta = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an answer"}},"session_id":"sess-9"}"#;
+    let script = format!("expect user\nemit {INIT}\nemit {delta}\nemit {RESULT}\n");
+    let fake = Fake::new(VERSION, &script);
+    let ws = tempfile::tempdir().unwrap();
+    let p = provider(&fake, Auth::Own);
+    let gate = Gate::new(GateAnswer::Allow);
+    let (outcome, _) = run(&p, &gate, turn(ws.path()), CancellationToken::new()).await;
+    assert_eq!(outcome.texts, ["half an answer"]);
+}
+
+#[tokio::test]
+async fn an_answer_that_could_not_be_kept_is_said_not_claimed() {
+    struct Broken;
+    impl OptInStore for Broken {
+        fn get(&self) -> Option<bool> {
+            None
+        }
+        fn set(&self, _yes: bool) -> Result<(), String> {
+            Err("the data directory is read-only".into())
+        }
+    }
+    let script = format!("expect user\nemit {INIT}\nemit {ASSISTANT}\nemit {RESULT}\n");
+    let fake = Fake::new(VERSION, &script);
+    let ws = tempfile::tempdir().unwrap();
+    let p = DelegatedProvider::with_backend(
+        BackendKind::Claude,
+        "sonnet",
+        DelegateSettings {
+            claude_binary: Some(fake.binary.clone()),
+            store: Some(Arc::new(Broken)),
+            ..DelegateSettings::default()
+        },
+        Auth::Undecided { key: None },
+        Arc::new(ClaudeBackend),
+    );
+    let gate = Gate::new(GateAnswer::Allow);
+    p.delegated().unwrap().prepare(&gate).await.unwrap();
+    let (_, events) = run(&p, &gate, turn(ws.path()), CancellationToken::new()).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Warning { message } if message.contains("could not be kept") && message.contains("read-only")
+        )),
+        "{events:?}"
+    );
 }

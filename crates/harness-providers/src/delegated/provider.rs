@@ -45,6 +45,10 @@ struct Inner {
     auth: Mutex<Auth>,
     windows: Mutex<Option<WindowSnapshot>>,
     said: AtomicBool,
+    /// The question about the subscription could not be put to anybody, so the key was used.
+    unasked: AtomicBool,
+    /// Why the answer to the question could not be kept, said at the next run.
+    unkept: Mutex<Option<String>>,
 }
 
 /// A model that runs in `claude` or `codex`.
@@ -93,6 +97,8 @@ impl DelegatedProvider {
                 auth: Mutex::new(auth),
                 windows: Mutex::new(None),
                 said: AtomicBool::new(false),
+                unasked: AtomicBool::new(false),
+                unkept: Mutex::new(None),
             }),
         }
     }
@@ -117,6 +123,10 @@ impl Provider for DelegatedProvider {
     }
 
     fn windows(&self) -> Option<BoxFuture<'static, Result<WindowSnapshot, String>>> {
+        // Claude reports no usage percentages: there is nothing to wait for.
+        if self.inner.kind == BackendKind::Claude {
+            return None;
+        }
         let seen = self.inner.windows.lock().expect("windows lock").clone();
         Some(
             async move {
@@ -149,6 +159,9 @@ impl Inner {
             return;
         }
         let message = match &*self.auth.lock().expect("auth lock") {
+            Auth::Key(_) if self.unasked.load(Ordering::Relaxed) => {
+                "nobody could be asked whether claude-code may use your Claude subscription, so it runs on your Anthropic API key, billed per token and counted by the money budgets (nothing was stored; set [delegate.claude] use_subscription = true in the global config.toml to use the subscription)"
+            }
             Auth::Key(_) => {
                 "claude-code runs on your Anthropic API key, billed per token and counted by the money budgets; to use your Claude subscription instead, set [delegate.claude] use_subscription = true in the global config.toml"
             }
@@ -205,19 +218,27 @@ impl DelegateTurns for Inner {
         match answer {
             Some(yes) => {
                 if let Some(store) = &self.settings.store {
-                    // A answer that cannot be kept is still used for this session.
-                    let _ = store.set(yes);
+                    // An answer that cannot be kept is still used for this session, and the
+                    // run says it was not kept.
+                    if let Err(why) = store.set(yes) {
+                        *self.unkept.lock().expect("unkept lock") = Some(why);
+                    }
                 }
                 *auth = optin::claude_auth(Some(yes), key);
             }
-            // Nobody could answer (a headless run, or Esc): not stored, asked again next time,
-            // and for now the API key if there is one.
+            // Esc: the user answered nothing and the turn ends. The question stays open, and the
+            // next turn asks it again; nothing is stored and no account is chosen.
+            None if gate.stopped() => {
+                return Err("the question about your Claude subscription was left unanswered: it is asked again at the next turn".into());
+            }
+            // Nobody can answer (a headless run): not stored, asked again next time, and for now
+            // the API key if there is one, which is said.
             None => {
                 *auth = match key {
                     Some(key) => Auth::Key(key),
                     None => return Err(optin::NO_ACCOUNT.to_string()),
                 };
-                // Asked again at the next session, not remembered as an answer.
+                self.unasked.store(true, Ordering::Relaxed);
             }
         }
         match &*auth {
@@ -245,6 +266,13 @@ impl DelegateTurns for Inner {
             Err(why) => return fail(why),
         };
         self.say_account(events);
+        if let Some(why) = self.unkept.lock().expect("unkept lock").take() {
+            let _ = events.send(AgentEvent::Warning {
+                message: format!(
+                    "your answer about using your Claude subscription could not be kept ({why}): it applies to this session only, and you are asked again next time"
+                ),
+            });
+        }
         let mut request = StartRequest::new(turn.task.clone(), turn.workspace.clone());
         request.model = Some(self.model.clone());
         request.mode = turn.mode;
@@ -261,11 +289,12 @@ impl DelegateTurns for Inner {
         };
         let mut run = match self.backend.start(request).await {
             Ok(run) => run,
-            Err(e) => return fail(e.to_string()),
+            Err(e) => return fail(format!("{} cannot be used: {e}", self.label())),
         };
 
         let mut outcome = DelegatedOutcome::ended(TurnEndReason::Error);
-        let mut texts_seen = false;
+        // Text streamed and not yet closed into a message.
+        let mut streamed = String::new();
         let mut pending: FuturesUnordered<BoxFuture<'_, (String, Option<GateAnswer>)>> =
             FuturesUnordered::new();
         let mut withdrawn: HashMap<String, CancellationToken> = HashMap::new();
@@ -292,13 +321,14 @@ impl DelegateTurns for Inner {
                             outcome.session_id = Some(session_id);
                         }
                         DelegateEvent::TextDelta { text } => {
+                            streamed.push_str(&text);
                             let _ = events.send(AgentEvent::TextDelta { text });
                         }
                         DelegateEvent::ReasoningDelta { text } => {
                             let _ = events.send(AgentEvent::ReasoningDelta { text });
                         }
                         DelegateEvent::AssistantMessage { content, .. } => {
-                            texts_seen = true;
+                            streamed.clear();
                             let _ = events.send(AgentEvent::AssistantMessage {
                                 content: content.clone(),
                                 model: turn.model_id.clone(),
@@ -395,9 +425,10 @@ impl DelegateTurns for Inner {
                 }
             }
         }
-        // Text the child streamed but never closed into a message still counts as what it said.
-        if !texts_seen {
-            outcome.texts.clear();
+        // Text the child streamed but never closed into a message (an interrupted reply) still
+        // counts as what it said.
+        if !streamed.trim().is_empty() {
+            outcome.texts.push(streamed);
         }
         if outcome.session_id.is_none() {
             outcome.session_id = run.control.session_id();

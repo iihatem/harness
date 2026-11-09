@@ -64,10 +64,17 @@ pub fn map(kind: BackendKind, approval: &DelegateApproval, workspace: &Path, mod
             reason: approval.reason.clone(),
         }),
         DelegateApprovalKind::FileChange { paths } => {
-            let actions: Vec<Action> = paths
+            let mut actions: Vec<Action> = paths
                 .iter()
                 .map(|p| Action::Write(absolute(workspace, p)))
                 .collect();
+            // Codex may ask to write under a wider root than the files: that is checked too,
+            // and the strictest answer decides.
+            let mut reason = approval.reason.clone();
+            if let Some(root) = args["grantRoot"].as_str().filter(|r| !r.is_empty()) {
+                actions.push(Action::Write(absolute(workspace, root)));
+                reason = format!("{reason} (and write access under {root})");
+            }
             // The shapes harness's own `write` and `edit` prompts show a diff for, where the
             // child's call has them.
             let (tool, arguments) = match (approval.tool.as_str(), paths.as_slice()) {
@@ -89,7 +96,7 @@ pub fn map(kind: BackendKind, approval: &DelegateApproval, workspace: &Path, mod
                 tool: tool.into(),
                 arguments,
                 actions,
-                reason: approval.reason.clone(),
+                reason,
             })
         }
         DelegateApprovalKind::Tool => {

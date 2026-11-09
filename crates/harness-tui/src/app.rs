@@ -431,6 +431,10 @@ pub struct App {
     prompts: std::collections::VecDeque<Prompt>,
     /// The child agents the session's supervisor runs, as it last said.
     children: Vec<harness_core::agents::AgentInfo>,
+    /// The children whose result line the transcript has, by id.
+    announced: std::collections::HashSet<String>,
+    /// The agents the model can start, for `/agents`.
+    agent_definitions: Option<harness_core::agents::Definitions>,
     /// When the approval or the plan choice shown starts to take keys.
     arming: Arming,
     /// Whether `arming` is the offer to resume automatically's: it starts afresh when the offer
@@ -531,6 +535,8 @@ impl App {
             window_note: options.window_note,
             prompts: std::collections::VecDeque::new(),
             children: Vec::new(),
+            announced: std::collections::HashSet::new(),
+            agent_definitions: None,
             arming: Arming::default(),
             offer_owns_arming: false,
             pending_mode: None,
@@ -1151,9 +1157,20 @@ impl App {
 
     /// What the supervisor says its child agents are doing now.
     pub fn set_children(&mut self, children: Vec<harness_core::agents::AgentInfo>) {
+        // A child that has ended leaves one line, once.
+        for child in children.iter().filter(|child| child.status.is_final()) {
+            if self.announced.insert(child.tag.id.to_string()) {
+                self.push_note(&crate::agents::result_line(child));
+            }
+        }
         self.children = children;
         // A child that ended takes the question it was asking with it.
         self.prune_prompts();
+    }
+
+    /// The agents the model can start, which `/agents` lists.
+    pub fn set_agent_definitions(&mut self, definitions: harness_core::agents::Definitions) {
+        self.agent_definitions = Some(definitions);
     }
 
     pub fn children(&self) -> &[harness_core::agents::AgentInfo] {
@@ -2071,6 +2088,14 @@ impl App {
                     self.window_note.as_deref(),
                     &theme,
                 );
+                self.transcript.push_lines(lines, width);
+            }
+            "agents" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                let theme = self.theme();
+                let lines =
+                    crate::agents::report(self.agent_definitions.as_ref(), &self.children, &theme);
                 self.transcript.push_lines(lines, width);
             }
             "roles" => {

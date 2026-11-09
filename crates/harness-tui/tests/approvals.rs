@@ -1379,8 +1379,14 @@ async fn a_running_child_has_a_line_with_its_label_status_and_model() {
     assert!(one.contains("grep"), "{one}");
     assert!(line("review").unwrap().contains("needs input"));
     assert!(line("later").unwrap().contains("queued"));
-    // One that has ended is not running any more.
-    assert!(line("finished").is_none(), "{shown:#?}");
+    // One that has ended is not running any more: it has its result line in the transcript, once,
+    // and no line of the live kind.
+    let ended: Vec<&String> = shown.iter().filter(|r| r.contains("finished")).collect();
+    assert_eq!(ended.len(), 1, "{shown:#?}");
+    assert!(
+        ended[0].contains("done") && !ended[0].contains("working"),
+        "{ended:?}"
+    );
     ui.finish().await.unwrap();
 }
 
@@ -1506,7 +1512,16 @@ async fn the_session_follows_a_supervisor() {
     .expect("the line goes")
     .unwrap();
     ui.draw().unwrap();
-    assert!(!screen(&ui).iter().any(|r| r.contains("explore")));
+    // No live line is left: the one row that names it is its result in the transcript.
+    let rows: Vec<String> = screen(&ui)
+        .into_iter()
+        .filter(|r| r.contains("explore"))
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0].contains("done") && !rows[0].contains("working"),
+        "{rows:?}"
+    );
     // Leaving the session cancels the children still running.
     let straggler = sup.spawn(AgentSpec::new("straggler", "look"));
     tokio::time::timeout(

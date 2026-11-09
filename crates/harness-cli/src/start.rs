@@ -104,6 +104,11 @@ impl Started {
 }
 
 impl Started {
+    /// The agents the model may start, for `/agents`.
+    pub fn agent_definitions(&self) -> Arc<harness_core::agents::Definitions> {
+        self.children.subagents.definitions.clone()
+    }
+
     /// The tool that lets the model start subagents under `supervisor`.
     pub fn spawn_tool(
         &self,

@@ -15,7 +15,7 @@ use std::{
 use crate::read::{not_regular, read_regular};
 
 /// The built-in commands and what they do, in `/help` order.
-pub const BUILTINS: [(&str, &str); 15] = [
+pub const BUILTINS: [(&str, &str); 16] = [
     ("help", "List commands"),
     ("model", "Switch the model"),
     ("mode", "Switch the approval mode"),
@@ -27,6 +27,10 @@ pub const BUILTINS: [(&str, &str); 15] = [
     ("usage", "Show token usage per model"),
     ("budget", "Show the budgets, or set this session's"),
     ("roles", "Show the model of each role"),
+    (
+        "agents",
+        "List the subagents the model can start, and those that ran",
+    ),
     ("escalate", "Use the escalation model for the next turn"),
     ("login", "Sign in to a provider"),
     ("init", "Draft an AGENTS.md for this project"),

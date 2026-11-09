@@ -40,6 +40,8 @@ fn record(
         ms: 100,
         outcome: "ok".into(),
         window: None,
+        agent: None,
+        parent: None,
     }
 }
 

@@ -43,6 +43,12 @@ pub struct LedgerRecord {
     pub outcome: String,
     /// The id of the subscription window snapshot seen with the request, when there is one.
     pub window: Option<String>,
+    /// The child agent that made the request; absent for the main agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The session of the agent that spawned `agent`: its budgets pay for the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// `YYYY-MM` of a time in seconds since the epoch: the month whose file a record goes in.

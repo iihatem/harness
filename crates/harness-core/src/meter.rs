@@ -316,10 +316,35 @@ pub struct TurnRecord {
     pub handoff: Option<HandoffRecord>,
 }
 
+/// A child agent as the ledger names it: its id, and the session of the agent that spawned it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentScope {
+    pub agent: String,
+    /// The parent's session: the one whose budgets the child's spend counts towards.
+    pub parent: String,
+}
+
 /// Where the runtime reports what each model request took. Implemented by `harness-usage`.
 pub trait Meter: Send + Sync {
     /// Records `request`, and says what it cost.
     fn record_request(&self, request: &RequestRecord) -> RequestCost;
+
+    /// Records `request` made by the child agent `scope` names (`None`: the main agent). A meter
+    /// that does not keep who made a request records it as any other.
+    fn record_request_as(
+        &self,
+        request: &RequestRecord,
+        scope: Option<&AgentScope>,
+    ) -> RequestCost {
+        let _ = scope;
+        self.record_request(request)
+    }
+
+    /// Records a finished turn of the child agent `scope` names (`None`: the main agent).
+    fn record_turn_as(&self, turn: &TurnRecord, scope: Option<&AgentScope>) {
+        let _ = scope;
+        self.record_turn(turn)
+    }
 
     /// Asked before each model request in `session`, which `account` pays for: whether a money
     /// budget allows it. A reached budget refuses only an `ApiKey` request. The meter says each

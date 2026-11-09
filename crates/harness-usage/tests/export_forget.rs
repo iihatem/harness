@@ -33,6 +33,8 @@ fn record(t: u64, model: &str) -> LedgerRecord {
         ms: 7,
         outcome: "ok".into(),
         window: None,
+        agent: None,
+        parent: None,
     }
 }
 

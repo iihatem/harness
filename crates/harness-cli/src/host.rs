@@ -425,6 +425,8 @@ pub mod tests {
                 ms: 1,
                 outcome: "ok".into(),
                 window: None,
+                agent: None,
+                parent: None,
             })
             .unwrap();
         let report = host.usage_report("provider").await.join("\n");

@@ -8,8 +8,8 @@ use std::{
 use harness_core::{
     message::Buckets,
     meter::{
-        AccountKind, Avoided, BudgetKind, BudgetNotice, BudgetStatus, Meter, RequestCost,
-        RequestRecord, TurnRecord, WindowSnapshot,
+        AccountKind, AgentScope, Avoided, BudgetKind, BudgetNotice, BudgetStatus, Meter,
+        RequestCost, RequestRecord, TurnRecord, WindowSnapshot,
     },
     time::civil_date,
     time::now_unix,
@@ -309,6 +309,32 @@ impl UsageMeter {
 
 impl Meter for UsageMeter {
     fn record_request(&self, request: &RequestRecord) -> RequestCost {
+        self.record_request_as(request, None)
+    }
+
+    fn record_turn_as(&self, turn: &TurnRecord, scope: Option<&AgentScope>) {
+        if !self.outcomes_enabled {
+            return;
+        }
+        let mut record = OutcomeRecord::of(turn, &self.project);
+        record.agent = scope.map(|s| s.agent.clone());
+        record.parent = scope.map(|s| s.parent.clone());
+        if let Err(e) = self.outcomes.append(&record) {
+            self.warn(
+                "outcomes",
+                format!(
+                    "cannot write the outcome log in {}: {e}",
+                    self.dirs.outcomes.display()
+                ),
+            );
+        }
+    }
+
+    fn record_request_as(
+        &self,
+        request: &RequestRecord,
+        scope: Option<&AgentScope>,
+    ) -> RequestCost {
         let account = AccountKind::of(&request.model, request.local);
         let buckets = request.usage.buckets();
         let (cost, price) = self.cost_of(&request.model, account, &buckets);
@@ -337,12 +363,16 @@ impl Meter for UsageMeter {
                 .unwrap_or_else(|e| e.into_inner())
                 .0
                 .take(),
+            agent: scope.map(|s| s.agent.clone()),
+            parent: scope.map(|s| s.parent.clone()),
         };
         if let Some(usd) = cost.billed_usd.filter(|usd| *usd > 0.0) {
+            // A child's spend is kept under the session that pays for it.
+            let paying = scope.map_or(record.session.clone(), |s| s.parent.clone());
             self.spent_here
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push((record.t, record.session.clone(), usd));
+                .push((record.t, paying, usd));
         }
         if let Err(e) = self.ledger.append(&record) {
             self.warn(
@@ -383,19 +413,7 @@ impl Meter for UsageMeter {
     }
 
     fn record_turn(&self, turn: &TurnRecord) {
-        if !self.outcomes_enabled {
-            return;
-        }
-        let record = OutcomeRecord::of(turn, &self.project);
-        if let Err(e) = self.outcomes.append(&record) {
-            self.warn(
-                "outcomes",
-                format!(
-                    "cannot write the outcome log in {}: {e}",
-                    self.dirs.outcomes.display()
-                ),
-            );
-        }
+        self.record_turn_as(turn, None)
     }
 
     fn turns_rewound(&self, session: &str, turns: &[String]) {

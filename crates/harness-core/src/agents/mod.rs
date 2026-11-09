@@ -2,5 +2,7 @@
 //! how they are limited, permitted, supervised and reported.
 
 pub mod identity;
+pub mod meter;
 
 pub use identity::{AgentEnvelope, AgentId, AgentStatus, AgentTag, qualify_call_id};
+pub use meter::ScopedMeter;

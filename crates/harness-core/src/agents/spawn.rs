@@ -441,6 +441,19 @@ impl Tool for SpawnAgentsTool {
         Action::Read(ctx.workspace.clone())
     }
 
+    /// An agent that can write and works in the checkout (not in a worktree of its own) changes
+    /// what a rewind of this turn must restore.
+    fn changes_workspace(&self, args: &Value) -> bool {
+        let Ok(Args { agents }) = serde_json::from_value::<Args>(args.clone()) else {
+            return false;
+        };
+        agents.iter().any(|entry| {
+            self.definitions
+                .get(&entry.agent)
+                .is_some_and(|def| !def.is_read_only() && !self.plan_for(def, entry).isolation)
+        })
+    }
+
     async fn run(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let Args { agents } = match serde_json::from_value(args) {
             Ok(args) => args,

@@ -171,6 +171,12 @@ pub trait Tool: Send + Sync {
     fn changed_paths(&self, _args: &Value, _ctx: &ToolContext) -> Vec<PathBuf> {
         Vec::new()
     }
+    /// Whether running this call may change the workspace through something other than its own
+    /// action (a tool that starts agents which edit the checkout it works in): the turn's
+    /// checkpoint is taken before it runs, so a rewind restores what they changed.
+    fn changes_workspace(&self, _args: &Value) -> bool {
+        false
+    }
 }
 
 /// What a [`CommandGuard`] did around one command, for the tool output.

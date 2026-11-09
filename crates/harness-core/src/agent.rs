@@ -3072,7 +3072,8 @@ impl Agent {
         if actions.is_empty() {
             actions.push(tool.action(&args, &self.ctx));
         }
-        let mutating = actions.iter().any(|a| self.is_mutating(a));
+        let mutating = actions.iter().any(|a| self.is_mutating(a))
+            || (self.ctx.access == FsAccess::WorkspaceWrite && tool.changes_workspace(&args));
         let mut checked: Vec<(Action, Decision)> = actions
             .into_iter()
             .map(|a| {

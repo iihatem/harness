@@ -38,21 +38,64 @@ impl std::fmt::Debug for CurrentModel {
     }
 }
 
+/// The models the roles other than `main` run on now: the configured ones, with what the session
+/// has switched (`/model --role`) over them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleModels {
+    pub plan: Option<String>,
+    pub build: Option<String>,
+    pub background: Option<String>,
+}
+
+impl RoleModels {
+    /// The ids that are set.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        [&self.plan, &self.build, &self.background]
+            .into_iter()
+            .filter_map(|id| id.as_deref())
+    }
+}
+
 /// Where the parent agent says which model it is on ([`Agent::with_model_cell`]
-/// (crate::agent::Agent::with_model_cell)) and a factory reads it.
+/// (crate::agent::Agent::with_model_cell)) and what its roles run on, and a factory or the tool
+/// that starts subagents reads it.
 #[derive(Clone, Default)]
-pub struct ParentModel(Arc<Mutex<Option<CurrentModel>>>);
+pub struct ParentModel {
+    current: Arc<Mutex<Option<CurrentModel>>>,
+    roles: Arc<Mutex<RoleModels>>,
+}
+
+impl std::fmt::Debug for ParentModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParentModel")
+            .field("current", &self.get())
+            .field("roles", &self.roles())
+            .finish()
+    }
+}
 
 impl ParentModel {
     /// The parent's model now; `None` until the agent has published one.
     pub fn get(&self) -> Option<CurrentModel> {
-        self.0
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// What the parent's roles run on now; nothing set until the agent has published them.
+    pub fn roles(&self) -> RoleModels {
+        self.roles
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
     pub(crate) fn set(&self, model: CurrentModel) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(model);
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(model);
+    }
+
+    pub(crate) fn set_roles(&self, roles: RoleModels) {
+        *self.roles.lock().unwrap_or_else(PoisonError::into_inner) = roles;
     }
 }

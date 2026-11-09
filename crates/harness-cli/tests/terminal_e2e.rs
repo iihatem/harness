@@ -873,3 +873,36 @@ fn a_burst_of_keys_arrives_whole_and_nothing_spins() {
     );
     session.quit();
 }
+
+// M3b review: `/agents` in a real session lists the definitions found for it (the app is given
+// them by the session's wiring, which nothing else exercises), and with `[agents] spawn = false`
+// says that this session cannot start subagents.
+#[test]
+fn agents_lists_the_sessions_definitions_and_says_so_when_spawning_is_off() {
+    for (spawn, expect) in [
+        (true, "Sorts the failing tests"),
+        (false, "cannot start subagents"),
+    ] {
+        let provider = Provider::start(Vec::new());
+        let env = Env::new(&provider);
+        let agents = env.ws.path().join(".harness/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("triage.md"),
+            "---\nname: triage\ndescription: Sorts the failing tests\n---\nLook.\n",
+        )
+        .unwrap();
+        if !spawn {
+            let config = env.home.path().join("config/config.toml");
+            let text = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(&config, format!("{text}\n[agents]\nspawn = false\n")).unwrap();
+        }
+        let mut session = Session::start(&env, Start::default());
+        session.wait_for("mock/test-model · ask", Duration::from_secs(20));
+        session.type_keys(b"/agents");
+        std::thread::sleep(Duration::from_millis(700));
+        session.type_keys(b"\r");
+        session.wait_for(expect, Duration::from_secs(10));
+        session.quit();
+    }
+}

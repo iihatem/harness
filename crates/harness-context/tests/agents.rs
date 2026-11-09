@@ -269,3 +269,132 @@ fn a_long_description_is_one_line_and_cut() {
         description.chars().count()
     );
 }
+
+fn one(base: &Path, front: &str) -> (agents::Found, harness_core::agents::AgentDefinition) {
+    write(
+        &base.join("project/.claude/agents/a.md"),
+        &format!("---\nname: a\ndescription: d\n{front}---\nbody\n"),
+    );
+    let found = discover(base);
+    let def = get(&found, "a").clone();
+    (found, def)
+}
+
+#[test]
+fn model_inherit_means_the_parents_model_and_is_not_a_model_id() {
+    let (_dir, base) = setup();
+    for value in ["inherit", "Inherit", "'inherit'"] {
+        let (found, def) = one(&base, &format!("model: {value}\n"));
+        assert!(found.warnings.is_empty(), "{value}: {:?}", found.warnings);
+        assert_eq!(def.model, None, "{value}");
+        assert!(def.model_inherit, "{value}");
+    }
+    let (_, def) = one(&base, "model: ollama/a\n");
+    assert!(!def.model_inherit);
+}
+
+#[test]
+fn a_claude_alias_is_ignored_with_one_note_and_never_becomes_a_model() {
+    let (_dir, base) = setup();
+    for alias in ["sonnet", "opus", "haiku", "fast", "claude-sonnet-4"] {
+        let (found, def) = one(&base, &format!("model: {alias}\n"));
+        assert_eq!(def.model, None, "{alias}");
+        assert!(!def.model_inherit, "{alias}");
+        assert_eq!(found.warnings.len(), 1, "{alias}: {:?}", found.warnings);
+        assert!(found.warnings[0].contains(alias), "{:?}", found.warnings);
+        assert!(
+            found.warnings[0].contains("<provider>/<model>"),
+            "{:?}",
+            found.warnings
+        );
+    }
+}
+
+#[test]
+fn a_provider_model_is_used_as_written() {
+    let (_dir, base) = setup();
+    let (found, def) = one(&base, "model: anthropic/claude-sonnet-4\n");
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+    assert_eq!(def.model.as_deref(), Some("anthropic/claude-sonnet-4"));
+}
+
+#[test]
+fn an_empty_tools_list_means_no_tools_and_says_so() {
+    let (_dir, base) = setup();
+    for front in ["tools: []\n", "tools:\n"] {
+        let (found, def) = one(&base, front);
+        assert_eq!(def.tools, Some(Vec::new()), "{front}");
+        assert!(
+            found.warnings.iter().any(|w| w.contains("no tools")),
+            "{front}: {:?}",
+            found.warnings
+        );
+    }
+    let (found, def) = one(&base, "");
+    assert_eq!(def.tools, None);
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}
+
+#[test]
+fn control_and_bidi_characters_never_reach_a_description() {
+    let (_dir, base) = setup();
+    write(
+        &base.join("project/.claude/agents/a.md"),
+        "---\nname: a\ndescription: hi \u{1b}]0;pwned\u{7} there \u{202e}fdp.exe\u{2066}x\u{0}\n---\nbody\n",
+    );
+    let found = discover(&base);
+    let def = get(&found, "a");
+    assert!(
+        !def.description.chars().any(|c| c.is_control()
+            || ('\u{202a}'..='\u{202e}').contains(&c)
+            || ('\u{2066}'..='\u{2069}').contains(&c)),
+        "{:?}",
+        def.description
+    );
+    assert!(def.description.contains("hi"), "{:?}", def.description);
+}
+
+#[test]
+fn a_directory_of_hundreds_of_definitions_is_cut_with_a_warning() {
+    let (_dir, base) = setup();
+    for i in 0..80 {
+        write(
+            &base.join(format!("project/.harness/agents/a{i:03}.md")),
+            "---\ndescription: d\n---\nbody\n",
+        );
+    }
+    let found = discover(&base);
+    assert_eq!(found.definitions.len(), 50);
+    assert!(
+        found.warnings.iter().any(|w| w.contains("50")),
+        "{:?}",
+        found.warnings
+    );
+    // The first by name are kept, so what is kept does not depend on the file system's order.
+    assert!(found.definitions.iter().any(|d| d.name == "a000"));
+    assert!(!found.definitions.iter().any(|d| d.name == "a079"));
+}
+
+#[test]
+fn all_directories_together_keep_at_most_a_hundred() {
+    let (_dir, base) = setup();
+    for dir in [
+        "project/.harness/agents",
+        "project/.claude/agents",
+        "config/agents",
+    ] {
+        for i in 0..50 {
+            write(
+                &base.join(format!("{dir}/{}{i:03}.md", dir.len())),
+                "---\ndescription: d\n---\nbody\n",
+            );
+        }
+    }
+    let found = discover(&base);
+    assert_eq!(found.definitions.len(), 100);
+    assert!(
+        found.warnings.iter().any(|w| w.contains("100")),
+        "{:?}",
+        found.warnings
+    );
+}

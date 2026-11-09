@@ -17,6 +17,8 @@ pub struct Subagents {
     /// `[agents] max_spawns_per_turn` and the background role's model. (`max_depth` above 1 is
     /// not offered: a subagent never starts subagents.)
     pub settings: SpawnSettings,
+    /// `[agents] spawn`: whether the main agent is offered the tool at all.
+    pub spawn: bool,
 }
 
 /// Finds the definitions for `setup`'s workspace, warning (once for each file) about what was
@@ -37,14 +39,18 @@ pub fn load(setup: &Setup, notices: &mut Notices) -> Subagents {
         settings: SpawnSettings {
             max_per_turn: limits.max_spawns_per_turn,
             background_model: setup.config.roles.background.clone(),
+            // The session's own model and its roles' are read live from the agent (the session
+            // gives it in `Started::spawn_tool`); the main role's configured model is the one
+            // other model an entry may name.
+            parent: harness_core::agents::ParentModel::default(),
+            also_in_play: setup.config.roles.main.iter().cloned().collect(),
         },
+        spawn: limits.spawn,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use harness_core::agents::DefinitionSource;
 
     use super::load;
@@ -153,6 +159,24 @@ mod tests {
         assert!(messages[0].contains("permissionMode"), "{messages:?}");
     }
 
-    #[allow(dead_code)]
-    fn unused(_: &Path) {}
+    #[test]
+    fn the_main_role_is_a_model_an_entry_may_name_and_spawn_is_on_by_default() {
+        let (_dir, setup) = setup("[roles]\nmain = \"ollama/big\"\n", &[]);
+        let found = load(&setup, &mut notices(&setup));
+        assert_eq!(found.settings.also_in_play, ["ollama/big"]);
+        assert!(found.spawn);
+    }
+
+    #[test]
+    fn spawn_can_be_turned_off_in_the_global_config_and_in_the_project_but_not_on() {
+        let (_dir, global) = setup("[agents]\nspawn = false\n", &[]);
+        assert!(!load(&global, &mut notices(&global)).spawn);
+        let (_dir, project) = setup("", &[(".harness/config.toml", "[agents]\nspawn = false\n")]);
+        assert!(!load(&project, &mut notices(&project)).spawn);
+        let (_dir, cannot) = setup(
+            "[agents]\nspawn = false\n",
+            &[(".harness/config.toml", "[agents]\nspawn = true\n")],
+        );
+        assert!(!load(&cannot, &mut notices(&cannot)).spawn);
+    }
 }

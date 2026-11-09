@@ -239,6 +239,11 @@ async fn two_subagents_run_together_and_their_reports_reach_the_parent() {
         !alpha.contains("\"content\":\"go\""),
         "a child does not see the parent's conversation"
     );
+    // The check above means something only if the parent's own request carries that text.
+    assert!(
+        bodies.iter().any(|b| b.contains("\"content\":\"go\"")),
+        "the parent's prompt is not sent as {{\"content\":\"go\"}}, so the check above is empty"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -270,4 +275,105 @@ async fn a_read_only_agent_runs_on_the_background_role_and_an_editing_one_on_the
     // `alpha` lists only read tools: it is read-only. `beta` lists none: it can edit.
     assert_eq!(model_of("ALPHA-BODY-MARKER"), "small-model");
     assert_eq!(model_of("BETA-BODY-MARKER"), "test-model");
+}
+
+/// Runs `ask --json go` against a server that answers the first request with `reply` and any
+/// request holding a tool result with a final text.
+async fn run_with(
+    config: &str,
+    project_config: Option<&str>,
+    reply: Value,
+) -> (Vec<Value>, Vec<String>) {
+    let server = MockServer::start().await;
+    let url = || path("/v1/chat/completions");
+    Mock::given(method("POST"))
+        .and(url())
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(stream(&[text_chunk("done")]))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(url())
+        .respond_with(stream(&[reply]))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let env = Env::new(&server.uri(), config);
+    if let Some(project) = project_config {
+        std::fs::write(env.ws.path().join(".harness/config.toml"), project).unwrap();
+    }
+    let output = tokio::task::spawn_blocking(move || {
+        env.cmd().args(["ask", "--json", "go"]).output().unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    (events(output.stdout), bodies)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_main_agent_is_offered_the_tool_unless_spawn_is_off_in_the_global_or_project_config() {
+    let reply = text_chunk("hi");
+    let (_, on) = run_with("model = \"mock/test-model\"\n", None, reply.clone()).await;
+    assert!(on[0].contains("spawn_agents"), "{}", on[0]);
+    let (_, global) = run_with(
+        "model = \"mock/test-model\"\n[agents]\nspawn = false\n",
+        None,
+        reply.clone(),
+    )
+    .await;
+    assert!(!global[0].contains("spawn_agents"), "{}", global[0]);
+    let (_, project) = run_with(
+        "model = \"mock/test-model\"\n",
+        Some("[agents]\nspawn = false\n"),
+        reply.clone(),
+    )
+    .await;
+    assert!(!project[0].contains("spawn_agents"), "{}", project[0]);
+    // A project cannot turn it back on.
+    let (_, cannot) = run_with(
+        "model = \"mock/test-model\"\n[agents]\nspawn = false\n",
+        Some("[agents]\nspawn = true\n"),
+        reply,
+    )
+    .await;
+    assert!(!cannot[0].contains("spawn_agents"), "{}", cannot[0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spawn_entry_naming_a_model_nobody_chose_is_refused_with_the_models_it_may_name() {
+    let args = json!({"agents": [
+        {"agent": "alpha", "task": "t", "model": "mock/not-in-play"},
+    ]});
+    let (events, bodies) = run_with(
+        "model = \"mock/test-model\"\n",
+        None,
+        tool_chunk("c1", "spawn_agents", &args.to_string()),
+    )
+    .await;
+    let result = events
+        .iter()
+        .find(|e| e["type"] == "tool_call_finished")
+        .expect("the tool call finished");
+    assert_eq!(result["is_error"], true, "{result}");
+    let output = result["output"].as_str().unwrap();
+    assert!(output.contains("mock/not-in-play"), "{output}");
+    assert!(output.contains("mock/test-model"), "{output}");
+    assert!(
+        !events.iter().any(|e| e["type"] == "agent_started"),
+        "{events:#?}"
+    );
+    assert_eq!(bodies.len(), 2, "no child made a request");
 }

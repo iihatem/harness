@@ -46,6 +46,9 @@ pub struct AgentDefinition {
     pub tools: Option<Vec<String>>,
     /// The `<provider>/<model>` it runs on, when it names one that is used.
     pub model: Option<String>,
+    /// The file says `model: inherit`: the model its parent is on, whatever the agent would
+    /// otherwise default to.
+    pub model_inherit: bool,
     /// Its mode. Never wider than its parent's: a child's permissions are narrowed from them.
     pub mode: Option<Mode>,
     pub max_steps: Option<u32>,
@@ -68,6 +71,7 @@ impl AgentDefinition {
             description: description.into(),
             tools: None,
             model: None,
+            model_inherit: false,
             mode: None,
             max_steps: None,
             isolation: None,
@@ -264,6 +268,19 @@ mod tests {
             all.get("explore").unwrap().source,
             DefinitionSource::User(PathBuf::from("/u/explore.md"))
         );
+    }
+
+    #[test]
+    fn a_project_file_named_explore_replaces_the_read_only_built_in_and_shows_where_it_came_from() {
+        let path = PathBuf::from("/p/.harness/agents/explore.md");
+        let mine = file("explore", DefinitionSource::Project(path.clone()));
+        let all = Definitions::new(vec![mine]);
+        let explore = all.get("explore").unwrap();
+        // It keeps nothing of the built-in's restrictions (its parent's permissions still bound
+        // it), so the listing must say that this is the project's file, not the built-in.
+        assert!(!explore.is_read_only());
+        assert_eq!(explore.source.label(), path.display().to_string());
+        assert_ne!(explore.source.label(), "built-in");
     }
 
     #[test]

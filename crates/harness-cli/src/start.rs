@@ -104,35 +104,47 @@ impl Started {
 }
 
 impl Started {
-    /// The agents the model may start, for `/agents`.
-    pub fn agent_definitions(&self) -> Arc<harness_core::agents::Definitions> {
-        self.children.subagents.definitions.clone()
+    /// The agents the model may start, for `/agents`; none when `[agents] spawn` is off.
+    pub fn agent_definitions(&self) -> Option<Arc<harness_core::agents::Definitions>> {
+        let subagents = &self.children.subagents;
+        subagents.spawn.then(|| subagents.definitions.clone())
     }
 
-    /// The tool that lets the model start subagents under `supervisor`.
+    /// The tool that lets the model start subagents under `supervisor`; none when
+    /// `[agents] spawn` is off. It reads the model and roles of the session's agent as they are.
     pub fn spawn_tool(
         &self,
         supervisor: &Arc<harness_core::agents::Supervisor>,
-    ) -> Arc<dyn harness_core::tool::Tool> {
+    ) -> Option<Arc<dyn harness_core::tool::Tool>> {
         let subagents = &self.children.subagents;
-        harness_core::agents::SpawnAgentsTool::new(
+        if !subagents.spawn {
+            return None;
+        }
+        let settings = harness_core::agents::SpawnSettings {
+            parent: self.children.factory.parent_model(),
+            ..subagents.settings.clone()
+        };
+        let tool: Arc<dyn harness_core::tool::Tool> = harness_core::agents::SpawnAgentsTool::new(
             supervisor,
             subagents.definitions.clone(),
-            subagents.settings.clone(),
-        )
+            settings,
+        );
+        Some(tool)
     }
 }
 
 /// `agent` keeping the records `supervisor` makes of its children in its session, and offering
-/// the model `spawn` (from [`Started::spawn_tool`]) to start them.
+/// the model `spawn` (from [`Started::spawn_tool`]), when there is one, to start them.
 pub fn with_supervisor(
     agent: Agent,
     supervisor: &harness_core::agents::Supervisor,
-    spawn: Arc<dyn harness_core::tool::Tool>,
+    spawn: Option<Arc<dyn harness_core::tool::Tool>>,
 ) -> Agent {
-    agent
-        .with_child_records(supervisor.records())
-        .with_extra_tool(spawn)
+    let agent = agent.with_child_records(supervisor.records());
+    match spawn {
+        Some(spawn) => agent.with_extra_tool(spawn),
+        None => agent,
+    }
 }
 
 /// The model a session starts on when it is not chosen another way: the `--model` flag, then

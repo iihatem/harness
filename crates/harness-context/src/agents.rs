@@ -43,6 +43,11 @@ const WIDENING: [&str; 10] = [
     "approval_policy",
 ];
 
+/// The most definitions read from one directory, and from all of them: each one's name and
+/// description go into the tool description the model is sent with every request.
+const DIR_CAP: usize = 50;
+const TOTAL_CAP: usize = 100;
+
 /// The definitions found, and what went wrong finding them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Found {
@@ -99,6 +104,7 @@ fn read_dir(dir: &Path, confine: Option<&Path>, found: &mut Found) {
     };
     let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
     entries.sort_by_key(|e| e.file_name());
+    let mut from_dir = 0;
     for entry in entries {
         let file_name = entry.file_name().to_string_lossy().into_owned();
         let Some(stem) = file_name.strip_suffix(".md") else {
@@ -162,6 +168,21 @@ fn read_dir(dir: &Path, confine: Option<&Path>, found: &mut Found) {
         };
         let text = String::from_utf8_lossy(&bytes);
         if let Some(def) = definition(&path, stem, &text, source, &mut found.warnings) {
+            if from_dir >= DIR_CAP {
+                found.warnings.push(format!(
+                    "{}: more than {DIR_CAP} definitions; the rest are ignored",
+                    dir.display()
+                ));
+                return;
+            }
+            if found.definitions.len() >= TOTAL_CAP {
+                found.warnings.push(format!(
+                    "more than {TOTAL_CAP} definitions in all; {} and the rest are ignored",
+                    path.display()
+                ));
+                return;
+            }
+            from_dir += 1;
             found.definitions.push(def);
         }
     }
@@ -218,7 +239,13 @@ fn definition(
             })
             .unwrap_or_else(|| "(no description)".into()),
     );
-    let tools = get("tools").filter(|raw| !raw.list.is_empty()).map(|raw| {
+    let tools = get("tools").map(|raw| {
+        if raw.list.is_empty() {
+            warnings.push(format!(
+                "{}: `tools` lists no tools, so the agent gets none; leave the key out for all of its parent's",
+                path.display()
+            ));
+        }
         let (tools, unknown) = normalize_tools(&raw.list);
         if !unknown.is_empty() {
             warnings.push(format!(
@@ -242,11 +269,13 @@ fn definition(
         .and_then(|steps| steps.parse::<u32>().ok())
         .filter(|steps| *steps > 0)
         .map(|steps| steps.min(STEPS_CAP));
+    let (model, model_inherit) = model_of(text_of("model"), path, warnings);
     Some(AgentDefinition {
         name,
         description,
         tools,
-        model: text_of("model"),
+        model,
+        model_inherit,
         mode,
         max_steps,
         isolation: text_of("isolation"),
@@ -257,9 +286,49 @@ fn definition(
     })
 }
 
-/// `text` on one line, cut to [`DESCRIPTION_CAP`] characters.
+/// What a `model:` value means: `inherit` is the parent's model; `<provider>/<model>` is used as
+/// written; anything else (Claude's `sonnet`, `opus`, `haiku`, ...) is not a harness model, and is
+/// ignored with a note, never mapped to a model that costs money.
+fn model_of(
+    value: Option<String>,
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> (Option<String>, bool) {
+    let Some(value) = value else {
+        return (None, false);
+    };
+    if value.eq_ignore_ascii_case("inherit") {
+        return (None, true);
+    }
+    if value.contains('/') && !value.chars().any(is_unsafe) {
+        return (Some(value), false);
+    }
+    warnings.push(format!(
+        "{}: ignored `model: {}`: harness models are `<provider>/<model>` (`inherit` is the parent's), so the agent runs on the default model",
+        path.display(),
+        clean(&value)
+    ));
+    (None, false)
+}
+
+/// Control characters and the bidirectional overrides and isolates.
+fn is_unsafe(c: char) -> bool {
+    c.is_control()
+        || ('\u{200b}'..='\u{200f}').contains(&c)
+        || ('\u{202a}'..='\u{202e}').contains(&c)
+        || ('\u{2066}'..='\u{2069}').contains(&c)
+        || c == '\u{feff}'
+}
+
+/// `text` without the characters a terminal or a reader could be fooled by.
+fn clean(text: &str) -> String {
+    text.chars().filter(|c| !is_unsafe(*c)).collect()
+}
+
+/// `text` on one line, cut to [`DESCRIPTION_CAP`] characters, without control or bidirectional
+/// characters (they would reach the terminal in `/agents` and the model's tool description).
 fn one_line(text: &str) -> String {
-    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let joined = clean(text).split_whitespace().collect::<Vec<_>>().join(" ");
     match joined.char_indices().nth(DESCRIPTION_CAP) {
         Some((end, _)) => format!("{}…", &joined[..end]),
         None => joined,

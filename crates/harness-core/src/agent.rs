@@ -588,6 +588,12 @@ impl Agent {
                     self.config.request.local,
                 ),
             };
+        let role_id = |role| self.roles.get(role).map(|(id, _)| id.clone());
+        cell.set_roles(crate::agents::RoleModels {
+            plan: role_id(Role::Plan),
+            build: role_id(Role::Build),
+            background: role_id(Role::Background),
+        });
         cell.set(crate::agents::CurrentModel {
             provider,
             id,
@@ -737,13 +743,16 @@ impl Agent {
     /// Sets the models of the roles from the configuration.
     pub fn with_roles(mut self, config: RoleConfig) -> Self {
         self.roles = RoleTable::from_config(&config);
+        self.publish_model();
         self
     }
 
     /// Sets the model of `role` for the session, as `/model --role` does: `plan`, `build` or
     /// `background`. `false` for `main`, which `switch_model` changes.
     pub fn set_role_model(&mut self, role: Role, id: &str) -> bool {
-        self.roles.set(role, id)
+        let set = self.roles.set(role, id);
+        self.publish_model();
+        set
     }
 
     /// The model `role` runs on now: its own, or the session's.

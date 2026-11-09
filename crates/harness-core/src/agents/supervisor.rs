@@ -203,17 +203,24 @@ impl AgentHandle {
             }
             if self.report.changed().await.is_err() {
                 // The task ended without a report (the runtime shut down).
-                return AgentReport::build(
-                    self.tag.id.as_str(),
-                    &self.tag.label,
-                    AgentStatus::Failed,
-                    "",
-                    &ToolLog::default(),
-                    std::path::Path::new("/"),
-                );
+                return ended_without_report(&self.tag);
             }
         }
     }
+}
+
+/// The report of a child whose task ended with none: failed, and says so.
+fn ended_without_report(tag: &AgentTag) -> AgentReport {
+    let mut report = AgentReport::build(
+        tag.id.as_str(),
+        &tag.label,
+        AgentStatus::Failed,
+        "",
+        &ToolLog::default(),
+        std::path::Path::new("/"),
+    );
+    report.error = Some("the subagent ended without a report".into());
+    report
 }
 
 impl Supervisor {
@@ -684,5 +691,24 @@ impl Approver for ChildApprover {
             self.cancel.cancel();
         }
         decision
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_child_that_ended_without_a_report_is_failed_and_says_why() {
+        let tag = AgentTag {
+            id: AgentId("a1".into()),
+            label: "explore".into(),
+        };
+        let report = ended_without_report(&tag);
+        assert_eq!(report.status, AgentStatus::Failed);
+        assert_eq!(
+            report.error.as_deref(),
+            Some("the subagent ended without a report")
+        );
     }
 }

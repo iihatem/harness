@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::{
     agents::{
-        AgentDefinition, AgentReport, AgentSpec, Definitions, ReportFlag, Supervisor,
+        AgentDefinition, AgentReport, AgentSpec, Definitions, ParentModel, ReportFlag, Supervisor,
         report::cap_chars,
     },
     message::ToolSpec,
@@ -31,14 +31,23 @@ const PREAMBLE: &str = "You are a subagent: another agent started you to do one 
 /// The longest a task is shown in a refusal.
 const TASK_ECHO: usize = 60;
 
+/// The most characters the reports of one call come to together (each keeps its opening tag and
+/// closing tag whatever is cut).
+const TOTAL_CAP: usize = 36_000;
+
 /// What limits and defaults the tool has.
 #[derive(Debug, Clone)]
 pub struct SpawnSettings {
     /// Subagents one turn of the parent may start.
     pub max_per_turn: u32,
-    /// The model read-only agents run on when nothing names one: the `background` role's, if it
-    /// has one of its own. Without, they run on the parent's.
+    /// The `background` role's model as configured, for read-only agents when nothing names one
+    /// and the parent has not published a live one. Without, they run on the parent's.
     pub background_model: Option<String>,
+    /// Where the parent publishes its current model and its roles' (what a `/model` or
+    /// `/model --role` switch changes), which the tool reads each time it is called.
+    pub parent: ParentModel,
+    /// Models in play that `parent` does not carry: the main role's configured model.
+    pub also_in_play: Vec<String>,
 }
 
 /// Which turn the count is of, and how many were started in it.
@@ -101,10 +110,48 @@ impl SpawnAgentsTool {
             .map(String::from)
             .or_else(|| def.model.clone())
             .or_else(|| {
-                def.is_read_only()
-                    .then(|| self.settings.background_model.clone())
+                (def.is_read_only() && !def.model_inherit)
+                    .then(|| {
+                        self.settings
+                            .parent
+                            .roles()
+                            .background
+                            .or_else(|| self.settings.background_model.clone())
+                    })
                     .flatten()
             })
+    }
+
+    /// The models an entry may name: the parent's current one, those the roles run on now, the
+    /// main role's configured one, and those of the definitions that are used.
+    fn models_in_play(&self) -> Vec<String> {
+        let mut models: Vec<String> = Vec::new();
+        let mut add = |id: &str| {
+            if !id.is_empty() && !models.iter().any(|m| m == id) {
+                models.push(id.to_string());
+            }
+        };
+        if let Some(current) = self.settings.parent.get() {
+            add(&current.id);
+        }
+        let roles = self.settings.parent.roles();
+        for id in roles.ids() {
+            add(id);
+        }
+        if roles.background.is_none()
+            && let Some(id) = &self.settings.background_model
+        {
+            add(id);
+        }
+        for id in &self.settings.also_in_play {
+            add(id);
+        }
+        for def in self.definitions.iter() {
+            if let Some(id) = &def.model {
+                add(id);
+            }
+        }
+        models
     }
 
     fn spec_for(&self, def: &AgentDefinition, entry: &Entry) -> AgentSpec {
@@ -170,9 +217,57 @@ fn tool_spec(definitions: &Definitions, max_per_turn: u32) -> ToolSpec {
     }
 }
 
-/// `text` that cannot end the block it is in.
+/// `text` that cannot end the block it is in, or look like another: `<subagent`, `</subagent` and
+/// `<refused` in any case get a backslash after the `<` (and the `/`).
 fn defang(text: &str) -> String {
-    text.replace("</subagent", "<\\/subagent")
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut done = 0;
+    for (at, _) in text.match_indices('<') {
+        let rest = &bytes[at + 1..];
+        let closing = rest.first() == Some(&b'/');
+        let name = if closing { &rest[1..] } else { rest };
+        let starts = |tag: &str| {
+            name.len() >= tag.len() && name[..tag.len()].eq_ignore_ascii_case(tag.as_bytes())
+        };
+        if starts("subagent") || (!closing && starts("refused")) {
+            out.push_str(&text[done..=at]);
+            out.push('\\');
+            if closing {
+                out.push('/');
+            }
+            done = at + 1 + usize::from(closing);
+        }
+    }
+    out.push_str(&text[done..]);
+    out
+}
+
+/// `blocks` cut so that together they come to at most `TOTAL_CAP` characters: a short block is
+/// kept whole, and what it leaves unused goes to the longer ones.
+fn within_total(blocks: Vec<String>) -> Vec<String> {
+    let mut order: Vec<usize> = (0..blocks.len()).collect();
+    order.sort_by_key(|&i| blocks[i].chars().count());
+    let mut left = TOTAL_CAP;
+    let mut budgets = vec![0; blocks.len()];
+    for (seen, &i) in order.iter().enumerate() {
+        let share = left / (blocks.len() - seen);
+        budgets[i] = blocks[i].chars().count().min(share);
+        left -= budgets[i];
+    }
+    blocks
+        .into_iter()
+        .zip(budgets)
+        .map(|(block, budget)| {
+            if block.chars().count() <= budget {
+                return block;
+            }
+            const END: &str = "\n[the reports of this call were cut for length]\n</subagent>";
+            let keep = budget.saturating_sub(END.chars().count());
+            let (head, _) = cap_chars(&block, keep);
+            format!("{}{END}", head.trim_end_matches('…'))
+        })
+        .collect()
 }
 
 fn money(usd: Option<f64>) -> String {
@@ -270,6 +365,20 @@ impl Tool for SpawnAgentsTool {
             }
             chosen.push(def);
         }
+        let in_play = self.models_in_play();
+        for entry in &agents {
+            let Some(model) = entry.model.as_deref().map(str::trim) else {
+                continue;
+            };
+            if !model.is_empty() && !in_play.iter().any(|m| m == model) {
+                return ToolOutput::error(format!(
+                    "the model `{}` for `{}` is not one this session uses, so it may not be named. The models you may name are: {}. Leave `model` out to use the agent's default. Nothing was started.",
+                    defang(model),
+                    entry.agent,
+                    in_play.join(", ")
+                ));
+            }
+        }
         let Some(supervisor) = self.supervisor.upgrade() else {
             return ToolOutput::error("subagents are not available: the session is ending");
         };
@@ -312,13 +421,20 @@ impl Tool for SpawnAgentsTool {
             out.push_str(&note);
             out.push('\n');
         }
-        for ((report, spec), id) in reports.iter().zip(&ids) {
-            let model = snapshot
-                .iter()
-                .find(|info| &info.tag.id == id)
-                .and_then(|info| info.model.clone());
+        let blocks = reports
+            .iter()
+            .zip(&ids)
+            .map(|((report, spec), id)| {
+                let model = snapshot
+                    .iter()
+                    .find(|info| &info.tag.id == id)
+                    .and_then(|info| info.model.clone());
+                block(report, model.as_deref(), spec)
+            })
+            .collect();
+        for block in within_total(blocks) {
             out.push('\n');
-            out.push_str(&block(report, model.as_deref(), spec));
+            out.push_str(&block);
             out.push('\n');
         }
         for entry in agents.iter().skip(granted) {

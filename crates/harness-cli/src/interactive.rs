@@ -442,7 +442,7 @@ async fn terminal_session(
     pick_session: bool,
     first_run: bool,
     supervisor: Arc<harness_core::agents::Supervisor>,
-    definitions: Arc<harness_core::agents::Definitions>,
+    definitions: Option<Arc<harness_core::agents::Definitions>>,
 ) -> std::io::Result<Ending> {
     // From here on, a hangup or SIGTERM ends the session rather than harness.
     let shutdown = shutdown_signals()?;
@@ -492,7 +492,9 @@ async fn terminal_session(
         .with_redactor(redactor)
         .with_cursor_query(input.cursor_query());
     ui.watch_agents(supervisor);
-    ui.app_mut().set_agent_definitions((*definitions).clone());
+    if let Some(definitions) = definitions {
+        ui.app_mut().set_agent_definitions((*definitions).clone());
+    }
     ui.app_mut().set_write_mode_warning(write_mode_warning);
     if first_run {
         ui.app_mut().set_first_run_model();

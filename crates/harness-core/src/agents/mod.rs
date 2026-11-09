@@ -17,7 +17,7 @@ pub mod workspace;
 pub use definition::{AgentDefinition, DefinitionSource, Definitions, normalize_tools};
 pub use identity::{AgentEnvelope, AgentId, AgentStatus, AgentTag, qualify_call_id};
 pub use meter::ScopedMeter;
-pub use model::{CurrentModel, ParentModel};
+pub use model::{CurrentModel, ParentModel, RoleModels};
 pub use records::AgentRecords;
 pub use report::{AgentReport, ReportFlag, ReportUsage, ToolLog, UsageTally};
 pub use sched::{Endpoint, Limits};

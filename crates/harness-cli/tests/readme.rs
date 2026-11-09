@@ -143,6 +143,17 @@ fn the_readme_documents_subagents() {
         "permissionMode",
         "explore",
         "`[roles] background`",
+        "`model: inherit` means the parent's current model",
+        "`sonnet`",
+        "is ignored with one note",
+        "never turned into a paid API model",
+        "may name only a model already in play",
+        "`[agents] spawn = false`",
+        "`apply_patch`",
+        "`hashline_edit`",
+        "whether or not the directory is trusted",
+        "start a new session",
+        "\"unchecked\"",
     ] {
         assert!(text.contains(word), "the README does not mention {word}");
     }

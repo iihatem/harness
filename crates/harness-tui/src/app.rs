@@ -2094,8 +2094,12 @@ impl App {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
                 let theme = self.theme();
-                let lines =
-                    crate::agents::report(self.agent_definitions.as_ref(), &self.children, &theme);
+                let lines = crate::agents::report(
+                    self.agent_definitions.as_ref(),
+                    &self.children,
+                    &theme,
+                    &|text| self.redacted(text),
+                );
                 self.transcript.push_lines(lines, width);
             }
             "roles" => {

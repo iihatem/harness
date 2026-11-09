@@ -72,6 +72,8 @@ async fn a_child_that_finished_leaves_one_line_with_what_it_found() {
     assert!(line.contains("explore"), "{line}");
     assert!(line.contains("done"), "{line}");
     assert!(line.contains("3 tool calls"), "{line}");
+    // The model it ran on, so a spawn that named another one is seen when it ends.
+    assert!(line.contains("mock/m1"), "{line}");
     assert!(line.contains("The entry point is src/main.rs."), "{line}");
     // Only the first line of its report, on one row.
     assert!(!line.contains("It calls run()"), "{line}");
@@ -125,6 +127,10 @@ async fn a_failed_child_says_why_a_cancelled_one_says_so_and_a_done_without_tool
     );
     assert!(row("a2").contains("cancelled"), "{all:#?}");
     assert!(row("a3").contains("no tool calls"), "{all:#?}");
+    assert!(row("a3").contains("unchecked"), "{all:#?}");
+    // Only a done child with no calls is flagged.
+    assert!(!row("a1").contains("unchecked"), "{all:#?}");
+    assert!(!row("a2").contains("unchecked"), "{all:#?}");
 }
 
 // ---- /agents -------------------------------------------------------------------------------
@@ -206,5 +212,32 @@ async fn with_no_children_agents_says_so() {
         shows(&ui, "No subagents have run in this session"),
         "{:#?}",
         everything(&ui)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_shows_what_a_child_says_with_secrets_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = agent(MockProvider::new(vec![]), dir.path(), Mode::Auto);
+    let mut options = options(dir.path(), Mode::Auto);
+    options.commands = vec![("agents".into(), "List the subagents".into())];
+    let (ui, _) = start(agent, Box::new(NoCommands), options);
+    let redactor = std::sync::Arc::new(harness_core::redact::Redactor::default());
+    redactor.add("sk-leaky-secret-123456");
+    let mut ui = ui.with_redactor(redactor);
+    let mut failed = child("a2", "review", AgentStatus::Failed);
+    failed.error = Some("the server said sk-leaky-secret-123456 is wrong".into());
+    failed.model = Some("sk-leaky-secret-123456/m".into());
+    ui.app_mut().set_agent_definitions(definitions());
+    ui.app_mut().set_children(vec![failed]);
+    send(&mut ui, "/agents");
+    let all = everything(&ui);
+    assert!(
+        all.iter().any(|r| r.contains("a2") && r.contains("failed")),
+        "{all:#?}"
+    );
+    assert!(
+        !all.iter().any(|r| r.contains("sk-leaky-secret")),
+        "{all:#?}"
     );
 }

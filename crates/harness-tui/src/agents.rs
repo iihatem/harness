@@ -9,8 +9,11 @@ use crate::{style::Theme, text::sanitize};
 /// The longest part of a child's report shown on its result line, in characters.
 const SUMMARY_SHOWN: usize = 100;
 
-fn calls(count: u32) -> String {
+/// `count` calls; a child that finished "done" without any is marked as unchecked, since nothing
+/// it says was looked up.
+fn calls(count: u32, status: AgentStatus) -> String {
     match count {
+        0 if status == AgentStatus::Done => "no tool calls (unchecked)".into(),
         0 => "no tool calls".into(),
         1 => "1 tool call".into(),
         n => format!("{n} tool calls"),
@@ -35,8 +38,11 @@ pub fn result_line(child: &AgentInfo) -> String {
         sanitize(&cut(&child.tag.label, 40)),
         child.status.as_str()
     );
+    if let Some(model) = &child.model {
+        line.push_str(&format!(" · {}", sanitize(&cut(model, 40))));
+    }
     if child.status != AgentStatus::Cancelled || child.tool_calls > 0 {
-        line.push_str(&format!(" · {}", calls(child.tool_calls)));
+        line.push_str(&format!(" · {}", calls(child.tool_calls, child.status)));
     }
     let detail = match child.status {
         AgentStatus::Failed => child.error.as_deref(),
@@ -54,7 +60,10 @@ pub fn report(
     definitions: Option<&Definitions>,
     children: &[AgentInfo],
     theme: &Theme,
+    redact: &dyn Fn(&str) -> String,
 ) -> Vec<Line<'static>> {
+    // Everything that came from a file or a model is redacted, then made safe to print.
+    let sanitize = |text: &str| sanitize(&redact(text));
     let mut lines = vec![Line::from(Span::styled(
         "Agents the model can start",
         theme.bold(),
@@ -83,6 +92,8 @@ pub fn report(
                 }
                 if let Some(model) = &def.model {
                     what.push(format!("model {}", sanitize(model)));
+                } else if def.model_inherit {
+                    what.push("model: the parent's".into());
                 }
                 if let Some(steps) = def.max_steps {
                     what.push(format!("{steps} steps at most"));
@@ -125,7 +136,7 @@ pub fn report(
         if let Some(model) = &child.model {
             text.push_str(&format!(" · {}", sanitize(&cut(model, 40))));
         }
-        text.push_str(&format!(" · {}", calls(child.tool_calls)));
+        text.push_str(&format!(" · {}", calls(child.tool_calls, child.status)));
         if child.status == AgentStatus::Failed
             && let Some(error) = &child.error
         {

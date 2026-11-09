@@ -3,26 +3,40 @@
 use std::sync::Arc;
 
 use harness_context::project::{project_key, project_root};
-use harness_core::worktree::{Record, Worktrees};
+use harness_core::worktree::{Record, WorktreeError, Worktrees};
 
 use crate::{setup::Setup, term::terminal_safe};
 
-/// The worktrees of the session's project, kept in `<data>/worktrees/<project>`; `None` when
-/// the workspace is not in a git repository (agents then cannot be isolated).
-pub fn open(setup: &Setup) -> Option<Arc<Worktrees>> {
+/// The worktrees of the session's project, kept in `<data>/worktrees/<project>`; an error when
+/// they cannot be used, and then agents cannot be isolated. `NotARepository` is the plain "no
+/// git repository here"; every other error (git too old or missing, an owner git does not
+/// trust, a setting it could not switch off) is a reason worth showing.
+pub fn open_or_why(setup: &Setup) -> Result<Arc<Worktrees>, WorktreeError> {
     let home = setup
         .paths
         .data_dir
         .join("worktrees")
         .join(project_key(&project_root(&setup.workspace)));
-    Worktrees::new(&setup.workspace, home).ok().map(Arc::new)
+    Worktrees::new(&setup.workspace, home).map(Arc::new)
+}
+
+/// What to tell the user when worktrees cannot be used here for a reason that is not simply
+/// "not a git repository".
+pub fn unavailable_reason(error: &WorktreeError) -> Option<String> {
+    match error {
+        WorktreeError::NotARepository(_) => None,
+        other => Some(other.to_string()),
+    }
 }
 
 /// The worktrees of the current directory's project, or why there are none.
 fn project() -> Result<(Arc<Worktrees>, Setup), String> {
     let setup = crate::setup::load()?;
-    let worktrees = open(&setup).ok_or_else(|| {
-        "this directory is not in a git repository, so harness made no worktrees here".to_string()
+    let worktrees = open_or_why(&setup).map_err(|e| {
+        unavailable_reason(&e).unwrap_or_else(|| {
+            "this directory is not in a git repository, so harness made no worktrees here"
+                .to_string()
+        })
     })?;
     Ok((worktrees, setup))
 }

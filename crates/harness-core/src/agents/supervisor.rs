@@ -189,6 +189,8 @@ struct Inner {
     /// The parent of the background children's tokens: cancelled only by [`Supervisor::stop_all`].
     lifetime: CancellationToken,
     worktrees: Mutex<Option<Arc<Worktrees>>>,
+    /// Why there are no worktrees when that is more than "not a git repository".
+    worktrees_why: Mutex<Option<String>>,
     /// Things the user should be told, which [`Supervisor::take_notices`] hands over once.
     notices: Mutex<Vec<String>>,
 }
@@ -278,6 +280,7 @@ impl Supervisor {
                 records: AgentRecords::default(),
                 lifetime: CancellationToken::new(),
                 worktrees: Mutex::new(None),
+                worktrees_why: Mutex::new(None),
                 notices: Mutex::new(Vec::new()),
             }),
         })
@@ -359,6 +362,13 @@ impl Supervisor {
     /// `worktrees`; without it they fail to start, saying why.
     pub fn set_worktrees(&self, worktrees: Arc<Worktrees>) {
         *lock(&self.inner.worktrees) = Some(worktrees);
+    }
+
+    /// Says why isolated children cannot get worktrees (git too old, an owner git does not
+    /// trust, ...): the user is told once, and a child that asks for one fails with it.
+    pub fn set_worktrees_unavailable(&self, why: String) {
+        lock(&self.inner.notices).push(format!("agents cannot be isolated in worktrees: {why}"));
+        *lock(&self.inner.worktrees_why) = Some(why);
     }
 
     /// The worktrees isolated children are made in, when there are any.
@@ -705,12 +715,16 @@ async fn run_child(
     if isolate {
         spec.isolation = true;
         let Some(wts) = lock(&inner.worktrees).clone() else {
-            let why = if delegated {
-                "could not start: an agent that runs in Claude Code or Codex and can edit works in a worktree, and that needs a git repository with a commit: there is none (a read-only agent needs no worktree)"
+            let mut why = if delegated {
+                "could not start: an agent that runs in Claude Code or Codex and can edit works in a worktree, and that needs a git repository with a commit: there is none (a read-only agent needs no worktree)".to_string()
             } else {
                 "could not start: it asked for a worktree, and isolation needs a git repository"
+                    .to_string()
             };
-            return finish(&inner, empty(AgentStatus::Failed, Some(why.into())), None);
+            if let Some(reason) = lock(&inner.worktrees_why).clone() {
+                why = format!("could not start: it needs a worktree, and {reason}");
+            }
+            return finish(&inner, empty(AgentStatus::Failed, Some(why)), None);
         };
         let (agent, label, task) = (id.to_string(), tag.label.clone(), spec.task.clone());
         let made = {

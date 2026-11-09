@@ -844,6 +844,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_child_that_needs_a_worktree_hears_why_there_is_none() {
+        let f = fixture("", vec![Script::text("done")]);
+        let (mut ctx, _rx, _a) = parent(&f, Mode::FullAccess);
+        ctx.sessions_dir = Some(f.data.join("sessions"));
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let sup = Supervisor::new(Limits::default(), f.factory.clone(), ctx, tx);
+        sup.set_worktrees_unavailable("git is too old for worktrees (2.30.2)".into());
+        assert!(sup.take_notices()[0].contains("2.30.2"));
+        let report = sup.spawn(isolated("writer")).wait().await;
+        assert_eq!(report.status, AgentStatus::Failed, "{report:?}");
+        assert!(report.error.unwrap().contains("2.30.2"));
+    }
+
+    #[tokio::test]
     async fn an_isolated_child_works_in_its_worktree_and_its_commands_know_who_it_is() {
         let f = fixture(
             "",

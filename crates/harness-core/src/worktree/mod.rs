@@ -75,7 +75,17 @@ fn not_a_repository(dir: &str, error: &GitError) -> WorktreeError {
             "git does not trust the owner of the repository at {dir}, so agents cannot be isolated in worktrees there: `git config --global --add safe.directory {dir}` says it is yours"
         ));
     }
-    WorktreeError::NotARepository(dir.to_string())
+    // Anything else is said as it is: a git that is missing or a setting that could not be
+    // switched off is not "not a repository".
+    if error.stderr.contains("not a git repository")
+        || error.code.is_some() && error.stderr.is_empty()
+    {
+        return WorktreeError::NotARepository(dir.to_string());
+    }
+    WorktreeError::Refused(format!(
+        "git could not be used in {dir} ({}), so agents cannot be isolated in worktrees there",
+        error.stderr
+    ))
 }
 
 fn io(context: &str, e: std::io::Error) -> WorktreeError {
@@ -223,6 +233,7 @@ fn base_name(label: &str, task: &str) -> String {
 impl Worktrees {
     /// The worktrees of the repository `dir` is in, kept in `home`.
     pub fn new(dir: &Path, home: PathBuf) -> Result<Worktrees, WorktreeError> {
+        git::check_version().map_err(WorktreeError::Refused)?;
         let shown = dir.display().to_string();
         let probe = Git::open(dir).map_err(|e| not_a_repository(&shown, &e))?;
         let root = probe

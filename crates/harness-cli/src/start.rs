@@ -74,6 +74,8 @@ pub struct ChildKit {
     subagents: crate::subagents::Subagents,
     /// Where agents that ask for isolation get their worktrees; none outside a git repository.
     worktrees: Option<Arc<harness_core::worktree::Worktrees>>,
+    /// Why there are none, when it is not just that the project has no git repository.
+    worktrees_why: Option<String>,
 }
 
 impl Started {
@@ -104,6 +106,8 @@ impl Started {
         );
         if let Some(worktrees) = &kit.worktrees {
             supervisor.set_worktrees(worktrees.clone());
+        } else if let Some(why) = &kit.worktrees_why {
+            supervisor.set_worktrees_unavailable(why.clone());
         }
         supervisor
     }
@@ -363,6 +367,10 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     let diagnostics = crate::lsp::diagnostics(setup, interactive.then(|| approver.clone()));
     let resolver = crate::routes::CliResolver::new(setup.clone());
     let subagents = crate::subagents::load(setup, notices);
+    let (worktrees, worktrees_why) = match crate::worktrees::open_or_why(setup) {
+        Ok(found) => (Some(found), None),
+        Err(e) => (None, crate::worktrees::unavailable_reason(&e)),
+    };
     let children = ChildKit {
         factory: crate::children::CliFactory::new(
             setup.clone(),
@@ -395,7 +403,8 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
             }
         },
         subagents,
-        worktrees: crate::worktrees::open(setup),
+        worktrees,
+        worktrees_why,
     };
     let mut agent = Agent::new(
         resolved.provider,

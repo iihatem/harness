@@ -143,6 +143,53 @@ fn replacement(key: &str) -> Option<&'static str> {
     }
 }
 
+/// The oldest git that honours `GIT_CONFIG_COUNT` (2.31), which every override above relies on:
+/// older git ignores it silently, and repository hooks and a filesystem monitor would run.
+const MIN_GIT: (u32, u32) = (2, 31);
+
+/// `(major, minor)` of the output of `git --version` (`git version 2.39.5 (Apple Git-154)`).
+fn parse_version(text: &str) -> Option<(u32, u32)> {
+    let rest = text.trim().strip_prefix("git version ")?;
+    let mut parts = rest
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .next()?
+        .split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// Asks `program` for its version; an error says why git cannot be used.
+fn probe_version(program: &std::ffi::OsStr) -> Result<(), String> {
+    let output = Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| {
+            format!("git could not be run ({e}), so agents cannot be isolated in worktrees")
+        })?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    match parse_version(&text) {
+        Some(found) if found >= MIN_GIT => Ok(()),
+        Some(_) => Err(format!(
+            "git is too old for worktrees ({}): harness needs git {}.{} or newer to keep a repository's hooks and drivers from running, so no worktree was made or touched",
+            text.trim().trim_start_matches("git version "),
+            MIN_GIT.0,
+            MIN_GIT.1
+        )),
+        None => Err(format!(
+            "could not tell which git this is (`git --version` printed {:?}), so no worktree was made or touched",
+            text.trim()
+        )),
+    }
+}
+
+/// Checks the git on `PATH` once per process.
+pub fn check_version() -> Result<(), String> {
+    static CHECKED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    CHECKED
+        .get_or_init(|| probe_version(std::ffi::OsStr::new("git")))
+        .clone()
+}
+
 /// The (key, value) pairs of `git config --null --get-regexp` output.
 fn parse_listing(text: &str) -> Vec<(String, String)> {
     text.split('\0')
@@ -440,6 +487,18 @@ impl Git {
 mod tests {
     use super::*;
     use crate::worktree::testing::{git as plain, init_repo, marking_script, write};
+
+    #[test]
+    fn versions_are_read_from_what_git_prints() {
+        assert_eq!(parse_version("git version 2.30.2\n"), Some((2, 30)));
+        assert_eq!(
+            parse_version("git version 2.39.5 (Apple Git-154)"),
+            Some((2, 39))
+        );
+        assert_eq!(parse_version("git version 2.31.0.windows.1"), Some((2, 31)));
+        assert_eq!(parse_version("something else"), None);
+        assert!(probe_version(std::ffi::OsStr::new("git")).is_ok());
+    }
 
     fn repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

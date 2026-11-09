@@ -115,6 +115,8 @@ enum Pick {
     Review(String),
     /// Whether to discard the result of this name.
     ConfirmDiscard(String),
+    /// What to do with the agents still running in the background when leaving.
+    QuitWithAgents,
 }
 
 /// How many times the countdown to an automatic resume is armed again when the window still shows
@@ -403,6 +405,8 @@ pub enum Action {
     Login { provider: String, device: bool },
     /// Do something with the result an agent left in its worktree.
     Review(Review),
+    /// Start a background agent on this task, in a worktree of its own.
+    Background(String),
     /// Stop the running turn.
     Interrupt,
     /// Leave harness.
@@ -449,6 +453,12 @@ pub struct App {
     results: Vec<harness_core::worktree::Record>,
     /// A review action (apply, keep, discard, or fetching a diff) is running.
     reviewing: bool,
+    /// How each background agent was when the supervisor last said, to notice when one ends.
+    last_status: std::collections::HashMap<String, harness_core::agents::AgentStatus>,
+    /// The failed agents the user has seen listed.
+    seen_failed: std::collections::HashSet<String>,
+    /// The user chose to wait for the background agents: harness leaves when none runs.
+    quit_when_idle: bool,
     /// When the approval or the plan choice shown starts to take keys.
     arming: Arming,
     /// Whether `arming` is the offer to resume automatically's: it starts afresh when the offer
@@ -553,6 +563,9 @@ impl App {
             agent_definitions: None,
             results: Vec::new(),
             reviewing: false,
+            last_status: std::collections::HashMap::new(),
+            seen_failed: std::collections::HashSet::new(),
+            quit_when_idle: false,
             arming: Arming::default(),
             offer_owns_arming: false,
             pending_mode: None,
@@ -1179,6 +1192,29 @@ impl App {
                 self.push_note(&crate::agents::result_line(child));
             }
         }
+        // A background agent that ended is told to the user, who may be looking elsewhere.
+        for child in children.iter().filter(|child| child.background) {
+            let before = self
+                .last_status
+                .insert(child.tag.id.to_string(), child.status);
+            if child.status.is_final() && !before.is_some_and(|status| status.is_final()) {
+                let what = match child.status {
+                    harness_core::agents::AgentStatus::Done
+                        if child.worktree.as_ref().is_some_and(|w| w.outcome.is_some()) =>
+                    {
+                        "finished: its changes are ready for review (/results)"
+                    }
+                    harness_core::agents::AgentStatus::Done => "finished",
+                    harness_core::agents::AgentStatus::Failed => "failed",
+                    _ => "was stopped",
+                };
+                self.notifications.push(format!(
+                    "{} ({}) {what}",
+                    child.tag.id,
+                    short(&child.tag.label, 40)
+                ));
+            }
+        }
         self.children = children;
         // A child that ended takes the question it was asking with it.
         self.prune_prompts();
@@ -1206,6 +1242,58 @@ impl App {
     /// A review action is running.
     pub fn reviewing(&self) -> bool {
         self.reviewing
+    }
+
+    /// How many background agents have not ended.
+    pub fn live_background(&self) -> usize {
+        self.children
+            .iter()
+            .filter(|child| child.background && !child.status.is_final())
+            .count()
+    }
+
+    /// The user chose to wait for the background agents, and none runs now: harness leaves.
+    pub fn quit_ready(&self) -> bool {
+        self.quit_when_idle && self.live_background() == 0
+    }
+
+    /// The agents the model can start (and `/bg` runs one of).
+    pub fn agent_definitions(&self) -> Option<&harness_core::agents::Definitions> {
+        self.agent_definitions.as_ref()
+    }
+
+    /// Shows `text`, something that did not work, as an error.
+    pub fn push_error(&mut self, text: &str) {
+        let text = self.redacted(text);
+        self.transcript.push_error(&text, self.width);
+    }
+
+    /// `/bg <task>`.
+    fn bg_command(&mut self, args: &str) -> Option<Action> {
+        let width = self.width;
+        let task = args.trim();
+        if task.is_empty() {
+            self.transcript.push_error(
+                "/bg takes the task for the agent, such as /bg fix the failing parser test",
+                width,
+            );
+            return None;
+        }
+        if self.agent_definitions.is_none() {
+            self.transcript.push_error(
+                "this session cannot start agents: [agents] spawn is off in the configuration",
+                width,
+            );
+            return None;
+        }
+        if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
+            self.transcript.push_error(
+                "a background agent edits files, and the session is in plan or read-only mode: switch to ask or auto first",
+                width,
+            );
+            return None;
+        }
+        Some(Action::Background(task.to_string()))
     }
 
     /// `/results [target]`: with a target, that result; alone, the only one waiting, or a choice
@@ -1379,6 +1467,33 @@ impl App {
                 ),
             ]));
         }
+        // A background agent that failed stays until the user has looked (/agents).
+        for child in self.children.iter().filter(|child| {
+            child.background
+                && child.status == AgentStatus::Failed
+                && !self.seen_failed.contains(child.tag.id.as_str())
+                && !self.results.iter().any(|r| {
+                    review::is_ready(r)
+                        && r.agent == child.tag.id.as_str()
+                        && r.label == child.tag.label
+                })
+        }) {
+            let mut spans = vec![
+                Span::styled("◦ ", theme.accent()),
+                Span::styled(
+                    format!("{} {}", child.tag.id, short(&child.tag.label, 40)),
+                    theme.bold(),
+                ),
+                Span::styled(" · failed", theme.warning()),
+            ];
+            if let Some(error) = &child.error {
+                spans.push(Span::styled(
+                    format!(" · {}", short(error, 60)),
+                    theme.dim(),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
         if lines.len() > MAX_CHILD_LINES {
             let hidden = lines.len() - (MAX_CHILD_LINES - 1);
             lines.truncate(MAX_CHILD_LINES - 1);
@@ -1406,6 +1521,21 @@ impl App {
 
     /// Leaves harness: nothing waits for an answer after.
     fn quit(&mut self) -> Option<Action> {
+        let live = self.live_background();
+        if live > 0 {
+            let plural = if live == 1 { "" } else { "s" };
+            let mut picker = Picker::new(
+                &format!("{live} agent{plural} still running in the background"),
+                vec![
+                    Item::new("Stop them and quit", "what they changed is kept for review"),
+                    Item::new("Wait for them to finish, then quit", ""),
+                    Item::new("Keep working", "do not quit"),
+                ],
+            );
+            picker.select(2);
+            self.open_picker(Pick::QuitWithAgents, picker);
+            return None;
+        }
         self.deny_waiting();
         Some(Action::Quit)
     }
@@ -2244,6 +2374,11 @@ impl App {
                 );
                 self.transcript.push_lines(lines, width);
             }
+            "bg" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return self.bg_command(args);
+            }
             "results" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
@@ -2253,6 +2388,9 @@ impl App {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
                 let theme = self.theme();
+                for child in &self.children {
+                    self.seen_failed.insert(child.tag.id.to_string());
+                }
                 let lines = crate::agents::report(
                     self.agent_definitions.as_ref(),
                     &self.children,
@@ -2397,6 +2535,26 @@ impl App {
                         "The worktree and the branch are deleted: this cannot be undone.".into(),
                     ]);
                     self.open_picker(Pick::ConfirmDiscard(name), picker);
+                    None
+                }
+                _ => None,
+            },
+            Pick::QuitWithAgents => match index {
+                0 => {
+                    self.deny_waiting();
+                    Some(Action::Quit)
+                }
+                1 => {
+                    self.quit_when_idle = true;
+                    let live = self.live_background();
+                    self.transcript.push_note(
+                        &format!(
+                            "waiting for {live} agent{} to finish: harness leaves when {} has (Ctrl+D asks again)",
+                            if live == 1 { "" } else { "s" },
+                            if live == 1 { "it" } else { "they" },
+                        ),
+                        self.width,
+                    );
                     None
                 }
                 _ => None,

@@ -15,7 +15,7 @@ use std::{
 use crate::read::{not_regular, read_regular};
 
 /// The built-in commands and what they do, in `/help` order.
-pub const BUILTINS: [(&str, &str); 17] = [
+pub const BUILTINS: [(&str, &str); 18] = [
     ("help", "List commands"),
     ("model", "Switch the model"),
     ("mode", "Switch the approval mode"),
@@ -31,6 +31,7 @@ pub const BUILTINS: [(&str, &str); 17] = [
         "agents",
         "List the subagents the model can start, and those that ran",
     ),
+    ("bg", "Run a task as a background agent in its own worktree"),
     (
         "results",
         "Look at what agents left in their worktrees: apply, keep or discard",

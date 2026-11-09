@@ -412,6 +412,37 @@ where
         self.app.set_results(worktrees.records());
     }
 
+    /// Starts the `general` agent on `task` in the background, in a worktree of its own.
+    fn start_background(&mut self, task: &str) {
+        let Some(watch) = &self.agents else {
+            self.app.push_error("this session cannot start agents");
+            return;
+        };
+        if watch.supervisor.worktrees().is_none() {
+            self.app.push_error(
+                "a background agent works in a worktree, and that needs the project to be in a git repository with a commit: there is none",
+            );
+            return;
+        }
+        let Some(def) = self
+            .app
+            .agent_definitions()
+            .and_then(|definitions| definitions.get("general"))
+        else {
+            self.app.push_error("there is no `general` agent to run it");
+            return;
+        };
+        let mut spec = harness_core::agents::definition_spec(def, task);
+        spec.model = def.model.clone();
+        spec.isolation = true;
+        spec.background = true;
+        let handle = watch.supervisor.spawn(spec);
+        self.app.push_note(&format!(
+            "started {} ({}) in the background, in its own worktree and branch: /agents lists it, and /results looks at what it changed once it is done",
+            handle.tag.id, handle.tag.label
+        ));
+    }
+
     /// Takes in a change of the children.
     fn children_changed(&mut self) -> io::Result<Flow> {
         let mut reread = false;
@@ -425,6 +456,10 @@ where
         // An agent that ended has left a result, or removed its worktree.
         if reread {
             self.refresh_results();
+        }
+        // The user chose to wait for the agents, and the last has ended.
+        if self.app.quit_ready() {
+            return Ok(Flow::Quit);
         }
         self.draw_soon().map(|()| Flow::Continue)
     }
@@ -652,6 +687,10 @@ where
                 tokio::task::spawn_blocking(move || {
                     let _ = tx.send(Background::Review(do_review(&worktrees, review)));
                 });
+                Flow::Continue
+            }
+            Action::Background(task) => {
+                self.start_background(&task);
                 Flow::Continue
             }
             Action::Interrupt => {
@@ -1191,8 +1230,9 @@ where
     /// as if the user had left) fails it, saying so.
     pub async fn finish(&mut self) -> io::Result<()> {
         self.app.deny_waiting();
+        // The session is over: background agents too (the user was asked).
         if let Some(watch) = &self.agents {
-            watch.supervisor.cancel_all();
+            watch.supervisor.stop_all();
         }
         self.approvals.close();
         // Dropping a reply denies it.

@@ -137,6 +137,9 @@ pub fn report(
         if let Some(model) = &child.model {
             text.push_str(&format!(" · {}", sanitize(&cut(model, 40))));
         }
+        if child.background {
+            text.push_str(" · background");
+        }
         text.push_str(&format!(" · {}", calls(child.tool_calls, child.status)));
         if child.status == AgentStatus::Failed
             && let Some(error) = &child.error

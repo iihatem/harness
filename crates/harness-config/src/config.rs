@@ -309,6 +309,74 @@ pub struct OutcomeSettings {
     pub enabled: Option<bool>,
 }
 
+/// `[agents]`: how many agents run at once, and how deep and how many they spawn (global config
+/// only: a project cannot make harness spend more). A limit that is not set has its default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsSettings {
+    /// At once on one local server (default 1).
+    pub per_local: Option<u32>,
+    /// At once on one hosted provider (default 3).
+    pub per_hosted: Option<u32>,
+    /// At once in all (default 4).
+    pub max_total: Option<u32>,
+    /// How deep agents may spawn agents (default 1: a subagent spawns none).
+    pub max_depth: Option<u32>,
+    /// Spawns in one turn (default 10).
+    pub max_spawns_per_turn: Option<u32>,
+}
+
+impl AgentsSettings {
+    fn problem(&self) -> Option<String> {
+        [
+            ("per_local", self.per_local),
+            ("per_hosted", self.per_hosted),
+            ("max_total", self.max_total),
+            ("max_depth", self.max_depth),
+            ("max_spawns_per_turn", self.max_spawns_per_turn),
+        ]
+        .into_iter()
+        .find_map(|(name, value)| {
+            (value == Some(0)).then(|| format!("agents.{name} must be a number above 0"))
+        })
+    }
+}
+
+/// The effective `[agents]` limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Agents {
+    pub per_local: u32,
+    pub per_hosted: u32,
+    pub max_total: u32,
+    pub max_depth: u32,
+    pub max_spawns_per_turn: u32,
+}
+
+impl Default for Agents {
+    fn default() -> Self {
+        Agents {
+            per_local: 1,
+            per_hosted: 3,
+            max_total: 4,
+            max_depth: 1,
+            max_spawns_per_turn: 10,
+        }
+    }
+}
+
+impl From<&AgentsSettings> for Agents {
+    fn from(s: &AgentsSettings) -> Self {
+        let d = Agents::default();
+        Agents {
+            per_local: s.per_local.unwrap_or(d.per_local),
+            per_hosted: s.per_hosted.unwrap_or(d.per_hosted),
+            max_total: s.max_total.unwrap_or(d.max_total),
+            max_depth: s.max_depth.unwrap_or(d.max_depth),
+            max_spawns_per_turn: s.max_spawns_per_turn.unwrap_or(d.max_spawns_per_turn),
+        }
+    }
+}
+
 /// `[budgets]`: money limits on billed cost, in USD. A budget that is not set has no limit.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -760,6 +828,8 @@ pub struct ConfigFile {
     pub fallback: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub escalation: EscalationSettings,
+    #[serde(default)]
+    pub agents: AgentsSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -812,6 +882,8 @@ pub struct Config {
     pub fallback: BTreeMap<String, Vec<String>>,
     /// The model `/escalate` switches to, when set: the global config's, or a trusted project's.
     pub escalation_to: Option<String>,
+    /// `[agents]` (global config only).
+    pub agents: Agents,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -1049,6 +1121,7 @@ pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening
         .or_else(|| project.roles.problem())
         .or_else(|| fallback_problem(&project.fallback))
         .or_else(|| project.escalation.problem())
+        .or_else(|| project.agents.problem())
     {
         return Err(ConfigError::Parse { path, message });
     }
@@ -1087,6 +1160,7 @@ pub fn load(
             .or_else(|| g.roles.problem())
             .or_else(|| fallback_problem(&g.fallback))
             .or_else(|| g.escalation.problem())
+            .or_else(|| g.agents.problem())
     }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
@@ -1117,6 +1191,7 @@ pub fn load(
         roles = global.roles;
         cfg.fallback = global.fallback;
         cfg.escalation_to = global.escalation.to;
+        cfg.agents = Agents::from(&global.agents);
         cfg.lsp.overlaid(&global.lsp, true);
     }
     let path = project_file(workspace);
@@ -1160,6 +1235,12 @@ pub fn load(
         if project.outcomes != OutcomeSettings::default() {
             cfg.warnings.push(format!(
                 "{}: ignoring [outcomes]: it is read from the global config only",
+                path.display()
+            ));
+        }
+        if project.agents != AgentsSettings::default() {
+            cfg.warnings.push(format!(
+                "{}: ignoring [agents]: it is read from the global config only",
                 path.display()
             ));
         }

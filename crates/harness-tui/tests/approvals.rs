@@ -1168,3 +1168,168 @@ async fn the_offer_to_resume_waits_while_the_language_server_question_asks() {
     assert!(ui.app().resume_waiting());
     ui.finish().await.unwrap();
 }
+
+// ---- M3a: one queue of approvals, each labelled with the agent that asked ---------------------
+
+fn request_from(command: &str, id: &str, label: &str) -> ApprovalRequest {
+    ApprovalRequest {
+        call_id: format!("{id}/c1"),
+        agent: Some(harness_core::agents::AgentTag {
+            id: harness_core::agents::AgentId(id.into()),
+            label: label.into(),
+        }),
+        ..request(command)
+    }
+}
+
+type Answer = oneshot::Receiver<ApprovalDecision>;
+type Asking = mpsc::UnboundedSender<(ApprovalRequest, oneshot::Sender<ApprovalDecision>)>;
+
+fn ask(requests: &Asking, request: ApprovalRequest) -> Answer {
+    let (reply, answer) = oneshot::channel();
+    requests.send((request, reply)).unwrap();
+    answer
+}
+
+fn queue_ui() -> (Ui<TestBackend>, Asking, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, approvals) = mpsc::unbounded_channel();
+    let ui = start_with(
+        MockProvider::new(vec![]),
+        dir.path(),
+        Mode::Ask,
+        Some(approvals),
+    );
+    (ui, requests, dir)
+}
+
+/// Lets the session take in what was sent, and draws.
+async fn take_in(ui: &mut Ui<TestBackend>, pending: usize) {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ui.until(move |app| app.pending_approvals() >= pending),
+    )
+    .await
+    .expect("the requests arrive")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_second_request_waits_behind_the_first_and_neither_is_dropped() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let mut first = ask(&requests, request_from("echo one", "a1", "explore"));
+    let mut second = ask(&requests, request_from("echo two", "a2", "review"));
+    take_in(&mut ui, 2).await;
+    ui.draw().unwrap();
+    assert_eq!(ui.app().pending_approvals(), 2);
+    assert!(!is_approval(first.try_recv()) && !is_approval(second.try_recv()));
+    // The first asked is the one shown.
+    assert!(
+        screen(&ui).iter().any(|r| r.contains("echo one")),
+        "{:#?}",
+        screen(&ui)
+    );
+    until_armed(&ui).await;
+    tokio::time::sleep(ARMING_DELAY).await;
+    press(&mut ui, KeyCode::Char('y'));
+    assert!(matches!(first.try_recv(), Ok(ApprovalDecision::Approve)));
+    // Now the second is shown, and still undecided.
+    assert_eq!(ui.app().pending_approvals(), 1);
+    ui.draw().unwrap();
+    assert!(screen(&ui).iter().any(|r| r.contains("echo two")));
+    assert!(second.try_recv().is_err());
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn each_prompt_names_the_agent_that_asked() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let _first = ask(&requests, request_from("echo one", "a1", "explore"));
+    let _second = ask(&requests, request("echo main"));
+    take_in(&mut ui, 2).await;
+    ui.draw().unwrap();
+    let shown = screen(&ui);
+    assert!(
+        shown.iter().any(|r| r.contains("a1 (explore)")),
+        "{shown:#?}"
+    );
+    assert!(
+        shown.iter().any(|r| r.contains("1 more waiting")),
+        "{shown:#?}"
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_main_agents_prompt_has_no_agent_label() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let _a = ask(&requests, request("echo main"));
+    take_in(&mut ui, 1).await;
+    ui.draw().unwrap();
+    assert!(
+        !screen(&ui)
+            .iter()
+            .any(|r| r.contains("(explore)") || r.contains("more waiting"))
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_next_prompt_takes_keys_only_after_the_user_pauses_again() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let mut first = ask(&requests, request_from("echo one", "a1", "x"));
+    let mut second = ask(&requests, request_from("echo two", "a2", "y"));
+    take_in(&mut ui, 2).await;
+    ui.draw().unwrap();
+    until_armed(&ui).await;
+    tokio::time::sleep(ARMING_DELAY).await;
+    press(&mut ui, KeyCode::Char('y'));
+    assert!(matches!(first.try_recv(), Ok(ApprovalDecision::Approve)));
+    // A second `y` straight after is typed ahead for the input, not an answer for the next one.
+    press(&mut ui, KeyCode::Char('y'));
+    assert!(
+        second.try_recv().is_err(),
+        "a typed-ahead key answered the next prompt"
+    );
+    assert_eq!(ui.app().pending_approvals(), 1);
+    assert_eq!(ui.app().editor().text(), "y");
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_prompt_whose_agent_went_away_leaves_the_queue() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let first = ask(&requests, request_from("echo one", "a1", "x"));
+    let mut second = ask(&requests, request_from("echo two", "a2", "y"));
+    take_in(&mut ui, 2).await;
+    // The first agent was cancelled: nobody waits for its answer.
+    drop(first);
+    ui.draw().unwrap();
+    assert_eq!(ui.app().pending_approvals(), 1);
+    assert!(screen(&ui).iter().any(|r| r.contains("echo two")));
+    assert!(second.try_recv().is_err());
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn esc_denies_the_shown_prompt_and_stops_the_turn_and_leaving_denies_them_all() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let mut first = ask(&requests, request_from("echo one", "a1", "x"));
+    let mut second = ask(&requests, request_from("echo two", "a2", "y"));
+    take_in(&mut ui, 2).await;
+    ui.draw().unwrap();
+    until_armed(&ui).await;
+    tokio::time::sleep(ARMING_DELAY).await;
+    press(&mut ui, KeyCode::Esc);
+    // Stopping the turn cancels the children too: nothing is left asking.
+    assert!(matches!(
+        first.try_recv(),
+        Ok(ApprovalDecision::Deny { .. })
+    ));
+    assert!(matches!(
+        second.try_recv(),
+        Ok(ApprovalDecision::Deny { .. })
+    ));
+    assert_eq!(ui.app().pending_approvals(), 0);
+    ui.finish().await.unwrap();
+}

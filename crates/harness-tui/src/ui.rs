@@ -397,6 +397,8 @@ where
     pub fn draw(&mut self) -> io::Result<()> {
         self.drawn_at = Some(tokio::time::Instant::now());
         self.redraw = false;
+        // An approval whose agent was cancelled meanwhile has nobody waiting for its answer.
+        self.app.prune_prompts();
         self.notify();
         if let Some(picker) = self.app.picker() {
             // Finished lines wait for the inline screen.

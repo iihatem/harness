@@ -414,7 +414,9 @@ pub struct App {
     instruction_files: Vec<(String, u64)>,
     window_note: Option<String>,
     /// An approval waiting for the user's answer.
-    prompt: Option<Prompt>,
+    /// The approvals waiting for an answer, oldest first: the front one is shown. Agents that run
+    /// at once can each ask; none overwrites another.
+    prompts: std::collections::VecDeque<Prompt>,
     /// When the approval or the plan choice shown starts to take keys.
     arming: Arming,
     /// Whether `arming` is the offer to resume automatically's: it starts afresh when the offer
@@ -513,7 +515,7 @@ impl App {
             totals: Totals::default(),
             instruction_files: options.instruction_files,
             window_note: options.window_note,
-            prompt: None,
+            prompts: std::collections::VecDeque::new(),
             arming: Arming::default(),
             offer_owns_arming: false,
             pending_mode: None,
@@ -705,7 +707,7 @@ impl App {
     fn offer_active(&self) -> bool {
         matches!(self.resume, Some(Resume::Asking { .. }))
             && !self.busy()
-            && self.prompt.is_none()
+            && self.prompts.is_empty()
             && self.plan_choice.is_none()
             && self.picker.is_none()
     }
@@ -1074,10 +1076,21 @@ impl App {
         if let Some(redactor) = &self.redactor {
             prompt.redact(redactor);
         }
+        let who = prompt
+            .request()
+            .agent
+            .as_ref()
+            .map(|agent| format!("{} ({}): ", agent.id, agent.label))
+            .unwrap_or_default();
         self.notifications
-            .push(format!("approval needed: {}", prompt.request().reason));
-        self.prompt = Some(prompt);
-        self.arming = Arming::default();
+            .push(format!("approval needed: {who}{}", prompt.request().reason));
+        let first = self.prompts.is_empty();
+        self.prompts.push_back(prompt);
+        // Only a prompt that becomes the one shown starts waiting for a pause: one that queues
+        // behind another does so when its turn comes.
+        if first {
+            self.arming = Arming::default();
+        }
     }
 
     /// The live region was drawn at `now`: an approval or a plan choice it showed for the first
@@ -1108,7 +1121,7 @@ impl App {
     /// Whether an approval, a plan choice or a picker waits for an answer: it takes keys only
     /// once the user has paused ([`Arming`]), so keys typed ahead never answer it.
     fn takes_keys_after_a_pause(&self) -> bool {
-        self.prompt.is_some()
+        !self.prompts.is_empty()
             || self.plan_choice.is_some()
             || self.picker.is_some()
             || self.offer_active()
@@ -1116,8 +1129,22 @@ impl App {
 
     /// Denies the approval waiting, if any, as the session ends: the turn stops.
     pub fn deny_waiting(&mut self) {
-        if self.prompt.is_some() {
+        while !self.prompts.is_empty() {
             self.answer(Answered::Interrupt);
+        }
+    }
+
+    /// How many approvals wait for an answer, the one shown included.
+    pub fn pending_approvals(&self) -> usize {
+        self.prompts.len()
+    }
+
+    /// Drops the approvals nobody waits for any more.
+    pub fn prune_prompts(&mut self) {
+        let front_gone = self.prompts.front().is_some_and(Prompt::is_abandoned);
+        self.prompts.retain(|prompt| !prompt.is_abandoned());
+        if front_gone && !self.prompts.is_empty() {
+            self.arming = Arming::default();
         }
     }
 
@@ -1129,14 +1156,17 @@ impl App {
 
     /// The approval waiting for an answer.
     pub fn prompt(&self) -> Option<&Prompt> {
-        self.prompt.as_ref()
+        self.prompts.front()
     }
 
     /// Answers the waiting approval, and notes the answer in the transcript.
     fn answer(&mut self, answered: Answered) {
-        let Some(mut prompt) = self.prompt.take() else {
+        let Some(mut prompt) = self.prompts.pop_front() else {
             return;
         };
+        // The next one is shown, and takes keys only once the user has paused again: a key typed
+        // for the answer just given is not an answer to it.
+        self.arming = Arming::default();
         let line = prompt.outcome(&answered, &self.theme());
         let decision = match answered {
             Answered::Decided(decision) => decision,
@@ -1318,7 +1348,7 @@ impl App {
 
     /// The next queued input, once no turn runs.
     pub fn next_queued(&mut self) -> Option<Action> {
-        if self.busy() || self.prompt.is_some() || self.plan_choice.is_some() {
+        if self.busy() || !self.prompts.is_empty() || self.plan_choice.is_some() {
             return None;
         }
         let (shown, full) = self.queued.pop_front()?;
@@ -1497,7 +1527,7 @@ impl App {
     /// typing: the prompt waits for a pause after it.
     pub fn on_paste_at(&mut self, text: &str, now: Instant) {
         self.sync_offer_arming();
-        if let Some(prompt) = &mut self.prompt
+        if let Some(prompt) = self.prompts.front_mut()
             && prompt.paste(text)
         {
             return;
@@ -1544,7 +1574,7 @@ impl App {
         if !ctrl
             && key.code == KeyCode::Esc
             && !self.busy()
-            && self.prompt.is_none()
+            && self.prompts.is_empty()
             && self.plan_choice.is_none()
             && self.picker.is_none()
             && matches!(
@@ -1569,8 +1599,8 @@ impl App {
                 self.arming.typed(now);
             }
             // Esc stops the turn, as it does without the prompt: the approval is denied.
-            if key.code == KeyCode::Esc && self.prompt.is_some() {
-                self.answer(Answered::Interrupt);
+            if key.code == KeyCode::Esc && !self.prompts.is_empty() {
+                self.deny_waiting();
                 return Some(Action::Interrupt);
             }
             // Until the prompt or the picker takes keys, they were typed for the input, and it
@@ -1613,7 +1643,7 @@ impl App {
     /// A key for the approval or the plan choice, once it takes keys.
     fn prompt_key(&mut self, key: KeyEvent) -> Option<Action> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            self.hint = Some(if self.prompt.is_some() {
+            self.hint = Some(if !self.prompts.is_empty() {
                 "answer the approval first: nothing is sent while it waits".into()
             } else {
                 "choose b, e or k first: nothing is sent while the plan waits".into()
@@ -1628,10 +1658,14 @@ impl App {
                 Picked::Cancelled => None,
             };
         }
-        if let Some(prompt) = &mut self.prompt {
+        if let Some(prompt) = self.prompts.front_mut() {
             let answered = prompt.key(key)?;
             let interrupt = answered == Answered::Interrupt;
             self.answer(answered);
+            if interrupt {
+                // Stopping the turn stops the agents it started: nothing else asks after.
+                self.deny_waiting();
+            }
             return interrupt.then_some(Action::Interrupt);
         }
         let choice = self.plan_choice.as_ref()?.key(key)?;
@@ -1701,9 +1735,7 @@ impl App {
         if self.picker.take().is_some() {
             return None;
         }
-        if self.prompt.is_some() {
-            self.answer(Answered::Interrupt);
-        }
+        self.deny_waiting();
         if self.busy() {
             return Some(Action::Interrupt);
         }
@@ -2296,7 +2328,7 @@ impl App {
         let theme = self.theme();
         let width = self.width;
         let mut below: Vec<Line<'static>> = Vec::new();
-        if (self.prompt.is_some() || self.plan_choice.is_some() || self.offer_active())
+        if (!self.prompts.is_empty() || self.plan_choice.is_some() || self.offer_active())
             && self.arming.typed_past()
         {
             below.extend(wrap(
@@ -2313,12 +2345,18 @@ impl App {
         if let Some(hint) = self
             .hint
             .as_ref()
-            .filter(|_| self.prompt.is_some() || self.plan_choice.is_some())
+            .filter(|_| !self.prompts.is_empty() || self.plan_choice.is_some())
         {
             below.extend(hint_rows(hint, width, &theme));
         }
-        if let Some(prompt) = &self.prompt {
+        if let Some(prompt) = self.prompts.front() {
             let mut lines = prompt.render(width, rows.saturating_sub(below.len()), &theme);
+            if self.prompts.len() > 1 {
+                lines.push(Line::from(Span::styled(
+                    format!("{} more waiting", self.prompts.len() - 1),
+                    theme.dim(),
+                )));
+            }
             lines.extend(below);
             let skip = lines.len().saturating_sub(rows);
             return (lines.split_off(skip), None);

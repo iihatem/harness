@@ -126,6 +126,10 @@ impl PermissionPolicy for ChildPolicy {
         self.engine.set_sandbox_available(available);
     }
 
+    fn set_unsandboxed_reason(&self, why: &str) {
+        PermissionPolicy::set_unsandboxed_reason(&self.engine, why);
+    }
+
     fn set_turn_rules(&self, rules: Option<RuleSet>) {
         self.engine.set_turn_rules(rules);
     }

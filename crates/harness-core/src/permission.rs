@@ -201,6 +201,10 @@ pub trait PermissionPolicy: Send + Sync {
     /// [`set_mode`](Self::set_mode), which it goes with.
     fn set_sandbox_available(&self, _available: bool) {}
 
+    /// Says why shell commands have no sandbox, in the reason for asking about each one. For a
+    /// child's policy, which the parent's own reason does not reach.
+    fn set_unsandboxed_reason(&self, _why: &str) {}
+
     /// Adds rules for the current turn only, or with `None` removes them. They never override
     /// deny rules, destructive-command confirmation or the sandbox.
     fn set_turn_rules(&self, _rules: Option<RuleSet>) {}

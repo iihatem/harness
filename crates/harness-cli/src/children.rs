@@ -34,6 +34,9 @@ pub struct CliFactory {
     sandboxes: Sandboxes,
     /// What sandboxed commands can write to, which a child's checkpoints must stay out of.
     writable: Vec<PathBuf>,
+    /// Why shell commands have no sandbox, when that is not just that the system has none: said
+    /// when a child is asked to approve one, as it is for its parent.
+    unsandboxed: Option<String>,
     /// Where each child's tool output goes: a directory of its own under this one.
     output_root: PathBuf,
     /// Stops a child's wait for a model's server.
@@ -51,6 +54,7 @@ impl CliFactory {
         sandboxes: Sandboxes,
         parent_local: bool,
         writable: Vec<PathBuf>,
+        unsandboxed: Option<String>,
         output_root: PathBuf,
         cancel: CancellationToken,
     ) -> Arc<CliFactory> {
@@ -74,6 +78,7 @@ impl CliFactory {
             started_on,
             sandboxes,
             writable,
+            unsandboxed,
             output_root,
             cancel,
         })
@@ -173,6 +178,11 @@ impl AgentFactory for CliFactory {
             &*policy,
             sandbox.is_some(),
         );
+        if sandbox.is_none()
+            && let Some(why) = &self.unsandboxed
+        {
+            harness_core::permission::PermissionPolicy::set_unsandboxed_reason(&*policy, why);
+        }
         let ctx = ToolContext::new(&workspace).with_sandbox(sandbox, mode.fs_access());
         // What it changes is told by comparing the workspace with a snapshot of its own, so what
         // a shell command edited counts, and the gates see it.
@@ -244,6 +254,7 @@ mod tests {
             Sandboxes::default(),
             false,
             Vec::new(),
+            Some("the sandbox is disabled by HARNESS_SANDBOX=none".into()),
             dir.path().join("out"),
             CancellationToken::new(),
         );
@@ -391,6 +402,37 @@ mod tests {
         assert_eq!(request.model, "big");
         assert_eq!(request.options.max_output_tokens, Some(999));
         assert!(request.options.local);
+    }
+
+    #[tokio::test]
+    async fn a_childs_approval_for_an_unsandboxed_command_says_why_there_is_no_sandbox() {
+        use harness_core::agent::{ApprovalDecision, ApprovalRequest, Approver};
+        struct Capture(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl Approver for Capture {
+            async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
+                self.0.lock().unwrap().push(request.reason.clone());
+                ApprovalDecision::Deny { feedback: None }
+            }
+        }
+        let f = fixture(
+            "",
+            vec![
+                Script::tool_call("c1", "bash", serde_json::json!({"command": "ls"})),
+                Script::text("could not"),
+            ],
+        );
+        let (mut ctx, _rx, _a) = parent(&f, Mode::Auto);
+        let capture = Arc::new(Capture(Default::default()));
+        ctx.approver = capture.clone();
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let sup = Supervisor::new(Limits::default(), f.factory.clone(), ctx, tx);
+        sup.spawn(AgentSpec::new("lister", "list")).wait().await;
+        let reasons = capture.0.lock().unwrap();
+        assert!(
+            reasons[0].contains("no sandbox: the sandbox is disabled by HARNESS_SANDBOX=none"),
+            "{reasons:?}"
+        );
     }
 
     #[tokio::test]

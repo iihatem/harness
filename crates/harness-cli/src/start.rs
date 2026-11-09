@@ -186,11 +186,9 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     let mut said = warning.clone();
     // From here on, however the run is left, the sandbox's session ends: on Linux that ends what
     // sandboxed commands left running, and checks git metadata once more.
-    let session_sandbox = if interactive {
-        detected
-    } else {
-        sandbox.clone()
-    };
+    // Every sandbox a child agent may be given, whatever its mode: one in a narrower mode than the
+    // session's may use a sandbox the session's own mode does not.
+    let session_sandbox = detected;
     let sandbox_session = SessionEnd::new(session_sandbox.clone());
     let sandboxed = sandbox.is_some();
     if mode != Mode::FullAccess && !sandboxed && warning.is_none() {
@@ -306,6 +304,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
             sandboxes.clone(),
             config.request.local,
             writable_roots.clone(),
+            lack.unsandboxed.map(String::from),
             setup.paths.state_dir.join("tool-output").join(&run_id),
             cancel.clone(),
         ),

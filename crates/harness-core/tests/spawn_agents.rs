@@ -1039,6 +1039,51 @@ async fn an_agent_whose_tools_could_not_write_runs_read_only_on_a_program() {
     assert_eq!(rig.specs()[0].mode, None);
 }
 
+#[tokio::test]
+async fn tools_that_cannot_write_narrow_the_mode_to_read_only_even_when_the_definition_sets_one() {
+    for mode in [Mode::Auto, Mode::Ask, Mode::Plan] {
+        let mut def = file(
+            "reader",
+            Some("codex/gpt"),
+            Some(&["read", "grep"]),
+            DefinitionSource::User("/u/reader.md".into()),
+        );
+        def.mode = Some(mode);
+        let rig = rig_in_defs(def);
+        let out = rig.call(1, json!({"agents": [entry("reader", "a")]})).await;
+        assert!(!out.is_error, "{}", out.content);
+        let spec = &rig.specs()[0];
+        assert!(
+            matches!(spec.mode, Some(Mode::ReadOnly | Mode::Plan)),
+            "{mode:?} gave {:?}",
+            spec.mode
+        );
+        assert!(!spec.isolation, "{mode:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_definition_fixed_at_plan_or_read_only_runs_on_a_program_with_no_worktree_and_needs_no_repository()
+ {
+    // This rig has no worktrees (no repository). The agent can write by its tools but its own
+    // mode never lets it, so it needs none.
+    for mode in [Mode::Plan, Mode::ReadOnly] {
+        let mut def = file(
+            "looker",
+            Some("codex/gpt"),
+            None,
+            DefinitionSource::User("/u/looker.md".into()),
+        );
+        def.mode = Some(mode);
+        let rig = rig_in_defs(def);
+        let out = rig.call(1, json!({"agents": [entry("looker", "a")]})).await;
+        assert!(!out.is_error, "{mode:?}: {}", out.content);
+        let spec = &rig.specs()[0];
+        assert_eq!(spec.mode, Some(mode));
+        assert!(!spec.isolation, "{mode:?}");
+    }
+}
+
 fn rig_in_defs(def: AgentDefinition) -> Rig {
     rig(Definitions::new(vec![def]), settings(10), says("ok"))
 }

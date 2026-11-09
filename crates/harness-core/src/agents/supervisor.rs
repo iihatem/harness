@@ -672,9 +672,11 @@ async fn run_child(
     // A place under the limits; a parent that is cancelled while this waits ends it here, before
     // anything is built.
     let endpoint = inner.factory.endpoint(&spec);
-    // An agent that runs in another program (Claude Code, Codex) is outside harness's sandbox, so
-    // one that can edit never works in the checkout: it gets a worktree whatever its spec says.
-    let delegated = endpoint.delegated;
+    // An agent that runs in another program (Claude Code, Codex) is outside harness's sandbox.
+    // Its own mode, when fixed at plan or read-only, is all that keeps it from changing the
+    // checkout (the parent's mode can widen while it runs, so that decides nothing): every other
+    // one works in a worktree.
+    let own_mode_fixed = matches!(spec.mode, Some(Mode::Plan | Mode::ReadOnly));
     let permit = tokio::select! {
         permit = inner.scheduler.acquire(endpoint) => permit,
         _ = cancel.cancelled() => {
@@ -691,8 +693,16 @@ async fn run_child(
     // worktree's.
     let live_mode = parent.policy.mode().unwrap_or(parent.engine.mode);
     let effective = spec.mode.map_or(live_mode, |own| live_mode.narrower(own));
+    // Asked again now that it has its place: an inherited model may have become a program while
+    // it waited.
+    let delegated = inner.factory.endpoint(&spec).delegated;
     let mut worktree: Option<Worktree> = None;
-    if (spec.isolation || delegated) && !matches!(effective, Mode::Plan | Mode::ReadOnly) {
+    let isolate = if delegated {
+        !own_mode_fixed
+    } else {
+        spec.isolation && !matches!(effective, Mode::Plan | Mode::ReadOnly)
+    };
+    if isolate {
         spec.isolation = true;
         let Some(wts) = lock(&inner.worktrees).clone() else {
             let why = if delegated {
@@ -878,6 +888,18 @@ async fn run_child(
             return finish(&inner, report, Some(session_id));
         }
     };
+    // Decided from what was built, not from what was expected: a program that can edit never
+    // starts in the checkout.
+    if agent.runs_in_program() && worktree.is_none() && !own_mode_fixed {
+        agent.close().await;
+        drop(agent);
+        drop(permit);
+        let report = empty(
+            AgentStatus::Failed,
+            Some("could not start: it runs in Claude Code or Codex and can edit, which needs a worktree, and it was not given one (its model changed while it waited); nothing ran, so try again".into()),
+        );
+        return finish(&inner, report, Some(session_id));
+    }
     agent.keep_tool_log();
     let model = agent.model_id().to_string();
     inner.update(&id, |info| info.model = Some(model.clone()));

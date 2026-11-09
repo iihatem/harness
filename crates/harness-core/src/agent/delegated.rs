@@ -257,6 +257,12 @@ impl Agent {
         }
     }
 
+    /// Whether this agent's turns run in another program (Claude Code, Codex), outside harness's
+    /// sandbox.
+    pub fn runs_in_program(&self) -> bool {
+        self.active_delegate().is_some()
+    }
+
     /// Confirms `full-access` for delegated agents for the rest of this session (a headless run
     /// started with `--yes-full-access`).
     pub fn confirm_full_access(&mut self) {

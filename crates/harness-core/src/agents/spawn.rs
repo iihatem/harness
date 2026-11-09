@@ -190,13 +190,18 @@ impl SpawnAgentsTool {
         let by_definition = def.isolation.as_deref() == Some("worktree");
         let in_background = def.background == Some(true);
         let writes = !def.is_read_only();
-        Plan {
-            // An agent that runs in Claude Code or Codex is outside harness's sandbox: when it can
-            // write it always has a worktree, whatever was asked.
+        let isolation = if on_program {
+            // An agent that runs in Claude Code or Codex is outside harness's sandbox: it has a
+            // worktree whatever was asked, unless its own mode is fixed at plan or read-only
+            // (never because its parent happens to be in one, which can change).
+            !matches!(program_mode(def, true), Some(Mode::Plan | Mode::ReadOnly))
+        } else {
             // `none` keeps an agent in the checkout, but never takes a worktree away from one its
             // definition (the project's own) requires.
-            isolation: writes
-                && (by_definition || asked == Some(true) || in_background || on_program),
+            writes && (by_definition || asked == Some(true) || in_background)
+        };
+        Plan {
+            isolation,
             background: in_background && !self.settings.wait_for_background,
             read_only_asked: !writes && asked == Some(true),
         }
@@ -205,14 +210,10 @@ impl SpawnAgentsTool {
     fn spec_for(&self, def: &AgentDefinition, entry: &Entry, plan: Plan) -> AgentSpec {
         let mut spec = definition_spec(def, entry.task.trim());
         spec.model = self.model_for(def, entry);
-        // Claude Code and Codex have tools of their own, which a definition's `tools:` cannot
-        // narrow. What can be enforced: an agent whose tools could not write runs read-only.
-        if def.is_read_only()
-            && spec.mode.is_none()
-            && self.model_in_use(def, entry).is_some_and(|m| delegated(&m))
-        {
-            spec.mode = Some(Mode::ReadOnly);
-        }
+        spec.mode = program_mode(
+            def,
+            self.model_in_use(def, entry).is_some_and(|m| delegated(&m)),
+        );
         spec.isolation = plan.isolation;
         spec.background = plan.background;
         spec
@@ -229,6 +230,19 @@ impl SpawnAgentsTool {
         count.started += granted as u32;
         granted
     }
+}
+
+/// The mode `def` runs in by itself. Claude Code and Codex have tools of their own, which a
+/// definition's `tools:` cannot narrow; what can be enforced is that an agent whose tools could
+/// not write runs read-only, whatever mode the definition also sets (never wider than either).
+fn program_mode(def: &AgentDefinition, on_program: bool) -> Option<Mode> {
+    if on_program && def.is_read_only() {
+        return Some(
+            def.mode
+                .map_or(Mode::ReadOnly, |own| own.narrower(Mode::ReadOnly)),
+        );
+    }
+    def.mode
 }
 
 /// Whether `id` (`<provider>/<model>`) is a model run by the Claude Code or Codex program.

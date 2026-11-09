@@ -26,7 +26,7 @@ use harness_core::{
     event::{AgentEvent, TurnEndReason},
     message::Usage,
     meter::{AccountKind, Avoided, BudgetStatus, Meter, RequestCost, RequestRecord},
-    permission::Mode,
+    permission::{Mode, PermissionPolicy},
     provider::{Provider, ProviderStream},
     testing::{MockProvider, Script},
     tool::{ToolContext, ToolRegistry},
@@ -154,30 +154,48 @@ struct Factory {
     main: PathBuf,
     program: Arc<Program>,
     specs: Mutex<Vec<AgentSpec>>,
+    /// The model a spec that names none runs on (the parent's, which `/model` can change).
+    parent_model: Mutex<String>,
+    /// `endpoint` says "not a program" whatever the model is, as a stale answer would.
+    stale_endpoint: std::sync::atomic::AtomicBool,
+    /// Runs inside `build`, for a change that happens while a child is being built.
+    during_build: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-fn is_delegated(spec: &AgentSpec) -> bool {
-    spec.model
-        .as_deref()
-        .is_some_and(harness_core::agents::is_delegated_model)
+impl Factory {
+    fn model_of(&self, spec: &AgentSpec) -> String {
+        spec.model
+            .clone()
+            .unwrap_or_else(|| self.parent_model.lock().unwrap().clone())
+    }
+}
+
+fn is_delegated(model: &str) -> bool {
+    harness_core::agents::is_delegated_model(model)
 }
 
 #[async_trait]
 impl AgentFactory for Factory {
     fn endpoint(&self, spec: &AgentSpec) -> Endpoint {
-        let model = spec.model.as_deref().unwrap_or("mock/m1");
+        let model = self.model_of(spec);
         Endpoint {
             key: model.split('/').next().unwrap().into(),
             local: false,
-            delegated: is_delegated(spec),
+            delegated: is_delegated(&model)
+                && !self
+                    .stale_endpoint
+                    .load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 
     async fn build(&self, setup: ChildSetup) -> Result<Agent, String> {
         self.specs.lock().unwrap().push(setup.spec.clone());
         let workspace = setup.spec.workspace.resolve(&self.main);
-        let model = setup.spec.model.clone().unwrap_or("mock/m1".into());
-        let provider: Arc<dyn Provider> = if is_delegated(&setup.spec) {
+        if let Some(change) = self.during_build.lock().unwrap().take() {
+            change();
+        }
+        let model = self.model_of(&setup.spec);
+        let provider: Arc<dyn Provider> = if is_delegated(&model) {
             Arc::new(ProgramProvider(self.program.clone()))
         } else {
             MockProvider::new(vec![Script::text("in-process answer")])
@@ -208,6 +226,7 @@ struct Rig {
     main: tempfile::TempDir,
     _home: tempfile::TempDir,
     factory: Arc<Factory>,
+    parent_policy: Arc<PermissionEngine>,
     supervisor: Arc<Supervisor>,
     program: Arc<Program>,
 }
@@ -237,6 +256,9 @@ fn rig_with(
         main: main.path().to_path_buf(),
         program: program.clone(),
         specs: Mutex::new(Vec::new()),
+        parent_model: Mutex::new("mock/m1".into()),
+        stale_endpoint: std::sync::atomic::AtomicBool::new(false),
+        during_build: Mutex::new(None),
     });
     let config = EngineConfig {
         mode: Mode::Auto,
@@ -246,6 +268,7 @@ fn rig_with(
         sandbox_available: true,
         writes_need_approval: false,
     };
+    let parent_policy = Arc::new(PermissionEngine::new(config.clone()));
     let (tx, _rx) = mpsc::unbounded_channel();
     let supervisor = Supervisor::new(
         limits,
@@ -253,7 +276,7 @@ fn rig_with(
         ParentContext {
             session: "parent".into(),
             cancel: CancellationToken::new(),
-            policy: Arc::new(PermissionEngine::new(config.clone())),
+            policy: parent_policy.clone(),
             engine: config,
             approver,
             meter,
@@ -271,6 +294,7 @@ fn rig_with(
         main,
         _home: home,
         factory,
+        parent_policy,
         supervisor,
         program,
     }
@@ -289,6 +313,10 @@ fn spec(model: &str, task: &str) -> AgentSpec {
     let mut spec = AgentSpec::new("builder", task);
     spec.model = Some(model.into());
     spec
+}
+
+async fn report_of(rig: &Rig, spec: AgentSpec) -> AgentReport {
+    report(rig, spec).await
 }
 
 async fn report(rig: &Rig, spec: AgentSpec) -> AgentReport {
@@ -365,6 +393,110 @@ async fn a_delegated_child_that_can_edit_does_not_start_without_a_repository_to_
     );
     // The program never ran: it could have edited the checkout.
     assert!(rig.program.runs().is_empty());
+}
+
+/// Where the program ran, and whether that is a worktree of the repository (never the checkout).
+fn ran_in_a_worktree(rig: &Rig, at: usize) -> bool {
+    let runs = rig.program.runs();
+    // A worktree that changed nothing is removed when the child ends: its path no longer resolves.
+    let at = &runs[at].workspace;
+    at.canonicalize().unwrap_or_else(|_| at.clone()) != rig.main.path().canonicalize().unwrap()
+}
+
+#[tokio::test]
+async fn a_child_whose_own_mode_is_plan_or_read_only_is_never_isolated() {
+    for mode in [Mode::Plan, Mode::ReadOnly] {
+        let rig = rig(vec![Step::default()], limits(), true);
+        let mut spec = spec("codex/gpt-5", "look around");
+        spec.mode = Some(mode);
+        let report = report(&rig, spec).await;
+        assert_eq!(report.status, AgentStatus::Done, "{mode:?}: {report:?}");
+        assert!(!ran_in_a_worktree(&rig, 0), "{mode:?}");
+        assert_eq!(rig.program.runs()[0].mode, mode);
+        assert_eq!(rig.supervisor.worktrees().unwrap().records().len(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_child_with_no_mode_of_its_own_gets_a_worktree_though_its_parent_is_in_plan_when_it_starts()
+ {
+    // The parent's mode can widen while the child runs, so what the parent is in at the start
+    // decides nothing.
+    let rig = rig(vec![Step::default()], limits(), true);
+    rig.parent_policy.set_mode(Mode::Plan);
+    let policy = rig.parent_policy.clone();
+    // The parent widens while the child is being built, and the program starts after.
+    *rig.factory.during_build.lock().unwrap() = Some(Box::new(move || policy.set_mode(Mode::Auto)));
+    let report = report(&rig, spec("codex/gpt-5", "edit")).await;
+    assert_eq!(report.status, AgentStatus::Done, "{report:?}");
+    assert!(ran_in_a_worktree(&rig, 0), "it ran in the checkout");
+}
+
+#[tokio::test]
+async fn a_child_whose_inherited_model_became_a_program_while_it_waited_is_isolated() {
+    let hold = Arc::new(Notify::new());
+    let rig = rig(
+        vec![
+            Step {
+                hold: Some(hold.clone()),
+                ..Step::default()
+            },
+            Step::default(),
+        ],
+        Limits {
+            total: 1,
+            ..limits()
+        },
+        true,
+    );
+    let mut first = spec("codex/gpt-5", "occupy the place");
+    first.mode = Some(Mode::ReadOnly);
+    let first = rig.supervisor.spawn(first);
+    // Queued behind it, naming no model: the parent's, which is not a program yet.
+    let second = rig.supervisor.spawn(AgentSpec::new("builder", "edit"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    *rig.factory.parent_model.lock().unwrap() = "codex/gpt-5".into();
+    hold.notify_one();
+    let report = tokio::time::timeout(WAIT, second.wait()).await.unwrap();
+    first.wait().await;
+    assert_eq!(report.status, AgentStatus::Done, "{report:?}");
+    let runs = rig.program.runs();
+    assert_eq!(runs.len(), 2, "both ran on the program");
+    assert!(ran_in_a_worktree(&rig, 1), "it ran in the checkout");
+}
+
+#[tokio::test]
+async fn a_background_child_on_the_parents_program_model_works_in_a_worktree() {
+    // What `/bg` makes: the general agent, the parent's model, in a worktree, in the background.
+    let rig = rig(vec![Step::default()], limits(), true);
+    *rig.factory.parent_model.lock().unwrap() = "claude-code/sonnet".into();
+    let mut spec = AgentSpec::new("general", "edit in the background");
+    spec.isolation = true;
+    spec.background = true;
+    let report = report(&rig, spec).await;
+    assert_eq!(report.status, AgentStatus::Done, "{report:?}");
+    assert!(ran_in_a_worktree(&rig, 0), "it ran in the checkout");
+}
+
+#[tokio::test]
+async fn a_child_built_on_a_program_the_decision_did_not_expect_is_refused_before_the_program_starts()
+ {
+    // `endpoint` said it is not a program (a stale answer), and the built child is one: with no
+    // worktree and nothing fixing its mode, it must not start.
+    let rig = rig(vec![Step::default()], limits(), true);
+    rig.factory
+        .stale_endpoint
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let report = report(&rig, spec("codex/gpt-5", "edit")).await;
+    assert_eq!(report.status, AgentStatus::Failed, "{report:?}");
+    let error = report.error.expect("it says why");
+    assert!(error.contains("worktree"), "{error}");
+    assert!(rig.program.runs().is_empty(), "the program started");
+    // One whose own mode is fixed read-only is fine in the checkout.
+    let mut read = spec("codex/gpt-5", "look");
+    read.mode = Some(Mode::ReadOnly);
+    let report = report_of(&rig, read).await;
+    assert_eq!(report.status, AgentStatus::Done, "{report:?}");
 }
 
 #[tokio::test]

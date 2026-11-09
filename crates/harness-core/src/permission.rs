@@ -27,6 +27,15 @@ impl Mode {
         self.rank() <= other.rank()
     }
 
+    /// The mode that grants no more than either `self` or `other`.
+    pub fn narrower(self, other: Mode) -> Mode {
+        if self.grants_at_most(other) {
+            self
+        } else {
+            other
+        }
+    }
+
     fn rank(self) -> u8 {
         match self {
             Mode::Plan | Mode::ReadOnly => 0,

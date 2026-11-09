@@ -29,6 +29,8 @@ pub use review::{Applied, Diff, Outcome, Overlap, author_of};
 
 /// The file in a worktree's git admin directory that says harness made it.
 const MARKER: &str = "harness-managed";
+/// In a worktree's admin directory: the files `.worktreeinclude` copied in, separated by NULs.
+const INCLUDED: &str = "harness-included";
 /// The first words of a lock's reason when harness holds it: `harness pid <pid>`.
 const LOCK_PREFIX: &str = "harness pid ";
 /// Longest worktree name, in characters.
@@ -124,9 +126,16 @@ impl Worktree {
         }
     }
 
-    /// The directory the agent works in.
+    /// The directory the agent works in: the one the session started in, when the worktree has
+    /// it (a directory that is untracked or ignored in the main checkout is not in a worktree
+    /// made from a commit), else the worktree's root.
     pub fn workspace(&self) -> PathBuf {
-        self.path.join(&self.prefix)
+        let below = self.path.join(&self.prefix);
+        if below.is_dir() {
+            below
+        } else {
+            self.path.clone()
+        }
     }
 
     /// What commands the agent runs in it are told: who it is, and a port offset to add to the
@@ -442,8 +451,26 @@ impl Worktrees {
         })?;
         let reason = format!("{LOCK_PREFIX}{}", std::process::id());
         let path_text = path.to_string_lossy().into_owned();
-        self.git
-            .run(&["worktree", "add", "-b", &branch, &path_text, &base])?;
+        // The record comes first: a harness that dies between making the worktree and the end of
+        // this function leaves one `reconcile` can find, and not a worktree nothing lists.
+        let mut record = Record::new(
+            &name,
+            &branch,
+            &path,
+            &base,
+            request.agent,
+            request.label,
+            request.task,
+        );
+        record.port_offset = offset;
+        self.write_record(&record)?;
+        if let Err(e) = self
+            .git
+            .run(&["worktree", "add", "-b", &branch, &path_text, &base])
+        {
+            let _ = std::fs::remove_file(self.record_path(&name));
+            return Err(e.into());
+        }
         let finished = (|| {
             // Locked with a reason in a command of its own: `add --lock --reason` needs a newer
             // git than `add` and `lock --reason` do.
@@ -460,17 +487,11 @@ impl Worktrees {
             )
             .map_err(|e| io("marking the worktree", e))?;
             let included = include::copy_included(&self.git, &self.root, &path);
-            let mut record = Record::new(
-                &name,
-                &branch,
-                &path,
-                &base,
-                request.agent,
-                request.label,
-                request.task,
-            );
-            record.port_offset = offset;
-            self.write_record(&record)?;
+            // What was copied in is not the agent's work: it is told apart from it for good.
+            if !included.paths.is_empty() {
+                std::fs::write(admin.join(INCLUDED), included.paths.join("\0"))
+                    .map_err(|e| io("noting the files copied in", e))?;
+            }
             Ok::<_, WorktreeError>(included)
         })();
         let included = match finished {
@@ -480,6 +501,7 @@ impl Worktrees {
                 let _ = self.git.run(&["worktree", "unlock", &path_text]);
                 let _ = self.git.run(&["worktree", "remove", "--force", &path_text]);
                 let _ = self.git.run(&["branch", "-D", &branch]);
+                let _ = std::fs::remove_file(self.record_path(&name));
                 return Err(e);
             }
         };
@@ -502,6 +524,22 @@ impl Worktrees {
             said_uncommitted,
             included,
         })
+    }
+
+    /// The files `.worktreeinclude` copied into the worktree at `path`, which are never part of
+    /// what an agent changed (nor committed): paths below its root.
+    pub(crate) fn included_paths(&self, path: &Path) -> std::collections::HashSet<String> {
+        let Ok(admin) = self.admin_dir(path) else {
+            return Default::default();
+        };
+        std::fs::read_to_string(admin.join(INCLUDED))
+            .map(|text| {
+                text.split('\0')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The git admin directory of the worktree at `path`.
@@ -716,8 +754,10 @@ impl Worktrees {
                 return Some("does not have the git directory harness made for it".into());
             }
             let inside = self.git.at(&record.path);
-            match inside.run(&["status", "--porcelain=v1", "-z"]) {
-                Ok(status) if status.is_empty() => {}
+            match inside.run(&["status", "--porcelain=v1", "-z", "-uall"]) {
+                Ok(status)
+                    if review::changes_in(&status, &self.included_paths(&record.path))
+                        .is_empty() => {}
                 Ok(_) => return Some("has changes that are not committed".into()),
                 Err(_) => return unreadable(),
             }

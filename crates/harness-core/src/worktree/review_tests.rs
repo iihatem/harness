@@ -515,3 +515,68 @@ fn an_apply_whose_cleanup_fails_still_reports_the_commit_that_landed() {
     assert!(applied.note.is_some(), "the leftover is said");
     std::fs::remove_file(&lock).unwrap();
 }
+
+#[test]
+fn a_file_copied_in_by_the_include_list_is_never_committed_even_when_only_an_uncommitted_rule_ignores_it()
+ {
+    let f = fixture();
+    // The rule that ignores `.env` is not committed, so the new worktree does not have it: there
+    // the copy is an untracked file nothing ignores.
+    write(f.repo.path(), ".gitignore", ".env\n");
+    write(f.repo.path(), ".env", "TOKEN=1\n");
+    write(f.repo.path(), ".worktreeinclude", ".env\n");
+    let made = f.wts.create(&request("a1", "general", "task")).unwrap();
+    let wt = made.worktree;
+    assert_eq!(made.included.copied, 1);
+    assert!(
+        wt.path.join(".env").exists(),
+        "the agent has it to work with"
+    );
+    write(&wt.path, "src/new.rs", "pub fn two() -> u32 { 2 }\n");
+    let outcome = f
+        .wts
+        .commit_result(&wt, "general", "task")
+        .unwrap()
+        .expect("there were changes");
+    f.wts.release(&wt).unwrap();
+    assert_eq!(outcome.files, ["src/new.rs"], "{outcome:?}");
+    let tree = git(
+        f.repo.path(),
+        &["ls-tree", "-r", "--name-only", &outcome.branch],
+    );
+    assert!(!tree.lines().any(|l| l == ".env"), "{tree}");
+}
+
+#[test]
+fn an_agent_that_only_had_files_copied_in_changed_nothing() {
+    let f = fixture();
+    write(f.repo.path(), ".gitignore", ".env\n");
+    write(f.repo.path(), ".env", "TOKEN=1\n");
+    write(f.repo.path(), ".worktreeinclude", ".env\n");
+    let wt = f
+        .wts
+        .create(&request("a1", "general", "task"))
+        .unwrap()
+        .worktree;
+    // The copy is not work that would be lost.
+    let record = f.wts.records().remove(0);
+    assert_eq!(f.wts.unsaved(&record), None);
+    assert!(
+        f.wts
+            .commit_result(&wt, "general", "task")
+            .unwrap()
+            .is_none()
+    );
+    f.wts.release(&wt).unwrap();
+}
+
+#[test]
+fn a_session_started_in_a_directory_the_commit_does_not_have_works_at_the_worktrees_root() {
+    let f = fixture();
+    // Untracked in the main checkout, so not in a worktree made from a commit.
+    write(f.repo.path(), "scratch/notes.txt", "n\n");
+    let wts = Worktrees::new(&f.repo.path().join("scratch"), f.home.path().join("below")).unwrap();
+    let wt = wts.create(&request("a1", "general", "t")).unwrap().worktree;
+    assert_eq!(wt.workspace(), wt.path);
+    assert!(wt.workspace().is_dir());
+}

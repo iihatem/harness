@@ -613,8 +613,10 @@ async fn settle_worktree(
     let (wt, label, task) = (worktree.clone(), label.to_string(), task.to_string());
     let settled = tokio::task::spawn_blocking(move || {
         let committed = wts.commit_result(&wt, &label, &task);
-        let _ = wts.release(&wt);
-        match committed {
+        // A lock that cannot be released leaves the worktree `Locked` for apply, keep and
+        // remove: the report says so, or nobody would know why.
+        let unlocked = wts.release(&wt).err();
+        let mut settled = match committed {
             Ok(Some(outcome)) => (Some(outcome), None, false),
             Ok(None) => match wts.remove(&wt.name) {
                 Ok(()) => (None, None, true),
@@ -629,7 +631,15 @@ async fn settle_worktree(
                 Some(format!("its changes could not be committed: {e}")),
                 false,
             ),
+        };
+        if let Some(e) = unlocked {
+            let why = format!("its worktree could not be unlocked: {e}");
+            settled.1 = Some(match settled.1.take() {
+                Some(first) => format!("{first}; {why}"),
+                None => why,
+            });
         }
+        settled
     })
     .await;
     let (outcome, error, removed) = settled.unwrap_or((

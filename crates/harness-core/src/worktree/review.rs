@@ -71,6 +71,28 @@ fn one_line(text: &str, cap: usize) -> String {
         .collect::<String>()
 }
 
+/// The paths a `status --porcelain=v1 -z` lists, but for the untracked files that
+/// `.worktreeinclude` copied in.
+pub(super) fn changes_in(
+    status: &str,
+    included: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut parts = status.split('\0').filter(|p| !p.is_empty());
+    while let Some(part) = parts.next() {
+        if part.len() > 3 {
+            let path = &part[3..];
+            if !(part.starts_with("??") && included.contains(path)) {
+                out.push(path.to_string());
+            }
+        }
+        if part.starts_with(['R', 'C']) {
+            out.extend(parts.next().map(str::to_string));
+        }
+    }
+    out
+}
+
 impl Worktrees {
     fn paths(&self, args: &[&str]) -> Result<Vec<String>, WorktreeError> {
         Ok(self
@@ -105,6 +127,14 @@ impl Worktrees {
             )));
         }
         git.run(&["add", "-A"])?;
+        // What `.worktreeinclude` copied in is never committed, whatever ignore rules the
+        // worktree has (the rule that ignores it in the main checkout may be uncommitted).
+        let copied: Vec<String> = self.included_paths(&wt.path).into_iter().collect();
+        for chunk in copied.chunks(200) {
+            let mut args = vec!["reset", "-q", "--"];
+            args.extend(chunk.iter().map(String::as_str));
+            git.run_with_env(&args, &[("GIT_LITERAL_PATHSPECS", "1")])?;
+        }
         let staged = match git.run(&[
             "diff",
             "--cached",
@@ -234,20 +264,12 @@ impl Worktrees {
         }
         if record.path.exists()
             && self.check_gitdir(&record.path).is_ok()
-            && let Ok(status) = self
-                .git
-                .at(&record.path)
-                .run(&["status", "--porcelain=v1", "-z"])
+            && let Ok(status) =
+                self.git
+                    .at(&record.path)
+                    .run(&["status", "--porcelain=v1", "-z", "-uall"])
         {
-            let mut parts = status.split('\0').filter(|p| !p.is_empty());
-            while let Some(part) = parts.next() {
-                if part.len() > 3 {
-                    files.push(part[3..].to_string());
-                }
-                if part.starts_with(['R', 'C']) {
-                    files.extend(parts.next().map(str::to_string));
-                }
-            }
+            files.extend(changes_in(&status, &self.included_paths(&record.path)));
         }
         files.sort();
         files.dedup();

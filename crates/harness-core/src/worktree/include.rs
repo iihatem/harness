@@ -35,6 +35,10 @@ pub struct Included {
     pub copied: usize,
     /// Things worth telling the user: a limit that was reached, an unreadable file.
     pub notes: Vec<String>,
+    /// What was copied, as paths below the repository's root. Harness never commits them to the
+    /// agent's branch: the rule that ignores a file in the main checkout may be one that is not
+    /// committed, and then the new worktree does not ignore it.
+    pub paths: Vec<String>,
 }
 
 struct Copier<'a> {
@@ -86,6 +90,7 @@ pub fn copy_with(git: &Git, root: &Path, dest: &Path, limits: Limits) -> Include
             return Included {
                 copied: 0,
                 notes: vec![format!("could not list the ignored files: {e}")],
+                paths: Vec::new(),
             };
         }
     };
@@ -224,6 +229,7 @@ impl Copier<'_> {
             Ok(_) => {
                 self.done.copied += 1;
                 self.bytes += len;
+                self.done.paths.push(rel.to_string_lossy().into_owned());
             }
             Err(e) => self
                 .done

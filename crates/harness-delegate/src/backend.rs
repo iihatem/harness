@@ -112,7 +112,6 @@ impl StartRequest {
 }
 
 /// What a [`RunControl`] asks of the driver.
-#[expect(dead_code, reason = "read by the driver, added in the next commit")]
 pub(crate) enum Command {
     Answer {
         id: String,
@@ -159,7 +158,9 @@ impl RunControl {
 
 /// A started run.
 pub struct DelegateRun {
-    pub events: mpsc::Receiver<DelegateEvent>,
+    /// Ends after `Finished`. Unbounded: the driver must keep reading the child's output (Claude
+    /// waits only 30 s for a slow reader), so a slow consumer costs memory, not a stall.
+    pub events: mpsc::UnboundedReceiver<DelegateEvent>,
     pub control: RunControl,
 }
 

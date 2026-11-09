@@ -9,6 +9,7 @@
 
 pub mod backend;
 pub mod detect;
+pub mod driver;
 pub mod env;
 pub mod event;
 pub mod redact;

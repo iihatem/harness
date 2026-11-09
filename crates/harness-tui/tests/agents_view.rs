@@ -243,3 +243,37 @@ async fn agents_shows_what_a_child_says_with_secrets_replaced() {
         "{all:#?}"
     );
 }
+
+// ---- children that run in Claude Code or Codex --------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_on_claude_code_or_codex_shows_like_any_other_with_its_program_named() {
+    let (_dir, mut ui) = open();
+    ui.app_mut().set_agent_definitions(definitions());
+    let mut codex = child("a1", "review", AgentStatus::Done);
+    codex.model = Some("codex/gpt-5.6-luna".into());
+    codex.summary = Some("No problems found.".into());
+    let mut claude = child("a2", "general", AgentStatus::Working);
+    claude.model = Some("claude-code/sonnet".into());
+    claude.background = true;
+    ui.app_mut().set_children(vec![codex, claude]);
+    ui.draw().unwrap();
+    // The result line of the child that ended names the program it ran in.
+    let line = everything(&ui)
+        .into_iter()
+        .find(|r| r.contains("a1"))
+        .expect("a result line");
+    assert!(
+        line.contains("codex/gpt-5.6-luna") && line.contains("done"),
+        "{line}"
+    );
+    send(&mut ui, "/agents");
+    let all = everything(&ui);
+    let at = all.iter().rposition(|r| r.contains("Subagents")).unwrap();
+    let text = all[at..].join("\n");
+    assert!(text.contains("codex/gpt-5.6-luna"), "{text}");
+    assert!(
+        text.contains("claude-code/sonnet") && text.contains("background"),
+        "{text}"
+    );
+}

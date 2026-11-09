@@ -1333,3 +1333,177 @@ async fn esc_denies_the_shown_prompt_and_stops_the_turn_and_leaving_denies_them_
     assert_eq!(ui.app().pending_approvals(), 0);
     ui.finish().await.unwrap();
 }
+
+// ---- M3a: a line for each running child agent, above the input --------------------------------
+
+fn info(
+    id: &str,
+    label: &str,
+    status: harness_core::agents::AgentStatus,
+    model: Option<&str>,
+    activity: Option<&str>,
+) -> harness_core::agents::AgentInfo {
+    harness_core::agents::AgentInfo {
+        tag: harness_core::agents::AgentTag {
+            id: harness_core::agents::AgentId(id.into()),
+            label: label.into(),
+        },
+        status,
+        model: model.map(String::from),
+        tool_calls: 0,
+        activity: activity.map(String::from),
+        started: None,
+    }
+}
+
+#[tokio::test]
+async fn a_running_child_has_a_line_with_its_label_status_and_model() {
+    use harness_core::agents::AgentStatus::*;
+    let (mut ui, _requests, _dir) = queue_ui();
+    ui.app_mut().set_children(vec![
+        info("a1", "explore", Working, Some("mock/m1"), Some("grep")),
+        info("a2", "review", NeedsInput, Some("mock/m2"), None),
+        info("a3", "later", Queued, None, None),
+        info("a4", "finished", Done, Some("mock/m1"), None),
+    ]);
+    ui.draw().unwrap();
+    let shown = screen(&ui);
+    let line = |label: &str| shown.iter().find(|r| r.contains(label)).cloned();
+    let one = line("explore").unwrap_or_else(|| panic!("{shown:#?}"));
+    assert!(
+        one.contains("a1") && one.contains("working") && one.contains("mock/m1"),
+        "{one}"
+    );
+    assert!(one.contains("grep"), "{one}");
+    assert!(line("review").unwrap().contains("needs input"));
+    assert!(line("later").unwrap().contains("queued"));
+    // One that has ended is not running any more.
+    assert!(line("finished").is_none(), "{shown:#?}");
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_children_no_lines() {
+    let (mut ui, _requests, _dir) = queue_ui();
+    ui.app_mut().set_children(Vec::new());
+    ui.draw().unwrap();
+    assert!(!screen(&ui).iter().any(|r| r.contains("working")));
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_session_follows_a_supervisor() {
+    use harness_core::{
+        agents::{
+            AgentFactory, AgentSpec, ChildSetup, Endpoint, Limits, ParentContext, Supervisor,
+        },
+        engine::EngineConfig,
+    };
+    use tokio_util::sync::CancellationToken;
+    struct Slow(Arc<tokio::sync::Notify>);
+    #[async_trait]
+    impl AgentFactory for Slow {
+        fn endpoint(&self, _spec: &AgentSpec) -> Endpoint {
+            Endpoint {
+                key: "x".into(),
+                local: false,
+            }
+        }
+        async fn build(&self, setup: ChildSetup) -> Result<Agent, String> {
+            let release = self.0.clone();
+            struct Hold(Arc<tokio::sync::Notify>);
+            impl harness_core::provider::Provider for Hold {
+                fn stream(
+                    &self,
+                    _r: harness_core::message::ChatRequest,
+                ) -> harness_core::provider::ProviderStream {
+                    use futures::StreamExt;
+                    let n = self.0.clone();
+                    futures::stream::once(async move {
+                        n.notified().await;
+                        futures::stream::iter(vec![Ok(
+                            harness_core::provider::ProviderEvent::Finished(
+                                harness_core::provider::FinishReason::Stop,
+                            ),
+                        )])
+                    })
+                    .flatten()
+                    .boxed()
+                }
+            }
+            let dir = std::env::temp_dir();
+            Ok(Agent::new(
+                Arc::new(Hold(release)),
+                ToolRegistry::new(vec![]),
+                setup.policy,
+                setup.approver,
+                AgentConfig::new("mock/m", "m", "s", dir.join("out")),
+                ToolContext::new(&dir),
+            ))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_requests, approvals) = mpsc::unbounded_channel();
+    let mut ui = start_with(
+        MockProvider::new(vec![]),
+        dir.path(),
+        Mode::Ask,
+        Some(approvals),
+    );
+    let release = Arc::new(tokio::sync::Notify::new());
+    let config = EngineConfig {
+        mode: Mode::Ask,
+        workspace: dir.path().to_path_buf(),
+        read_dirs: vec![],
+        rules: RuleSet::default(),
+        sandbox_available: true,
+        writes_need_approval: false,
+    };
+    let engine = Arc::new(PermissionEngine::new(config.clone()));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (approver, _) = ChannelApprover::new();
+    let sup = Supervisor::new(
+        Limits::default(),
+        Arc::new(Slow(release.clone())),
+        ParentContext {
+            session: "p".into(),
+            cancel: CancellationToken::new(),
+            policy: engine,
+            engine: config,
+            approver,
+            meter: None,
+            sessions_dir: None,
+            workspace: dir.path().to_path_buf(),
+        },
+        tx,
+    );
+    ui.watch_agents(sup.clone());
+    let handle = sup.spawn(AgentSpec::new("explore", "look"));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ui.until(|app| app.children().iter().any(|c| c.tag.label == "explore")),
+    )
+    .await
+    .expect("the line appears")
+    .unwrap();
+    ui.draw().unwrap();
+    assert!(
+        screen(&ui).iter().any(|r| r.contains("explore")),
+        "{:#?}",
+        screen(&ui)
+    );
+    release.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("the child ends");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ui.until(|app| app.children().iter().all(|c| c.status.is_final())),
+    )
+    .await
+    .expect("the line goes")
+    .unwrap();
+    ui.draw().unwrap();
+    assert!(!screen(&ui).iter().any(|r| r.contains("explore")));
+    ui.finish().await.unwrap();
+}

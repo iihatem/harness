@@ -417,6 +417,8 @@ pub struct App {
     /// The approvals waiting for an answer, oldest first: the front one is shown. Agents that run
     /// at once can each ask; none overwrites another.
     prompts: std::collections::VecDeque<Prompt>,
+    /// The child agents the session's supervisor runs, as it last said.
+    children: Vec<harness_core::agents::AgentInfo>,
     /// When the approval or the plan choice shown starts to take keys.
     arming: Arming,
     /// Whether `arming` is the offer to resume automatically's: it starts afresh when the offer
@@ -516,6 +518,7 @@ impl App {
             instruction_files: options.instruction_files,
             window_note: options.window_note,
             prompts: std::collections::VecDeque::new(),
+            children: Vec::new(),
             arming: Arming::default(),
             offer_owns_arming: false,
             pending_mode: None,
@@ -1132,6 +1135,47 @@ impl App {
         while !self.prompts.is_empty() {
             self.answer(Answered::Interrupt);
         }
+    }
+
+    /// What the supervisor says its child agents are doing now.
+    pub fn set_children(&mut self, children: Vec<harness_core::agents::AgentInfo>) {
+        self.children = children;
+    }
+
+    pub fn children(&self) -> &[harness_core::agents::AgentInfo] {
+        &self.children
+    }
+
+    /// One line for each child that has not ended: label, status, model, and the tool it called
+    /// last.
+    fn child_lines(&self, theme: &Theme) -> Vec<Line<'static>> {
+        use harness_core::agents::AgentStatus;
+        self.children
+            .iter()
+            .filter(|child| !child.status.is_final())
+            .map(|child| {
+                let status_style = if child.status == AgentStatus::NeedsInput {
+                    theme.warning()
+                } else {
+                    theme.dim()
+                };
+                let mut spans = vec![
+                    Span::styled("◦ ", theme.accent()),
+                    Span::styled(
+                        format!("{} {}", child.tag.id, sanitize(&child.tag.label)),
+                        theme.bold(),
+                    ),
+                    Span::styled(format!(" · {}", child.status.as_str()), status_style),
+                ];
+                if let Some(model) = &child.model {
+                    spans.push(Span::styled(format!(" · {}", sanitize(model)), theme.dim()));
+                }
+                if let Some(tool) = &child.activity {
+                    spans.push(Span::styled(format!(" · {}", sanitize(tool)), theme.dim()));
+                }
+                Line::from(spans)
+            })
+            .collect()
     }
 
     /// How many approvals wait for an answer, the one shown included.
@@ -2396,6 +2440,12 @@ impl App {
                     ),
                 ]),
             );
+        }
+        // The child agents running, above what waits to be sent.
+        let children = self.child_lines(&theme);
+        let at = usize::from(self.working.is_some());
+        for (n, line) in children.into_iter().enumerate() {
+            waiting.insert(at + n, line);
         }
         cursor.y += waiting.len() as u16;
         waiting.append(&mut editor);

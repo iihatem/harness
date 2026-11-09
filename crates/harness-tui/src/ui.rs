@@ -197,6 +197,24 @@ pub struct Ui<B: Backend> {
     background: mpsc::UnboundedReceiver<Background>,
     /// The provider the session's model runs on, asked where its usage windows stand.
     provider: Arc<dyn Provider>,
+    /// The supervisor of the session's child agents, and its changes, when it has one.
+    agents: Option<AgentsWatch>,
+}
+
+/// A supervisor the session shows the children of.
+struct AgentsWatch {
+    supervisor: Arc<harness_core::agents::Supervisor>,
+    changes: tokio::sync::watch::Receiver<u64>,
+}
+
+/// Resolves when the supervisor's children change; never when there is none.
+async fn agents_changed(watch: &mut Option<AgentsWatch>) {
+    if let Some(watch) = watch
+        && watch.changes.changed().await.is_ok()
+    {
+        return;
+    }
+    std::future::pending().await
 }
 
 impl<B> Ui<B>
@@ -324,6 +342,7 @@ where
             background_tx,
             background,
             provider,
+            agents: None,
         };
         // A subscription's windows are asked for once as the session starts, never on a timer.
         ui.poll_windows();
@@ -365,6 +384,24 @@ where
     pub fn open_session_picker(&mut self) -> io::Result<()> {
         self.app.open_session_picker();
         self.draw()
+    }
+
+    /// Shows the child agents `supervisor` runs, a line each above the input, as they change.
+    pub fn watch_agents(&mut self, supervisor: Arc<harness_core::agents::Supervisor>) {
+        let changes = supervisor.subscribe();
+        self.app.set_children(supervisor.snapshot());
+        self.agents = Some(AgentsWatch {
+            supervisor,
+            changes,
+        });
+    }
+
+    /// Takes in a change of the children.
+    fn children_changed(&mut self) -> io::Result<Flow> {
+        if let Some(watch) = &self.agents {
+            self.app.set_children(watch.supervisor.snapshot());
+        }
+        self.draw_soon().map(|()| Flow::Continue)
     }
 
     pub fn app(&self) -> &App {
@@ -933,6 +970,7 @@ where
             Some(update) = self.updates.recv() => self.update(update),
             Some(done) = self.background.recv() => self.background(done),
             Some((request, reply)) = self.approvals.recv() => self.approval(request, reply).await,
+            _ = agents_changed(&mut self.agents) => self.children_changed(),
             _ = tokio::time::sleep_until(redraw_at), if redraw => {
                 self.draw().map(|()| Flow::Continue)
             }
@@ -1081,6 +1119,7 @@ where
                     None => self.approval(request, reply).await?,
                     Some(ending) => return Ok(ending),
                 },
+                _ = agents_changed(&mut self.agents) => self.children_changed()?,
                 // Drawn after the keys waiting.
                 _ = tokio::time::sleep_until(redraw_at), if redraw => match self.keys(None, input).await? {
                     None => self.draw().map(|()| Flow::Continue)?,

@@ -136,3 +136,160 @@ async fn a_smaller_window_is_compacted_into_before_the_next_request() {
     assert!(!sent.contains(&long), "the old messages were sent whole");
     assert!(agent.context_usage().total < 2_048);
 }
+
+// ---- the model a child is built from -------------------------------------------------------
+
+mod parent_model {
+    use super::*;
+    use async_trait::async_trait;
+    use harness_core::{
+        agent::{Agent, AgentConfig},
+        agents::ParentModel,
+        engine::{EngineConfig, PermissionEngine},
+        message::ToolSpec,
+        permission::Action,
+        tool::{Tool, ToolContext, ToolOutput, ToolRegistry},
+        turn::{TurnInput, TurnModel},
+    };
+    use serde_json::{Value, json};
+    use std::sync::Mutex;
+
+    /// (model id, window, local) as the parent says it is on, each time `peek` is called.
+    type Seen = Arc<Mutex<Vec<(String, u64, bool)>>>;
+
+    /// Notes which model the parent says it is on when it is called.
+    struct Peek {
+        cell: ParentModel,
+        seen: Seen,
+    }
+
+    #[async_trait]
+    impl Tool for Peek {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "peek".into(),
+                description: "looks".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        fn action(&self, _args: &Value, ctx: &ToolContext) -> Action {
+            Action::Read(ctx.workspace.clone())
+        }
+        async fn run(&self, _args: Value, _ctx: &ToolContext) -> ToolOutput {
+            let now = self.cell.get().expect("the agent published its model");
+            self.seen
+                .lock()
+                .unwrap()
+                .push((now.id, now.context_window, now.local));
+            ToolOutput::ok("peeked")
+        }
+    }
+
+    fn parent(dir: &std::path::Path, provider: Arc<MockProvider>) -> (Agent, ParentModel, Seen) {
+        let cell = ParentModel::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let tools = ToolRegistry::new(vec![Arc::new(Peek {
+            cell: cell.clone(),
+            seen: seen.clone(),
+        })]);
+        let policy = Arc::new(PermissionEngine::new(EngineConfig {
+            mode: Mode::Auto,
+            workspace: dir.to_path_buf(),
+            read_dirs: vec![],
+            rules: Default::default(),
+            sandbox_available: false,
+            writes_need_approval: false,
+        }));
+        let mut config = AgentConfig::new("mock/m1", "m1", "prompt", dir.join(".spill"));
+        config.context_window = 50_000;
+        let agent = Agent::new(
+            provider,
+            tools,
+            policy,
+            Arc::new(NonInteractive),
+            config,
+            ToolContext::new(dir),
+        )
+        .with_model_cell(cell.clone());
+        (agent, cell, seen)
+    }
+
+    #[tokio::test]
+    async fn the_model_a_child_is_built_from_follows_the_session_and_its_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = MockProvider::new(vec![
+            Script::tool_call("c1", "peek", json!({})),
+            Script::text("one"),
+        ]);
+        let (mut agent, cell, seen) = parent(dir.path(), first);
+        // Before any turn it is the model the session started on.
+        let at_start = cell.get().unwrap();
+        assert_eq!(
+            (at_start.id.as_str(), at_start.context_window),
+            ("mock/m1", 50_000)
+        );
+        run(&mut agent, "go").await;
+        // `/model`: the next child is built from the new one, window, options and side included.
+        let second = MockProvider::new(vec![
+            Script::tool_call("c2", "peek", json!({})),
+            Script::text("two"),
+            Script::tool_call("c3", "peek", json!({})),
+            Script::text("three"),
+        ]);
+        agent.switch_model(SessionModel {
+            provider: second.clone(),
+            id: "other/big".into(),
+            name: "big".into(),
+            context_window: 200_000,
+            request: RequestOptions {
+                local: true,
+                max_output_tokens: Some(4_096),
+                ..RequestOptions::default()
+            },
+            text_tool_calls: false,
+            tools: None,
+            edit_section: None,
+        });
+        let now = cell.get().unwrap();
+        assert_eq!(
+            (now.id.as_str(), now.context_window, now.local),
+            ("other/big", 200_000, true)
+        );
+        assert_eq!(now.request.max_output_tokens, Some(4_096));
+        run(&mut agent, "again").await;
+        // A turn on a role's model: a child spawned during it is built from that one; after it,
+        // from the session's again.
+        let turn_model = TurnModel {
+            provider: second,
+            id: "role/plan".into(),
+            name: "plan".into(),
+            local: false,
+            tools: None,
+            edit_section: None,
+            context_window: Some(90_000),
+            request: None,
+            text_tool_calls: false,
+        };
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                TurnInput {
+                    parts: vec![harness_core::turn::InputPart::Text("plan".into())],
+                    model: Some(turn_model),
+                    ..TurnInput::default()
+                },
+                &events,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ("mock/m1".to_string(), 50_000, false),
+                ("other/big".to_string(), 200_000, true),
+                ("role/plan".to_string(), 90_000, false),
+            ]
+        );
+        assert_eq!(cell.get().unwrap().id, "other/big");
+    }
+}

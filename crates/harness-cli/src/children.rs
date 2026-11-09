@@ -9,7 +9,7 @@ use std::{path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use harness_core::{
     agent::{Agent, AgentConfig, Sandboxes},
-    agents::{AgentFactory, AgentSpec, ChildSetup, Endpoint},
+    agents::{AgentFactory, AgentSpec, ChildSetup, CurrentModel, Endpoint, ParentModel},
     edit_format::EditFormat,
     provider::Provider,
     role::ModelResolver,
@@ -23,14 +23,15 @@ use crate::{routes::CliResolver, setup::Setup};
 pub struct CliFactory {
     setup: Arc<Setup>,
     resolver: Arc<CliResolver>,
-    /// The parent's provider and settings, which a child that names no model of its own uses.
-    provider: Arc<dyn Provider>,
+    /// The parent's settings other than its model (steps, limits, retries, compaction).
     template: AgentConfig,
-    edit_format: EditFormat,
+    /// The model the parent is on now, which a child that names none of its own is built from:
+    /// published by the parent agent as it changes, and the one it started on until it has.
+    current: ParentModel,
+    started_on: CurrentModel,
     /// The sandbox for each mode. A child that runs in a mode with none asks about every shell
     /// command, as its parent would.
     sandboxes: Sandboxes,
-    parent_local: bool,
     /// What sandboxed commands can write to, which a child's checkpoints must stay out of.
     writable: Vec<PathBuf>,
     /// Where each child's tool output goes: a directory of its own under this one.
@@ -53,37 +54,57 @@ impl CliFactory {
         output_root: PathBuf,
         cancel: CancellationToken,
     ) -> Arc<CliFactory> {
+        let started_on = CurrentModel {
+            provider,
+            id: template.model_id.clone(),
+            name: template.model_name.clone(),
+            context_window: template.context_window,
+            request: template.request.clone(),
+            text_tool_calls: template.text_tool_calls,
+            local: parent_local,
+            tools: harness_tools::builtin_for(edit_format),
+            system_prompt: template.system_prompt.clone(),
+            edit_section: template.edit_section.clone(),
+        };
         Arc::new(CliFactory {
             setup,
             resolver,
-            provider,
             template,
-            edit_format,
+            current: ParentModel::default(),
+            started_on,
             sandboxes,
-            parent_local,
             writable,
             output_root,
             cancel,
         })
     }
 
-    /// The model a spec runs on when it names one other than its parent's.
-    fn own_model<'a>(&self, spec: &'a AgentSpec) -> Option<&'a str> {
-        spec.model
-            .as_deref()
-            .filter(|id| *id != self.template.model_id)
+    /// Where the parent agent publishes the model it is on, for it to be given
+    /// ([`Agent::with_model_cell`]).
+    pub fn parent_model(&self) -> ParentModel {
+        self.current.clone()
     }
+
+    /// The model the parent is on now.
+    fn parent_now(&self) -> CurrentModel {
+        self.current
+            .get()
+            .unwrap_or_else(|| self.started_on.clone())
+    }
+}
+
+/// The model a spec runs on when it names one other than its parent's.
+fn own_model<'a>(spec: &'a AgentSpec, parent: &CurrentModel) -> Option<&'a str> {
+    spec.model.as_deref().filter(|id| *id != parent.id)
 }
 
 #[async_trait]
 impl AgentFactory for CliFactory {
     fn endpoint(&self, spec: &AgentSpec) -> Endpoint {
-        let (id, local) = match self.own_model(spec) {
-            Some(id) => (
-                id,
-                self.resolver.runs_locally(id).unwrap_or(self.parent_local),
-            ),
-            None => (self.template.model_id.as_str(), self.parent_local),
+        let parent = self.parent_now();
+        let (id, local) = match own_model(spec, &parent) {
+            Some(id) => (id, self.resolver.runs_locally(id).unwrap_or(parent.local)),
+            None => (parent.id.as_str(), parent.local),
         };
         Endpoint {
             key: id.split('/').next().unwrap_or(id).to_string(),
@@ -101,15 +122,25 @@ impl AgentFactory for CliFactory {
             meter,
             session,
         } = child;
+        // A child that names no model is built from the one its parent is on now (after `/model`,
+        // a role's model, a fallback), the provider, window, request settings and side included.
+        let parent = self.parent_now();
         let mut config = self.template.clone();
         config.output_dir = self.output_root.join(tag.id.as_str());
+        config.model_id = parent.id.clone();
+        config.model_name = parent.name.clone();
+        config.context_window = parent.context_window;
+        config.request = parent.request.clone();
+        config.text_tool_calls = parent.text_tool_calls;
+        config.edit_section = parent.edit_section.clone();
+        config.system_prompt = parent.system_prompt.clone();
         if let Some(prompt) = &spec.system_prompt {
             config.system_prompt = prompt.clone();
         }
         if let Some(steps) = spec.max_steps {
             config.max_steps = steps;
         }
-        let (provider, mut tools) = match self.own_model(&spec) {
+        let (provider, mut tools) = match own_model(&spec, &parent) {
             Some(id) => {
                 let model = self.resolver.resolve(id, self.cancel.clone()).await?;
                 config.model_id = model.id.clone();
@@ -122,16 +153,10 @@ impl AgentFactory for CliFactory {
                 }
                 config.text_tool_calls = model.text_tool_calls;
                 config.edit_section = model.edit_section.clone();
-                let tools = model
-                    .tools
-                    .clone()
-                    .unwrap_or_else(|| harness_tools::builtin_for(self.edit_format));
+                let tools = model.tools.clone().unwrap_or_else(|| parent.tools.clone());
                 (model.provider.clone(), tools)
             }
-            None => (
-                self.provider.clone(),
-                harness_tools::builtin_for(self.edit_format),
-            ),
+            None => (parent.provider.clone(), parent.tools.clone()),
         };
         if let Some(names) = &spec.tools {
             let allowed: Vec<Arc<dyn Tool>> = tools
@@ -308,6 +333,64 @@ mod tests {
         );
         assert!(events.try_recv().is_ok());
         let _ = &f.data;
+    }
+
+    #[tokio::test]
+    async fn a_child_naming_no_model_is_built_from_the_one_its_parent_switched_to() {
+        use harness_core::{
+            agent::{Agent, SessionModel},
+            message::RequestOptions,
+            tool::{ToolContext, ToolRegistry},
+        };
+        let f = fixture("", vec![Script::text("from the old model")]);
+        let switched = MockProvider::new(vec![Script::text("from the new model")]);
+        // The parent publishes what it is on; `/model` changes it.
+        let mut parent_agent = Agent::new(
+            f.provider.clone(),
+            ToolRegistry::new(Vec::new()),
+            Arc::new(PermissionEngine::new(EngineConfig {
+                mode: Mode::Auto,
+                workspace: f.workspace.clone(),
+                read_dirs: vec![],
+                rules: RuleSet::default(),
+                sandbox_available: false,
+                writes_need_approval: false,
+            })),
+            Arc::new(harness_core::agent::NonInteractive),
+            AgentConfig::new("openai/gpt-5", "gpt-5", "p", f.workspace.join("out")),
+            ToolContext::new(&f.workspace),
+        )
+        .with_model_cell(f.factory.parent_model());
+        let spec = || AgentSpec::new("x", "y");
+        let endpoint = f.factory.endpoint(&spec());
+        assert_eq!((endpoint.key.as_str(), endpoint.local), ("openai", false));
+        parent_agent.switch_model(SessionModel {
+            provider: switched.clone(),
+            id: "mine/big".into(),
+            name: "big".into(),
+            context_window: 123_000,
+            request: RequestOptions {
+                local: true,
+                max_output_tokens: Some(999),
+                ..RequestOptions::default()
+            },
+            text_tool_calls: false,
+            tools: None,
+            edit_section: None,
+        });
+        // Its limits are those of the side and server it is on now.
+        let endpoint = f.factory.endpoint(&spec());
+        assert_eq!((endpoint.key.as_str(), endpoint.local), ("mine", true));
+        let (ctx, _rx, _a) = parent(&f, Mode::Auto);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let sup = Supervisor::new(Limits::default(), f.factory.clone(), ctx, tx);
+        let report = sup.spawn(spec()).wait().await;
+        assert_eq!(report.summary, "from the new model", "{report:?}");
+        assert!(f.provider.requests().is_empty());
+        let request = &switched.requests()[0];
+        assert_eq!(request.model, "big");
+        assert_eq!(request.options.max_output_tokens, Some(999));
+        assert!(request.options.local);
     }
 
     #[tokio::test]

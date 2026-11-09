@@ -4,6 +4,7 @@
 
 pub mod identity;
 pub mod meter;
+pub mod model;
 pub mod perm;
 pub mod records;
 pub mod report;
@@ -13,6 +14,7 @@ pub mod workspace;
 
 pub use identity::{AgentEnvelope, AgentId, AgentStatus, AgentTag, qualify_call_id};
 pub use meter::ScopedMeter;
+pub use model::{CurrentModel, ParentModel};
 pub use records::AgentRecords;
 pub use report::{AgentReport, ReportFlag, ToolLog};
 pub use sched::{Endpoint, Limits};

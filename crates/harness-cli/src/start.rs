@@ -342,7 +342,9 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     .with_diagnostics(diagnostics.clone())
     .with_roles(setup.config.roles.clone())
     .with_escalation(setup.config.escalation_to.clone())
-    .with_resolver(resolver.clone());
+    .with_resolver(resolver.clone())
+    // Children that name no model are built from the one the session is on at that moment.
+    .with_model_cell(children.factory.parent_model());
     if interactive {
         agent = agent.with_sandboxes(sandboxes);
     }

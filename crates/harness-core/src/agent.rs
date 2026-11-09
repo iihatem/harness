@@ -471,6 +471,8 @@ pub struct Agent {
     keep_tool_log: bool,
     /// Records of child agents to save in the session, from the supervisor.
     child_records: Option<crate::agents::AgentRecords>,
+    /// Where the model the agent answers with now is published, for children to be built from.
+    model_cell: Option<crate::agents::ParentModel>,
 }
 
 impl Agent {
@@ -541,7 +543,57 @@ impl Agent {
             tool_log: crate::agents::ToolLog::default(),
             keep_tool_log: false,
             child_records: None,
+            model_cell: None,
         }
+    }
+
+    /// Publishes the model the agent answers with, now and whenever it changes (`/model`, a
+    /// role's model for a turn, a fallback), into `cell`: children that name no model of their own
+    /// are built from it.
+    pub fn with_model_cell(mut self, cell: crate::agents::ParentModel) -> Self {
+        self.model_cell = Some(cell);
+        self.publish_model();
+        self
+    }
+
+    /// Says which model the agent answers with now.
+    fn publish_model(&self) {
+        let Some(cell) = &self.model_cell else {
+            return;
+        };
+        let (provider, id, name, context_window, request, text_tool_calls, local) =
+            match &self.turn_model {
+                Some(turn) => (
+                    turn.provider.clone(),
+                    turn.id.clone(),
+                    turn.name.clone(),
+                    turn.context_window.unwrap_or(self.config.context_window),
+                    turn.options(),
+                    turn.text_tool_calls,
+                    turn.local,
+                ),
+                None => (
+                    self.provider.clone(),
+                    self.config.model_id.clone(),
+                    self.config.model_name.clone(),
+                    self.config.context_window,
+                    self.config.request.clone(),
+                    self.config.text_tool_calls,
+                    self.config.request.local,
+                ),
+            };
+        cell.set(crate::agents::CurrentModel {
+            provider,
+            id,
+            name,
+            context_window,
+            request,
+            text_tool_calls,
+            local,
+            tools: self.tools.clone(),
+            system_prompt: self.config.system_prompt.clone(),
+            edit_section: self.config.edit_section.clone(),
+        });
     }
 
     /// Saves the records of child agents that `records` holds in the session, beside the
@@ -1367,6 +1419,7 @@ impl Agent {
         self.auto_compaction_paused = false;
         self.model_chosen_by_user = true;
         self.main_reason = Some(reason);
+        self.publish_model();
         AgentEvent::ModelSwitched {
             from,
             to: self.config.model_id.clone(),
@@ -1532,6 +1585,7 @@ impl Agent {
         if let Some((_, _, _, tools, section)) = session_format.clone() {
             self.use_edit_format(tools, section);
         }
+        self.publish_model();
         self.turn_plan = input.plan.clone().filter(|_| role == Role::Build);
         let reason = self.turn(input, events, cancel).await;
         self.turn_plan = None;
@@ -1543,6 +1597,7 @@ impl Agent {
         self.ctx.access = access;
         self.policy.set_turn_rules(None);
         self.turn_model = None;
+        self.publish_model();
         reason
     }
 
@@ -2444,6 +2499,7 @@ impl Agent {
         self.reported_usage = None;
         self.turn_reason = Some(SwitchReason::Fallback);
         self.turn_model = Some(model);
+        self.publish_model();
         true
     }
 

@@ -343,3 +343,19 @@ fn a_session_started_below_the_root_works_in_the_same_place_in_the_worktree() {
         repo.path().canonicalize().unwrap()
     );
 }
+
+#[test]
+fn a_new_worktree_gets_the_ignored_files_the_list_names() {
+    let f = fixture();
+    write(f.repo.path(), ".gitignore", ".env\n");
+    git(f.repo.path(), &["add", "-A"]);
+    git(f.repo.path(), &["commit", "-q", "-m", "ignore"]);
+    write(f.repo.path(), ".env", "TOKEN=1\n");
+    write(f.repo.path(), ".worktreeinclude", ".env\n");
+    let made = f.wts.create(&request("a1", "general", "task")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(made.worktree.path.join(".env")).unwrap(),
+        "TOKEN=1\n"
+    );
+    assert_eq!(made.included.copied, 1);
+}

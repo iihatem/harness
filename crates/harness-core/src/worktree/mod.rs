@@ -7,6 +7,7 @@
 //! nothing harness did not make.
 
 pub mod git;
+pub mod include;
 pub mod record;
 pub mod testing;
 
@@ -19,6 +20,7 @@ use std::{
 };
 
 pub use git::{Git, GitError};
+pub use include::Included;
 pub use record::Record;
 
 /// The file in a worktree's git admin directory that says harness made it.
@@ -108,6 +110,8 @@ pub struct Created {
     /// This is the first worktree that was made while there were such changes: the caller says
     /// so, once.
     pub said_uncommitted: bool,
+    /// What `.worktreeinclude` copied.
+    pub included: Included,
 }
 
 /// The worktrees of one repository, in one directory.
@@ -320,6 +324,7 @@ impl Worktrees {
                 ),
             )
             .map_err(|e| io("marking the worktree", e))?;
+            let included = include::copy_included(&self.git, &self.root, &path);
             let offset = self.lowest_free_offset();
             let mut record = Record::new(
                 &name,
@@ -332,10 +337,10 @@ impl Worktrees {
             );
             record.port_offset = offset;
             self.write_record(&record)?;
-            Ok::<_, WorktreeError>(offset)
+            Ok::<_, WorktreeError>((offset, included))
         })();
-        let offset = match finished {
-            Ok(offset) => offset,
+        let (offset, included) = match finished {
+            Ok(done) => done,
             Err(e) => {
                 // Do not leave a half-made worktree behind.
                 let _ = self.git.run(&["worktree", "unlock", &path_text]);
@@ -361,6 +366,7 @@ impl Worktrees {
             },
             uncommitted,
             said_uncommitted,
+            included,
         })
     }
 

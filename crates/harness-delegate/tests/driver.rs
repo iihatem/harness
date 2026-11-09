@@ -314,3 +314,45 @@ async fn a_protocol_that_asks_to_stop_starts_the_signal_ladder() {
         "{events:?}"
     );
 }
+
+/// A protocol that opens with a first line far larger than a pipe holds.
+struct BigFirstLine(Toy);
+
+impl harness_delegate::driver::Protocol for BigFirstLine {
+    fn start(&mut self) -> harness_delegate::driver::Out {
+        harness_delegate::driver::Out {
+            writes: vec!["x".repeat(1 << 20)],
+            ..Default::default()
+        }
+    }
+    fn on_line(&mut self, line: &str) -> harness_delegate::driver::Out {
+        self.0.on_line(line)
+    }
+    fn on_answer(
+        &mut self,
+        id: &str,
+        answer: ApprovalAnswer,
+    ) -> Result<harness_delegate::driver::Out, DelegateError> {
+        self.0.on_answer(id, answer)
+    }
+    fn on_interrupt(&mut self) -> harness_delegate::driver::Out {
+        self.0.on_interrupt()
+    }
+    fn escalation(&self) -> &'static [nix::sys::signal::Signal] {
+        self.0.escalation()
+    }
+}
+
+#[tokio::test]
+async fn a_child_that_exits_without_reading_a_large_first_line_ends_as_an_exit() {
+    let fake = Fake::new("x", "1.0.0", "emit a\nexit 3\n");
+    let mut r = spawn_run(
+        Command::new(&fake.binary),
+        BigFirstLine(Toy::default()),
+        cfg(),
+    )
+    .expect("the child started, so this is not a spawn error");
+    let events = collect(&mut r.events, LIMIT).await;
+    assert_eq!(texts(&events), ["a"]);
+    assert_eq!(finished(&events), Some(TurnEndReason::Error));
+}

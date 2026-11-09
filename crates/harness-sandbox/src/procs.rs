@@ -1273,6 +1273,8 @@ mod tests {
         let mut sibling_registration = Registration::new();
         sibling_registration.started(sibling.id());
         // This agent's command ended: its zombie is reaped by the look that follows.
+        // Never waited for here: its being a zombie is what `look_and_reap` is checked on.
+        #[allow(clippy::zombie_processes)]
         let ended = zombie_in_its_own_session();
         let ended_dir = Path::new("/proc").join(ended.id().to_string());
         look_and_reap();

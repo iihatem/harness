@@ -2,7 +2,7 @@
 //!
 //! `FAKE_CHILD_SCRIPT` names a file of directives, one per line:
 //! `emit <text>` prints a line; `expect <substring>` reads a line of stdin and exits 97 when it
-//! does not contain the text; `read` reads and logs one stdin line; `until-eof` reads and logs
+//! does not contain the text; `read` reads and logs one stdin line; `close-stdin` closes its end of stdin (what a write then meets is a broken pipe); `until-eof` reads and logs
 //! stdin to its end; `stderr <text>` prints to stderr; `sleep <ms>`; `exit <code>`;
 //! `ignore-sigint` and `ignore-sigterm`; `spawn-grandchild <pidfile>` starts a `sleep 300` in
 //! the same process group and writes its pid; `hang` sleeps for ever. A `$LINE` in an `emit` is
@@ -13,6 +13,7 @@
 use std::{
     fs::OpenOptions,
     io::{BufRead, Write},
+    os::fd::FromRawFd,
     process::{Command, Stdio},
     time::Duration,
 };
@@ -73,6 +74,10 @@ fn main() {
             },
             "read" => last = read_line(&mut stdin).unwrap_or_default(),
             "until-eof" => while read_line(&mut stdin).is_some() {},
+            "close-stdin" => {
+                // SAFETY: fd 0 is this process's own stdin and nothing reads it after this.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(0) });
+            }
             "stderr" => eprintln!("{rest}"),
             "sleep" => std::thread::sleep(Duration::from_millis(rest.parse().expect("ms"))),
             "exit" => std::process::exit(rest.parse().expect("code")),

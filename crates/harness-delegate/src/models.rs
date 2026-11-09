@@ -207,9 +207,25 @@ pub async fn codex_models(options: &ListOptions) -> Result<Vec<String>, Delegate
     let stdout = child.stdout.take().expect("piped");
     let exchange = async {
         let mut lines = BufReader::new(stdout).lines();
+        // A child that has gone (or closed its input) has exited, which is not a failure to
+        // start it: a line that finds the pipe broken is dropped, and what the child printed
+        // before it went is still read to its end.
+        let mut gone = false;
         let mut send = async |value: Value| -> std::io::Result<()> {
-            stdin.write_all(format!("{value}\n").as_bytes()).await?;
-            stdin.flush().await
+            if gone {
+                return Ok(());
+            }
+            let sent = async {
+                stdin.write_all(format!("{value}\n").as_bytes()).await?;
+                stdin.flush().await
+            };
+            match sent.await {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                    gone = true;
+                    Ok(())
+                }
+                other => other,
+            }
         };
         send(json!({"id": 1, "method": "initialize", "params": {
             "clientInfo": {"name": "harness", "title": "harness", "version": env!("CARGO_PKG_VERSION")},

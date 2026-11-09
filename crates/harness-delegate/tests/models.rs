@@ -79,7 +79,7 @@ async fn codex_models_are_listed_through_the_app_server() {
 #[tokio::test]
 async fn codex_model_list_error_lists_nothing_and_a_missing_binary_says_so() {
     let script = "expect \"method\":\"initialize\"\n\
-        emit {\"id\":1,\"result\":{}}\nexpect \"method\":\"model/list\"\n\
+        emit {\"id\":1,\"result\":{}}\nexpect \"method\":\"initialized\"\nexpect \"method\":\"model/list\"\n\
         emit {\"id\":2,\"error\":{\"code\":-1,\"message\":\"no\"}}\nuntil-eof\n";
     let fake = Fake::new("codex", "codex-cli 0.154.0", script);
     assert!(codex_models(&options(&fake)).await.unwrap().is_empty());
@@ -91,6 +91,26 @@ async fn codex_model_list_error_lists_nothing_and_a_missing_binary_says_so() {
         codex_models(&none).await,
         Err(DelegateError::NotFound("codex"))
     ));
+}
+
+/// A child that has closed its input before harness's next line is written is an exit, not a
+/// failure to start: whatever it printed is read, and nothing is listed from it.
+#[tokio::test]
+async fn a_codex_that_closes_its_input_early_lists_nothing_rather_than_failing_to_start() {
+    let script = "close-stdin\nemit {\"id\":1,\"result\":{}}\nexit 0\n";
+    let fake = Fake::new("codex", "codex-cli 0.154.0", script);
+    let models = codex_models(&options(&fake)).await;
+    assert_eq!(models.unwrap(), Vec::<String>::new());
+}
+
+/// What it printed before it went is still the answer.
+#[tokio::test]
+async fn a_codex_that_answers_and_closes_its_input_still_has_its_answer_read() {
+    let script = "close-stdin\nemit {\"id\":1,\"result\":{}}\n\
+        emit {\"id\":2,\"result\":{\"data\":[{\"id\":\"x\",\"model\":\"gpt-5-codex\"}]}}\nexit 0\n";
+    let fake = Fake::new("codex", "codex-cli 0.154.0", script);
+    let models = codex_models(&options(&fake)).await.unwrap();
+    assert_eq!(models, ["gpt-5-codex"]);
 }
 
 #[tokio::test]

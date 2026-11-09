@@ -768,3 +768,27 @@ fn the_reports_flags_are_refused_with_a_subcommand() {
     let ok = run_usage(&env, &["usage", "export", "--since", "2026-10-01"]);
     assert!(ok.status.success(), "{ok:?}");
 }
+
+// M3a: `harness usage --by agent` groups child agents' requests, the main agent's as `main`.
+#[test]
+fn usage_by_agent_groups_children_and_the_main_agent() {
+    let env = Env::new("http://127.0.0.1:1", "");
+    std::fs::create_dir_all(env.usage_dir()).unwrap();
+    let line = |session: &str, extra: &str| {
+        format!(
+            r#"{{"v":1,"t":1790942400,"session":"{session}","project":"p","role":"main","model":"mock/m","account":"api_key","input":10,"cache_read":0,"cache_write":0,"cache_write_1h":0,"output":1,"reasoning":0,"billed_usd":0.5,"list_usd":0.5,"price":null,"ms":1,"outcome":"ok","window":null{extra}}}"#
+        )
+    };
+    let ledger = format!(
+        "{}\n{}\n",
+        line("s1", ""),
+        line("s2", r#","agent":"a1","parent":"s1""#)
+    );
+    std::fs::write(env.usage_dir().join("ledger-2026-10.jsonl"), ledger).unwrap();
+    let out = env.cmd().args(["usage", "--by", "agent"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Usage by agent"), "{text}");
+    assert!(text.lines().any(|l| l.starts_with("a1 ")), "{text}");
+    assert!(text.lines().any(|l| l.starts_with("main ")), "{text}");
+}

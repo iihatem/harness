@@ -1,4 +1,4 @@
-//! `harness usage`: what the ledger holds, by model, provider, day or project. Offline: it reads
+//! `harness usage`: what the ledger holds, by model, provider, day, project or agent. Offline: it reads
 //! only files on this machine.
 
 use harness_usage::{
@@ -25,7 +25,7 @@ fn date(flag: &str, value: Option<String>) -> Result<Option<String>, String> {
 /// What to report, from the command line's words.
 fn query(by: &str, since: Option<String>, until: Option<String>) -> Result<Query, String> {
     let by = Group::parse(by)
-        .ok_or_else(|| format!("--by takes model, provider, day or project, not `{by}`"))?;
+        .ok_or_else(|| format!("--by takes model, provider, day, project or agent, not `{by}`"))?;
     Ok(Query {
         by,
         since: date("--since", since)?,
@@ -52,7 +52,7 @@ pub fn lines(setup: &Setup, query: &Query) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
-/// The report for `/usage <args>`: a group (`model`, `provider`, `day`, `project`; `model` by
+/// The report for `/usage <args>`: a group (`model`, `provider`, `day`, `project`, `agent`; `model` by
 /// default) and `--since DATE`, `--until DATE`. A mistake in the arguments is one line saying so.
 pub fn session_lines(setup: &Setup, args: &str) -> Vec<String> {
     let mut by = "model".to_string();

@@ -115,13 +115,13 @@ enum Command {
         #[command(subcommand)]
         command: PricingCommand,
     },
-    /// Report model usage and cost from the local ledger, by model, provider, day or project;
+    /// Report model usage and cost from the local ledger, by model, provider, day, project or agent;
     /// `usage export` and `usage forget` handle the data
     #[command(args_conflicts_with_subcommands = true)]
     Usage {
         #[command(subcommand)]
         command: Option<UsageCommand>,
-        /// What to group by: model, provider, day or project
+        /// What to group by: model, provider, day, project or agent
         #[arg(long, default_value = "model")]
         by: String,
         /// Only requests on or after this UTC date (YYYY-MM-DD)

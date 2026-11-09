@@ -27,6 +27,8 @@ pub enum Group {
     Provider,
     Day,
     Project,
+    /// The child agent that made the request; the main agent's are `main`.
+    Agent,
 }
 
 impl Group {
@@ -37,16 +39,18 @@ impl Group {
             Group::Provider => "provider",
             Group::Day => "day",
             Group::Project => "project",
+            Group::Agent => "agent",
         }
     }
 
-    /// Reads `model`, `provider`, `day` or `project`.
+    /// Reads `model`, `provider`, `day`, `project` or `agent`.
     pub fn parse(text: &str) -> Option<Group> {
         match text {
             "model" => Some(Group::Model),
             "provider" => Some(Group::Provider),
             "day" => Some(Group::Day),
             "project" => Some(Group::Project),
+            "agent" => Some(Group::Agent),
             _ => None,
         }
     }
@@ -57,6 +61,7 @@ impl Group {
             Group::Provider => "provider",
             Group::Day => "day",
             Group::Project => "project",
+            Group::Agent => "COALESCE(agent, 'main')",
         }
     }
 }

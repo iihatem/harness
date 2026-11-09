@@ -197,3 +197,24 @@ fn a_childs_outcome_names_its_agent_and_parent_and_the_mains_does_not() {
     let text = serde_json::to_string(&records[1]).unwrap();
     assert!(!text.contains("\"agent\""));
 }
+
+#[test]
+fn usage_can_be_grouped_by_agent_with_the_main_agent_as_main() {
+    use harness_usage::store::{Group, Query, Store};
+    let data = tempfile::tempdir().unwrap();
+    let m = meter(data.path(), Budgets::default());
+    m.record_request(&request("parent", 2));
+    m.record_request_as(&request("child", 3), Some(&scope()));
+    m.record_request_as(&request("child", 4), Some(&scope()));
+    assert_eq!(Group::parse("agent"), Some(Group::Agent));
+    let mut store = Store::open(&Dirs::under(data.path())).unwrap();
+    store.sync().unwrap();
+    let report = store.report(&Query::all(Group::Agent)).unwrap();
+    let keys: Vec<(&str, u64)> = report
+        .rows
+        .iter()
+        .map(|r| (r.key.as_str(), r.requests))
+        .collect();
+    assert_eq!(keys, vec![("a1", 2), ("main", 1)]);
+    assert_eq!(report.total.requests, 3);
+}

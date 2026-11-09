@@ -2,6 +2,7 @@
 //! what each may do ([`perm`]), what it reports ([`report`]), how its usage is recorded
 //! ([`meter`]) and the [`supervisor`] that spawns and tracks them.
 
+pub mod definition;
 pub mod identity;
 pub mod meter;
 pub mod model;
@@ -12,6 +13,7 @@ pub mod sched;
 pub mod supervisor;
 pub mod workspace;
 
+pub use definition::{AgentDefinition, DefinitionSource, Definitions, normalize_tools};
 pub use identity::{AgentEnvelope, AgentId, AgentStatus, AgentTag, qualify_call_id};
 pub use meter::ScopedMeter;
 pub use model::{CurrentModel, ParentModel};

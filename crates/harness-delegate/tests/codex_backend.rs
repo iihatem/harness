@@ -97,11 +97,54 @@ fn all_stdin_valid(fake: &Fake) {
 
 #[test]
 fn the_command_line_is_app_server_on_stdio() {
-    let a: Vec<String> = argv::build()
+    let a: Vec<String> = argv::build(&[])
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     assert_eq!(a, ["app-server", "--listen", "stdio://"]);
+}
+
+#[test]
+fn the_users_mcp_servers_are_switched_off_by_name_with_a_toml_table() {
+    let names = ["alpha".to_string(), "we.ird \"name\"".to_string()];
+    let a: Vec<String> = argv::build(&names)
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let i = a.iter().position(|x| x == "-c").expect("a -c override");
+    assert_eq!(
+        a[i + 1],
+        r#"mcp_servers={"alpha"={enabled=false},"we.ird \"name\""={enabled=false}}"#
+    );
+    assert_eq!(a[0], "app-server", "the subcommand comes first");
+}
+
+#[tokio::test]
+async fn the_servers_codex_lists_for_the_user_are_disabled_on_the_command_line() {
+    let script = format!("{}emit {}\n", handshake(), completed("completed"));
+    let fake = Fake::new("codex", VERSION, &script);
+    std::fs::write(
+        fake.path().join("mcp.json"),
+        r#"[{"name":"alpha","enabled":true},{"name":"beta","enabled":false}]"#,
+    )
+    .unwrap();
+    let mut run = CodexBackend.start(req(&fake)).await.unwrap();
+    collect(&mut run.events, LIMIT).await;
+    let a = fake.argv();
+    let i = a.iter().position(|x| x == "-c").expect("a -c override");
+    assert_eq!(
+        a[i + 1],
+        r#"mcp_servers={"alpha"={enabled=false},"beta"={enabled=false}}"#
+    );
+}
+
+#[tokio::test]
+async fn with_no_user_mcp_servers_there_is_no_override() {
+    let script = format!("{}emit {}\n", handshake(), completed("completed"));
+    let fake = Fake::new("codex", VERSION, &script);
+    let mut run = CodexBackend.start(req(&fake)).await.unwrap();
+    collect(&mut run.events, LIMIT).await;
+    assert!(!fake.argv().contains(&"-c".to_string()));
 }
 
 #[tokio::test]

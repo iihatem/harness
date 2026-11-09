@@ -9,7 +9,7 @@ use tokio::process::Command;
 use crate::{
     BackendKind, DelegateBackend, DelegateError, DelegateRun, StartRequest,
     detect::{DetectOptions, detect},
-    driver::{DriverConfig, spawn_run},
+    driver::{DriverConfig, Keep, spawn_run},
     env::{AuthMode, child_env},
 };
 
@@ -30,7 +30,7 @@ impl DelegateBackend for ClaudeBackend {
 
     async fn start(&self, request: StartRequest) -> Result<DelegateRun, DelegateError> {
         // Refuse before looking for anything: this needs no binary.
-        let args = argv::build(&request)?;
+        argv::build(&request)?;
         let found = detect(
             BackendKind::Claude,
             &DetectOptions {
@@ -41,6 +41,16 @@ impl DelegateBackend for ClaudeBackend {
             },
         )
         .await?;
+        // The instructions file lives as long as the run (the driver holds it) and goes with it.
+        let (instructions, keep) = match request.instructions.as_deref().filter(|i| !i.is_empty()) {
+            Some(text) => {
+                let file = write_instructions(text)?;
+                let path = file.to_path_buf();
+                (Some(path), Keep::new(file))
+            }
+            None => (None, Keep::default()),
+        };
+        let args = argv::build_with(&request, instructions.as_deref())?;
         let parent = request
             .parent_env
             .clone()
@@ -67,7 +77,25 @@ impl DelegateBackend for ClaudeBackend {
                 grace: request.grace,
                 redactor: request.redactor,
                 max_line: MAX_LINE,
+                keep,
             },
         )
     }
+}
+
+/// The instructions in a private temporary file (mode 0600) that is removed when dropped.
+fn write_instructions(text: &str) -> Result<tempfile::TempPath, DelegateError> {
+    use std::io::Write;
+    let spawn = |source| DelegateError::Spawn {
+        binary: "claude".into(),
+        source,
+    };
+    let mut file = tempfile::Builder::new()
+        .prefix("harness-instructions-")
+        .suffix(".md")
+        .tempfile()
+        .map_err(spawn)?;
+    file.write_all(text.as_bytes()).map_err(spawn)?;
+    file.flush().map_err(spawn)?;
+    Ok(file.into_temp_path())
 }

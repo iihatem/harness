@@ -23,6 +23,7 @@ fn cfg() -> DriverConfig {
         grace: Duration::from_millis(150),
         redactor: Arc::new(Redactor::default()),
         max_line: 4096,
+        keep: Default::default(),
     }
 }
 
@@ -84,6 +85,7 @@ async fn a_line_over_the_cap_is_dropped_with_a_warning_and_the_stream_goes_on() 
         &fake,
         DriverConfig {
             max_line: 256,
+            keep: Default::default(),
             ..cfg()
         },
     );

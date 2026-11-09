@@ -454,3 +454,121 @@ async fn the_child_runs_in_the_workspace() {
     let want = std::fs::canonicalize(dir.path()).unwrap();
     assert_eq!(pwd.map(|p| std::fs::canonicalize(p).unwrap()), Some(want));
 }
+
+// --- the project's instructions -----------------------------------------------------------
+
+const INSTRUCTIONS: &str = "Project rules: use tabs.\nSecret word: PINEAPPLE\n";
+
+/// Wraps the fake so that the file named after `--append-system-prompt-file` is copied while the
+/// child runs, and its path recorded.
+fn spy_on_instructions_file(fake: &Fake) {
+    let orig = fake.path().join("orig");
+    std::fs::rename(&fake.binary, &orig).unwrap();
+    std::fs::write(
+        &fake.binary,
+        format!(
+            "#!/bin/sh\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--append-system-prompt-file\" ]; then\n    cp \"$a\" '{d}/copied.md'; echo \"$a\" > '{d}/path.txt'; ls -l \"$a\" | cut -c1-10 > '{d}/mode.txt'\n  fi\n  prev=\"$a\"\ndone\nexec '{o}' \"$@\"\n",
+            d = fake.path().display(),
+            o = orig.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &fake.binary,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn the_instructions_go_in_a_file_the_run_owns_and_removes() {
+    let script = format!("expect fix the bug\nemit {INIT}\nemit {RESULT_OK}\n");
+    let fake = Fake::new("claude", VERSION, &script);
+    spy_on_instructions_file(&fake);
+    let mut r = req(&fake);
+    r.instructions = Some(INSTRUCTIONS.into());
+    let mut run = ClaudeBackend.start(r).await.unwrap();
+    let events = collect(&mut run.events, LIMIT).await;
+    assert_eq!(finished(&events), Some(TurnEndReason::Completed));
+
+    let argv = fake.argv();
+    assert!(
+        argv.iter().any(|a| a == "--append-system-prompt-file"),
+        "{argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|a| a.contains("PINEAPPLE")),
+        "the instructions never go on the command line: {argv:?}"
+    );
+    let copied = std::fs::read_to_string(fake.path().join("copied.md")).unwrap();
+    assert_eq!(copied, INSTRUCTIONS);
+    let mode = std::fs::read_to_string(fake.path().join("mode.txt")).unwrap();
+    assert_eq!(mode.trim(), "-rw-------", "only the user can read it");
+
+    let path = std::fs::read_to_string(fake.path().join("path.txt")).unwrap();
+    let path = std::path::PathBuf::from(path.trim());
+    for _ in 0..100 {
+        if !path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!path.exists(), "the file is removed when the run ends");
+}
+
+#[tokio::test]
+async fn no_instructions_means_no_flag() {
+    let script = format!("expect fix the bug\nemit {INIT}\nemit {RESULT_OK}\n");
+    let fake = Fake::new("claude", VERSION, &script);
+    let mut run = ClaudeBackend.start(req(&fake)).await.unwrap();
+    collect(&mut run.events, LIMIT).await;
+    assert!(
+        !fake
+            .argv()
+            .iter()
+            .any(|a| a.starts_with("--append-system-prompt"))
+    );
+}
+
+#[test]
+fn the_flag_names_the_file_before_the_variadic_directories() {
+    let mut r = StartRequest::new("t", "/w");
+    r.extra_dirs = vec!["/a".into()];
+    let a: Vec<String> = argv::build_with(&r, Some(std::path::Path::new("/tmp/i.md")))
+        .unwrap()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(has_pair(&a, "--append-system-prompt-file", "/tmp/i.md"));
+    assert_eq!(&a[a.len() - 2..], ["--add-dir", "/a"]);
+}
+
+// --- values that become part of the command line -------------------------------------------
+
+#[test]
+fn a_value_that_looks_like_a_flag_is_refused_not_passed() {
+    for (field, set) in [
+        (
+            "model",
+            (|r: &mut StartRequest| r.model = Some("--dangerously-skip-permissions".into()))
+                as fn(&mut StartRequest),
+        ),
+        ("model", |r| r.model = Some("opus extra".into())),
+        ("model", |r| r.model = Some(String::new())),
+        ("resume", |r| r.resume = Some("-x".into())),
+        ("resume", |r| r.resume = Some("a;b".into())),
+        ("add-dir", |r| r.extra_dirs = vec!["-rf".into()]),
+    ] {
+        let mut r = StartRequest::new("t", "/w");
+        set(&mut r);
+        assert!(
+            matches!(argv::build(&r), Err(DelegateError::InvalidValue { field: f, .. }) if f == field),
+            "{field}"
+        );
+    }
+    let mut r = StartRequest::new("t", "/w");
+    r.model = Some("claude-opus-4-5:beta/x_y.1".into());
+    r.resume = Some("0a1b2c3d-aaaa-bbbb".into());
+    r.extra_dirs = vec!["/ok/-dash".into(), "rel/dir".into()];
+    assert!(argv::build(&r).is_ok());
+}

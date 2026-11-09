@@ -74,6 +74,26 @@ pub trait Protocol: Send + 'static {
     }
 }
 
+/// Something the run owns until it ends (a temporary file, say): dropped with the driver.
+#[derive(Clone, Default)]
+pub struct Keep(Option<Arc<dyn std::any::Any + Send + Sync>>);
+
+impl Keep {
+    pub fn new<T: Send + Sync + 'static>(value: T) -> Keep {
+        Keep(Some(Arc::new(value)))
+    }
+}
+
+impl std::fmt::Debug for Keep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Keep(..)"
+        } else {
+            "Keep(none)"
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DriverConfig {
     /// The program's name, for messages.
@@ -83,6 +103,8 @@ pub struct DriverConfig {
     pub redactor: Arc<Redactor>,
     /// The longest line read; a longer one is dropped with a warning.
     pub max_line: usize,
+    /// Held until the run has ended.
+    pub keep: Keep,
 }
 
 /// A line of the child's output.
@@ -214,6 +236,11 @@ fn ladder_for<P: Protocol>(protocol: &P, grace: Duration) -> Ladder {
         next: 0,
         at: Instant::now() + grace,
     }
+}
+
+/// Whether any process is left in the group `pid` led (signal 0 sends nothing).
+fn group_alive(pid: i32) -> bool {
+    killpg(Pid::from_raw(pid), None).is_ok()
 }
 
 fn signal_group(pid: i32, signal: Signal) {
@@ -415,8 +442,11 @@ async fn drive<P: Protocol>(
         }
     }
 
-    // Whatever is left of the child's group goes with it.
-    signal_group(pid, Signal::SIGKILL);
+    // Whatever is left of the child's group goes with it. Once the child has been reaped, a group
+    // with no member left is gone and its id may be reused: it is not signalled then.
+    if exit.is_none() || group_alive(pid) {
+        signal_group(pid, Signal::SIGKILL);
+    }
     let status = match exit {
         Some(status) => Some(status),
         None => child.wait().await.ok(),

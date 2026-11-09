@@ -16,17 +16,27 @@
 //!   an approval's raw `arguments`, which the approver needs to work out what to show.
 //! - harness's permission engine is the only approver: Claude is started with no settings
 //!   sources and an empty rule set, Codex with the sandbox and approval policy of the harness
-//!   mode ([`codex::protocol::policy`]). `full-access` needs `full_access_confirmed`.
-//! - The environment is scrubbed by [`env::child_env`] for subscription or API-key mode.
+//!   mode ([`codex::protocol::policy`]) and the user's own MCP servers switched off.
+//!   `full-access` needs `full_access_confirmed`.
+//! - Project instructions: with no setting sources Claude Code likely does not read CLAUDE.md
+//!   itself (static evidence from 2.1.312), so the caller passes the instructions harness
+//!   already loads in [`StartRequest::instructions`]; they go to a private temporary file the
+//!   run owns and removes (`--append-system-prompt-file`). If a later live check shows Claude
+//!   does read them, they appear twice (tokens only). Codex reads its own AGENTS.md.
+//! - The environment is scrubbed by [`env::child_env`] for subscription or API-key mode: by
+//!   pattern (`ANTHROPIC_*`, `CLAUDE_CODE_*`, `OPENAI_*`, `CODEX_*` but the user's own
+//!   `CODEX_HOME`-style settings), so a variable a newer release reads is covered too.
 //! - Versions outside [`detect::tested_range`] are refused unless the caller allows them.
 //!
 //! # What was not verified against a live run
 //!
 //! See the plan: the Claude stdio permission handshake (no `initialize` request is sent), the
-//! shapes of Claude's assistant and stream events (hand-written fixtures), `--setting-sources=`
-//! with an empty value, Claude's `rate_limit_event` fields, the Codex API-key variable, and
-//! whether a user's own Codex execution-policy rules can approve a command before harness is
-//! asked. The Codex messages are validated against the schema generated from codex-cli 0.154.0.
+//! shapes of Claude's assistant and stream events (hand-written fixtures), CLAUDE.md loading
+//! with `--setting-sources=` (and whether `apiProvider` appears in `system/init`), Claude's
+//! `rate_limit_event` fields, the resume cost baseline, the Codex API-key variable, and whether
+//! a user's own Codex execution-policy rules and hooks can act before harness is asked. The
+//! Codex messages are validated against the schema generated from codex-cli 0.154.0, and one
+//! real Codex run (`tests/fixtures/codex/ask-0.154.0.jsonl`) is replayed through the protocol.
 
 pub mod backend;
 pub mod claude;

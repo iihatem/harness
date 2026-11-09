@@ -49,6 +49,10 @@ pub enum DelegateError {
     },
     #[error("full-access delegation needs an explicit confirmation for this run")]
     FullAccessUnconfirmed,
+    #[error(
+        "{field} {value:?} cannot be passed to the program: it must not be empty or start with `-`, and may only hold letters, digits and `._:/@+=-`"
+    )]
+    InvalidValue { field: &'static str, value: String },
     #[error("could not start {binary}: {source}")]
     Spawn {
         binary: String,
@@ -91,6 +95,11 @@ pub struct StartRequest {
     pub grace: Duration,
     /// For a resumed Claude session: the session's cost total before this run.
     pub cost_baseline_usd: f64,
+    /// The project instructions harness already loads (the AGENTS.md / CLAUDE.md chain), for
+    /// Claude: with no setting sources it very likely reads none itself, so they go to it in a
+    /// file the run owns (`--append-system-prompt-file`; never on the command line) and removes.
+    /// Codex reads its own AGENTS.md: ignored there.
+    pub instructions: Option<String>,
 }
 
 impl StartRequest {
@@ -111,6 +120,7 @@ impl StartRequest {
             allow_untested: false,
             grace: Duration::from_secs(5),
             cost_baseline_usd: 0.0,
+            instructions: None,
         }
     }
 }

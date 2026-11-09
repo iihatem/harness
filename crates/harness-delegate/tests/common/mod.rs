@@ -38,7 +38,9 @@ impl Fake {
             &binary,
             format!(
                 "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '{version_line}'; exit 0; fi\n\
+                 if [ \"$1\" = \"mcp\" ]; then cat '{}/mcp.json' 2>/dev/null || echo '[]'; exit 0; fi\n\
                  FAKE_CHILD_SCRIPT='{}' FAKE_CHILD_LOG='{}' FAKE_CHILD_ENVDUMP='{}' exec '{FAKE}' \"$@\"\n",
+                dir.path().display(),
                 script_path.display(),
                 log.display(),
                 env_dump.display()

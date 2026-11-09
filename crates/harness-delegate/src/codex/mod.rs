@@ -9,7 +9,7 @@ use tokio::process::Command;
 use crate::{
     BackendKind, DelegateBackend, DelegateError, DelegateRun, StartRequest,
     detect::{DetectOptions, detect},
-    driver::{DriverConfig, spawn_run},
+    driver::{DriverConfig, Keep, spawn_run},
     env::child_env,
 };
 
@@ -58,12 +58,16 @@ impl DelegateBackend for CodexBackend {
             .parent_env
             .clone()
             .unwrap_or_else(|| std::env::vars_os().collect());
+        let env = child_env(BackendKind::Codex, &request.auth, parent);
+        // Codex starts the MCP servers of the user's own config: harness decides what a delegate
+        // may reach, so they are switched off, by the names codex itself lists.
+        let servers = user_mcp_servers(&found.path, &env, &request.workspace).await;
         let mut command = Command::new(&found.path);
         command
-            .args(argv::build())
+            .args(argv::build(&servers))
             .current_dir(&request.workspace)
             .env_clear()
-            .envs(child_env(BackendKind::Codex, &request.auth, parent));
+            .envs(env);
         spawn_run(
             command,
             protocol,
@@ -72,7 +76,58 @@ impl DelegateBackend for CodexBackend {
                 grace: request.grace,
                 redactor: request.redactor,
                 max_line: MAX_LINE,
+                keep: Keep::default(),
             },
         )
     }
+}
+
+/// The names of the MCP servers codex would start for the user (`codex mcp list --json`, which
+/// reads the config but starts nothing). Best effort: when it cannot be run or read, there are
+/// no names, and the servers are not switched off (the plan lists this as a limit).
+async fn user_mcp_servers(
+    binary: &std::path::Path,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+    workspace: &std::path::Path,
+) -> Vec<String> {
+    use std::process::Stdio;
+    let mut command = Command::new(binary);
+    command
+        .args(["mcp", "list", "--json"])
+        .current_dir(workspace)
+        .env_clear()
+        .envs(env.iter().cloned())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true);
+    let Ok(child) = command.spawn() else {
+        return Vec::new();
+    };
+    let pid = child.id();
+    let listed =
+        tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output()).await;
+    let output = match listed {
+        Ok(Ok(output)) if output.status.success() => output.stdout,
+        _ => {
+            if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            return Vec::new();
+        }
+    };
+    let Ok(list) = serde_json::from_slice::<serde_json::Value>(&output) else {
+        return Vec::new();
+    };
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|server| server["name"].as_str())
+        .filter(|name| !name.chars().any(char::is_control))
+        .map(String::from)
+        .collect()
 }

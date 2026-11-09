@@ -446,12 +446,19 @@ where
     /// Takes in a change of the children.
     fn children_changed(&mut self) -> io::Result<Flow> {
         let mut reread = false;
+        let mut notices = Vec::new();
         if let Some(watch) = &mut self.agents {
             let children = watch.supervisor.snapshot();
             let ended = children.iter().filter(|c| c.status.is_final()).count();
             reread = ended != watch.ended;
             watch.ended = ended;
             self.app.set_children(children);
+            // What the supervisor says the user should know (changes not committed that a
+            // worktree lacks, a copy that stopped), once each.
+            notices = watch.supervisor.take_notices();
+        }
+        for notice in notices {
+            self.show(AgentEvent::Warning { message: notice });
         }
         // An agent that ended has left a result, or removed its worktree.
         if reread {
@@ -1233,6 +1240,12 @@ where
         // The session is over: background agents too (the user was asked).
         if let Some(watch) = &self.agents {
             watch.supervisor.stop_all();
+            // They commit what they changed and release their worktrees as they end: a moment
+            // is given for that, so what is left is settled, not found failed at the next start.
+            watch
+                .supervisor
+                .settled(std::time::Duration::from_secs(5))
+                .await;
         }
         self.approvals.close();
         // Dropping a reply denies it.

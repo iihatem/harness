@@ -362,8 +362,12 @@ async fn quitting_with_a_background_agent_running_asks_and_stopping_ends_it() {
     let flow = key(&mut rig.ui, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(flow, Flow::Quit);
     rig.ui.finish().await.unwrap();
-    until_status(&rig, AgentStatus::Cancelled).await;
+    // Finishing waited for the agent to settle: it is stopped, its worktree (it changed nothing)
+    // is gone and its lock released, with no waiting here.
+    assert_eq!(rig.sup.snapshot()[0].status, AgentStatus::Cancelled);
     assert_eq!(rig.sup.live_background(), 0);
+    assert!(rig.wts.records().is_empty(), "{:?}", rig.wts.records());
+    assert!(!git(rig.main.path(), &["worktree", "list", "--porcelain"]).contains("locked"));
 }
 
 /// Takes in the supervisor's changes until the session shows as many live background agents.
@@ -376,14 +380,6 @@ fn rig_working(r: &Rig) -> bool {
         .snapshot()
         .first()
         .is_some_and(|i| i.status == AgentStatus::Working)
-}
-
-async fn until_status(rig: &Rig, status: AgentStatus) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while rig.sup.snapshot()[0].status != status {
-        assert!(tokio::time::Instant::now() < deadline, "never {status:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -441,6 +437,109 @@ async fn keep_working_leaves_everything_as_it_was_and_no_agents_means_no_questio
         key(&mut idle.ui, KeyCode::Char('d'), KeyModifiers::CONTROL),
         Flow::Quit
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changes_not_committed_in_the_checkout_are_said_once_in_the_transcript() {
+    let mut rig = rig(
+        Mode::Auto,
+        vec![vec![Script::Hang(vec![])], vec![Script::Hang(vec![])]],
+        true,
+    );
+    std::fs::write(rig.main.path().join("README.md"), "dirty\n").unwrap();
+    std::fs::write(rig.main.path().join("scratch.txt"), "new\n").unwrap();
+    send(&mut rig.ui, "/bg first job");
+    until_background(&mut rig, "its worktree", |r| r.wts.records().len() == 1).await;
+    until(&mut rig.ui, |app| app.live_background() == 1).await;
+    // A moment for the supervisor's notice to reach the transcript.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !shows_wrapped(&rig.ui, "not in the agents' worktrees") {
+        assert!(tokio::time::Instant::now() < deadline, "never said");
+        let _ = tokio::time::timeout(Duration::from_millis(50), rig.ui.next()).await;
+        rig.ui.draw().unwrap();
+    }
+    assert!(
+        shows_wrapped(&rig.ui, "2 files with changes not committed"),
+        "{:?}",
+        everything(&rig.ui)
+    );
+    // A second agent does not say it again.
+    send(&mut rig.ui, "/bg second job");
+    until_background(&mut rig, "the second worktree", |r| {
+        r.wts.records().len() == 2
+    })
+    .await;
+    for _ in 0..5 {
+        let _ = tokio::time::timeout(Duration::from_millis(50), rig.ui.next()).await;
+    }
+    rig.ui.draw().unwrap();
+    let said = everything(&rig.ui)
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .matches("not in the agents' worktrees")
+        .count();
+    assert_eq!(said, 1);
+    rig.sup.stop_all();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn esc_and_ctrl_c_leave_a_background_agents_approval_queued() {
+    let mut rig = rig(Mode::Ask, vec![writes("a.txt")], true);
+    send(&mut rig.ui, "/bg write a file");
+    until(&mut rig.ui, |app| app.pending_approvals() == 1).await;
+    until_background(&mut rig, "needs input", |r| {
+        r.sup.snapshot()[0].status == AgentStatus::NeedsInput
+    })
+    .await;
+    // Not the user's keys for the prompt: Esc and Ctrl+C are for the turn.
+    key(&mut rig.ui, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(rig.ui.app().pending_approvals(), 1, "Esc");
+    key(&mut rig.ui, KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert_eq!(rig.ui.app().pending_approvals(), 1, "Ctrl+C");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = tokio::time::timeout(Duration::from_millis(50), rig.ui.next()).await;
+    assert_eq!(rig.sup.snapshot()[0].status, AgentStatus::NeedsInput);
+    assert_eq!(rig.ui.app().pending_approvals(), 1);
+    // It is still the user's to answer.
+    until_armed(&rig.ui).await;
+    press(&mut rig.ui, KeyCode::Char('y'));
+    until_background(&mut rig, "it finished", |r| {
+        r.sup.snapshot()[0].status.is_final()
+    })
+    .await;
+    assert_eq!(rig.sup.snapshot()[0].status, AgentStatus::Done);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keep_working_after_wait_takes_the_wait_back() {
+    let mut rig = rig(Mode::Auto, vec![vec![Script::Hang(vec![])]], true);
+    send(&mut rig.ui, "/bg long job");
+    until_background(&mut rig, "working", rig_working).await;
+    until_seen(&mut rig, 1).await;
+    // Wait.
+    key(&mut rig.ui, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    until_armed(&rig.ui).await;
+    type_text(&mut rig.ui, "wait");
+    key(&mut rig.ui, KeyCode::Enter, KeyModifiers::NONE);
+    // Ctrl+D asks again; this time: keep working.
+    key(&mut rig.ui, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    until_armed(&rig.ui).await;
+    type_text(&mut rig.ui, "keep");
+    assert_eq!(
+        key(&mut rig.ui, KeyCode::Enter, KeyModifiers::NONE),
+        Flow::Continue
+    );
+    // The last agent ends: harness does not leave.
+    rig.sup.stop_all();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(flow) = tokio::time::timeout(Duration::from_millis(50), rig.ui.next()).await {
+            assert_ne!(flow.unwrap(), Flow::Quit, "it quit after keep working");
+        }
+    }
+    assert!(!rig.ui.app().quit_ready());
 }
 
 #[allow(dead_code)]

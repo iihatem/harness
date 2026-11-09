@@ -297,6 +297,50 @@ async fn the_agents_session_is_in_its_record_while_it_runs() {
     let _ = wait(handle).await;
 }
 
+/// What anyone who is woken by a child's end (the terminal's panel) and then reads the record
+/// must find: the record is final, with its result, by the time the status says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_record_is_final_before_the_status_that_wakes_the_terminal_says_so() {
+    for round in 0..6 {
+        let f = fixture(vec![edits("src/new.rs", "pub fn two() {}\n")], true);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen: Arc<Mutex<Option<(AgentStatus, bool)>>> = Arc::new(Mutex::new(None));
+        let (sup, wts) = (f.sup.clone(), f.wts.clone());
+        let (flag, out) = (stop.clone(), seen.clone());
+        // Like the terminal: the moment the child is final, the records are read.
+        let observer = std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                let ended = sup
+                    .snapshot()
+                    .first()
+                    .is_some_and(|info| info.status.is_final());
+                if ended {
+                    let record = wts.records().into_iter().next();
+                    *out.lock().unwrap() = Some((
+                        record.as_ref().map_or(AgentStatus::Queued, |r| r.status),
+                        record.is_some_and(|r| r.outcome.is_some()),
+                    ));
+                    return;
+                }
+            }
+        });
+        let report = wait(f.sup.spawn(isolated("general"))).await;
+        assert_eq!(report.status, AgentStatus::Done);
+        let started = std::time::Instant::now();
+        while seen.lock().unwrap().is_none() && started.elapsed() < WAIT {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        observer.join().unwrap();
+        let (status, has_outcome) = seen.lock().unwrap().take().expect("it saw the end");
+        assert_eq!(status, AgentStatus::Done, "round {round}");
+        assert!(
+            has_outcome,
+            "round {round}: the result was not in the record yet"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_child_that_changed_nothing_leaves_no_worktree_and_no_branch() {
     let f = fixture(vec![vec![Script::text("nothing to do")]], true);

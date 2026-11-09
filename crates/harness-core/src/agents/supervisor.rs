@@ -366,6 +366,27 @@ impl Supervisor {
         std::mem::take(&mut *lock(&self.inner.notices))
     }
 
+    /// Waits until no child is still running (each has settled its worktree by then), for at most
+    /// `limit`; whether that happened.
+    pub async fn settled(&self, limit: std::time::Duration) -> bool {
+        let mut changes = self.subscribe();
+        let all_ended = || {
+            lock(&self.inner.registry)
+                .entries
+                .iter()
+                .all(|e| e.info.status.is_final())
+        };
+        tokio::time::timeout(limit, async {
+            while !all_ended() {
+                if changes.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     /// Spawns a child under the parent's own token.
     pub fn spawn(&self, spec: AgentSpec) -> AgentHandle {
         let cancel = lock(&self.inner.parent).cancel.clone();
@@ -495,16 +516,9 @@ fn finish_child(
         .iter()
         .find(|e| &e.info.tag.id == id)
         .map(|e| e.info.clone());
-    inner.update(id, |info| {
-        info.status = report.status;
-        info.summary = Some(crate::agents::report::cap_chars(&report.summary, 400).0)
-            .filter(|summary| !summary.is_empty());
-        info.error = report.error.clone();
-        if let Some(worktree) = &mut info.worktree {
-            worktree.outcome = report.worktree.clone();
-        }
-    });
-    // What a worktree's record says, for a listing after a restart.
+    // What a worktree's record says, for a listing after a restart. Written before the status
+    // changes: whoever the change wakes (the terminal's panel) reads the record at once, and must
+    // find the result in it.
     if let (Some(info), Some(worktrees)) = (&entry, lock(&inner.worktrees).clone())
         && let Some(worktree) = &info.worktree
     {
@@ -519,6 +533,15 @@ fn finish_child(
             record.outcome = report.worktree.clone();
         });
     }
+    inner.update(id, |info| {
+        info.status = report.status;
+        info.summary = Some(crate::agents::report::cap_chars(&report.summary, 400).0)
+            .filter(|summary| !summary.is_empty());
+        info.error = report.error.clone();
+        if let Some(worktree) = &mut info.worktree {
+            worktree.outcome = report.worktree.clone();
+        }
+    });
     let _ = inner.events.send(AgentEnvelope::child(
         id,
         AgentEvent::AgentFinished {
@@ -710,14 +733,6 @@ async fn run_child(
             Some(first) => format!("{first}\n\n{note}"),
             None => note,
         });
-        inner.update(&id, |info| {
-            info.worktree = Some(WorktreeInfo {
-                name: made.name.clone(),
-                branch: made.branch.clone(),
-                path: made.path.clone(),
-                outcome: None,
-            });
-        });
         let background = spec.background;
         let _ = wts.update_record(&made.name, |record| record.background = background);
         let mut said = Vec::new();
@@ -736,6 +751,14 @@ async fn run_child(
             }));
             lock(&inner.notices).push(text);
         }
+        inner.update(&id, |info| {
+            info.worktree = Some(WorktreeInfo {
+                name: made.name.clone(),
+                branch: made.branch.clone(),
+                path: made.path.clone(),
+                outcome: None,
+            });
+        });
         worktree = Some(made);
     }
     let workspace = spec.workspace.resolve(&parent.workspace);

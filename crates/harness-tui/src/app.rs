@@ -1184,6 +1184,32 @@ impl App {
         }
     }
 
+    /// Whether the approval of `prompt` is a background agent's: one that waits as "needs
+    /// input" and survives an interrupt of the turn.
+    fn is_background_prompt(&self, prompt: &Prompt) -> bool {
+        prompt.request().agent.as_ref().is_some_and(|tag| {
+            self.children
+                .iter()
+                .any(|child| child.tag.id == tag.id && child.background)
+        })
+    }
+
+    /// Denies the approvals of the turn that is stopped: its own, and those of the agents it
+    /// waits for. A background agent's stays queued, still needing input. Whether any was denied.
+    pub fn deny_foreground(&mut self) -> bool {
+        let mut denied = false;
+        let mut at = 0;
+        while at < self.prompts.len() {
+            if self.is_background_prompt(&self.prompts[at]) {
+                at += 1;
+            } else {
+                self.answer_at(at, Answered::Interrupt);
+                denied = true;
+            }
+        }
+        denied
+    }
+
     /// What the supervisor says its child agents are doing now.
     pub fn set_children(&mut self, children: Vec<harness_core::agents::AgentInfo>) {
         // A child that has ended leaves one line, once.
@@ -1533,6 +1559,8 @@ impl App {
                 ],
             );
             picker.select(2);
+            // Asking again takes back an earlier "wait": only a new answer quits.
+            self.quit_when_idle = false;
             self.open_picker(Pick::QuitWithAgents, picker);
             return None;
         }
@@ -1547,12 +1575,19 @@ impl App {
 
     /// Answers the waiting approval, and notes the answer in the transcript.
     fn answer(&mut self, answered: Answered) {
-        let Some(mut prompt) = self.prompts.pop_front() else {
+        self.answer_at(0, answered);
+    }
+
+    /// Answers the `at`th approval in the queue.
+    fn answer_at(&mut self, at: usize, answered: Answered) {
+        let Some(mut prompt) = self.prompts.remove(at) else {
             return;
         };
         // The next one is shown, and takes keys only once the user has paused again: a key typed
         // for the answer just given is not an answer to it.
-        self.arming = Arming::default();
+        if at == 0 {
+            self.arming = Arming::default();
+        }
         let line = prompt.outcome(&answered, &self.theme());
         let decision = match answered {
             Answered::Decided(decision) => decision,
@@ -1990,8 +2025,10 @@ impl App {
             }
             // Esc stops the turn, as it does without the prompt: the approval is denied.
             if key.code == KeyCode::Esc && !self.prompts.is_empty() {
-                self.deny_waiting();
-                return Some(Action::Interrupt);
+                // Only the turn's own approvals (and those of agents it waits for): a background
+                // agent's stays queued.
+                let denied = self.deny_foreground();
+                return (denied || self.busy()).then_some(Action::Interrupt);
             }
             // Until the prompt or the picker takes keys, they were typed for the input, and it
             // waits for the user to pause.
@@ -2053,8 +2090,9 @@ impl App {
             let interrupt = answered == Answered::Interrupt;
             self.answer(answered);
             if interrupt {
-                // Stopping the turn stops the agents it started: nothing else asks after.
-                self.deny_waiting();
+                // Stopping the turn stops the agents it started: nothing else of theirs asks
+                // after (a background agent's approval stays queued).
+                self.deny_foreground();
             }
             return interrupt.then_some(Action::Interrupt);
         }
@@ -2125,7 +2163,7 @@ impl App {
         if self.picker.take().is_some() {
             return None;
         }
-        self.deny_waiting();
+        self.deny_foreground();
         if self.busy() {
             return Some(Action::Interrupt);
         }
@@ -2545,8 +2583,12 @@ impl App {
                     Some(Action::Quit)
                 }
                 1 => {
-                    self.quit_when_idle = true;
                     let live = self.live_background();
+                    // The last one has ended since the question was asked: nothing to wait for.
+                    if live == 0 {
+                        return Some(Action::Quit);
+                    }
+                    self.quit_when_idle = true;
                     self.transcript.push_note(
                         &format!(
                             "waiting for {live} agent{} to finish: harness leaves when {} has (Ctrl+D asks again)",

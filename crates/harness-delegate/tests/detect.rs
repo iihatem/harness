@@ -217,3 +217,27 @@ async fn an_explicit_binary_is_used_without_searching_path() {
     let found = detect(BackendKind::Claude, &opts).await.unwrap();
     assert_eq!(found.version.patch, 400);
 }
+
+#[tokio::test]
+async fn a_pre_release_of_a_tested_version_counts_as_untested() {
+    let dir = tempfile::tempdir().unwrap();
+    script(
+        dir.path(),
+        "codex",
+        "echo 'codex-cli 0.154.0-alpha.1'",
+        0o755,
+    );
+    let err = detect(BackendKind::Codex, &options(dir.path()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DelegateError::VersionOutOfRange { .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("0.154.0-alpha.1"), "{err}");
+    let opts = DetectOptions {
+        allow_untested: true,
+        ..options(dir.path())
+    };
+    assert!(!detect(BackendKind::Codex, &opts).await.unwrap().tested);
+}

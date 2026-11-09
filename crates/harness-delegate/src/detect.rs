@@ -94,6 +94,20 @@ pub fn parse_version(output: &str) -> Option<Version> {
     })
 }
 
+/// The word of `output` that holds the version, as printed (with any suffix).
+fn version_word(output: &str) -> Option<String> {
+    output
+        .split_whitespace()
+        .map(|w| w.trim_start_matches('v'))
+        .find(|w| parse_version(w).is_some())
+        .map(String::from)
+}
+
+/// Whether the printed version carries a `-suffix` or `+build` part.
+fn has_suffix(output: &str) -> bool {
+    version_word(output).is_some_and(|w| w.contains(['-', '+']))
+}
+
 #[derive(Debug, Clone)]
 pub struct DetectOptions {
     /// The binary to use; else `PATH` is searched for the program's name.
@@ -160,11 +174,12 @@ pub async fn detect(kind: BackendKind, options: &DetectOptions) -> Result<Detect
         output: output.trim().to_string(),
     })?;
     let range = tested_range(kind);
-    let tested = range.contains(version);
+    // A pre-release (`0.154.0-alpha.1`) is not the release that was tested.
+    let tested = range.contains(version) && !has_suffix(&output);
     if !tested && !options.allow_untested {
         return Err(DelegateError::VersionOutOfRange {
             binary: kind.binary(),
-            found: version.to_string(),
+            found: version_word(&output).unwrap_or_else(|| version.to_string()),
             range: range.to_string(),
         });
     }

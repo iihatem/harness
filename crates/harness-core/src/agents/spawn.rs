@@ -191,17 +191,8 @@ impl SpawnAgentsTool {
     }
 
     fn spec_for(&self, def: &AgentDefinition, entry: &Entry, plan: Plan) -> AgentSpec {
-        let mut instructions = PREAMBLE.to_string();
-        if !def.body.trim().is_empty() {
-            instructions.push_str("\n\n");
-            instructions.push_str(def.body.trim());
-        }
-        let mut spec = AgentSpec::new(def.name.clone(), entry.task.trim().to_string());
-        spec.instructions = Some(instructions);
+        let mut spec = definition_spec(def, entry.task.trim());
         spec.model = self.model_for(def, entry);
-        spec.tools = def.tools.clone();
-        spec.mode = def.mode;
-        spec.max_steps = def.max_steps;
         spec.isolation = plan.isolation;
         spec.background = plan.background;
         spec
@@ -218,6 +209,23 @@ impl SpawnAgentsTool {
         count.started += granted as u32;
         granted
     }
+}
+
+/// The spec for `def` to do `task`: its prompt (the preamble every subagent gets, then its own
+/// instructions), tools, mode and step limit. The model, isolation and background are the
+/// caller's to set.
+pub fn definition_spec(def: &AgentDefinition, task: &str) -> AgentSpec {
+    let mut instructions = PREAMBLE.to_string();
+    if !def.body.trim().is_empty() {
+        instructions.push_str("\n\n");
+        instructions.push_str(def.body.trim());
+    }
+    let mut spec = AgentSpec::new(def.name.clone(), task.to_string());
+    spec.instructions = Some(instructions);
+    spec.tools = def.tools.clone();
+    spec.mode = def.mode;
+    spec.max_steps = def.max_steps;
+    spec
 }
 
 fn tool_spec(definitions: &Definitions, max_per_turn: u32) -> ToolSpec {

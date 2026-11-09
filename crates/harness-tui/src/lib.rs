@@ -15,6 +15,7 @@ pub mod markdown;
 pub mod notify;
 pub mod picker;
 pub mod plan;
+pub mod review;
 pub mod status;
 pub mod style;
 pub mod terminal;

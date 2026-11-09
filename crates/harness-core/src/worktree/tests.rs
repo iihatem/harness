@@ -463,3 +463,34 @@ fn an_agent_whose_harness_died_is_failed_its_lock_released_and_its_edits_saved()
     assert_eq!(by(&live.name).status, crate::agents::AgentStatus::Working);
     assert_eq!(by(&finished.name).status, crate::agents::AgentStatus::Done);
 }
+
+#[test]
+fn an_agent_that_died_having_changed_nothing_leaves_nothing_to_review() {
+    let f = fixture();
+    let dead = f
+        .wts
+        .create(&request("a1", "general", "idle"))
+        .unwrap()
+        .worktree;
+    let gone = dead_pid();
+    f.wts.update_record(&dead.name, |r| r.pid = gone).unwrap();
+    git(&dead.path, &["worktree", "unlock", "."]);
+    git(
+        &dead.path,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            &format!("harness pid {gone}"),
+            ".",
+        ],
+    );
+    assert_eq!(f.wts.reconcile(), vec![dead.name.clone()]);
+    assert!(f.wts.records().is_empty());
+    assert!(!dead.path.exists());
+    assert!(
+        git(f.repo.path(), &["branch", "--list", "harness/*"])
+            .trim()
+            .is_empty()
+    );
+}

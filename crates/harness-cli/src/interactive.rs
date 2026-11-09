@@ -307,7 +307,7 @@ pub async fn run(
             .unwrap_or_default();
         if !ended.is_empty() {
             notices.note(&format!(
-                "{} agent{} of an earlier session ended while it ran: /agents lists {}, and /review shows what {} changed",
+                "{} agent{} of an earlier session ended while it ran: /agents lists {}, and /results shows what {} changed",
                 ended.len(),
                 if ended.len() == 1 { "" } else { "s" },
                 if ended.len() == 1 { "it" } else { "them" },

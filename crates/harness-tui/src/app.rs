@@ -40,6 +40,7 @@ use crate::{
     notify::{self, Notify},
     picker::{Item, Picked, Picker, model_item},
     plan::{Choice, PlanChoice, TextEditor},
+    review::{self, Review, Reviewed, Shown},
     status::{self, Costs, Totals},
     style::Theme,
     text::{sanitize, wrap},
@@ -108,6 +109,12 @@ enum Pick {
     Model(Vec<String>),
     /// What to restore to before this message.
     RewindScope(RewindPoint),
+    /// The result to review, one name per item.
+    ReviewWhich(Vec<String>),
+    /// What to do with the result of this name.
+    Review(String),
+    /// Whether to discard the result of this name.
+    ConfirmDiscard(String),
 }
 
 /// How many times the countdown to an automatic resume is armed again when the window still shows
@@ -394,6 +401,8 @@ pub enum Action {
     SetRole { role: Role, id: String },
     /// Sign in to a provider, with a device code when `device` is set.
     Login { provider: String, device: bool },
+    /// Do something with the result an agent left in its worktree.
+    Review(Review),
     /// Stop the running turn.
     Interrupt,
     /// Leave harness.
@@ -435,6 +444,11 @@ pub struct App {
     announced: std::collections::HashSet<String>,
     /// The agents the model can start, for `/agents`.
     agent_definitions: Option<harness_core::agents::Definitions>,
+    /// The worktrees agents left, as the records say: what is ready for review, and what
+    /// earlier sessions left.
+    results: Vec<harness_core::worktree::Record>,
+    /// A review action (apply, keep, discard, or fetching a diff) is running.
+    reviewing: bool,
     /// When the approval or the plan choice shown starts to take keys.
     arming: Arming,
     /// Whether `arming` is the offer to resume automatically's: it starts afresh when the offer
@@ -537,6 +551,8 @@ impl App {
             children: Vec::new(),
             announced: std::collections::HashSet::new(),
             agent_definitions: None,
+            results: Vec::new(),
+            reviewing: false,
             arming: Arming::default(),
             offer_owns_arming: false,
             pending_mode: None,
@@ -1177,6 +1193,113 @@ impl App {
         &self.children
     }
 
+    /// What the records of worktrees say now.
+    pub fn set_results(&mut self, results: Vec<harness_core::worktree::Record>) {
+        self.results = results;
+    }
+
+    /// The results waiting for review, and the others the records hold.
+    pub fn results(&self) -> &[harness_core::worktree::Record] {
+        &self.results
+    }
+
+    /// A review action is running.
+    pub fn reviewing(&self) -> bool {
+        self.reviewing
+    }
+
+    /// `/results [target]`: with a target, that result; alone, the only one waiting, or a choice
+    /// among them.
+    fn review_command(&mut self, args: &str) -> Option<Action> {
+        let width = self.width;
+        let ready: Vec<&harness_core::worktree::Record> = self
+            .results
+            .iter()
+            .filter(|r| review::is_ready(r))
+            .collect();
+        let args = args.trim();
+        if !args.is_empty() {
+            return match review::find(&self.results, args) {
+                Some(record) => self.start_review(&record.name.clone()),
+                None => {
+                    let known: Vec<String> = ready.iter().map(|r| r.branch.clone()).collect();
+                    let message = if known.is_empty() {
+                        format!(
+                            "no result named {}: nothing is waiting for review",
+                            sanitize(args)
+                        )
+                    } else {
+                        format!(
+                            "no result named {}; waiting for review: {}",
+                            sanitize(args),
+                            known.join(", ")
+                        )
+                    };
+                    self.transcript.push_error(&message, width);
+                    None
+                }
+            };
+        }
+        match ready.len() {
+            0 => {
+                self.transcript.push_note(
+                    "nothing to review: no agent has left changes in a worktree",
+                    width,
+                );
+                None
+            }
+            1 => {
+                let name = ready[0].name.clone();
+                self.start_review(&name)
+            }
+            _ => {
+                let names: Vec<String> = ready.iter().map(|r| r.name.clone()).collect();
+                let picker = Picker::new("Review which result?", review::which_items(&ready));
+                self.open_picker(Pick::ReviewWhich(names), picker);
+                None
+            }
+        }
+    }
+
+    /// Asks for the diff of the result `name`.
+    fn start_review(&mut self, name: &str) -> Option<Action> {
+        self.reviewing = true;
+        Some(Action::Review(Review::Show(name.to_string())))
+    }
+
+    /// What a review action came to.
+    pub fn review_done(&mut self, done: Reviewed) {
+        let width = self.width;
+        self.reviewing = false;
+        match done {
+            Reviewed::Shown(shown) => self.show_review(*shown),
+            Reviewed::Applied(text) | Reviewed::Kept(text) | Reviewed::Discarded(text) => {
+                let text = self.redacted(&text);
+                self.transcript.push_note(&text, width);
+            }
+            Reviewed::Failed(why) => {
+                let why = self.redacted(&why);
+                self.transcript.push_error(&why, width);
+            }
+        }
+    }
+
+    /// The diff of a result, and the question of what to do with it, in a full-screen view.
+    fn show_review(&mut self, shown: Shown) {
+        let theme = self.theme();
+        let mut preview = review::lines(&shown, &theme);
+        preview.extend(review::overlap_lines(&shown, &theme));
+        let mut picker = Picker::new(
+            &format!("What to do with {}?", shown.record.branch),
+            review::choices(),
+        )
+        .with_footer(review::footer(&shown))
+        .with_preview(preview);
+        // Enter without a choice does nothing: the safe answer is the one it lands on.
+        picker.select(3);
+        self.open_picker(Pick::Review(shown.record.name), picker);
+    }
+
     /// One line for each child that has not ended: label, status, model, and the tool it called
     /// last. At most [`MAX_CHILD_LINES`] of them, whatever the number of children (those that
     /// need an answer first, then the working, then the queued; the rest as a count), each a
@@ -1193,14 +1316,8 @@ impl App {
             AgentStatus::Working => 1,
             _ => 2,
         });
-        let (shown, hidden) = if running.len() > MAX_CHILD_LINES {
-            (MAX_CHILD_LINES - 1, running.len() - (MAX_CHILD_LINES - 1))
-        } else {
-            (running.len(), 0)
-        };
         let mut lines: Vec<Line<'static>> = running
             .into_iter()
-            .take(shown)
             .map(|child| {
                 let status_style = if child.status == AgentStatus::NeedsInput {
                     theme.warning()
@@ -1215,6 +1332,9 @@ impl App {
                     ),
                     Span::styled(format!(" · {}", child.status.as_str()), status_style),
                 ];
+                if child.background {
+                    spans.push(Span::styled(" · background", theme.dim()));
+                }
                 if let Some(model) = &child.model {
                     spans.push(Span::styled(
                         format!(" · {}", short(model, 40)),
@@ -1227,7 +1347,41 @@ impl App {
                 Line::from(spans)
             })
             .collect();
-        if hidden > 0 {
+        // What agents left in their worktrees, from this session and earlier ones, waits below
+        // those that run.
+        let ready = self.results.iter().filter(|r| review::is_ready(r));
+        for (n, record) in ready.enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled("◦ ", theme.accent()),
+                Span::styled(
+                    format!("{} {}", short(&record.agent, 12), short(&record.label, 40)),
+                    theme.bold(),
+                ),
+                Span::styled(
+                    format!(
+                        " · {}{}",
+                        review::state(record),
+                        if n == 0 { " (/results)" } else { "" }
+                    ),
+                    if record.status == AgentStatus::Done {
+                        theme.accent()
+                    } else {
+                        theme.warning()
+                    },
+                ),
+                Span::styled(
+                    format!(
+                        " · {} · {}",
+                        short(&record.branch, 50),
+                        review::counts(record)
+                    ),
+                    theme.dim(),
+                ),
+            ]));
+        }
+        if lines.len() > MAX_CHILD_LINES {
+            let hidden = lines.len() - (MAX_CHILD_LINES - 1);
+            lines.truncate(MAX_CHILD_LINES - 1);
             lines.push(Line::from(Span::styled(
                 format!("◦ and {hidden} more agents"),
                 theme.dim(),
@@ -2090,6 +2244,11 @@ impl App {
                 );
                 self.transcript.push_lines(lines, width);
             }
+            "results" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return self.review_command(args);
+            }
             "agents" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
@@ -2097,6 +2256,7 @@ impl App {
                 let lines = crate::agents::report(
                     self.agent_definitions.as_ref(),
                     &self.children,
+                    &self.results,
                     &theme,
                     &|text| self.redacted(text),
                 );
@@ -2207,6 +2367,47 @@ impl App {
                 let id = ids.into_iter().nth(index)?;
                 self.work("loading the session", true);
                 Some(Action::OpenSession(Some(id)))
+            }
+            Pick::ReviewWhich(names) => {
+                let name = names.into_iter().nth(index)?;
+                self.start_review(&name)
+            }
+            Pick::Review(name) => match index {
+                0 => {
+                    if self.busy() {
+                        self.hint = Some(
+                            "apply works between turns: the turn that runs changes the files it would change"
+                                .into(),
+                        );
+                        return None;
+                    }
+                    self.reviewing = true;
+                    Some(Action::Review(Review::Apply(name)))
+                }
+                1 => {
+                    self.reviewing = true;
+                    Some(Action::Review(Review::Keep(name)))
+                }
+                2 => {
+                    let picker = Picker::new(
+                        "Discard this result?",
+                        vec![Item::new("No", "keep it"), Item::new("Yes, discard it", "")],
+                    )
+                    .with_footer(vec![
+                        "The worktree and the branch are deleted: this cannot be undone.".into(),
+                    ]);
+                    self.open_picker(Pick::ConfirmDiscard(name), picker);
+                    None
+                }
+                _ => None,
+            },
+            Pick::ConfirmDiscard(name) => {
+                if index == 1 {
+                    self.reviewing = true;
+                    Some(Action::Review(Review::Discard(name)))
+                } else {
+                    None
+                }
             }
             Pick::RewindScope(point) => {
                 let scope = SCOPES.get(index)?.0;

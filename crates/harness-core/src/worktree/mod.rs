@@ -306,6 +306,11 @@ impl Worktrees {
                     .commit_result(&wt, &record.label, &record.task)
                     .ok()
                     .flatten();
+                // It had changed nothing: there is nothing to review or keep.
+                if outcome.is_none() && self.remove(&record.name).is_ok() {
+                    fixed.push(record.name);
+                    continue;
+                }
             }
             let updated = self.update_record(&record.name, |r| {
                 r.status = AgentStatus::Failed;

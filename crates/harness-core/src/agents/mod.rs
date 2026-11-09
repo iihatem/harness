@@ -21,7 +21,7 @@ pub use model::{CurrentModel, ParentModel, RoleModels};
 pub use records::AgentRecords;
 pub use report::{AgentReport, ReportFlag, ReportUsage, ToolLog, UsageTally};
 pub use sched::{Endpoint, Limits};
-pub use spawn::{SPAWN_TOOL, SpawnAgentsTool, SpawnSettings};
+pub use spawn::{SPAWN_TOOL, SpawnAgentsTool, SpawnSettings, definition_spec};
 pub use supervisor::{
     AgentFactory, AgentHandle, AgentInfo, AgentSpec, ChildSetup, ParentContext, Supervisor,
     WorktreeInfo,

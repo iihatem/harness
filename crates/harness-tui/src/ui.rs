@@ -145,6 +145,8 @@ enum Background {
     Budget(Result<Vec<String>, String>),
     /// The window as the provider said it at the reset of a usage limit.
     ResumeCheck(Result<WindowSnapshot, String>),
+    /// What a review action came to.
+    Review(crate::review::Reviewed),
     /// What `/usage` asked for: the provider's windows (when it has any) and the ledger's report.
     Usage {
         windows: Option<Result<WindowSnapshot, String>>,
@@ -205,6 +207,8 @@ pub struct Ui<B: Backend> {
 struct AgentsWatch {
     supervisor: Arc<harness_core::agents::Supervisor>,
     changes: tokio::sync::watch::Receiver<u64>,
+    /// How many children had ended when the results of worktrees were last read.
+    ended: usize,
 }
 
 /// Resolves when the supervisor's children change; never when there is none.
@@ -395,13 +399,32 @@ where
         self.agents = Some(AgentsWatch {
             supervisor,
             changes,
+            ended: 0,
         });
+        self.refresh_results();
+    }
+
+    /// Reads what the worktrees hold again: the results waiting for review.
+    pub fn refresh_results(&mut self) {
+        let Some(worktrees) = self.agents.as_ref().and_then(|w| w.supervisor.worktrees()) else {
+            return;
+        };
+        self.app.set_results(worktrees.records());
     }
 
     /// Takes in a change of the children.
     fn children_changed(&mut self) -> io::Result<Flow> {
-        if let Some(watch) = &self.agents {
-            self.app.set_children(watch.supervisor.snapshot());
+        let mut reread = false;
+        if let Some(watch) = &mut self.agents {
+            let children = watch.supervisor.snapshot();
+            let ended = children.iter().filter(|c| c.status.is_final()).count();
+            reread = ended != watch.ended;
+            watch.ended = ended;
+            self.app.set_children(children);
+        }
+        // An agent that ended has left a result, or removed its worktree.
+        if reread {
+            self.refresh_results();
         }
         self.draw_soon().map(|()| Flow::Continue)
     }
@@ -615,6 +638,20 @@ where
                     let _ = jobs.send(Job::Compact { focus, cancel });
                     self.awaiting_context = true;
                 }
+                Flow::Continue
+            }
+            Action::Review(review) => {
+                let Some(worktrees) = self.agents.as_ref().and_then(|w| w.supervisor.worktrees())
+                else {
+                    self.app.review_done(crate::review::Reviewed::Failed(
+                        "there are no worktrees in this session".into(),
+                    ));
+                    return Ok(Flow::Continue);
+                };
+                let tx = self.background_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = tx.send(Background::Review(do_review(&worktrees, review)));
+                });
                 Flow::Continue
             }
             Action::Interrupt => {
@@ -949,6 +986,10 @@ where
                 });
                 self.next_actions()?;
             }
+            Background::Review(done) => {
+                self.app.review_done(done);
+                self.refresh_results();
+            }
             Background::Budget(result) => self.app.on_budget(result),
             Background::ResumeCheck(result) => {
                 if let Some(action) = self.app.on_resume_check(result) {
@@ -1181,6 +1222,61 @@ where
         let finished = self.app.transcript.take_finished();
         let written = self.term.insert(&finished).and_then(|()| self.term.clear());
         stopped.and(written)
+    }
+}
+
+/// Does what the user chose for a result, with git, off the session's tasks.
+fn do_review(
+    worktrees: &harness_core::worktree::Worktrees,
+    review: crate::review::Review,
+) -> crate::review::Reviewed {
+    use crate::review::{PATCH_BYTES, Review, Reviewed, Shown};
+    let record = |name: &str| worktrees.records().into_iter().find(|r| r.name == name);
+    match review {
+        Review::Show(name) => {
+            let Some(record) = record(&name) else {
+                return Reviewed::Failed(format!("{name} is no longer there"));
+            };
+            match worktrees.diff(&name, PATCH_BYTES) {
+                Ok(diff) => Reviewed::Shown(Box::new(Shown {
+                    overlaps: worktrees.overlaps(&name),
+                    record,
+                    diff,
+                })),
+                Err(e) => Reviewed::Failed(e.to_string()),
+            }
+        }
+        Review::Apply(name) => match worktrees.apply(&name) {
+            Ok(applied) => Reviewed::Applied(format!(
+                "applied {} to {} ({} file{}, commit {}); its worktree and branch are removed",
+                name,
+                applied.branch,
+                applied.files.len(),
+                if applied.files.len() == 1 { "" } else { "s" },
+                &applied.commit[..applied.commit.len().min(10)],
+            )),
+            Err(e) => Reviewed::Failed(e.to_string()),
+        },
+        Review::Keep(name) => {
+            let branch = record(&name).map(|r| r.branch);
+            match worktrees.keep(&name) {
+                Ok(()) => Reviewed::Kept(format!(
+                    "kept the branch {}: its worktree is removed, and the branch is yours (harness will not remove it)",
+                    branch.unwrap_or(name)
+                )),
+                Err(e) => Reviewed::Failed(e.to_string()),
+            }
+        }
+        Review::Discard(name) => {
+            let branch = record(&name).map(|r| r.branch);
+            match worktrees.discard(&name) {
+                Ok(()) => Reviewed::Discarded(format!(
+                    "discarded {}: its worktree and branch are removed",
+                    branch.unwrap_or(name)
+                )),
+                Err(e) => Reviewed::Failed(e.to_string()),
+            }
+        }
     }
 }
 

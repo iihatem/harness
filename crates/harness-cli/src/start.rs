@@ -302,6 +302,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         output_dir,
     );
     config.edit_section = Some(prompt::edit_section(model.edit_format));
+    config.instructions = crate::context::instructions_text(setup);
     config.context_window = context_window;
     config.request = model.request;
     config.text_tool_calls = model.text_tool_calls;

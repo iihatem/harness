@@ -154,6 +154,8 @@ fn the_readme_documents_subagents() {
         "whether or not the directory is trusted",
         "start a new session",
         "\"unchecked\"",
+        "delegating a sub-task to them comes later",
+        "`spawn_agents` is not used",
     ] {
         assert!(text.contains(word), "the README does not mention {word}");
     }

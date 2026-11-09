@@ -61,3 +61,16 @@ pub fn instruction_files(setup: &Setup) -> Vec<(String, u64)> {
         })
         .collect()
 }
+
+/// The instruction files as one text, for a model that runs in another program (which gets them
+/// in a file of its own): each under its path. `None` when there are none.
+pub fn instructions_text(setup: &Setup) -> Option<String> {
+    let loaded =
+        instructions::discover(&setup.workspace, &setup.paths.config_dir, home().as_deref());
+    let parts: Vec<String> = loaded
+        .files
+        .iter()
+        .map(|file| format!("# {}\n\n{}", file.path.display(), file.content.trim_end()))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}

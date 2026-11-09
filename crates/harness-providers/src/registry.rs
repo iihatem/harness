@@ -149,6 +149,9 @@ pub enum ResolveError {
     /// A test hook's value that is not an http(s) URL.
     #[error("{var} is `{value}`, which is not an http(s) URL")]
     BadHook { var: String, value: String },
+    /// A model that runs in another program (`claude-code/*`) that cannot be used as things are.
+    #[error("{provider} cannot be used: {reason}")]
+    DelegateUnusable { provider: String, reason: String },
 }
 
 /// ` in <file>`, when it is known.
@@ -209,6 +212,12 @@ pub trait Secrets {
     /// The credential store, for providers that sign in (`chatgpt`).
     fn credentials(&self) -> Option<Arc<Credentials>> {
         None
+    }
+
+    /// What `claude-code/*` and `codex/*` models need to know: the opt-in for a Claude
+    /// subscription, and where an answer is kept.
+    fn delegate(&self) -> crate::delegated::DelegateSettings {
+        crate::delegated::DelegateSettings::default()
     }
 
     /// Where the keys and tokens a provider is given are registered as secrets, so that nothing
@@ -371,6 +380,9 @@ pub fn resolve(
         .split_once('/')
         .filter(|(p, m)| !p.is_empty() && !m.is_empty())
         .ok_or_else(|| ResolveError::BadId(model_id.to_string()))?;
+    if crate::delegated::is_delegated(name) {
+        return delegated(model_id, name, model, &secrets);
+    }
     // `chatgpt` is always the signed-in account: configuration cannot define it.
     if name == CHATGPT {
         return chatgpt(model_id, model, &secrets);
@@ -441,6 +453,56 @@ pub fn resolve(
         protocol,
         base_url,
         api_key,
+    })
+}
+
+/// A `claude-code/*` or `codex/*` model: the program the user already signed in to, driven by
+/// harness. Nothing is read of its credentials; `claude-code` runs on a Claude subscription only
+/// after the opt-in, and otherwise on the user's Anthropic API key.
+fn delegated(
+    model_id: &str,
+    name: &str,
+    model: &str,
+    secrets: &impl Secrets,
+) -> Result<Resolved, ResolveError> {
+    use crate::delegated::{CLAUDE_CODE, CODEX, DelegatedProvider};
+    let mut settings = secrets.delegate();
+    // Debug builds only, never from configuration: a cloned project must not choose a program.
+    let binary = |var: &str| test_hook(var, |var| secrets.env(var)).map(std::path::PathBuf::from);
+    settings.claude_binary = binary("HARNESS_CLAUDE_BIN");
+    settings.codex_binary = binary("HARNESS_CODEX_BIN");
+    let key = if name == CLAUDE_CODE {
+        let found = api_key("anthropic", Some("ANTHROPIC_API_KEY"), secrets)
+            .map_err(|e| store_error("anthropic", e))?;
+        // A subscription token is never a key (and never sent anywhere).
+        found
+            .map(|(key, _)| key)
+            .filter(|key| !is_claude_subscription_token(key))
+            .inspect(|key| {
+                if let Some(redactor) = secrets.redactor() {
+                    redactor.add(key);
+                }
+            })
+            .map(harness_delegate::env::ApiKey::new)
+    } else {
+        None
+    };
+    debug_assert!(name == CLAUDE_CODE || name == CODEX);
+    let provider = DelegatedProvider::new(name, model, settings, key)
+        .ok_or_else(|| ResolveError::UnknownProvider(name.to_string()))?;
+    if let Some(reason) = provider.unusable() {
+        return Err(ResolveError::DelegateUnusable {
+            provider: name.to_string(),
+            reason,
+        });
+    }
+    Ok(Resolved {
+        provider: Arc::new(provider),
+        model: model.to_string(),
+        id: model_id.to_string(),
+        protocol: Protocol::OpenaiChat,
+        base_url: String::new(),
+        api_key: None,
     })
 }
 

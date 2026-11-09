@@ -904,3 +904,126 @@ async fn an_agent_that_inherits_runs_on_the_parents_model_not_the_background_rol
     assert_eq!(specs[0].model, None, "inherit: the parent's");
     assert_eq!(specs[1].model.as_deref(), Some("ollama/small"));
 }
+
+// ---- delegated models (Claude Code and Codex) are not subagent models yet -------------------------
+
+fn refused_for_delegation(out: &ToolOutput, rig: &Rig, model: &str) {
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content
+            .contains("delegating a sub-task to Claude Code or Codex comes later"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains(model), "{}", out.content);
+    assert!(
+        out.content.contains("Nothing was started"),
+        "{}",
+        out.content
+    );
+    assert!(rig.specs().is_empty());
+}
+
+#[tokio::test]
+async fn an_entry_naming_a_delegated_model_is_refused_even_when_the_session_runs_on_it() {
+    let cell = ParentModel::default();
+    let dir = tempfile::tempdir().unwrap();
+    let _agent = parent_agent(&cell, RoleConfig::default(), dir.path());
+    // The model is one the session uses (so the model rule alone would allow it).
+    let rig = rig(
+        defs(),
+        in_play_settings(&cell, &["claude-code/sonnet", "codex/gpt"]),
+        says("ok"),
+    );
+    for model in ["claude-code/sonnet", "codex/gpt"] {
+        let out = rig
+            .call(
+                1,
+                json!({"agents": [
+                    {"agent": "explore", "task": "a"},
+                    {"agent": "general", "task": "b", "model": model},
+                ]}),
+            )
+            .await;
+        refused_for_delegation(&out, &rig, model);
+    }
+}
+
+#[tokio::test]
+async fn a_definition_or_the_background_role_naming_a_delegated_model_refuses_the_call() {
+    let pinned = file(
+        "pinned",
+        Some("codex/gpt"),
+        None,
+        DefinitionSource::User("/u/pinned.md".into()),
+    );
+    let rig_def = rig(Definitions::new(vec![pinned]), settings(10), says("ok"));
+    let out = rig_def
+        .call(
+            1,
+            json!({"agents": [entry("explore", "a"), entry("pinned", "b")]}),
+        )
+        .await;
+    refused_for_delegation(&out, &rig_def, "codex/gpt");
+    // A read-only agent runs on the background role's model: delegated, so refused too.
+    let rig_bg = rig(
+        defs(),
+        SpawnSettings {
+            background_model: Some("claude-code/haiku".into()),
+            ..settings(10)
+        },
+        says("ok"),
+    );
+    let out = rig_bg
+        .call(1, json!({"agents": [entry("explore", "a")]}))
+        .await;
+    refused_for_delegation(&out, &rig_bg, "claude-code/haiku");
+}
+
+#[tokio::test]
+async fn an_agent_that_would_run_on_a_delegated_parents_model_is_refused_and_it_is_never_listed() {
+    let cell = ParentModel::default();
+    let dir = tempfile::tempdir().unwrap();
+    let config = AgentConfig::new(
+        "claude-code/sonnet",
+        "sonnet",
+        "p",
+        dir.path().join(".spill"),
+    );
+    let mut engine = EngineConfig {
+        mode: Mode::Auto,
+        workspace: dir.path().to_path_buf(),
+        read_dirs: vec![],
+        rules: RuleSet::default(),
+        sandbox_available: true,
+        writes_need_approval: false,
+    };
+    engine.sandbox_available = true;
+    let _agent = Agent::new(
+        MockProvider::new(vec![]),
+        ToolRegistry::new(vec![]),
+        Arc::new(PermissionEngine::new(engine)),
+        Arc::new(NonInteractive),
+        config,
+        ToolContext::new(dir.path()),
+    )
+    .with_model_cell(cell.clone());
+    let rig = rig(defs(), in_play_settings(&cell, &["ok/model"]), says("ok"));
+    let out = rig
+        .call(1, json!({"agents": [entry("general", "a")]}))
+        .await;
+    refused_for_delegation(&out, &rig, "claude-code/sonnet");
+    // The list of models an entry may name has no delegated one.
+    let out = rig
+        .call(
+            1,
+            json!({"agents": [{"agent": "general", "task": "a", "model": "paid/big"}]}),
+        )
+        .await;
+    assert!(out.content.contains("ok/model"), "{}", out.content);
+    assert!(
+        !out.content.contains("claude-code/sonnet"),
+        "{}",
+        out.content
+    );
+}

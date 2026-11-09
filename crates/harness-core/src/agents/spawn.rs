@@ -151,7 +151,23 @@ impl SpawnAgentsTool {
                 add(id);
             }
         }
+        // Delegated models are never an option for a subagent (see `delegated`).
+        models.retain(|m| !delegated(m));
         models
+    }
+
+    /// The first model a call's entries would run on that is Claude Code or Codex, with the agent
+    /// that would use it. An agent with no model of its own runs on the parent's.
+    fn delegated_choice(
+        &self,
+        chosen: &[&AgentDefinition],
+        agents: &[Entry],
+    ) -> Option<(String, String)> {
+        let parent = self.settings.parent.get().map(|current| current.id);
+        agents.iter().zip(chosen).find_map(|(entry, def)| {
+            let model = self.model_for(def, entry).or_else(|| parent.clone())?;
+            delegated(&model).then(|| (def.name.clone(), model))
+        })
     }
 
     fn spec_for(&self, def: &AgentDefinition, entry: &Entry) -> AgentSpec {
@@ -180,6 +196,11 @@ impl SpawnAgentsTool {
         count.started += granted as u32;
         granted
     }
+}
+
+/// Whether `id` (`<provider>/<model>`) is a model run by the Claude Code or Codex program.
+fn delegated(id: &str) -> bool {
+    matches!(id.split('/').next(), Some("claude-code" | "codex"))
 }
 
 fn tool_spec(definitions: &Definitions, max_per_turn: u32) -> ToolSpec {
@@ -364,6 +385,14 @@ impl Tool for SpawnAgentsTool {
                 ));
             }
             chosen.push(def);
+        }
+        // A subagent is an in-process child: one on Claude Code or Codex would need that program
+        // run for it, which comes later.
+        if let Some((agent, model)) = self.delegated_choice(&chosen, &agents) {
+            return ToolOutput::error(format!(
+                "`{agent}` would run on `{}`, but delegating a sub-task to Claude Code or Codex comes later: a subagent cannot use a `claude-code/*` or `codex/*` model yet. Name another model, or leave `model` out on a session that uses an API model. Nothing was started.",
+                defang(&model)
+            ));
         }
         let in_play = self.models_in_play();
         for entry in &agents {

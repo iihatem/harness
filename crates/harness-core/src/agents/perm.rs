@@ -107,6 +107,11 @@ impl PermissionPolicy for ChildPolicy {
         self.engine.check(action)
     }
 
+    fn check_unsandboxed(&self, action: &Action) -> Decision {
+        self.follow_parent();
+        self.engine.check_unsandboxed(action)
+    }
+
     fn remember(&self, action: &Action) -> bool {
         self.follow_parent();
         self.engine.remember(action)

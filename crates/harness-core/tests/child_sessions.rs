@@ -223,3 +223,43 @@ fn an_m2_build_reads_a_record_that_ends_the_file_as_a_note_on_the_branch() {
         "{m2_leaf:?}"
     );
 }
+
+/// M3c: the child agent's session on an assistant message (`attribution.delegate`) is a field an
+/// M2 build does not know and so ignores: every line still reads as before.
+#[test]
+fn a_session_with_a_delegated_turn_reads_with_the_m2_entry_types() {
+    use harness_core::{
+        role::Role,
+        session::{Attribution, DelegateMark},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::create(dir.path(), Path::new("/w"));
+    user(&mut session, "fix it");
+    session.append(EntryKind::Message {
+        message: Message::Assistant {
+            content: "done".into(),
+            tool_calls: vec![],
+            model: "claude-code/sonnet".into(),
+        },
+        display: None,
+        note: false,
+        plan: None,
+        attribution: Some(Attribution {
+            role: Role::Main,
+            switch_reason: None,
+            handoff: None,
+            delegate: Some(Box::new(DelegateMark {
+                model: "claude-code/sonnet".into(),
+                session: "child-1".into(),
+                cost_total_micros: Some(1_000),
+            })),
+        }),
+        agent_record: None,
+    });
+    let text = std::fs::read_to_string(session.path().unwrap()).unwrap();
+    assert!(text.contains("child-1"));
+    for line in text.lines() {
+        serde_json::from_str::<m2::Entry>(line)
+            .unwrap_or_else(|e| panic!("an M2 build skips this line ({e}): {line}"));
+    }
+}

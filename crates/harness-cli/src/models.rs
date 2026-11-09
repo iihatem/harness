@@ -29,6 +29,7 @@ pub async fn choices(setup: &Setup) -> Vec<String> {
         .into_iter()
         .map(|model| model.id())
         .collect();
+    ids.extend(crate::delegate::listing(setup).await.0);
     if signed_in_to_chatgpt(setup).await {
         ids.extend(
             registry::CHATGPT_MODELS
@@ -67,8 +68,12 @@ pub async fn run() -> u8 {
         }
     };
     let found = available(&setup).await;
+    let (delegated, missing) = crate::delegate::listing(&setup).await;
     setup.print_credential_warnings();
-    if found.is_empty() {
+    for (provider, why) in &missing {
+        eprintln!("{provider}: not listed: {}", terminal_safe(why));
+    }
+    if found.is_empty() && delegated.is_empty() {
         eprintln!(
             "No models found. Start Ollama, LM Studio, or llama.cpp, or configure a provider in {}.",
             setup.paths.global_config_file().display()
@@ -76,6 +81,9 @@ pub async fn run() -> u8 {
     }
     for model in found {
         println!("{}", terminal_safe(&model.id()));
+    }
+    for id in delegated {
+        println!("{}", terminal_safe(&id));
     }
     0
 }

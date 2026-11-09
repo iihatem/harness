@@ -120,7 +120,7 @@ fn recorded(agent: &Agent) -> Option<Handoff> {
                 plan: Some(_),
                 attribution,
                 ..
-            } => attribution.and_then(|a| a.handoff),
+            } => attribution.clone().and_then(|a| a.handoff),
             _ => None,
         })
 }

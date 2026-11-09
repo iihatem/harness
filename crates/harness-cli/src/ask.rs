@@ -32,6 +32,7 @@ pub async fn run(
     prompt_text: String,
     json: bool,
     debug: bool,
+    yes_full_access: bool,
 ) -> u8 {
     // Registered as the very first thing this function does (a plain synchronous call, not an
     // awaited future): once it returns, the OS delivers SIGINT to tokio's signal driver instead of
@@ -92,7 +93,8 @@ pub async fn run(
         }
     };
 
-    // Ctrl+C must be honoured from here on: the piped-stdin wait below can block for seconds (the
+    // Ctrl+C must be honoured from here on (also while the program of a delegated model is
+    // looked for, which can take seconds): the piped-stdin wait below can block for seconds (the
     // first-data timeout) or indefinitely (the unbounded read-to-EOF phase once data has started
     // arriving but the pipe never closes, e.g. `tail -f | harness ask ...`). So the cancellation
     // token and its SIGINT listener are wired up before that wait, not after it.
@@ -103,6 +105,16 @@ pub async fn run(
             on_ctrl_c.cancel();
         }
     });
+
+    let found = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return exit_code(TurnEndReason::Interrupted, false),
+        found = crate::delegate::ready(&setup, &resolved.id) => found,
+    };
+    if let Err(why) = found {
+        eprintln!("error: {}", terminal_safe(&why));
+        return 2;
+    }
 
     // Only read (and potentially block on) stdin once we know we're actually going to run: a
     // missing model must exit 2 promptly even if a pipe into stdin is still open.
@@ -162,6 +174,9 @@ pub async fn run(
         ..
     } = started;
     let mut agent = start::with_supervisor(agent, &supervisor, spawn);
+    if yes_full_access {
+        agent.confirm_full_access();
+    }
     // `with_piped_stdin` returns the prompt with any piped text appended.
     let turn = crate::slash::turn_input(
         &typed,

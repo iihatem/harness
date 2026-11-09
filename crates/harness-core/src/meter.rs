@@ -20,6 +20,10 @@ pub enum AccountKind {
     Subscription,
     /// A server of the user's own: free.
     Local,
+    /// A turn run by another agent program (Claude Code, Codex) on the user's own sign-in to it:
+    /// no per-token bill, and the program's own cost figure, where it gives one, is an estimate.
+    /// A delegated run on the user's API key is `ApiKey`.
+    Delegated,
 }
 
 impl AccountKind {
@@ -30,6 +34,8 @@ impl AccountKind {
             AccountKind::Local
         } else if model_id.split('/').next() == Some("chatgpt") {
             AccountKind::Subscription
+        } else if matches!(model_id.split('/').next(), Some("claude-code" | "codex")) {
+            AccountKind::Delegated
         } else {
             AccountKind::ApiKey
         }
@@ -41,6 +47,7 @@ impl AccountKind {
             AccountKind::ApiKey => "api_key",
             AccountKind::Subscription => "subscription",
             AccountKind::Local => "local",
+            AccountKind::Delegated => "delegated",
         }
     }
 }
@@ -62,6 +69,18 @@ pub struct RequestRecord {
     pub duration: Duration,
     /// `ok`, or `error:<kind>` (see `ProviderError::kind`).
     pub outcome: String,
+}
+
+/// What a request's record needs that the model's id and token counts do not give: set for a
+/// turn run by another agent program.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RequestDetail {
+    /// The account that pays, when it is not the one the model's id says (a delegated run on an
+    /// API key).
+    pub account: Option<AccountKind>,
+    /// What the program estimated the run cost, in USD: its own figure, never looked up in a
+    /// price table.
+    pub estimated_usd: Option<f64>,
 }
 
 /// How long after it was observed a window snapshot is shown as stale, in seconds.
@@ -342,6 +361,18 @@ pub trait Meter: Send + Sync {
         self.record_request(request)
     }
 
+    /// Records `request` with what only a delegated run knows (see [`RequestDetail`]). A meter
+    /// that does not use the detail records it as any other.
+    fn record_request_detailed(
+        &self,
+        request: &RequestRecord,
+        scope: Option<&AgentScope>,
+        detail: &RequestDetail,
+    ) -> RequestCost {
+        let _ = detail;
+        self.record_request_as(request, scope)
+    }
+
     /// Records a finished turn of the child agent `scope` names (`None`: the main agent).
     fn record_turn_as(&self, turn: &TurnRecord, scope: Option<&AgentScope>) {
         let _ = scope;
@@ -410,5 +441,14 @@ mod tests {
             AccountKind::Local
         );
         assert_eq!(AccountKind::of("mine/x", true), AccountKind::Local);
+        assert_eq!(
+            AccountKind::of("claude-code/sonnet", false),
+            AccountKind::Delegated
+        );
+        assert_eq!(
+            AccountKind::of("codex/gpt-5", false),
+            AccountKind::Delegated
+        );
+        assert_eq!(AccountKind::Delegated.as_str(), "delegated");
     }
 }

@@ -1408,6 +1408,7 @@ dependencies = [
  "harness-config",
  "harness-context",
  "harness-core",
+ "harness-delegate",
  "harness-lsp",
  "harness-providers",
  "harness-sandbox",
@@ -1473,6 +1474,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-delegate"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "harness-core",
+ "jsonschema",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "harness-lsp"
 version = "0.1.0"
 dependencies = [
@@ -1497,12 +1513,14 @@ version = "0.1.0"
 dependencies = [
  "apple-native-keyring-store",
  "async-stream",
+ "async-trait",
  "base64 0.23.1",
  "eventsource-stream",
  "futures",
  "globset",
  "harness-config",
  "harness-core",
+ "harness-delegate",
  "keyring-core",
  "libc",
  "reqwest",
@@ -1512,6 +1530,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "toml",
  "wiremock",
  "zbus-secret-service-keyring-store",

@@ -14,6 +14,7 @@ brush-parser = "=0.4.0"
 harness-config = { path = "crates/harness-config" }
 harness-context = { path = "crates/harness-context" }
 harness-core = { path = "crates/harness-core" }
+harness-delegate = { path = "crates/harness-delegate" }
 harness-lsp = { path = "crates/harness-lsp" }
 harness-providers = { path = "crates/harness-providers", default-features = false }
 harness-sandbox = { path = "crates/harness-sandbox" }

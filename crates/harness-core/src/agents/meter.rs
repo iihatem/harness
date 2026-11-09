@@ -39,6 +39,16 @@ impl Meter for ScopedMeter {
         cost
     }
 
+    fn record_request_detailed(
+        &self,
+        request: &RequestRecord,
+        _scope: Option<&AgentScope>,
+        detail: &crate::meter::RequestDetail,
+    ) -> RequestCost {
+        self.inner
+            .record_request_detailed(request, Some(&self.scope), detail)
+    }
+
     fn check_budget(&self, _session: &str, account: AccountKind) -> BudgetStatus {
         self.inner
             .check_budget_as(&self.scope.parent, account, Some(&self.scope))

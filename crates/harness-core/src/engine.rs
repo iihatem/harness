@@ -592,6 +592,32 @@ impl PermissionEngine {
         }
     }
 
+    /// [`check_bash`](Self::check_bash) for a command that runs outside harness's sandbox (a
+    /// delegated program's): the sandbox never makes an unlisted command safe, so it asks unless
+    /// an allow rule (config, turn or session) covers it, and plan and read-only mode refuse it.
+    fn check_bash_unsandboxed(&self, command: &str, mode: Mode) -> Decision {
+        let rules = self.bash_rules();
+        match harness_shell::evaluate(command, &rules, &self.workspace) {
+            Verdict::Deny { reason } => Decision::Deny(reason),
+            Verdict::Ask {
+                reason,
+                may_deny: true,
+                ..
+            } if mode == Mode::FullAccess => Decision::Ask(reason),
+            _ if mode == Mode::FullAccess => Decision::Allow,
+            _ if matches!(mode, Mode::Plan | Mode::ReadOnly) => Decision::Deny(
+                "shell commands of a delegated program are not sandboxed by harness, so they are not allowed in plan and read-only mode"
+                    .into(),
+            ),
+            Verdict::Ask { reason, .. } => Decision::Ask(reason),
+            Verdict::Allow => Decision::Allow,
+            Verdict::Unlisted => Decision::Ask(format!(
+                "run `{}` (harness cannot sandbox a delegated program's commands)",
+                short(command)
+            )),
+        }
+    }
+
     /// Remembers a bash command's session prefixes as allow rules. Returns `false` (and
     /// remembers nothing) when doing so could never change a later decision: without a sandbox
     /// every command still asks regardless of the allow-list; and harness-shell's own analysis
@@ -709,6 +735,14 @@ impl PermissionPolicy for PermissionEngine {
             Action::Read(path) => self.check_read(path, mode),
             Action::Write(path) => self.check_write(path, mode),
             Action::Bash(command) => self.check_bash(command, mode),
+        }
+    }
+
+    fn check_unsandboxed(&self, action: &Action) -> Decision {
+        let mode = self.mode();
+        match action {
+            Action::Bash(command) => self.check_bash_unsandboxed(command, mode),
+            other => self.check(other),
         }
     }
 

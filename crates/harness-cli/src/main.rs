@@ -2,6 +2,7 @@ mod ask;
 mod auth;
 mod children;
 mod context;
+mod delegate;
 mod doctor;
 mod gates;
 mod host;
@@ -48,6 +49,10 @@ struct Cli {
     /// the state directory
     #[arg(long, global = true)]
     debug: bool,
+    /// Only with `ask`: confirm `full-access` mode for a claude-code or codex model, which would
+    /// otherwise ask (a headless run cannot be asked)
+    #[arg(long, global = true)]
+    yes_full_access: bool,
     /// Resume the session with this id; without an id, list this project's sessions
     #[arg(
         long,
@@ -314,6 +319,12 @@ fn main() -> ExitCode {
         (None, true) => sessions::Choice::Continue,
         (None, false) => sessions::Choice::New,
     };
+    if cli.yes_full_access && !matches!(cli.command, Some(Command::Ask { .. })) {
+        eprintln!(
+            "error: --yes-full-access only works with `harness ask`: the terminal asks for the confirmation itself"
+        );
+        return ExitCode::from(2);
+    }
     // Before the runtime starts its threads: see `interactive::prepare`.
     if cli.command.is_none()
         && let Some(code) = interactive::prepare()
@@ -331,6 +342,7 @@ fn main() -> ExitCode {
                     prompt.join(" "),
                     json,
                     cli.debug,
+                    cli.yes_full_access,
                 )
                 .await
             }

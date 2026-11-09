@@ -355,7 +355,8 @@ fn claude_code_without_an_opt_in_or_a_key_says_how_to_get_one() {
         .args(["--model", "claude-code/sonnet", "ask", "hi"])
         .output()
         .unwrap();
-    assert!(!out.status.success());
+    // Invalid usage, as a hosted model with no key is: decided before any turn.
+    assert_eq!(out.status.code(), Some(2), "{:?}", out.status);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("use_subscription") && err.contains("harness auth add anthropic"),

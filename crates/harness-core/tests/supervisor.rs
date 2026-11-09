@@ -406,6 +406,38 @@ async fn a_second_child_on_a_local_server_waits_its_turn_and_is_not_refused() {
 }
 
 #[tokio::test]
+async fn a_child_cancelled_in_the_queue_still_has_a_start_before_its_finish_in_the_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (factory, started, release) = held_factory(dir.path(), true);
+    let p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
+    let (sup, mut rx) = supervisor(factory, p.ctx);
+    let a = sup.spawn(spec("one"));
+    started.notified().await;
+    let b = sup.spawn(spec("two"));
+    until("the second is queued", || {
+        statuses(&sup) == vec![AgentStatus::Working, AgentStatus::Queued]
+    })
+    .await;
+    let second = b.tag.id.clone();
+    assert!(sup.cancel(&second));
+    assert_eq!(wait(b).await.status, AgentStatus::Cancelled);
+    release.notify_waiters();
+    wait(a).await;
+    let events: Vec<_> = drain(&mut rx)
+        .into_iter()
+        .filter(|e| e.agent.as_ref() == Some(&second))
+        .map(|e| e.event)
+        .collect();
+    let at = |what: fn(&AgentEvent) -> bool| events.iter().position(what);
+    let started_at = at(|e| matches!(e, AgentEvent::AgentStarted { .. }));
+    let finished_at = at(|e| matches!(e, AgentEvent::AgentFinished { .. }));
+    assert!(
+        started_at.is_some() && started_at < finished_at,
+        "a finish without a start: {events:?}"
+    );
+}
+
+#[tokio::test]
 async fn four_run_in_all_and_the_fifth_waits() {
     let dir = tempfile::tempdir().unwrap();
     let (factory, started, release) = held_factory(dir.path(), false);

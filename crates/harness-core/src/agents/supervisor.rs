@@ -563,6 +563,18 @@ fn finish_child(
             worktree.outcome = report.worktree.clone();
         }
     });
+    // One that ended before it got a model (cancelled in the queue, a model that could not be
+    // made ready) still starts and finishes in the stream, so lines can be paired; its `model`
+    // is empty.
+    if entry.as_ref().is_some_and(|info| info.model.is_none()) {
+        let _ = inner.events.send(AgentEnvelope::child(
+            id,
+            AgentEvent::AgentStarted {
+                label: tag.label.clone(),
+                model: String::new(),
+            },
+        ));
+    }
     let _ = inner.events.send(AgentEnvelope::child(
         id,
         AgentEvent::AgentFinished {

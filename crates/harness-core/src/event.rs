@@ -240,7 +240,9 @@ pub enum AgentEvent {
         kind: ErrorKind,
         message: String,
     },
-    /// A child agent started (sent in its own envelope).
+    /// A child agent started (sent in its own envelope). A child that ended before it had a
+    /// model (cancelled while it waited its turn) is announced just before its end, with an
+    /// empty `model`.
     AgentStarted {
         label: String,
         model: String,

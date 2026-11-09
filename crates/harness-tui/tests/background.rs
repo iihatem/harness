@@ -541,6 +541,29 @@ async fn esc_and_ctrl_c_leave_a_background_agents_approval_queued() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn esc_on_an_armed_background_approval_says_no_to_that_agent_and_leaves_the_turn_alone() {
+    let mut rig = rig(Mode::Ask, vec![writes("a.txt")], true);
+    send(&mut rig.ui, "/bg write a file");
+    until(&mut rig.ui, |app| app.pending_approvals() == 1).await;
+    until_armed(&rig.ui).await;
+    let action = rig.ui.app_mut().on_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        std::time::Instant::now(),
+    );
+    assert!(action.is_none(), "Esc stopped the user's own turn");
+    assert_eq!(
+        rig.ui.app().pending_approvals(),
+        0,
+        "the agent's question was answered"
+    );
+    until_background(&mut rig, "it finished", |r| {
+        r.sup.snapshot()[0].status.is_final()
+    })
+    .await;
+    assert!(!rig.main.path().join("a.txt").exists(), "it was told no");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn keep_working_after_wait_takes_the_wait_back() {
     let mut rig = rig(Mode::Auto, vec![vec![Script::Hang(vec![])]], true);
     send(&mut rig.ui, "/bg long job");

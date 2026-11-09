@@ -2085,9 +2085,15 @@ impl App {
                 Picked::Cancelled => None,
             };
         }
+        let background = self
+            .prompts
+            .front()
+            .is_some_and(|prompt| self.is_background_prompt(prompt));
         if let Some(prompt) = self.prompts.front_mut() {
             let answered = prompt.key(key)?;
-            let interrupt = answered == Answered::Interrupt;
+            // Esc on a background agent's approval is a no for that agent, not a stop of the
+            // turn the user is in (which has nothing to do with it).
+            let interrupt = answered == Answered::Interrupt && !background;
             self.answer(answered);
             if interrupt {
                 // Stopping the turn stops the agents it started: nothing else of theirs asks

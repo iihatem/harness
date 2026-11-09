@@ -137,6 +137,15 @@ pub fn open_listing(
     Ok(session)
 }
 
+/// What a listing says of a session: the start of the user's first message. A session in which
+/// only a background agent ran has none: it is listed as the picker lists it, not with a blank.
+fn listed_title(first_message: Option<&str>) -> String {
+    match first_message.and_then(|message| message.lines().next()) {
+        Some(line) if !line.trim().is_empty() => line.chars().take(72).collect(),
+        _ => "(no message)".to_string(),
+    }
+}
+
 /// `harness --resume` without an id and without a terminal: prints each session of this
 /// project, most recent first, with its id, start time and first message. On a terminal the
 /// interactive session opens with the session picker instead.
@@ -154,15 +163,7 @@ pub fn print_list() -> u8 {
         return 0;
     }
     for summary in listed {
-        let first: String = summary
-            .first_message
-            .unwrap_or_default()
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .take(72)
-            .collect();
+        let first = listed_title(summary.first_message.as_deref());
         println!(
             "{}  {}  {}",
             terminal_safe(&summary.id),
@@ -172,4 +173,17 @@ pub fn print_list() -> u8 {
     }
     println!("Continue one with: harness --resume <id>, or harness --resume <id> ask \"...\"");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listed_title;
+
+    #[test]
+    fn a_session_with_no_user_message_is_not_listed_with_a_blank() {
+        assert_eq!(listed_title(None), "(no message)");
+        assert_eq!(listed_title(Some("")), "(no message)");
+        assert_eq!(listed_title(Some("fix it\nand more")), "fix it");
+        assert_eq!(listed_title(Some(&"x".repeat(100))).chars().count(), 72);
+    }
 }

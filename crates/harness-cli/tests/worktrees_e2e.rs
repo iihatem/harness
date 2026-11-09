@@ -205,3 +205,28 @@ async fn a_builder_works_in_a_worktree_and_ask_reports_its_branch_without_applyi
     assert!(stderr.contains("harness/builder"), "{stderr}");
     assert!(stderr.contains("not applied"), "{stderr}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_run_says_why_a_child_failed_not_only_that_it_did() {
+    let server = MockServer::start().await;
+    script(&server).await;
+    let env = Env::new(&server.uri());
+    let out = tokio::task::spawn_blocking(move || {
+        // In `ask` mode the builder's write needs an approval nobody can give.
+        let out = env
+            .cmd()
+            .args(["--mode", "ask", "ask", "go"])
+            .output()
+            .unwrap();
+        (out, env)
+    })
+    .await
+    .unwrap()
+    .0;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("agent a1 failed"), "{stderr}");
+    assert!(
+        stderr.contains("agent a1 blocked: write src/built.rs"),
+        "{stderr}"
+    );
+}

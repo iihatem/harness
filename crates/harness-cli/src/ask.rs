@@ -174,6 +174,16 @@ async fn run_until_signalled(
         eprintln!("error: {}", terminal_safe(&why));
         return 2;
     }
+    // Nobody can be asked here: a Claude Code model whose subscription question is unanswered
+    // and that has no API key is refused like a hosted model with no key, before any turn.
+    if let Some(why) = resolved
+        .provider
+        .delegated()
+        .and_then(|program| program.unusable_unasked())
+    {
+        eprintln!("error: {}", terminal_safe(&why));
+        return 2;
+    }
 
     // Only read (and potentially block on) stdin once we know we're actually going to run: a
     // missing model must exit 2 promptly even if a pipe into stdin is still open.
@@ -574,10 +584,23 @@ impl Shown {
         if let Some(agent) = agent {
             if !json {
                 match &event {
+                    AgentEvent::AgentStarted { label, model } if model.is_empty() => {
+                        eprintln!("agent {agent} ({}) never started", terminal_safe(label));
+                    }
                     AgentEvent::AgentStarted { label, model } => eprintln!(
                         "agent {agent} ({}) started on {}",
                         terminal_safe(label),
                         terminal_safe(model)
+                    ),
+                    // Why a child failed, for a run that is not `--json` (the parent is told as
+                    // well, as the result of its call).
+                    AgentEvent::Error { message, .. } => eprintln!(
+                        "agent {agent} error: {}",
+                        terminal_safe(message.lines().next().unwrap_or_default())
+                    ),
+                    AgentEvent::ActionBlocked { reason, .. } => eprintln!(
+                        "agent {agent} blocked: {}",
+                        terminal_safe(reason.lines().next().unwrap_or_default())
                     ),
                     AgentEvent::AgentFinished { status, branch, .. } => {
                         eprintln!("agent {agent} {}", status.as_str());

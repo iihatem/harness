@@ -114,6 +114,18 @@ enum Pick {
 /// no capacity at the reset.
 const MAX_REARMS: u8 = 2;
 
+/// The most rows the child agents take above the input.
+const MAX_CHILD_LINES: usize = 5;
+
+/// `text` made safe to draw, cut to `max` characters.
+fn short(text: &str, max: usize) -> String {
+    let safe = sanitize(text).replace('\n', " ");
+    match safe.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &safe[..end]),
+        None => safe,
+    }
+}
+
 /// The message sent when the session resumes by itself.
 pub const RESUME_MESSAGE: &str = "Continue where you left off.";
 
@@ -1140,6 +1152,8 @@ impl App {
     /// What the supervisor says its child agents are doing now.
     pub fn set_children(&mut self, children: Vec<harness_core::agents::AgentInfo>) {
         self.children = children;
+        // A child that ended takes the question it was asking with it.
+        self.prune_prompts();
     }
 
     pub fn children(&self) -> &[harness_core::agents::AgentInfo] {
@@ -1147,12 +1161,29 @@ impl App {
     }
 
     /// One line for each child that has not ended: label, status, model, and the tool it called
-    /// last.
+    /// last. At most [`MAX_CHILD_LINES`] of them, whatever the number of children (those that
+    /// need an answer first, then the working, then the queued; the rest as a count), each a
+    /// short line: the label, model and tool are cut.
     fn child_lines(&self, theme: &Theme) -> Vec<Line<'static>> {
         use harness_core::agents::AgentStatus;
-        self.children
+        let mut running: Vec<_> = self
+            .children
             .iter()
             .filter(|child| !child.status.is_final())
+            .collect();
+        running.sort_by_key(|child| match child.status {
+            AgentStatus::NeedsInput => 0,
+            AgentStatus::Working => 1,
+            _ => 2,
+        });
+        let (shown, hidden) = if running.len() > MAX_CHILD_LINES {
+            (MAX_CHILD_LINES - 1, running.len() - (MAX_CHILD_LINES - 1))
+        } else {
+            (running.len(), 0)
+        };
+        let mut lines: Vec<Line<'static>> = running
+            .into_iter()
+            .take(shown)
             .map(|child| {
                 let status_style = if child.status == AgentStatus::NeedsInput {
                     theme.warning()
@@ -1162,20 +1193,30 @@ impl App {
                 let mut spans = vec![
                     Span::styled("◦ ", theme.accent()),
                     Span::styled(
-                        format!("{} {}", child.tag.id, sanitize(&child.tag.label)),
+                        format!("{} {}", child.tag.id, short(&child.tag.label, 40)),
                         theme.bold(),
                     ),
                     Span::styled(format!(" · {}", child.status.as_str()), status_style),
                 ];
                 if let Some(model) = &child.model {
-                    spans.push(Span::styled(format!(" · {}", sanitize(model)), theme.dim()));
+                    spans.push(Span::styled(
+                        format!(" · {}", short(model, 40)),
+                        theme.dim(),
+                    ));
                 }
                 if let Some(tool) = &child.activity {
-                    spans.push(Span::styled(format!(" · {}", sanitize(tool)), theme.dim()));
+                    spans.push(Span::styled(format!(" · {}", short(tool, 40)), theme.dim()));
                 }
                 Line::from(spans)
             })
-            .collect()
+            .collect();
+        if hidden > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("◦ and {hidden} more agents"),
+                theme.dim(),
+            )));
+        }
+        lines
     }
 
     /// How many approvals wait for an answer, the one shown included.
@@ -1570,6 +1611,7 @@ impl App {
     /// Takes in a paste read at `now`. One that goes to the input while a prompt waits counts as
     /// typing: the prompt waits for a pause after it.
     pub fn on_paste_at(&mut self, text: &str, now: Instant) {
+        self.prune_prompts();
         self.sync_offer_arming();
         if let Some(prompt) = self.prompts.front_mut()
             && prompt.paste(text)
@@ -1602,6 +1644,9 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return None;
         }
+        // A prompt nobody waits for any more (its agent was cancelled) must not take this key as
+        // its answer: it is gone before the key is read, whenever the screen was last drawn.
+        self.prune_prompts();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             return self.ctrl_c(now);

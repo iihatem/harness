@@ -101,6 +101,16 @@ fn rig(
     settings: SpawnSettings,
     make: impl Fn(&ChildSetup) -> Arc<dyn Provider> + Send + Sync + 'static,
 ) -> Rig {
+    rig_in(Mode::Auto, definitions, settings, make)
+}
+
+/// A rig whose parent is in `mode`.
+fn rig_in(
+    mode: Mode,
+    definitions: Definitions,
+    settings: SpawnSettings,
+    make: impl Fn(&ChildSetup) -> Arc<dyn Provider> + Send + Sync + 'static,
+) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().canonicalize().unwrap();
     let factory = Arc::new(Factory {
@@ -109,7 +119,7 @@ fn rig(
         specs: Mutex::new(Vec::new()),
     });
     let config = EngineConfig {
-        mode: Mode::Auto,
+        mode,
         workspace: workspace.clone(),
         read_dirs: vec![],
         rules: RuleSet::default(),
@@ -612,3 +622,53 @@ async fn a_reports_text_cannot_close_its_own_block_or_grow_without_bound() {
 
 #[allow(dead_code)]
 fn unused(_: &Path) {}
+
+// ---- permissions ----------------------------------------------------------------------------
+
+fn writes_a_file() -> impl Fn(&ChildSetup) -> Arc<dyn Provider> + Send + Sync + 'static {
+    |_| {
+        MockProvider::new(vec![
+            Script::tool_call("t1", "touch", json!({"path": "made.txt"})),
+            Script::text("tried"),
+        ])
+    }
+}
+
+#[tokio::test]
+async fn a_definition_cannot_give_a_child_a_wider_mode_than_the_parents() {
+    let def = AgentDefinition {
+        mode: Some(Mode::FullAccess),
+        ..file(
+            "bold",
+            None,
+            None,
+            DefinitionSource::User("/u/bold.md".into()),
+        )
+    };
+    let rig = rig_in(
+        Mode::ReadOnly,
+        Definitions::new(vec![def]),
+        settings(10),
+        writes_a_file(),
+    );
+    let out = rig
+        .call(1, json!({"agents": [entry("bold", "write it")]}))
+        .await;
+    assert!(!rig.workspace.join("made.txt").exists(), "{}", out.content);
+    assert!(!out.content.contains("files changed"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn a_child_that_needs_an_approval_nobody_can_give_fails_and_the_parent_is_told() {
+    let rig = rig_in(Mode::Ask, defs(), settings(10), writes_a_file());
+    let out = rig
+        .call(1, json!({"agents": [entry("general", "write it")]}))
+        .await;
+    assert!(!rig.workspace.join("made.txt").exists());
+    assert!(out.content.contains("status=\"failed\""), "{}", out.content);
+    assert!(
+        out.content.contains("no one could answer"),
+        "{}",
+        out.content
+    );
+}

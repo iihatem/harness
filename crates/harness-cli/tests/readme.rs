@@ -130,3 +130,20 @@ fn the_readme_documents_roles_hand_off_fallback_and_escalation() {
         assert!(trust.contains(word), "the trust paragraph omits {word}");
     }
 }
+
+#[test]
+fn the_readme_documents_subagents() {
+    let text = readme();
+    for word in [
+        "spawn_agents",
+        "/agents",
+        ".harness/agents/",
+        ".claude/agents/",
+        "max_spawns_per_turn",
+        "permissionMode",
+        "explore",
+        "`[roles] background`",
+    ] {
+        assert!(text.contains(word), "the README does not mention {word}");
+    }
+}

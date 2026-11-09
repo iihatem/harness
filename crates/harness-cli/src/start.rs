@@ -114,6 +114,11 @@ impl Started {
         self.children.factory.confirm_full_access();
     }
 
+    /// Nobody can be asked a question in this run (`harness ask`).
+    pub fn children_headless(&self) {
+        self.children.factory.set_headless();
+    }
+
     /// The worktrees agents are isolated in, when the project is in a git repository.
     pub fn worktrees(&self) -> Option<Arc<harness_core::worktree::Worktrees>> {
         self.children.worktrees.clone()

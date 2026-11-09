@@ -157,6 +157,13 @@ pub trait DelegateTurns: Send + Sync {
     /// The name for messages: `claude-code`, `codex`.
     fn label(&self) -> String;
 
+    /// Why this model cannot be used where nobody can be asked a question (a headless run), when
+    /// that is already known: the opt-in is unanswered and there is no fallback. `None` when it
+    /// can run, or can be asked.
+    fn unusable_unasked(&self) -> Option<String> {
+        None
+    }
+
     /// Answers what has to be asked before the first turn (an opt-in), through `gate`. `Err`
     /// is why the model cannot be used: the turn ends with it.
     async fn prepare(&self, gate: &dyn ApprovalGate) -> Result<(), String>;

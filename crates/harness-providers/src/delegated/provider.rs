@@ -209,6 +209,20 @@ impl DelegateTurns for Inner {
         .to_string()
     }
 
+    fn unusable_unasked(&self) -> Option<String> {
+        // An answer given since this model was made decides, as it does at the first turn.
+        let answered = self.settings.store.as_ref().and_then(|store| store.get());
+        match &*self.auth.lock().expect("auth lock") {
+            Auth::Undecided { key: None } if answered.is_none() => {
+                Some(optin::NO_ACCOUNT.to_string())
+            }
+            Auth::Undecided { key: None } if answered == Some(false) => {
+                Some(optin::REFUSED_NO_KEY.to_string())
+            }
+            _ => None,
+        }
+    }
+
     async fn prepare(&self, gate: &dyn ApprovalGate) -> Result<(), String> {
         let _asking = self.asking.lock().await;
         // An answer given since this model was made (by another child) decides.

@@ -799,3 +799,29 @@ async fn an_answer_given_since_the_model_was_made_is_not_asked_again() {
     assert!(gate.confirmed.lock().unwrap().is_empty());
     assert_eq!(p.delegated().unwrap().account(), AccountKind::Delegated);
 }
+
+#[tokio::test]
+async fn where_nobody_can_be_asked_an_undecided_claude_without_a_key_says_so_up_front() {
+    let store = Arc::new(Store::default());
+    let settings = DelegateSettings {
+        store: Some(store.clone()),
+        ..DelegateSettings::default()
+    };
+    let make = |key| {
+        DelegatedProvider::new("claude-code", "sonnet", settings.clone(), key)
+            .unwrap()
+            .delegated()
+            .unwrap()
+    };
+    let why = make(None).unusable_unasked().expect("no key, no answer");
+    assert!(why.contains("harness auth add anthropic"), "{why}");
+    assert!(make(Some(api_key())).unusable_unasked().is_none());
+    // An answer given since (kept in the store) decides.
+    store.set(true).unwrap();
+    assert!(make(None).unusable_unasked().is_none());
+    let codex = DelegatedProvider::new("codex", "gpt-5", settings, None)
+        .unwrap()
+        .delegated()
+        .unwrap();
+    assert!(codex.unusable_unasked().is_none());
+}

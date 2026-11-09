@@ -44,6 +44,9 @@ pub struct CliFactory {
     /// The user confirmed `full-access` for the program-run children of this run
     /// (`ask --yes-full-access`): they are not asked again.
     full_access: std::sync::atomic::AtomicBool,
+    /// Nobody can be asked a question (`harness ask`): a model that needs an answer first and
+    /// has no fallback cannot be used.
+    headless: std::sync::atomic::AtomicBool,
 }
 
 impl CliFactory {
@@ -85,6 +88,7 @@ impl CliFactory {
             output_root,
             cancel,
             full_access: std::sync::atomic::AtomicBool::new(false),
+            headless: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -92,6 +96,12 @@ impl CliFactory {
     /// it: the user already did (a headless run started with `--yes-full-access`).
     pub fn confirm_full_access(&self) {
         self.full_access
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The run has no one to ask (`harness ask`).
+    pub fn set_headless(&self) {
+        self.headless
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -167,10 +177,18 @@ impl AgentFactory for CliFactory {
         // The program is there and in its tested range; then the account (a Claude whose opt-in
         // was declined and has no key says so). Not yet answered is usable: it asks at its start.
         crate::delegate::ready(&self.setup, model).await?;
-        self.resolver
-            .resolve(model, self.cancel.clone())
-            .await
-            .map(|_| ())
+        let resolved = self.resolver.resolve(model, self.cancel.clone()).await?;
+        // Where nobody can answer the Claude subscription question and there is no key, the
+        // child could only fail at its start: the call is refused instead.
+        if self.headless.load(std::sync::atomic::Ordering::SeqCst)
+            && let Some(why) = resolved
+                .provider
+                .delegated()
+                .and_then(|program| program.unusable_unasked())
+        {
+            return Err(why);
+        }
+        Ok(())
     }
 
     async fn build(&self, child: ChildSetup) -> Result<Agent, String> {
@@ -487,6 +505,29 @@ mod tests {
             "[delegate.claude]\nuse_subscription = false\n",
             &[bin, ("ANTHROPIC_API_KEY", "sk-ant-api03-test")],
         );
+        assert!(f.usable("claude-code/sonnet").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn headless_with_the_claude_question_unanswered_and_no_key_is_not_usable() {
+        let tools = tempfile::tempdir().unwrap();
+        let claude = fake_program(tools.path(), "claude", "2.1.312 (Claude Code)");
+        let bin = ("HARNESS_CLAUDE_BIN", claude.to_str().unwrap());
+        // Nobody can answer the question, and there is no key to fall back on: the whole call
+        // is refused before anything starts.
+        let (_d, f) = fixture_with_vars("", &[bin]);
+        f.set_headless();
+        let why = f.usable("claude-code/sonnet").await.unwrap_err();
+        assert!(why.contains("harness auth add anthropic"), "{why}");
+        // With a key, with the opt-in, or in the terminal (where it can be asked) it is fine,
+        // and Codex needs no answer.
+        let (_d, f) = fixture_with_vars("", &[bin, ("ANTHROPIC_API_KEY", "sk-ant-api03-test")]);
+        f.set_headless();
+        assert!(f.usable("claude-code/sonnet").await.is_ok());
+        let (_d, f) = fixture_with_vars("[delegate.claude]\nuse_subscription = true\n", &[bin]);
+        f.set_headless();
+        assert!(f.usable("claude-code/sonnet").await.is_ok());
+        let (_d, f) = fixture_with_vars("", &[bin]);
         assert!(f.usable("claude-code/sonnet").await.is_ok());
     }
 

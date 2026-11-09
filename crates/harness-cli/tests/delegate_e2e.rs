@@ -188,7 +188,8 @@ fn a_codex_run_replayed_from_a_real_recording_shows_like_any_turn_in_json() {
             "--model",
             "codex/gpt-5.6-luna",
             "--mode",
-            "auto",
+            "full-access",
+            "--yes-full-access",
             "ask",
             "--json",
             "read",
@@ -261,7 +262,8 @@ fn plain_ask_prints_the_childs_last_answer() {
             "--model",
             "codex/gpt-5.6-luna",
             "--mode",
-            "auto",
+            "full-access",
+            "--yes-full-access",
             "ask",
             "read",
             "it",
@@ -502,4 +504,23 @@ fn models_lists_what_can_be_used_and_says_why_the_rest_cannot() {
     assert!(!stdout.contains("codex/"), "{stdout}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("codex: not listed"), "{stderr}");
+}
+
+#[test]
+fn in_auto_mode_a_command_nobody_allowed_is_blocked_because_the_program_has_no_sandbox() {
+    let env = Env::new("");
+    let codex = env.fake("codex", CODEX_VERSION, "", &codex_script(env.ws.path()));
+    env.cmd()
+        .env("HARNESS_CODEX_BIN", &codex)
+        .args([
+            "--model",
+            "codex/gpt-5.6-luna",
+            "--mode",
+            "auto",
+            "ask",
+            "go",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains("cannot sandbox"));
 }

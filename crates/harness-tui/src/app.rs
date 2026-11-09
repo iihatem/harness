@@ -1256,7 +1256,7 @@ impl App {
         let decision = match answered {
             Answered::Decided(decision) => decision,
             Answered::Interrupt => ApprovalDecision::Deny {
-                feedback: Some("the user stopped the turn".into()),
+                feedback: Some(harness_core::agent::STOPPED_BY_USER.into()),
             },
         };
         prompt.answer(decision);

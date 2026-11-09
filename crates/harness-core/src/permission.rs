@@ -179,6 +179,15 @@ pub fn resolve_path(workspace: &Path, path: &Path) -> PathBuf {
 pub trait PermissionPolicy: Send + Sync {
     fn check(&self, action: &Action) -> Decision;
 
+    /// What [`check`](Self::check) says when the action runs outside harness's own sandbox, as a
+    /// delegated program's commands do: nothing is confined, so a command is judged as it is
+    /// when this machine has no sandbox. Only an explicit allow rule (or a session approval)
+    /// lets an unlisted command run, and shell commands are refused in plan and read-only mode.
+    /// Policies that do not tell the two apart answer as `check` does.
+    fn check_unsandboxed(&self, action: &Action) -> Decision {
+        self.check(action)
+    }
+
     /// Records that the user approved `action` for the rest of the session. Returns whether anything
     /// was remembered (destructive commands never are).
     fn remember(&self, _action: &Action) -> bool {

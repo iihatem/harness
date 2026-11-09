@@ -232,6 +232,10 @@ pub struct ApprovalRequest {
     pub agent: Option<crate::agents::AgentTag>,
 }
 
+/// The feedback of the `Deny` an approver gives when the user pressed Esc on a prompt: the turn
+/// is being stopped, which is not an answer to a question the prompt asked.
+pub const STOPPED_BY_USER: &str = "the user stopped the turn";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Approve,
@@ -1681,8 +1685,15 @@ impl Agent {
         self.message_recorded = false;
         let content = self.user_message(input.parts, events).await;
         let delegate = self.active_delegate();
-        let task = delegate.as_ref().map(|_| content.clone());
         let plan = input.plan.clone();
+        // A Build message that only points at the plan above would send a delegated child nothing
+        // to build: it is given the plan itself, whole (the session keeps the message as it was).
+        let task = delegate.as_ref().map(|_| match &plan {
+            Some(plan) if !content.contains(plan.as_str()) => {
+                format!("Implement this plan:\n\n{plan}")
+            }
+            _ => content.clone(),
+        });
         let attribution = self.turn_handoff.map(|handoff| Attribution {
             role: Role::Build,
             switch_reason: None,
@@ -1706,7 +1717,9 @@ impl Agent {
         }
         // A model that runs in another agent program does not go through the request loop.
         if let (Some(delegate), Some(task)) = (delegate, task) {
-            return self.delegated_turn(delegate, task, events, cancel).await;
+            return self
+                .delegated_turn(delegate, task, plan, events, cancel)
+                .await;
         }
 
         let mut auto_compaction_failed = false;

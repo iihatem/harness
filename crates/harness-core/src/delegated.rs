@@ -134,8 +134,14 @@ pub trait ApprovalGate: Send + Sync {
     async fn authorize(&self, request: GateRequest) -> GateAnswer;
 
     /// A plain yes-or-no question of `kind` (see [`ApprovalKind::is_question`]). `None` when
-    /// nobody can answer it or the turn was stopped.
+    /// nobody can answer it or the turn was stopped (see [`stopped`](Self::stopped)).
     async fn confirm(&self, kind: ApprovalKind, question: String) -> Option<bool>;
+
+    /// Whether the user stopped the turn (Esc), which a `None` from [`confirm`](Self::confirm)
+    /// may mean: an answer left undecided, to be asked again, not "nobody can answer".
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 /// An agent program driven for a whole turn.

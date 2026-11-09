@@ -2,6 +2,8 @@
 //! message, the checkpoint, the child's session, the confirmations, the ledger) and how the
 //! child's approvals meet the permission engine.
 
+mod common;
+
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
@@ -27,9 +29,11 @@ use harness_core::{
     },
     permission::{Action, Mode},
     provider::{Provider, ProviderStream},
+    role::{HandoffMode, Role, RoleConfig},
     session::{EntryKind, RewindScope, Session},
     testing::{MockProvider, Script},
     tool::{ToolContext, ToolRegistry},
+    turn::{InputPart, TurnInput, TurnModel},
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -61,6 +65,11 @@ struct Delegate {
     runs: Mutex<Vec<DelegatedTurn>>,
     answers: Mutex<Vec<GateAnswer>>,
     prepared: Mutex<u32>,
+    /// A mode switch the user makes while the child runs, before its first question.
+    switch: Mutex<Option<(Arc<PermissionEngine>, Mode)>>,
+    /// `prepare` puts the opt-in question, as the real provider does, and ends with an error when
+    /// it was left unanswered.
+    asks_opt_in: Mutex<bool>,
 }
 
 impl Delegate {
@@ -73,6 +82,8 @@ impl Delegate {
             runs: Mutex::new(Vec::new()),
             answers: Mutex::new(Vec::new()),
             prepared: Mutex::new(0),
+            asks_opt_in: Mutex::new(false),
+            switch: Mutex::new(None),
         })
     }
 
@@ -91,8 +102,16 @@ impl DelegateTurns for Delegate {
         "claude-code".into()
     }
 
-    async fn prepare(&self, _gate: &dyn ApprovalGate) -> Result<(), String> {
+    async fn prepare(&self, gate: &dyn ApprovalGate) -> Result<(), String> {
         *self.prepared.lock().unwrap() += 1;
+        if *self.asks_opt_in.lock().unwrap()
+            && gate
+                .confirm(ApprovalKind::DelegateOptIn, "use it?".into())
+                .await
+                .is_none()
+        {
+            return Err("left unanswered".into());
+        }
         if let Some(account) = *self.after_prepare.lock().unwrap() {
             *self.account.lock().unwrap() = account;
         }
@@ -108,6 +127,10 @@ impl DelegateTurns for Delegate {
     ) -> DelegatedOutcome {
         let workspace = turn.workspace.clone();
         self.runs.lock().unwrap().push(turn);
+        if let Some((engine, mode)) = self.switch.lock().unwrap().take() {
+            use harness_core::permission::PermissionPolicy;
+            engine.set_mode(mode);
+        }
         let step = self.steps.lock().unwrap().pop_front().unwrap_or_default();
         for ask in &step.asks {
             let answer = gate.authorize(ask.clone()).await;
@@ -187,6 +210,16 @@ fn agent_on(
     approver: Arc<dyn Approver>,
     rules: RuleSet,
 ) -> Agent {
+    agent_with_engine(f, delegate, engine(&f.ws, mode, rules), approver)
+}
+
+fn agent_with_engine(
+    f: &Ws,
+    delegate: &Arc<Delegate>,
+    engine: Arc<PermissionEngine>,
+    approver: Arc<dyn Approver>,
+) -> Agent {
+    let mode = engine.mode();
     let session = Session::create(&f.data.join("sessions"), &f.ws);
     let checkpoints =
         Checkpoints::open(&f.data.join("checkpoints.git"), &f.ws, session.id()).unwrap();
@@ -200,7 +233,7 @@ fn agent_on(
     Agent::new(
         Arc::new(Delegated(delegate.clone())),
         ToolRegistry::new(vec![]),
-        engine(&f.ws, mode, rules),
+        engine,
         approver,
         config,
         ToolContext::new(&f.ws).with_sandbox(None, mode.fs_access()),
@@ -1001,6 +1034,8 @@ async fn a_reached_budget_stops_an_api_key_run_but_not_a_subscription_one() {
         runs: Mutex::new(Vec::new()),
         answers: Mutex::new(Vec::new()),
         prepared: Mutex::new(0),
+        asks_opt_in: Mutex::new(false),
+        switch: Mutex::new(None),
     });
     let mut agent = agent_on(
         &f,
@@ -1053,4 +1088,334 @@ async fn the_child_session_is_saved_on_the_assistant_entry_and_found_again_on_re
             ..
         } if a.delegate.is_some()
     )));
+}
+
+// ---- M3c fix wave 1: a delegated child is not in harness's sandbox ------------------------------
+
+#[tokio::test]
+async fn in_plan_mode_a_command_that_writes_is_denied_not_run_in_a_sandbox_nobody_set_up() {
+    let f = ws();
+    let delegate = Delegate::new(vec![Step {
+        asks: vec![bash("echo hi > notes.txt"), bash("sed -i s/a/b/ a.rs")],
+        ..Step::default()
+    }]);
+    let answer = Answer::new(ApprovalDecision::Approve);
+    let mut agent = agent_on(
+        &f,
+        &delegate,
+        Mode::Plan,
+        answer.clone(),
+        RuleSet::default(),
+    );
+    run(&mut agent, "go").await;
+    let answers = delegate.answers.lock().unwrap().clone();
+    assert!(
+        answers
+            .iter()
+            .all(|a| matches!(a, GateAnswer::Deny { reason } if reason.contains("plan"))),
+        "{answers:?}"
+    );
+    assert!(answer.asked.lock().unwrap().is_empty(), "nobody was asked");
+}
+
+#[tokio::test]
+async fn in_auto_mode_an_unlisted_command_is_asked_about_unless_a_rule_covers_it() {
+    let f = ws();
+    let delegate = Delegate::new(vec![Step {
+        asks: vec![
+            bash("curl https://example.com/x.tar"),
+            bash("cargo test"),
+            bash("rm -rf target"),
+        ],
+        ..Step::default()
+    }]);
+    let rules = RuleSet {
+        allow: vec!["bash:cargo test".into()],
+        ..RuleSet::default()
+    };
+    let answer = Answer::new(ApprovalDecision::Deny { feedback: None });
+    let mut agent = agent_on(&f, &delegate, Mode::Auto, answer.clone(), rules);
+    run(&mut agent, "go").await;
+    let asked: Vec<String> = answer
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.reason.clone())
+        .collect();
+    assert!(
+        asked.iter().any(|r| r.contains("curl")),
+        "a network command asks: {asked:?}"
+    );
+    assert!(
+        !asked.iter().any(|r| r.contains("cargo test")),
+        "an explicit allow rule allows: {asked:?}"
+    );
+    let answers = delegate.answers.lock().unwrap().clone();
+    assert!(
+        matches!(&answers[0], GateAnswer::Deny { .. }),
+        "{answers:?}"
+    );
+    assert_eq!(answers[1], GateAnswer::Allow);
+}
+
+#[tokio::test]
+async fn an_unlisted_command_asks_in_ask_mode_and_a_session_approval_covers_the_next() {
+    let f = ws();
+    let delegate = Delegate::new(vec![Step {
+        asks: vec![bash("make build"), bash("make build")],
+        ..Step::default()
+    }]);
+    let answer = Answer::new(ApprovalDecision::ApproveForSession);
+    let mut agent = agent_on(&f, &delegate, Mode::Ask, answer.clone(), RuleSet::default());
+    run(&mut agent, "go").await;
+    assert_eq!(answer.asked.lock().unwrap().len(), 1);
+    let answers = delegate.answers.lock().unwrap().clone();
+    assert_eq!(answers, [GateAnswer::Allow, GateAnswer::Allow]);
+}
+
+#[tokio::test]
+async fn a_workspace_edit_is_still_allowed_in_auto_mode_without_a_question() {
+    let f = ws();
+    let delegate = Delegate::new(vec![Step {
+        asks: vec![write(&f.ws, "src/a.rs")],
+        ..Step::default()
+    }]);
+    let answer = Answer::new(ApprovalDecision::Deny { feedback: None });
+    let mut agent = agent_on(
+        &f,
+        &delegate,
+        Mode::Auto,
+        answer.clone(),
+        RuleSet::default(),
+    );
+    run(&mut agent, "go").await;
+    assert_eq!(delegate.answers.lock().unwrap()[0], GateAnswer::Allow);
+    assert!(answer.asked.lock().unwrap().is_empty());
+}
+
+// ---- M3c fix wave 1: a Build turn on a delegated model is sent the approved plan ----------------
+
+fn long_plan() -> &'static str {
+    let steps: String = (1..=120)
+        .map(|n| format!("{n}. Change module {n} and keep its tests passing, as agreed.\n"))
+        .collect();
+    assert!(steps.chars().count() > 2_000);
+    Box::leak(steps.into_boxed_str())
+}
+
+fn build_input(plan: &str) -> TurnInput {
+    TurnInput {
+        parts: vec![InputPart::Text("Implement the plan above.".into())],
+        plan: Some(plan.into()),
+        role: Some(Role::Build),
+        ..TurnInput::default()
+    }
+}
+
+async fn run_input(agent: &mut Agent, input: TurnInput) -> (TurnEndReason, Vec<AgentEvent>) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let reason = agent.run_turn(input, &tx, CancellationToken::new()).await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(e) = rx.recv().await {
+        events.push(e);
+    }
+    (reason, events)
+}
+
+#[tokio::test]
+async fn a_build_turn_on_a_fresh_child_is_sent_the_whole_long_plan() {
+    let f = ws();
+    let plan = long_plan();
+    let delegate = Delegate::new(vec![
+        Step {
+            texts: vec![plan],
+            ..Step::default()
+        },
+        Step::default(),
+    ]);
+    let mut agent = agent_on(
+        &f,
+        &delegate,
+        Mode::Plan,
+        Answer::new(ApprovalDecision::Approve),
+        RuleSet::default(),
+    );
+    run(&mut agent, "plan it").await;
+    agent.set_mode(Mode::Auto);
+    run_input(&mut agent, build_input(plan)).await;
+    let task = delegate.runs()[1].task.clone();
+    assert!(
+        task.ends_with(&format!("Implement this plan:\n\n{plan}")),
+        "the plan, whole, is the request: {task}"
+    );
+    assert!(!task.contains("[…]"), "nothing of it was cut: {task}");
+    assert_eq!(
+        task.matches("120. Change module 120").count(),
+        1,
+        "and it is not said twice"
+    );
+}
+
+#[tokio::test]
+async fn a_plan_only_handoff_to_a_delegated_build_model_sends_the_plan() {
+    let f = ws();
+    let plan = long_plan();
+    let delegate = Delegate::new(vec![Step::default()]);
+    let planner = MockProvider::new(vec![Script::text(plan)]);
+    let build: Arc<dyn Provider> = Arc::new(Delegated(delegate.clone()));
+    let session = Session::create(&f.data.join("sessions"), &f.ws);
+    let mut agent = common::roles::with_models(
+        common::agent(
+            MockProvider::new(vec![]),
+            Mode::Plan,
+            Arc::new(NonInteractive),
+            &f.ws,
+        ),
+        vec![
+            common::roles::model("plan/big", &planner, 1_000_000),
+            TurnModel {
+                provider: build,
+                id: "claude-code/sonnet".into(),
+                name: "sonnet".into(),
+                local: false,
+                tools: None,
+                edit_section: None,
+                context_window: Some(1_000_000),
+                request: None,
+                text_tool_calls: false,
+            },
+        ],
+    )
+    .with_roles(RoleConfig {
+        plan: Some("plan/big".into()),
+        build: Some("claude-code/sonnet".into()),
+        handoff: Some(HandoffMode::PlanOnly),
+        ..RoleConfig::default()
+    })
+    .with_session(session);
+    run(&mut agent, "plan it").await;
+    agent.set_mode(Mode::Auto);
+    let (reason, _) = run_input(&mut agent, build_input(plan)).await;
+    assert_eq!(reason, TurnEndReason::Completed);
+    let runs = delegate.runs();
+    assert_eq!(runs.len(), 1, "the build turn ran on the delegated model");
+    assert_eq!(
+        runs[0].task,
+        format!("Implement this plan:\n\n{plan}"),
+        "the plan alone, not the sentence pointing at it"
+    );
+}
+
+// ---- M3c fix wave 1: Esc on a question is not an answer ----------------------------------------
+
+fn esc() -> ApprovalDecision {
+    ApprovalDecision::Deny {
+        feedback: Some(harness_core::agent::STOPPED_BY_USER.into()),
+    }
+}
+
+#[tokio::test]
+async fn esc_on_the_opt_in_ends_the_turn_interrupted_and_nothing_runs() {
+    let f = ws();
+    let delegate = Delegate::new(vec![Step::default(), Step::default()]);
+    *delegate.asks_opt_in.lock().unwrap() = true;
+    let answer = Answer::new(esc());
+    let mut agent = agent_on(&f, &delegate, Mode::Ask, answer.clone(), RuleSet::default());
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Interrupted);
+    assert!(delegate.runs().is_empty());
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+    // The next turn asks again.
+    run(&mut agent, "again").await;
+    assert_eq!(answer.kinds(), [ApprovalKind::DelegateOptIn; 2]);
+}
+
+#[tokio::test]
+async fn esc_on_the_full_access_question_ends_the_turn_interrupted() {
+    let f = ws();
+    let delegate = Delegate::new(vec![Step::default()]);
+    let answer = Answer::new(esc());
+    let mut agent = agent_on(
+        &f,
+        &delegate,
+        Mode::FullAccess,
+        answer.clone(),
+        RuleSet::default(),
+    );
+    let (reason, events) = run(&mut agent, "go").await;
+    assert_eq!(reason, TurnEndReason::Interrupted);
+    assert!(delegate.runs().is_empty());
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+}
+
+#[tokio::test]
+async fn a_paused_budget_is_said_once_in_every_delegated_turn() {
+    struct Paused;
+    impl Meter for Paused {
+        fn record_request(&self, _r: &RequestRecord) -> RequestCost {
+            RequestCost {
+                account: AccountKind::Delegated,
+                billed_usd: Some(0.0),
+                list_usd: None,
+                avoided: Avoided::NotApplicable,
+            }
+        }
+        fn check_budget(&self, _session: &str, _account: AccountKind) -> BudgetStatus {
+            BudgetStatus {
+                paused: Some(BudgetNotice {
+                    budget: BudgetKind::Session,
+                    spent_usd: 2.0,
+                    limit_usd: 1.0,
+                }),
+                ..BudgetStatus::default()
+            }
+        }
+    }
+    let f = ws();
+    let delegate = Delegate::new(vec![Step::default(), Step::default()]);
+    let mut agent = agent_on(
+        &f,
+        &delegate,
+        Mode::Ask,
+        Arc::new(NonInteractive),
+        RuleSet::default(),
+    )
+    .with_meter(Arc::new(Paused));
+    for turn in ["one", "two"] {
+        let (_, events) = run(&mut agent, turn).await;
+        let said = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Warning { message } if message.contains("paused")))
+            .count();
+        assert_eq!(said, 1, "turn {turn}: {events:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_switch_to_full_access_during_a_turn_does_not_let_the_engine_allow_what_the_user_was_not_asked()
+ {
+    let f = ws();
+    let delegate = Delegate::new(vec![Step {
+        asks: vec![bash("make build"), write(&f.ws, "a.rs")],
+        ..Step::default()
+    }]);
+    let engine = engine(&f.ws, Mode::Ask, RuleSet::default());
+    *delegate.switch.lock().unwrap() = Some((engine.clone(), Mode::FullAccess));
+    let answer = Answer::new(ApprovalDecision::Deny { feedback: None });
+    let mut agent = agent_with_engine(&f, &delegate, engine, answer.clone());
+    run(&mut agent, "go").await;
+    let reasons: Vec<String> = answer
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.reason.clone())
+        .collect();
+    assert_eq!(reasons.len(), 2, "both were asked: {reasons:?}");
+    assert!(reasons[0].contains("full-access"), "{reasons:?}");
 }

@@ -29,6 +29,8 @@ struct AgentGate {
     cancel: CancellationToken,
     events: UnboundedSender<AgentEvent>,
     mode: Mode,
+    /// Set when the user pressed Esc on a question.
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -41,12 +43,13 @@ impl ApprovalGate for AgentGate {
         if self.cancel.is_cancelled() {
             return GateAnswer::Stopped;
         }
-        // Each action is checked, and the strictest answer decides: a refusal first, then a
+        // A delegated child does not run in harness's sandbox, so every action is judged as
+        // harness judges a command when it has none. Each action is checked, and the strictest answer decides: a refusal first, then a
         // question. A call with no action the engine knows is always a question.
         let mut checked: Vec<(Action, Decision)> = request
             .actions
             .iter()
-            .map(|action| (action.clone(), self.policy.check(action)))
+            .map(|action| (action.clone(), self.policy.check_unsandboxed(action)))
             .collect();
         let at = checked
             .iter()
@@ -64,6 +67,18 @@ impl ApprovalGate for AgentGate {
             )
         } else {
             checked.swap_remove(at)
+        };
+        // The child runs with the mode the turn began in, while the engine follows the live one: a
+        // switch to a wider mode in mid-turn (Shift+Tab) does not let the engine allow for the
+        // child what the user was never asked about (the full-access confirmation), so it asks.
+        let decision = match (decision, self.policy.mode()) {
+            (Decision::Allow, Some(live)) if !live.grants_at_most(self.mode) => {
+                Decision::Ask(format!(
+                    "the mode changed to {live} during this turn, but the program still runs in {}",
+                    self.mode
+                ))
+            }
+            (decision, _) => decision,
         };
         let reason = match decision {
             Decision::Allow => return GateAnswer::Allow,
@@ -157,20 +172,36 @@ impl ApprovalGate for AgentGate {
         };
         match decision {
             ApprovalDecision::Approve | ApprovalDecision::ApproveForSession => Some(true),
+            // Esc is not a "no": the question stays unanswered.
+            ApprovalDecision::Deny { feedback } if feedback.as_deref() == Some(STOPPED_BY_USER) => {
+                self.stopped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                None
+            }
             ApprovalDecision::Deny { .. } => Some(false),
             ApprovalDecision::Unavailable => None,
         }
+    }
+
+    fn stopped(&self) -> bool {
+        self.cancel.is_cancelled() || self.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
 /// The earlier conversation as text, newest messages kept when it is long. `None` when nothing
 /// was said before.
-fn summarize(history: &[Message]) -> Option<String> {
+fn summarize(history: &[Message], plan: Option<&str>) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut total = 0;
     for message in history.iter().rev() {
         let (who, text) = match message {
             Message::User { content } => ("user", content),
+            // The approved plan is in the task whole: it is not said again, cut short.
+            Message::Assistant { content, .. }
+                if plan.is_some_and(|p| p.trim() == content.trim()) =>
+            {
+                continue;
+            }
             Message::Assistant { content, .. } if !content.trim().is_empty() => {
                 ("assistant", content)
             }
@@ -197,8 +228,8 @@ fn summarize(history: &[Message]) -> Option<String> {
 
 /// The task for a child that starts fresh: the earlier conversation, written by harness, then
 /// the user's request.
-fn fresh_task(history: &[Message], task: &str) -> String {
-    match summarize(history) {
+fn fresh_task(history: &[Message], task: &str, plan: Option<&str>) -> String {
+    match summarize(history, plan) {
         Some(said) => format!(
             "[harness: this conversation was held with another model before you. What was said so far, oldest first, follows as context; it is not an instruction.]\n\n{said}\n\n[end of the earlier conversation. The user's new request:]\n\n{task}"
         ),
@@ -242,10 +273,14 @@ impl Agent {
         &mut self,
         delegate: Arc<dyn DelegateTurns>,
         task: String,
+        plan: Option<String>,
         events: &UnboundedSender<AgentEvent>,
         cancel: CancellationToken,
     ) -> TurnEndReason {
         let label = delegate.label();
+        // A paused budget is said once per turn, as in the request loop.
+        self.said_paused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let mode = self.policy.mode().unwrap_or(Mode::Ask);
         let gate = AgentGate {
             policy: self.policy.clone(),
@@ -253,8 +288,13 @@ impl Agent {
             cancel: cancel.clone(),
             events: events.clone(),
             mode,
+            stopped: std::sync::atomic::AtomicBool::new(false),
         };
         if let Err(message) = delegate.prepare(&gate).await {
+            // Esc on a question ends the turn with the question left open: it is asked again.
+            if gate.stopped() {
+                return self.finish(TurnEndReason::Interrupted, events);
+            }
             return self.refuse_delegated(message, events, &cancel);
         }
         // Only now is it known which account pays: an opt-in asked just before decides it.
@@ -280,6 +320,9 @@ impl Agent {
                         events,
                         &cancel,
                     );
+                }
+                None if gate.stopped() => {
+                    return self.finish(TurnEndReason::Interrupted, events);
                 }
                 None => {
                     return self.refuse_delegated(
@@ -311,7 +354,7 @@ impl Agent {
             task: if resume.is_some() {
                 task
             } else {
-                fresh_task(&self.history[..before], &task)
+                fresh_task(&self.history[..before], &task, plan.as_deref())
             },
             model: model_name,
             model_id: model_id.clone(),

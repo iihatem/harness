@@ -32,6 +32,7 @@ pub async fn run(
     prompt_text: String,
     json: bool,
     debug: bool,
+    yes_full_access: bool,
 ) -> u8 {
     // Registered as the very first thing this function does (a plain synchronous call, not an
     // awaited future): once it returns, the OS delivers SIGINT to tokio's signal driver instead of
@@ -91,6 +92,11 @@ pub async fn run(
             return 2;
         }
     };
+
+    if let Err(why) = crate::delegate::ready(&setup, &resolved.id).await {
+        eprintln!("error: {}", terminal_safe(&why));
+        return 2;
+    }
 
     // Ctrl+C must be honoured from here on: the piped-stdin wait below can block for seconds (the
     // first-data timeout) or indefinitely (the unbounded read-to-EOF phase once data has started
@@ -161,6 +167,9 @@ pub async fn run(
         ..
     } = started;
     let mut agent = start::with_supervisor(agent, &supervisor);
+    if yes_full_access {
+        agent.confirm_full_access();
+    }
     // `with_piped_stdin` returns the prompt with any piped text appended.
     let turn = crate::slash::turn_input(
         &typed,

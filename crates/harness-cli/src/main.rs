@@ -2,6 +2,7 @@ mod ask;
 mod auth;
 mod children;
 mod context;
+mod delegate;
 mod doctor;
 mod gates;
 mod host;
@@ -47,6 +48,10 @@ struct Cli {
     /// the state directory
     #[arg(long, global = true)]
     debug: bool,
+    /// With `ask`: confirm `full-access` mode for a claude-code or codex model, which would
+    /// otherwise ask (a headless run cannot be asked)
+    #[arg(long, global = true)]
+    yes_full_access: bool,
     /// Resume the session with this id; without an id, list this project's sessions
     #[arg(
         long,
@@ -330,6 +335,7 @@ fn main() -> ExitCode {
                     prompt.join(" "),
                     json,
                     cli.debug,
+                    cli.yes_full_access,
                 )
                 .await
             }

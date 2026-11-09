@@ -246,6 +246,7 @@ impl Host for CliHost {
                 () = cancel.cancelled() => return Err("stopped".to_string()),
                 resolved = resolving => resolved.map_err(|e| format!("resolving it failed: {e}"))??,
             };
+            crate::delegate::ready(&setup, &resolved.id).await?;
             let model = crate::start::model_setup(&setup, &resolved, &cancel)
                 .await
                 .ok_or("stopped")?;

@@ -51,6 +51,8 @@ fn child(id: &str, label: &str, status: AgentStatus) -> AgentInfo {
         summary: None,
         error: None,
         started: None,
+        background: false,
+        worktree: None,
     }
 }
 

@@ -24,5 +24,6 @@ pub use sched::{Endpoint, Limits};
 pub use spawn::{SPAWN_TOOL, SpawnAgentsTool, SpawnSettings};
 pub use supervisor::{
     AgentFactory, AgentHandle, AgentInfo, AgentSpec, ChildSetup, ParentContext, Supervisor,
+    WorktreeInfo,
 };
 pub use workspace::{ChildWorkspace, WorkspaceRefused};

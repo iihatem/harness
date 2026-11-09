@@ -128,6 +128,10 @@ pub struct AgentReport {
     /// What its model requests used, when a meter saw them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ReportUsage>,
+    /// What it changed in its worktree, committed on its branch; none when it had no worktree
+    /// or changed nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<crate::worktree::Outcome>,
 }
 
 /// `text` cut to `cap` characters; whether it was cut.
@@ -200,6 +204,7 @@ impl AgentReport {
             error: None,
             session: None,
             usage: None,
+            worktree: None,
         }
     }
 }

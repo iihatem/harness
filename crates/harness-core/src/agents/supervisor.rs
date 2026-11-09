@@ -34,6 +34,7 @@ use crate::{
     role::Role,
     session::{AgentRecord, AgentRecordKind, Lineage, Session},
     turn::{InputPart, TurnInput},
+    worktree::{Outcome, Request as WorktreeRequest, Worktree, Worktrees},
 };
 
 /// What a child is asked to do, and with what.
@@ -62,6 +63,12 @@ pub struct AgentSpec {
     pub max_steps: Option<u32>,
     /// The role its turn runs for, which picks its model when `model` does not.
     pub role: Option<Role>,
+    /// It works in a worktree of its own, made for it when it starts. Ignored for an agent that
+    /// cannot write (plan or read-only mode): it reads the main checkout.
+    pub isolation: bool,
+    /// It keeps running when the turn that started it ends or is interrupted; only
+    /// [`Supervisor::stop_all`] (and the end of the session) stops it.
+    pub background: bool,
 }
 
 impl AgentSpec {
@@ -122,6 +129,16 @@ pub struct ParentContext {
     pub workspace: PathBuf,
 }
 
+/// The worktree of a child, as far as lists need it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    pub name: String,
+    pub branch: String,
+    pub path: PathBuf,
+    /// What it left, committed on the branch, once it has ended and changed something.
+    pub outcome: Option<Outcome>,
+}
+
 /// What the supervisor knows of a child, for lists and status lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentInfo {
@@ -137,6 +154,10 @@ pub struct AgentInfo {
     pub error: Option<String>,
     /// When it started working (it is not set while it waits for a place).
     pub started: Option<Instant>,
+    /// It keeps running when the turn ends.
+    pub background: bool,
+    /// Its worktree, when it has one.
+    pub worktree: Option<WorktreeInfo>,
 }
 
 struct Entry {
@@ -157,6 +178,11 @@ struct Inner {
     registry: Mutex<Registry>,
     version: watch::Sender<u64>,
     records: AgentRecords,
+    /// The parent of the background children's tokens: cancelled only by [`Supervisor::stop_all`].
+    lifetime: CancellationToken,
+    worktrees: Mutex<Option<Arc<Worktrees>>>,
+    /// Things the user should be told, which [`Supervisor::take_notices`] hands over once.
+    notices: Mutex<Vec<String>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -242,6 +268,9 @@ impl Supervisor {
                 }),
                 version: watch::channel(0).0,
                 records: AgentRecords::default(),
+                lifetime: CancellationToken::new(),
+                worktrees: Mutex::new(None),
+                notices: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -290,11 +319,49 @@ impl Supervisor {
         }
     }
 
-    /// Cancels every child that has not ended.
+    /// Cancels every child of the foreground that has not ended: the turn was interrupted or
+    /// is over. Background children go on.
     pub fn cancel_all(&self) {
+        for entry in &lock(&self.inner.registry).entries {
+            if !entry.info.background {
+                entry.cancel.cancel();
+            }
+        }
+    }
+
+    /// Cancels every child that has not ended, background ones too: the session is ending, or
+    /// the user said to stop them.
+    pub fn stop_all(&self) {
+        self.inner.lifetime.cancel();
         for entry in &lock(&self.inner.registry).entries {
             entry.cancel.cancel();
         }
+    }
+
+    /// How many background children have not ended.
+    pub fn live_background(&self) -> usize {
+        lock(&self.inner.registry)
+            .entries
+            .iter()
+            .filter(|e| e.info.background && !e.info.status.is_final())
+            .count()
+    }
+
+    /// Children made by [`Supervisor::spawn`] that ask for isolation get a worktree from
+    /// `worktrees`; without it they fail to start, saying why.
+    pub fn set_worktrees(&self, worktrees: Arc<Worktrees>) {
+        *lock(&self.inner.worktrees) = Some(worktrees);
+    }
+
+    /// The worktrees isolated children are made in, when there are any.
+    pub fn worktrees(&self) -> Option<Arc<Worktrees>> {
+        lock(&self.inner.worktrees).clone()
+    }
+
+    /// What the user should be told (a note about uncommitted work, a copy that stopped), each
+    /// said once.
+    pub fn take_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *lock(&self.inner.notices))
     }
 
     /// Spawns a child under the parent's own token.
@@ -306,7 +373,12 @@ impl Supervisor {
     /// Spawns a child that is cancelled when `parent_cancel` is: a tool call spawning it passes
     /// the turn's token. It waits for a place under the limits, then runs.
     pub fn spawn_under(&self, spec: AgentSpec, parent_cancel: CancellationToken) -> AgentHandle {
-        let cancel = parent_cancel.child_token();
+        // A background child answers to the supervisor, not to the turn that started it.
+        let cancel = if spec.background {
+            self.inner.lifetime.child_token()
+        } else {
+            parent_cancel.child_token()
+        };
         let tag = {
             let mut registry = lock(&self.inner.registry);
             let tag = AgentTag {
@@ -324,6 +396,8 @@ impl Supervisor {
                     summary: None,
                     error: None,
                     started: None,
+                    background: spec.background,
+                    worktree: None,
                 },
                 cancel: cancel.clone(),
             });
@@ -396,17 +470,41 @@ fn finish_child(
 ) -> AgentReport {
     let id = &tag.id;
     report.session = session.clone();
+    let entry = lock(&inner.registry)
+        .entries
+        .iter()
+        .find(|e| &e.info.tag.id == id)
+        .map(|e| e.info.clone());
     inner.update(id, |info| {
         info.status = report.status;
         info.summary = Some(crate::agents::report::cap_chars(&report.summary, 400).0)
             .filter(|summary| !summary.is_empty());
         info.error = report.error.clone();
+        if let Some(worktree) = &mut info.worktree {
+            worktree.outcome = report.worktree.clone();
+        }
     });
+    // What a worktree's record says, for a listing after a restart.
+    if let (Some(info), Some(worktrees)) = (&entry, lock(&inner.worktrees).clone())
+        && let Some(worktree) = &info.worktree
+    {
+        let _ = worktrees.update_record(&worktree.name, |record| {
+            record.status = report.status;
+            record.summary = Some(crate::agents::report::cap_chars(&report.summary, 400).0)
+                .filter(|summary| !summary.is_empty());
+            record.error = report.error.clone();
+            record.session = session.clone();
+            record.model = info.model.clone();
+            record.tool_calls = report.tool_calls;
+            record.outcome = report.worktree.clone();
+        });
+    }
     let _ = inner.events.send(AgentEnvelope::child(
         id,
         AgentEvent::AgentFinished {
             status: report.status,
             summary: crate::agents::report::cap_chars(&report.summary, 200).0,
+            branch: report.worktree.as_ref().map(|o| o.branch.clone()),
         },
     ));
     inner.records.push(
@@ -422,11 +520,77 @@ fn finish_child(
     report
 }
 
+/// What it takes to say a child's worktree is done with.
+fn worktree_note(wt: &Worktree) -> String {
+    format!(
+        "You work in a git worktree of the repository, on the branch `{branch}`, made from commit {base}; the repository's other checkout and its uncommitted changes are not here. You can read git state (status, log, diff, show) but you cannot write it: do not commit, checkout, reset, stash, merge, rebase or push. Harness commits your changes on `{branch}` when you finish, and the user then reviews them. Your shell commands have HARNESS_AGENT_ID={agent} and HARNESS_PORT_OFFSET={offset}: add the offset to any port a server of yours listens on, so that agents working at the same time do not clash.",
+        branch = wt.branch,
+        base = &wt.base[..wt.base.len().min(10)],
+        agent = wt.agent,
+        offset = wt.port_offset,
+    )
+}
+
+/// Puts an end to the worktree of a child that has ended: what it changed is committed on its
+/// branch and the lock released; a worktree with no changes is removed with its branch. Puts
+/// what it left in `report` (and an error, when the changes could not be committed: the
+/// worktree then stays as it is).
+async fn settle_worktree(
+    inner: &Arc<Inner>,
+    id: &AgentId,
+    worktree: Option<&Worktree>,
+    label: &str,
+    task: &str,
+    mut report: AgentReport,
+) -> AgentReport {
+    let (Some(worktree), Some(wts)) = (worktree, lock(&inner.worktrees).clone()) else {
+        return report;
+    };
+    let (wt, label, task) = (worktree.clone(), label.to_string(), task.to_string());
+    let settled = tokio::task::spawn_blocking(move || {
+        let committed = wts.commit_result(&wt, &label, &task);
+        let _ = wts.release(&wt);
+        match committed {
+            Ok(Some(outcome)) => (Some(outcome), None, false),
+            Ok(None) => match wts.remove(&wt.name) {
+                Ok(()) => (None, None, true),
+                Err(e) => (
+                    None,
+                    Some(format!("its worktree could not be removed: {e}")),
+                    false,
+                ),
+            },
+            Err(e) => (
+                None,
+                Some(format!("its changes could not be committed: {e}")),
+                false,
+            ),
+        }
+    })
+    .await;
+    let (outcome, error, removed) = settled.unwrap_or((
+        None,
+        Some("its worktree could not be settled".into()),
+        false,
+    ));
+    if removed {
+        inner.update(id, |info| info.worktree = None);
+    }
+    report.worktree = outcome;
+    if let Some(error) = error {
+        report.error = Some(match report.error.take() {
+            Some(first) => format!("{first}; {error}"),
+            None => error,
+        });
+    }
+    report
+}
+
 async fn run_child(
     inner: Arc<Inner>,
     parent_session: String,
     tag: AgentTag,
-    spec: AgentSpec,
+    mut spec: AgentSpec,
     cancel: CancellationToken,
 ) -> AgentReport {
     // The child belongs to the session its parent was in when it was spawned, whatever happens
@@ -437,7 +601,7 @@ async fn run_child(
     let finish = |inner: &Inner, report: AgentReport, session: Option<String>| {
         finish_child(inner, &parent.session, &tag, report, session)
     };
-    let workspace = spec.workspace.resolve(&parent.workspace);
+    let main_workspace = spec.workspace.resolve(&parent.workspace);
     let empty = |status, error: Option<String>| {
         let mut report = AgentReport::build(
             id.as_str(),
@@ -445,7 +609,7 @@ async fn run_child(
             status,
             "",
             &ToolLog::default(),
-            &workspace,
+            &main_workspace,
         );
         report.error = error;
         report
@@ -465,6 +629,97 @@ async fn run_child(
         info.started = Some(Instant::now());
     });
 
+    // A worktree of its own, when it asked for one and can write: made now that it has its place,
+    // so a child that waits makes none. Its workspace, its prompt and its info are then the
+    // worktree's.
+    let live_mode = parent.policy.mode().unwrap_or(parent.engine.mode);
+    let effective = spec.mode.map_or(live_mode, |own| live_mode.narrower(own));
+    let mut worktree: Option<Worktree> = None;
+    if spec.isolation && !matches!(effective, Mode::Plan | Mode::ReadOnly) {
+        let Some(wts) = lock(&inner.worktrees).clone() else {
+            return finish(
+                &inner,
+                empty(
+                    AgentStatus::Failed,
+                    Some("could not start: it asked for a worktree, and isolation needs a git repository".into()),
+                ),
+                None,
+            );
+        };
+        let (agent, label, task) = (id.to_string(), tag.label.clone(), spec.task.clone());
+        let made = {
+            let wts = wts.clone();
+            tokio::task::spawn_blocking(move || {
+                wts.create(&WorktreeRequest {
+                    agent: &agent,
+                    label: &label,
+                    task: &task,
+                })
+            })
+            .await
+        };
+        let created = match made {
+            Ok(Ok(created)) => created,
+            Ok(Err(e)) => {
+                return finish(
+                    &inner,
+                    empty(
+                        AgentStatus::Failed,
+                        Some(format!(
+                            "could not start: its worktree could not be made: {e}"
+                        )),
+                    ),
+                    None,
+                );
+            }
+            Err(_) => {
+                return finish(
+                    &inner,
+                    empty(
+                        AgentStatus::Failed,
+                        Some("could not start: its worktree could not be made".into()),
+                    ),
+                    None,
+                );
+            }
+        };
+        let made = created.worktree.clone();
+        spec.workspace = ChildWorkspace::worktree(&made);
+        let note = worktree_note(&made);
+        spec.instructions = Some(match spec.instructions.take() {
+            Some(first) => format!("{first}\n\n{note}"),
+            None => note,
+        });
+        inner.update(&id, |info| {
+            info.worktree = Some(WorktreeInfo {
+                name: made.name.clone(),
+                branch: made.branch.clone(),
+                path: made.path.clone(),
+                outcome: None,
+            });
+        });
+        let background = spec.background;
+        let _ = wts.update_record(&made.name, |record| record.background = background);
+        let mut said = Vec::new();
+        if created.said_uncommitted {
+            said.push(format!(
+                "{} file{} with changes not committed in the main checkout {} not in the agents' worktrees: a worktree starts from the last commit.",
+                created.uncommitted,
+                if created.uncommitted == 1 { "" } else { "s" },
+                if created.uncommitted == 1 { "is" } else { "are" },
+            ));
+        }
+        said.extend(created.included.notes.iter().cloned());
+        for text in said {
+            let _ = inner.events.send(AgentEnvelope::main(AgentEvent::Warning {
+                message: text.clone(),
+            }));
+            lock(&inner.notices).push(text);
+        }
+        worktree = Some(made);
+    }
+    let workspace = spec.workspace.resolve(&parent.workspace);
+
     // Its session, its permissions, its approver and its meter.
     let lineage = Lineage {
         parent: parent.session.clone(),
@@ -476,7 +731,6 @@ async fn run_child(
         None => Session::in_memory(&workspace),
     };
     let session_id = session.id().to_string();
-    let live_mode = parent.policy.mode().unwrap_or(parent.engine.mode);
     let config = perm::child_engine_config(
         &parent.engine,
         live_mode,
@@ -540,22 +794,26 @@ async fn run_child(
         }) => built,
         _ = cancel.cancelled() => {
             drop(permit);
-            return finish(
-                &inner,
-                empty(AgentStatus::Cancelled, Some("cancelled while it started".into())),
-                Some(session_id),
-            );
+            let report = empty(AgentStatus::Cancelled, Some("cancelled while it started".into()));
+            let report = settle_worktree(&inner, &id, worktree.as_ref(), &tag.label, &spec.task, report).await;
+            return finish(&inner, report, Some(session_id));
         }
     };
     let mut agent = match built {
         Ok(agent) => agent,
         Err(why) => {
             drop(permit);
-            return finish(
+            let report = empty(AgentStatus::Failed, Some(format!("could not start: {why}")));
+            let report = settle_worktree(
                 &inner,
-                empty(AgentStatus::Failed, Some(format!("could not start: {why}"))),
-                Some(session_id),
-            );
+                &id,
+                worktree.as_ref(),
+                &tag.label,
+                &spec.task,
+                report,
+            )
+            .await;
+            return finish(&inner, report, Some(session_id));
         }
     };
     agent.keep_tool_log();
@@ -655,6 +913,15 @@ async fn run_child(
     );
     report.error = error;
     report.usage = tally.and_then(|tally| tally.snapshot());
+    let report = settle_worktree(
+        &inner,
+        &id,
+        worktree.as_ref(),
+        &tag.label,
+        &spec.task,
+        report,
+    )
+    .await;
     finish(&inner, report, Some(session_id))
 }
 

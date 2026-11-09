@@ -149,6 +149,9 @@ pub struct Worktrees {
     prefix: PathBuf,
     home: PathBuf,
     said: AtomicBool,
+    /// One worktree is made at a time: two children starting together must not choose the same
+    /// name, or both ask git to change the repository at once.
+    creating: std::sync::Mutex<()>,
 }
 
 /// Whether process `pid` is alive.
@@ -219,6 +222,7 @@ impl Worktrees {
             prefix: PathBuf::from(prefix.trim()),
             home,
             said: AtomicBool::new(false),
+            creating: std::sync::Mutex::new(()),
         })
     }
 
@@ -370,6 +374,10 @@ impl Worktrees {
     /// Makes a worktree for an agent, on a new branch from the local HEAD, locked, marked, and
     /// recorded.
     pub fn create(&self, request: &Request) -> Result<Created, WorktreeError> {
+        let _one_at_a_time = self
+            .creating
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = self
             .git
             .run(&["rev-parse", "--verify", "-q", "HEAD^{commit}"])

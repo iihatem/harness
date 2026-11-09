@@ -53,7 +53,9 @@ struct Step {
 }
 
 struct Delegate {
-    account: AccountKind,
+    account: Mutex<AccountKind>,
+    /// The account once `prepare` has run (an opt-in answered "no").
+    after_prepare: Mutex<Option<AccountKind>>,
     prepare: Mutex<Result<(), String>>,
     steps: Mutex<VecDeque<Step>>,
     runs: Mutex<Vec<DelegatedTurn>>,
@@ -64,7 +66,8 @@ struct Delegate {
 impl Delegate {
     fn new(steps: Vec<Step>) -> Arc<Delegate> {
         Arc::new(Delegate {
-            account: AccountKind::Delegated,
+            account: Mutex::new(AccountKind::Delegated),
+            after_prepare: Mutex::new(None),
             prepare: Mutex::new(Ok(())),
             steps: Mutex::new(steps.into()),
             runs: Mutex::new(Vec::new()),
@@ -81,7 +84,7 @@ impl Delegate {
 #[async_trait]
 impl DelegateTurns for Delegate {
     fn account(&self) -> AccountKind {
-        self.account
+        *self.account.lock().unwrap()
     }
 
     fn label(&self) -> String {
@@ -90,6 +93,9 @@ impl DelegateTurns for Delegate {
 
     async fn prepare(&self, _gate: &dyn ApprovalGate) -> Result<(), String> {
         *self.prepared.lock().unwrap() += 1;
+        if let Some(account) = *self.after_prepare.lock().unwrap() {
+            *self.account.lock().unwrap() = account;
+        }
         self.prepare.lock().unwrap().clone()
     }
 
@@ -899,6 +905,29 @@ async fn one_ledger_record_per_turn_carries_the_childs_estimate_and_the_account(
     );
 }
 
+// The account is known only once the opt-in was answered: a run that turns out to be on an API key
+// is recorded as one, and a budget is checked against it.
+#[tokio::test]
+async fn the_account_is_taken_after_the_opt_in_was_answered() {
+    let f = ws();
+    let delegate = Delegate::new(vec![Step::default()]);
+    *delegate.after_prepare.lock().unwrap() = Some(AccountKind::ApiKey);
+    let meter = Arc::new(Ledger::default());
+    let mut agent = agent_on(
+        &f,
+        &delegate,
+        Mode::Ask,
+        Arc::new(NonInteractive),
+        RuleSet::default(),
+    )
+    .with_meter(meter.clone());
+    run(&mut agent, "go").await;
+    assert_eq!(
+        meter.seen.lock().unwrap()[0].1.account,
+        Some(AccountKind::ApiKey)
+    );
+}
+
 #[tokio::test]
 async fn the_windows_the_child_reported_are_recorded_with_the_turns_request() {
     use harness_core::meter::{Window, WindowSnapshot, WindowSource};
@@ -965,7 +994,8 @@ async fn a_reached_budget_stops_an_api_key_run_but_not_a_subscription_one() {
     assert_eq!(subscription.runs().len(), 1);
     // An API-key run: the budget stops it before the child starts.
     let paid = Arc::new(Delegate {
-        account: AccountKind::ApiKey,
+        account: Mutex::new(AccountKind::ApiKey),
+        after_prepare: Mutex::new(None),
         prepare: Mutex::new(Ok(())),
         steps: Mutex::new(vec![Step::default()].into()),
         runs: Mutex::new(Vec::new()),

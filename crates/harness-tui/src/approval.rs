@@ -223,7 +223,7 @@ impl Prompt {
             return None;
         }
         let last = self.rows.get().saturating_sub(rows);
-        let question = self.request.kind == ApprovalKind::StartServers;
+        let question = self.request.kind.is_question();
         match key.code {
             KeyCode::Char('y') if plain => {
                 return Some(Answered::Decided(ApprovalDecision::Approve));
@@ -267,7 +267,7 @@ impl Prompt {
                 who.into_iter()
                     .chain([
                         Span::styled(
-                            if self.request.kind == ApprovalKind::StartServers {
+                            if self.request.kind.is_question() {
                                 ""
                             } else {
                                 "approve? "
@@ -301,7 +301,7 @@ impl Prompt {
                     keys.push(Span::raw("yes, for this session  "));
                 }
                 keys.push(Span::styled("[n] ", theme.accent()));
-                if self.request.kind == ApprovalKind::StartServers {
+                if self.request.kind.is_question() {
                     keys.push(Span::raw("no (or Enter)  "));
                 } else {
                     keys.push(Span::raw("no  "));
@@ -357,6 +357,32 @@ impl Prompt {
     pub fn outcome(&self, answered: &Answered, theme: &Theme) -> Line<'static> {
         let reason = reveal(&sanitize(&self.request.reason).replace('\n', " "));
         let (mark, text) = match answered {
+            Answered::Decided(ApprovalDecision::Approve)
+                if self.request.kind == ApprovalKind::DelegateOptIn =>
+            {
+                (
+                    "✓",
+                    "claude-code will use your Claude subscription".to_string(),
+                )
+            }
+            Answered::Decided(_) | Answered::Interrupt
+                if self.request.kind == ApprovalKind::DelegateOptIn =>
+            {
+                (
+                    "✗",
+                    "claude-code will use your Anthropic API key, if there is one".to_string(),
+                )
+            }
+            Answered::Decided(ApprovalDecision::Approve)
+                if self.request.kind == ApprovalKind::DelegateFullAccess =>
+            {
+                ("✓", "full-access confirmed for this session".to_string())
+            }
+            Answered::Decided(_) | Answered::Interrupt
+                if self.request.kind == ApprovalKind::DelegateFullAccess =>
+            {
+                ("✗", "full-access was not confirmed".to_string())
+            }
             Answered::Decided(ApprovalDecision::Approve)
                 if self.request.kind == ApprovalKind::StartServers =>
             {

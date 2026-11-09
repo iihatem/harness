@@ -342,6 +342,43 @@ impl AgentsSettings {
     }
 }
 
+/// `[delegate]`: how `claude-code/*` and `codex/*` models run (global config only: a project must
+/// not opt the user in to using their subscription, or accept an untested version).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateSettings {
+    /// Run a program whose version is outside the range harness was tested with.
+    pub allow_untested: Option<bool>,
+    #[serde(default)]
+    pub claude: ClaudeDelegateSettings,
+}
+
+/// `[delegate.claude]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeDelegateSettings {
+    /// `true`: `claude-code/*` models run on the user's Claude subscription through the `claude`
+    /// program they signed in to. `false`: they use the Anthropic API key. Not set: asked the
+    /// first time one is used (the answer is kept by harness, not in this file).
+    pub use_subscription: Option<bool>,
+}
+
+/// The effective `[delegate]` settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Delegate {
+    pub allow_untested: bool,
+    pub claude_subscription: Option<bool>,
+}
+
+impl From<&DelegateSettings> for Delegate {
+    fn from(s: &DelegateSettings) -> Self {
+        Delegate {
+            allow_untested: s.allow_untested.unwrap_or(false),
+            claude_subscription: s.claude.use_subscription,
+        }
+    }
+}
+
 /// The effective `[agents]` limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Agents {
@@ -830,6 +867,8 @@ pub struct ConfigFile {
     pub escalation: EscalationSettings,
     #[serde(default)]
     pub agents: AgentsSettings,
+    #[serde(default)]
+    pub delegate: DelegateSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -884,6 +923,8 @@ pub struct Config {
     pub escalation_to: Option<String>,
     /// `[agents]` (global config only).
     pub agents: Agents,
+    /// `[delegate]` (global config only).
+    pub delegate: Delegate,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -1192,6 +1233,7 @@ pub fn load(
         cfg.fallback = global.fallback;
         cfg.escalation_to = global.escalation.to;
         cfg.agents = Agents::from(&global.agents);
+        cfg.delegate = Delegate::from(&global.delegate);
         cfg.lsp.overlaid(&global.lsp, true);
     }
     let path = project_file(workspace);
@@ -1241,6 +1283,12 @@ pub fn load(
         if project.agents != AgentsSettings::default() {
             cfg.warnings.push(format!(
                 "{}: ignoring [agents]: it is read from the global config only",
+                path.display()
+            ));
+        }
+        if project.delegate != DelegateSettings::default() {
+            cfg.warnings.push(format!(
+                "{}: ignoring [delegate]: it is read from the global config only, so a cloned repository cannot opt you in to using your subscription",
                 path.display()
             ));
         }

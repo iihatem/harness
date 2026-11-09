@@ -1671,3 +1671,72 @@ async fn at_most_a_few_child_lines_show_and_the_rest_are_counted() {
     );
     ui.finish().await.unwrap();
 }
+
+// ---- M3c: the two questions a delegated model asks -------------------------------------------
+
+fn delegate_question(dir: &Path, kind: ApprovalKind, text: &str) -> Asked {
+    let (requests, approvals) = mpsc::unbounded_channel();
+    let ui = start_with(MockProvider::new(vec![]), dir, Mode::Ask, Some(approvals));
+    let (reply, answer) = oneshot::channel();
+    requests
+        .send((
+            ApprovalRequest {
+                call_id: String::new(),
+                tool: "delegate".into(),
+                arguments: serde_json::Value::Null,
+                action: Action::Bash(String::new()),
+                reason: text.into(),
+                kind,
+                kept_for_session: false,
+                agent: None,
+            },
+            reply,
+        ))
+        .unwrap();
+    (ui, answer, requests)
+}
+
+// Both are plain yes or no questions: no "approve?" lead, no "for this session" key, `y` is yes,
+// `n` and Enter are no at once, and the outcome says what the answer means.
+#[tokio::test]
+async fn the_opt_in_and_full_access_questions_are_plain_yes_or_no() {
+    for (kind, text, yes, no) in [
+        (
+            ApprovalKind::DelegateOptIn,
+            "Use your Claude subscription for claude-code models?",
+            "claude-code will use your Claude subscription",
+            "claude-code will use your Anthropic API key",
+        ),
+        (
+            ApprovalKind::DelegateFullAccess,
+            "Run claude-code in full-access mode for this session?",
+            "full-access confirmed for this session",
+            "full-access was not confirmed",
+        ),
+    ] {
+        for (code, expected, outcome) in [
+            (KeyCode::Char('y'), ApprovalDecision::Approve, yes),
+            (
+                KeyCode::Enter,
+                ApprovalDecision::Deny { feedback: None },
+                no,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut ui, mut answer, _requests) = delegate_question(dir.path(), kind, text);
+            until_server_question(&mut ui).await;
+            let shown = screen(&ui).join("\n");
+            assert!(shown.contains(text), "{shown}");
+            assert!(!shown.contains("approve?"), "{shown}");
+            assert!(!shown.contains("for this session  "), "{shown}");
+            assert!(shown.contains("[n] no (or Enter)"), "{shown}");
+            press(&mut ui, code);
+            assert_eq!(answer.try_recv(), Ok(expected), "{kind:?} {code:?}");
+            ui.draw().unwrap();
+            let shown = screen(&ui).join("\n");
+            assert!(shown.contains(outcome), "{kind:?}: {shown}");
+            assert!(!shown.contains("tell the model"), "{shown}");
+            ui.finish().await.unwrap();
+        }
+    }
+}

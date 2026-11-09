@@ -246,7 +246,6 @@ impl Agent {
         cancel: CancellationToken,
     ) -> TurnEndReason {
         let label = delegate.label();
-        let account = delegate.account();
         let mode = self.policy.mode().unwrap_or(Mode::Ask);
         let gate = AgentGate {
             policy: self.policy.clone(),
@@ -255,12 +254,14 @@ impl Agent {
             events: events.clone(),
             mode,
         };
+        if let Err(message) = delegate.prepare(&gate).await {
+            return self.refuse_delegated(message, events, &cancel);
+        }
+        // Only now is it known which account pays: an opt-in asked just before decides it.
+        let account = delegate.account();
         if let Some(notice) = self.budget_check(account, events) {
             let _ = events.send(AgentEvent::BudgetReached { notice });
             return self.finish(TurnEndReason::Budget, events);
-        }
-        if let Err(message) = delegate.prepare(&gate).await {
-            return self.refuse_delegated(message, events, &cancel);
         }
         if mode == Mode::FullAccess && !self.full_access_confirmed {
             let question = format!(

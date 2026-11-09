@@ -44,6 +44,7 @@ impl AgentFactory for NoFactory {
         Endpoint {
             key: "mock".into(),
             local: false,
+            delegated: false,
         }
     }
     async fn build(&self, _setup: ChildSetup) -> Result<Agent, String> {

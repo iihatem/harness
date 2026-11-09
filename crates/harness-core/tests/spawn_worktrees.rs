@@ -43,6 +43,7 @@ impl AgentFactory for Factory {
         Endpoint {
             key: "mock".into(),
             local: false,
+            delegated: false,
         }
     }
     async fn build(&self, setup: ChildSetup) -> Result<Agent, String> {
@@ -106,6 +107,7 @@ fn rig(
         Limits {
             per_local: 4,
             per_hosted: 4,
+            per_delegated: 4,
             total: 4,
         },
         factory.clone(),

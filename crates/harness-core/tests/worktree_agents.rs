@@ -46,6 +46,7 @@ impl AgentFactory for Factory {
         Endpoint {
             key: "mock".into(),
             local: false,
+            delegated: false,
         }
     }
 

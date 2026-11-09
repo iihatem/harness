@@ -139,9 +139,13 @@ impl AgentFactory for CliFactory {
             Some(id) => (id, self.resolver.runs_locally(id).unwrap_or(parent.local)),
             None => (parent.id.as_str(), parent.local),
         };
+        // Claude Code and Codex are programs of their own, each an endpoint with its own limit;
+        // they are never "local": their requests go to the program, not a server of the user's.
+        let delegated = harness_core::agents::is_delegated_model(id);
         Endpoint {
             key: id.split('/').next().unwrap_or(id).to_string(),
-            local,
+            local: local && !delegated,
+            delegated,
         }
     }
 
@@ -381,6 +385,29 @@ mod tests {
         let local = endpoint(Some("mine/x"));
         assert_eq!((local.key.as_str(), local.local), ("mine", true));
         assert!(endpoint(Some("ollama/llama3")).local);
+        assert!(!parents.delegated && !local.delegated);
+    }
+
+    #[test]
+    fn a_child_on_claude_code_or_codex_is_an_endpoint_of_its_own_program_with_its_own_class() {
+        let f = fixture(LOCAL, vec![]);
+        let endpoint = |model: &str| {
+            let mut spec = AgentSpec::new("x", "y");
+            spec.model = Some(model.into());
+            f.factory.endpoint(&spec)
+        };
+        let claude = endpoint("claude-code/sonnet");
+        assert_eq!(
+            (claude.key.as_str(), claude.local, claude.delegated),
+            ("claude-code", false, true)
+        );
+        // Two models of one program share its limit; the other program has its own.
+        assert_eq!(endpoint("claude-code/opus").key, claude.key);
+        let codex = endpoint("codex/gpt-5");
+        assert_eq!(
+            (codex.key.as_str(), codex.local, codex.delegated),
+            ("codex", false, true)
+        );
     }
 
     #[tokio::test]

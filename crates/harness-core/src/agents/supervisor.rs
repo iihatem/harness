@@ -661,6 +661,9 @@ async fn run_child(
     // A place under the limits; a parent that is cancelled while this waits ends it here, before
     // anything is built.
     let endpoint = inner.factory.endpoint(&spec);
+    // An agent that runs in another program (Claude Code, Codex) is outside harness's sandbox, so
+    // one that can edit never works in the checkout: it gets a worktree whatever its spec says.
+    let delegated = endpoint.delegated;
     let permit = tokio::select! {
         permit = inner.scheduler.acquire(endpoint) => permit,
         _ = cancel.cancelled() => {
@@ -678,16 +681,15 @@ async fn run_child(
     let live_mode = parent.policy.mode().unwrap_or(parent.engine.mode);
     let effective = spec.mode.map_or(live_mode, |own| live_mode.narrower(own));
     let mut worktree: Option<Worktree> = None;
-    if spec.isolation && !matches!(effective, Mode::Plan | Mode::ReadOnly) {
+    if (spec.isolation || delegated) && !matches!(effective, Mode::Plan | Mode::ReadOnly) {
+        spec.isolation = true;
         let Some(wts) = lock(&inner.worktrees).clone() else {
-            return finish(
-                &inner,
-                empty(
-                    AgentStatus::Failed,
-                    Some("could not start: it asked for a worktree, and isolation needs a git repository".into()),
-                ),
-                None,
-            );
+            let why = if delegated {
+                "could not start: an agent that runs in Claude Code or Codex and can edit works in a worktree, and that needs a git repository with a commit: there is none (a read-only agent needs no worktree)"
+            } else {
+                "could not start: it asked for a worktree, and isolation needs a git repository"
+            };
+            return finish(&inner, empty(AgentStatus::Failed, Some(why.into())), None);
         };
         let (agent, label, task) = (id.to_string(), tag.label.clone(), spec.task.clone());
         let made = {

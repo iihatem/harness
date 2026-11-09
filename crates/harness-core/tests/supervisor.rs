@@ -133,6 +133,7 @@ fn hosted(spec: &AgentSpec) -> Endpoint {
     Endpoint {
         key: spec.model.clone().unwrap_or_else(|| "mock".into()),
         local: false,
+        delegated: false,
     }
 }
 
@@ -371,6 +372,7 @@ fn held_factory(dir: &Path, local: bool) -> (Arc<Factory>, Arc<Notify>, Arc<Noti
         endpoint: Box::new(move |spec| Endpoint {
             key: spec.model.clone().unwrap_or_else(|| "server".into()),
             local,
+            delegated: false,
         }),
         built: Mutex::new(Vec::new()),
     });
@@ -978,6 +980,7 @@ impl AgentFactory for Never {
         Endpoint {
             key: "mock".into(),
             local: true,
+            delegated: false,
         }
     }
     async fn build(&self, _setup: ChildSetup) -> Result<Agent, String> {

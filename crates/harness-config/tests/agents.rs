@@ -20,6 +20,8 @@ fn the_defaults_are_one_per_local_server_three_per_provider_four_in_all() {
     assert_eq!(cfg.agents.per_local, 1);
     assert_eq!(cfg.agents.per_hosted, 3);
     assert_eq!(cfg.agents.max_total, 4);
+    // Claude Code and Codex are each limited to two at once, inside the four.
+    assert_eq!(cfg.agents.per_delegated, 2);
     assert_eq!(cfg.agents.max_depth, 1);
     assert_eq!(cfg.agents.max_spawns_per_turn, 10);
 }
@@ -46,10 +48,18 @@ fn each_limit_can_be_set() {
 }
 
 #[test]
+fn the_limit_per_delegated_program_can_be_set() {
+    let cfg = load("[agents]\nper_delegated = 1\n", "").unwrap();
+    assert_eq!(cfg.agents.per_delegated, 1);
+    assert_eq!(cfg.agents.per_hosted, 3);
+}
+
+#[test]
 fn zero_and_unknown_keys_are_errors() {
     for bad in [
         "[agents]\nmax_total = 0\n",
         "[agents]\nper_local = 0\n",
+        "[agents]\nper_delegated = 0\n",
         "[agents]\nparallel = 3\n",
     ] {
         assert!(load(bad, "").is_err(), "{bad}");

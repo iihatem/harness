@@ -65,6 +65,7 @@ impl AgentFactory for Factory {
         Endpoint {
             key: spec.model.clone().unwrap_or_else(|| "mock".into()),
             local: false,
+            delegated: false,
         }
     }
     async fn build(&self, setup: ChildSetup) -> Result<Agent, String> {
@@ -134,6 +135,7 @@ fn rig_in(
         Limits {
             per_local: 4,
             per_hosted: 4,
+            per_delegated: 4,
             total: 4,
         },
         factory.clone(),

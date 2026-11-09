@@ -318,6 +318,8 @@ pub struct AgentsSettings {
     pub per_local: Option<u32>,
     /// At once on one hosted provider (default 3).
     pub per_hosted: Option<u32>,
+    /// At once in one agent program, Claude Code and Codex each (default 2).
+    pub per_delegated: Option<u32>,
     /// At once in all (default 4).
     pub max_total: Option<u32>,
     /// How deep agents may spawn agents (default 1: a subagent spawns none).
@@ -334,6 +336,7 @@ impl AgentsSettings {
         [
             ("per_local", self.per_local),
             ("per_hosted", self.per_hosted),
+            ("per_delegated", self.per_delegated),
             ("max_total", self.max_total),
             ("max_depth", self.max_depth),
             ("max_spawns_per_turn", self.max_spawns_per_turn),
@@ -387,6 +390,7 @@ impl From<&DelegateSettings> for Delegate {
 pub struct Agents {
     pub per_local: u32,
     pub per_hosted: u32,
+    pub per_delegated: u32,
     pub max_total: u32,
     pub max_depth: u32,
     pub max_spawns_per_turn: u32,
@@ -399,6 +403,7 @@ impl Default for Agents {
         Agents {
             per_local: 1,
             per_hosted: 3,
+            per_delegated: 2,
             max_total: 4,
             max_depth: 1,
             max_spawns_per_turn: 10,
@@ -413,6 +418,7 @@ impl From<&AgentsSettings> for Agents {
         Agents {
             per_local: s.per_local.unwrap_or(d.per_local),
             per_hosted: s.per_hosted.unwrap_or(d.per_hosted),
+            per_delegated: s.per_delegated.unwrap_or(d.per_delegated),
             max_total: s.max_total.unwrap_or(d.max_total),
             max_depth: s.max_depth.unwrap_or(d.max_depth),
             max_spawns_per_turn: s.max_spawns_per_turn.unwrap_or(d.max_spawns_per_turn),

@@ -1,7 +1,7 @@
-//! How many agents run at once. A model request is made to an endpoint: one local server, or one
-//! hosted provider. Each endpoint has its own limit (1 for a local server, 3 for a hosted
-//! provider by default) and so do all agents together (4). An agent beyond a limit waits for a
-//! place; it is not refused.
+//! How many agents run at once. A model request is made to an endpoint: one local server, one
+//! hosted provider, or one agent program (Claude Code, Codex). Each endpoint has its own limit (1
+//! for a local server, 3 for a hosted provider, 2 for an agent program by default) and so do all
+//! agents together (4). An agent beyond a limit waits for a place; it is not refused.
 //!
 //! Places are given in the order agents asked, among the agents that can have one: an agent whose
 //! endpoint is full does not hold up an agent on another endpoint.
@@ -20,6 +20,8 @@ pub struct Limits {
     pub per_local: usize,
     /// At once on one hosted provider.
     pub per_hosted: usize,
+    /// At once in one agent program (Claude Code, Codex): each is an endpoint of its own.
+    pub per_delegated: usize,
     /// At once in all.
     pub total: usize,
 }
@@ -29,6 +31,7 @@ impl Default for Limits {
         Limits {
             per_local: 1,
             per_hosted: 3,
+            per_delegated: 2,
             total: 4,
         }
     }
@@ -41,6 +44,9 @@ pub struct Endpoint {
     pub key: String,
     /// Whether it is a server of the user's own.
     pub local: bool,
+    /// Whether the agent runs in another program (Claude Code, Codex) rather than sending
+    /// requests itself: its own limit applies, and it works outside harness's sandbox.
+    pub delegated: bool,
 }
 
 struct Waiter {
@@ -66,7 +72,9 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 
 impl Shared {
     fn fits(&self, state: &State, endpoint: &Endpoint) -> bool {
-        let limit = if endpoint.local {
+        let limit = if endpoint.delegated {
+            self.limits.per_delegated
+        } else if endpoint.local {
             self.limits.per_local
         } else {
             self.limits.per_hosted
@@ -176,6 +184,7 @@ mod tests {
         Endpoint {
             key: key.into(),
             local: false,
+            delegated: false,
         }
     }
 
@@ -183,6 +192,15 @@ mod tests {
         Endpoint {
             key: key.into(),
             local: true,
+            delegated: false,
+        }
+    }
+
+    fn delegated(key: &str) -> Endpoint {
+        Endpoint {
+            key: key.into(),
+            local: false,
+            delegated: true,
         }
     }
 
@@ -290,5 +308,34 @@ mod tests {
             "the place was lost"
         );
         assert_eq!(sched.counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_delegated_program_runs_two_at_a_time_inside_the_total_of_four() {
+        let sched = Scheduler::new(Limits::default());
+        assert_eq!(Limits::default().per_delegated, 2);
+        let first = gets(&sched, delegated("claude-code")).await.expect("first");
+        let _second = gets(&sched, delegated("claude-code"))
+            .await
+            .expect("second");
+        // The program's own limit, not the hosted one (3).
+        assert!(gets(&sched, delegated("claude-code")).await.is_none());
+        // The other program is another endpoint with a limit of its own.
+        let _codex = gets(&sched, delegated("codex")).await.expect("codex");
+        let _api = gets(&sched, hosted("openai")).await.expect("api");
+        // Four hold a place: the total still binds.
+        assert!(gets(&sched, delegated("codex")).await.is_none());
+        drop(first);
+        assert!(gets(&sched, delegated("claude-code")).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_limit_per_delegated_program_is_configurable() {
+        let sched = Scheduler::new(Limits {
+            per_delegated: 1,
+            ..Limits::default()
+        });
+        let _held = gets(&sched, delegated("codex")).await.expect("first");
+        assert!(gets(&sched, delegated("codex")).await.is_none());
     }
 }

@@ -379,6 +379,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
             harness_core::agents::Limits {
                 per_local: a.per_local as usize,
                 per_hosted: a.per_hosted as usize,
+                per_delegated: a.per_delegated as usize,
                 total: a.max_total as usize,
             }
         },

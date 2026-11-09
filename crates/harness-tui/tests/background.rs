@@ -62,6 +62,7 @@ impl AgentFactory for Factory {
         Endpoint {
             key: "mock".into(),
             local: false,
+            delegated: false,
         }
     }
     async fn build(&self, setup: ChildSetup) -> Result<Agent, String> {

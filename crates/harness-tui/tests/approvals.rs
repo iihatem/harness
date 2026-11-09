@@ -1417,6 +1417,7 @@ async fn the_session_follows_a_supervisor() {
             Endpoint {
                 key: "x".into(),
                 local: false,
+                delegated: false,
             }
         }
         async fn build(&self, setup: ChildSetup) -> Result<Agent, String> {
@@ -1596,6 +1597,7 @@ async fn esc_while_a_turn_runs_cancels_the_children_it_started() {
             Endpoint {
                 key: "x".into(),
                 local: false,
+                delegated: false,
             }
         }
         async fn build(&self, _setup: ChildSetup) -> Result<Agent, String> {

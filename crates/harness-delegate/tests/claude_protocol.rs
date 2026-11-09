@@ -631,3 +631,150 @@ fn a_question_for_the_user_is_denied_with_a_message_and_a_request_harness_cannot
     assert_eq!(v["response"]["subtype"], "error");
     assert_eq!(v["response"]["request_id"], "h1");
 }
+
+fn init_line(extra: Value) -> String {
+    let mut v = json!({"type":"system","subtype":"init","apiKeySource":"none",
+        "claude_code_version":"2.1.312","model":"m","session_id":"s"});
+    for (k, val) in extra.as_object().unwrap() {
+        v[k] = val.clone();
+    }
+    v.to_string()
+}
+
+#[test]
+fn in_subscription_mode_any_api_key_source_but_none_ends_the_run() {
+    for source in [
+        "ANTHROPIC_API_KEY",
+        "apiKeyHelper",
+        "/login managed key",
+        "user",
+        "project",
+        "org",
+        "temporary",
+        "something-new",
+    ] {
+        let mut p = protocol();
+        let out = p.on_line(&init_line(json!({"apiKeySource": source})));
+        assert!(out.finished && out.stop, "{source} is a key");
+    }
+    let mut p = protocol();
+    assert!(!p.on_line(&init_line(json!({}))).finished);
+}
+
+#[test]
+fn in_subscription_mode_a_provider_other_than_first_party_ends_the_run() {
+    for provider in [
+        "bedrock",
+        "vertex",
+        "foundry",
+        "anthropicAws",
+        "mantle",
+        "gateway",
+    ] {
+        for place in [
+            json!({"apiProvider": provider}),
+            json!({"account": {"apiProvider": provider}}),
+        ] {
+            let mut p = protocol();
+            let out = p.on_line(&init_line(place));
+            assert!(out.finished && out.stop, "{provider}");
+            assert!(out.events.iter().any(
+                |e| matches!(e, DelegateEvent::Error { message, .. } if message.contains(provider))
+            ));
+        }
+    }
+    let mut p = protocol();
+    assert!(
+        !p.on_line(&init_line(json!({"apiProvider": "firstParty"})))
+            .finished
+    );
+}
+
+#[test]
+fn several_text_blocks_of_one_message_are_each_shown_once() {
+    let mut p = protocol();
+    let mut played = Played::default();
+    for text in ["A", "B"] {
+        played.add(
+            p.on_line(
+                &json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,
+                "delta":{"type":"text_delta","text":text}}})
+                .to_string(),
+            ),
+        );
+    }
+    played.add(
+        p.on_line(
+            &json!({"type":"assistant","message":{"id":"m","model":"x","role":"assistant",
+        "content":[{"type":"text","text":"A"},{"type":"text","text":"B"}]}})
+            .to_string(),
+        ),
+    );
+    let shown: Vec<&DelegateEvent> = played
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                DelegateEvent::TextDelta { .. } | DelegateEvent::AssistantMessage { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            &DelegateEvent::TextDelta { text: "A".into() },
+            &DelegateEvent::TextDelta { text: "B".into() },
+            &DelegateEvent::AssistantMessage {
+                content: "A".into(),
+                model: Some("x".into())
+            },
+            &DelegateEvent::AssistantMessage {
+                content: "B".into(),
+                model: Some("x".into())
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_streamed_block_that_never_arrives_does_not_hide_the_next_unstreamed_one() {
+    let mut p = protocol();
+    let mut played = Played::default();
+    played.add(
+        p.on_line(
+            &json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"lost"}}})
+            .to_string(),
+        ),
+    );
+    played.add(
+        p.on_line(
+            &json!({"type":"assistant","message":{"id":"m","model":"x","role":"assistant",
+        "content":[{"type":"text","text":"later"}]}})
+            .to_string(),
+        ),
+    );
+    assert!(played.events.contains(&DelegateEvent::TextDelta {
+        text: "later".into()
+    }));
+}
+
+#[test]
+fn a_control_request_without_a_request_id_gets_an_error_and_no_approval() {
+    let mut p = protocol();
+    let out = p.on_line(
+        &json!({"type":"control_request","request":{"subtype":"can_use_tool",
+        "tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"t"}})
+        .to_string(),
+    );
+    assert!(
+        !out.events
+            .iter()
+            .any(|e| matches!(e, DelegateEvent::ApprovalNeeded(_)))
+    );
+    assert_eq!(out.writes.len(), 1);
+    let v = json(&out.writes[0]);
+    assert_eq!(v["type"], "control_response");
+    assert_ne!(v["response"]["subtype"], "success");
+}

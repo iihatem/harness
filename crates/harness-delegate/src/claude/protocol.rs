@@ -73,8 +73,10 @@ pub struct ClaudeProtocol {
     params: ClaudeParams,
     session_id: Option<String>,
     model: Option<String>,
-    text_streamed: bool,
-    thinking_streamed: bool,
+    /// Text and thinking streamed as deltas and not yet matched by a block of an assistant
+    /// message: a block that equals the front of it was already shown.
+    text_streamed: String,
+    thinking_streamed: String,
     /// Tool calls seen and not yet finished: id to (name, input).
     calls: HashMap<String, (String, Value)>,
     pending: HashMap<String, Pending>,
@@ -100,14 +102,29 @@ fn events(events: Vec<DelegateEvent>) -> Out {
     }
 }
 
+/// Whether `block` was already streamed: it is the front of what was, which is then used up.
+/// When it is not, whatever was streamed is dropped (it belonged to a block that never came).
+fn take_streamed(streamed: &mut String, block: &str) -> bool {
+    match streamed.strip_prefix(block) {
+        Some(rest) => {
+            *streamed = rest.to_string();
+            true
+        }
+        None => {
+            streamed.clear();
+            false
+        }
+    }
+}
+
 impl ClaudeProtocol {
     pub fn new(params: ClaudeParams) -> ClaudeProtocol {
         ClaudeProtocol {
             params,
             session_id: None,
             model: None,
-            text_streamed: false,
-            thinking_streamed: false,
+            text_streamed: String::new(),
+            thinking_streamed: String::new(),
             calls: HashMap::new(),
             pending: HashMap::new(),
             withdrawn: HashSet::new(),
@@ -157,16 +174,21 @@ impl ClaudeProtocol {
             model: self.model.clone(),
             child_version: version,
         };
+        // Anything but `none` is a key of some kind (the environment's, a helper's, a managed
+        // one, or one from settings): in subscription mode none may be in use.
         let source = v["apiKeySource"].as_str().unwrap_or("none");
-        let uses_key = matches!(
-            source,
-            "ANTHROPIC_API_KEY" | "apiKeyHelper" | "/login managed key"
-        );
-        let wrong = match self.params.auth {
-            AuthKind::Subscription if uses_key => Some(format!(
+        let uses_key = source != "none";
+        let provider = v["apiProvider"]
+            .as_str()
+            .or_else(|| v["account"]["apiProvider"].as_str());
+        let wrong = match (self.params.auth, provider) {
+            (AuthKind::Subscription, Some(provider)) if provider != "firstParty" => Some(format!(
+                "claude reports it uses the `{provider}` provider but this run is in subscription mode: the run was stopped"
+            )),
+            (AuthKind::Subscription, _) if uses_key => Some(format!(
                 "claude reports it uses an API key ({source}) but this run is in subscription mode: the run was stopped"
             )),
-            AuthKind::ApiKey if !uses_key => Some(
+            (AuthKind::ApiKey, _) if !uses_key => Some(
                 "claude is not using the API key harness passed (apiKeySource: none): the run was stopped"
                     .to_string(),
             ),
@@ -194,20 +216,27 @@ impl ClaudeProtocol {
             return Out::default();
         }
         let delta = &v["event"]["delta"];
+        if v["event"]["type"] == "message_start" {
+            // Whatever an earlier message streamed and never delivered is not this one's.
+            self.text_streamed.clear();
+            self.thinking_streamed.clear();
+        }
         if v["event"]["type"] != "content_block_delta" {
             return Out::default();
         }
         match delta["type"].as_str() {
             Some("text_delta") => {
-                self.text_streamed = true;
+                let text = delta["text"].as_str().unwrap_or_default();
+                self.text_streamed.push_str(text);
                 events(vec![DelegateEvent::TextDelta {
-                    text: delta["text"].as_str().unwrap_or_default().to_string(),
+                    text: text.to_string(),
                 }])
             }
             Some("thinking_delta") => {
-                self.thinking_streamed = true;
+                let text = delta["thinking"].as_str().unwrap_or_default();
+                self.thinking_streamed.push_str(text);
                 events(vec![DelegateEvent::ReasoningDelta {
-                    text: delta["thinking"].as_str().unwrap_or_default().to_string(),
+                    text: text.to_string(),
                 }])
             }
             _ => Out::default(),
@@ -227,7 +256,7 @@ impl ClaudeProtocol {
             match block["type"].as_str() {
                 Some("text") => {
                     let text = block["text"].as_str().unwrap_or_default();
-                    if !std::mem::take(&mut self.text_streamed) {
+                    if !take_streamed(&mut self.text_streamed, text) {
                         out.push(DelegateEvent::TextDelta {
                             text: text.to_string(),
                         });
@@ -238,9 +267,10 @@ impl ClaudeProtocol {
                     });
                 }
                 Some("thinking") => {
-                    if !std::mem::take(&mut self.thinking_streamed) {
+                    let thinking = block["thinking"].as_str().unwrap_or_default();
+                    if !take_streamed(&mut self.thinking_streamed, thinking) {
                         out.push(DelegateEvent::ReasoningDelta {
-                            text: block["thinking"].as_str().unwrap_or_default().to_string(),
+                            text: thinking.to_string(),
                         });
                     }
                 }
@@ -303,7 +333,17 @@ impl ClaudeProtocol {
     }
 
     fn control_request(&mut self, v: &Value) -> Out {
-        let id = v["request_id"].as_str().unwrap_or_default().to_string();
+        let Some(id) = v["request_id"].as_str().filter(|id| !id.is_empty()) else {
+            // Nothing could match an answer to it, and nothing may be approved by default.
+            return Out {
+                events: vec![warning(
+                    "claude sent a control request without a request_id: it was refused".into(),
+                )],
+                writes: vec![error_response("", "a control request needs a request_id")],
+                ..Out::default()
+            };
+        };
+        let id = id.to_string();
         let request = &v["request"];
         let subtype = request["subtype"].as_str().unwrap_or_default();
         if subtype != "can_use_tool" {

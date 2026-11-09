@@ -1126,3 +1126,82 @@ async fn switching_the_parent_to_read_only_restricts_a_child_that_is_already_run
         "a read-only parent stops its running child's next write"
     );
 }
+
+// ---- files changed through bash -------------------------------------------------------------
+
+/// A factory whose child has checkpoints, and a `bash` that writes `made.txt` when it runs
+/// `make edit`, as `sed -i` or `cargo fmt` would: no edit tool says it changed that file.
+fn bash_editing(dir: &Path, gates: Gates) -> Arc<Factory> {
+    let base = dir.canonicalize().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("c1", "bash", json!({"command": "make edit"})),
+        Script::text("edited with a command"),
+    ]);
+    factory(move |setup| {
+        let made = base.join("work/made.txt");
+        let (bash, _ran) = common::gates::ScriptedBash::new(vec![
+            ("make edit", vec![common::gates::passing()]),
+            (
+                "make test",
+                vec![common::gates::failing(1, "1 test failed")],
+            ),
+        ]);
+        let bash = bash.during("make edit", move || std::fs::write(&made, "x").unwrap());
+        let mode = setup.mode;
+        let checkpoints = harness_core::checkpoint::Checkpoints::open(
+            &base.join("data/checkpoints/project.git"),
+            &base.join("work"),
+            setup.session.id(),
+        )
+        .unwrap();
+        Ok(Agent::new(
+            provider.clone(),
+            ToolRegistry::new(vec![Arc::new(bash)]),
+            setup.policy,
+            setup.approver,
+            AgentConfig::new("mock/m1", "m1", "p", base.join(".spill")),
+            ToolContext::new(&base.join("work")).with_sandbox(None, mode.fs_access()),
+        )
+        .with_session(setup.session)
+        .with_checkpoints(Some(Arc::new(checkpoints)))
+        .with_gates(gates.clone()))
+    })
+}
+
+fn bash_workspace() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().canonicalize().unwrap().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    (dir, work)
+}
+
+#[tokio::test]
+async fn a_file_a_command_changed_is_in_the_report_beside_the_command() {
+    let (dir, work) = bash_workspace();
+    let factory = bash_editing(dir.path(), Gates::default());
+    let p = parent(&work, Mode::Auto, Arc::new(NonInteractive));
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    let report = wait(sup.spawn(spec("editor"))).await;
+    assert_eq!(report.status, AgentStatus::Done, "{report:?}");
+    assert_eq!(report.files_changed, vec!["made.txt"]);
+    assert_eq!(report.commands_run, vec!["make edit"]);
+}
+
+#[tokio::test]
+async fn a_child_that_edited_through_a_command_runs_the_gates() {
+    let (dir, work) = bash_workspace();
+    let factory = bash_editing(
+        dir.path(),
+        Gates {
+            test: Some("make test".into()),
+            max_retries: 0,
+            ..Gates::default()
+        },
+    );
+    let p = parent(&work, Mode::Auto, Arc::new(NonInteractive));
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    let report = wait(sup.spawn(spec("editor"))).await;
+    assert_eq!(report.status, AgentStatus::Failed, "{report:?}");
+    assert!(report.error.unwrap().contains("tests"));
+    assert_eq!(report.files_changed, vec!["made.txt"]);
+}

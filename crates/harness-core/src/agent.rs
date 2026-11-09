@@ -563,6 +563,22 @@ impl Agent {
         std::mem::take(&mut self.tool_log)
     }
 
+    /// The files that differ now from the workspace as it was at this turn's checkpoint, as
+    /// absolute paths: by comparing the workspace with it, so what `bash` changed counts (the
+    /// decision of M2, P4). `None` where there is no checkpoint to compare with (none was made,
+    /// the agent has no checkpoints, or the comparison failed), in which case only the tool log
+    /// knows.
+    pub async fn files_changed_in_workspace(&self) -> Option<Vec<PathBuf>> {
+        let checkpoints = self.checkpoints.clone()?;
+        let baseline = self.turn_baseline.clone()?;
+        let workspace = checkpoints.workspace().to_path_buf();
+        let files = tokio::task::spawn_blocking(move || checkpoints.files_changed_since(&baseline))
+            .await
+            .ok()?
+            .ok()?;
+        Some(files.into_iter().map(|file| workspace.join(file)).collect())
+    }
+
     /// Notes one tool call in the log.
     fn log_call(&mut self, call: &ToolCall, raw: &ToolOutput) {
         if !self.keep_tool_log {

@@ -548,7 +548,18 @@ async fn run_child(
     let reason = agent.run_turn(input, &events, cancel.clone()).await;
     drop(events);
     let seen = forward.await.unwrap_or_default();
-    let log = agent.take_tool_log();
+    let mut log = agent.take_tool_log();
+    // What changed in the workspace since the child's checkpoint counts too, so a file `bash`
+    // edited is listed (the tools' own list comes first). Not waited for after a cancel.
+    if !cancel.is_cancelled()
+        && let Some(files) = agent.files_changed_in_workspace().await
+    {
+        for file in files {
+            if !log.files_changed.contains(&file) {
+                log.files_changed.push(file);
+            }
+        }
+    }
     agent.close().await;
     drop(agent);
     drop(permit);

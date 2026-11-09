@@ -1522,3 +1522,29 @@ fn the_workspace_is_compared_with_a_snapshot_without_making_one() {
     f.write("a.txt", "one\n");
     assert_eq!(cp.tree_now().unwrap(), cp.tree_of(&before).unwrap());
 }
+
+#[test]
+fn the_files_changed_since_a_snapshot_are_added_changed_and_removed_ones() {
+    let f = fixture();
+    f.write("kept.txt", "same");
+    f.write("edited.txt", "before");
+    f.write("gone.txt", "bye");
+    f.write("dir/inner.txt", "x");
+    let cp = f.checkpoints();
+    let commit = cp.snapshot("start").unwrap();
+    assert_eq!(
+        cp.files_changed_since(&commit).unwrap(),
+        Vec::<PathBuf>::new()
+    );
+    f.write("edited.txt", "after");
+    f.write("added.txt", "new");
+    f.write("dir/added.txt", "new");
+    std::fs::remove_file(f.ws.join("gone.txt")).unwrap();
+    let mut changed = cp.files_changed_since(&commit).unwrap();
+    changed.sort();
+    let expected: Vec<PathBuf> = ["added.txt", "dir/added.txt", "edited.txt", "gone.txt"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    assert_eq!(changed, expected);
+}

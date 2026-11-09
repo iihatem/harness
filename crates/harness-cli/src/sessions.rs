@@ -30,6 +30,32 @@ pub fn dir(setup: &Setup) -> PathBuf {
         .join(project_key(&project_root(&setup.workspace)))
 }
 
+/// The project's shadow repository, where every session's checkpoints are kept.
+fn shadow_repository(setup: &Setup) -> PathBuf {
+    let key = project_key(&project_root(&setup.workspace));
+    setup
+        .paths
+        .data_dir
+        .join("checkpoints")
+        .join(format!("{key}.git"))
+}
+
+/// The checkpoints of a child agent's session `session_id`, in the same repository: what the
+/// child changed is told by comparing the workspace with its snapshot. `None` when they cannot
+/// work; the child's report then holds only what its tools say they changed. Nothing is pruned
+/// here: the session that spawned it did.
+pub fn child_checkpoints(
+    setup: &Setup,
+    session_id: &str,
+    writable: &[PathBuf],
+) -> Option<Arc<Checkpoints>> {
+    let gitdir = shadow_repository(setup);
+    checkpoint::check_location(&gitdir, &setup.workspace, writable)
+        .and_then(|()| Checkpoints::open(&gitdir, &setup.workspace, session_id))
+        .ok()
+        .map(Arc::new)
+}
+
 /// The checkpoints of `session`, in the project's shadow repository. `None`, after a warning,
 /// when they cannot work (no `git` on `PATH`, the repository cannot be created, or it is inside
 /// the workspace or one of the `writable` directories sandboxed commands can write to).
@@ -39,12 +65,7 @@ pub fn checkpoints(
     writable: &[PathBuf],
     notices: &mut Notices,
 ) -> Option<Arc<Checkpoints>> {
-    let key = project_key(&project_root(&setup.workspace));
-    let gitdir = setup
-        .paths
-        .data_dir
-        .join("checkpoints")
-        .join(format!("{key}.git"));
+    let gitdir = shadow_repository(setup);
     let opened = checkpoint::check_location(&gitdir, &setup.workspace, writable)
         .and_then(|()| Checkpoints::open(&gitdir, &setup.workspace, session.id()));
     match opened {

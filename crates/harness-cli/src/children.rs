@@ -31,6 +31,8 @@ pub struct CliFactory {
     /// command, as its parent would.
     sandboxes: Sandboxes,
     parent_local: bool,
+    /// What sandboxed commands can write to, which a child's checkpoints must stay out of.
+    writable: Vec<PathBuf>,
     /// Where each child's tool output goes: a directory of its own under this one.
     output_root: PathBuf,
     /// Stops a child's wait for a model's server.
@@ -47,6 +49,7 @@ impl CliFactory {
         edit_format: EditFormat,
         sandboxes: Sandboxes,
         parent_local: bool,
+        writable: Vec<PathBuf>,
         output_root: PathBuf,
         cancel: CancellationToken,
     ) -> Arc<CliFactory> {
@@ -58,6 +61,7 @@ impl CliFactory {
             edit_format,
             sandboxes,
             parent_local,
+            writable,
             output_root,
             cancel,
         })
@@ -145,9 +149,14 @@ impl AgentFactory for CliFactory {
             sandbox.is_some(),
         );
         let ctx = ToolContext::new(&workspace).with_sandbox(sandbox, mode.fs_access());
+        // What it changes is told by comparing the workspace with a snapshot of its own, so what
+        // a shell command edited counts, and the gates see it.
+        let checkpoints =
+            crate::sessions::child_checkpoints(&self.setup, session.id(), &self.writable);
         let mut agent = Agent::new(provider, tools, policy, approver, config, ctx)
             .with_redactor(self.setup.redactor.clone())
             .with_session(session)
+            .with_checkpoints(checkpoints)
             .with_gates(self.setup.config.gates.clone())
             .with_roles(self.setup.config.roles.clone())
             .with_resolver(self.resolver.clone());
@@ -209,6 +218,7 @@ mod tests {
             EditFormat::StrReplace,
             Sandboxes::default(),
             false,
+            Vec::new(),
             dir.path().join("out"),
             CancellationToken::new(),
         );
@@ -298,6 +308,28 @@ mod tests {
         );
         assert!(events.try_recv().is_ok());
         let _ = &f.data;
+    }
+
+    #[tokio::test]
+    async fn a_file_a_childs_shell_command_wrote_is_in_its_report() {
+        let f = fixture(
+            "",
+            vec![
+                Script::tool_call(
+                    "c1",
+                    "bash",
+                    serde_json::json!({"command": "echo hi > made.txt"}),
+                ),
+                Script::text("wrote it"),
+            ],
+        );
+        let (mut ctx, _rx, _a) = parent(&f, Mode::FullAccess);
+        ctx.sessions_dir = Some(f.data.join("sessions"));
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let sup = Supervisor::new(Limits::default(), f.factory.clone(), ctx, tx);
+        let report = sup.spawn(AgentSpec::new("writer", "write it")).wait().await;
+        assert_eq!(report.status, AgentStatus::Done, "{report:?}");
+        assert_eq!(report.files_changed, vec!["made.txt"], "{report:?}");
     }
 
     #[tokio::test]

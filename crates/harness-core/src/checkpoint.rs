@@ -439,6 +439,34 @@ impl Checkpoints {
         Ok(self.tree_now()? != self.tree_of(commit)?)
     }
 
+    /// The files that differ between `commit` (a snapshot of this session) and the workspace
+    /// now, relative to the workspace, in git's order: added, changed and removed ones, `bash`'s
+    /// changes included. No snapshot is made.
+    pub fn files_changed_since(&self, commit: &str) -> Result<Vec<PathBuf>, CheckpointError> {
+        check_commit(commit)?;
+        let (now, then) = (self.tree_now()?, self.tree_of(commit)?);
+        if now == then {
+            return Ok(Vec::new());
+        }
+        let listed = self.git_bytes(
+            &[
+                "diff-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                "--no-renames",
+                &then,
+                &now,
+            ],
+            Instant::now() + self.restore_timeout,
+        )?;
+        Ok(split_nul(&listed)
+            .iter()
+            .filter_map(|p| self.in_workspace(p))
+            .map(|p| PathBuf::from(OsStr::from_bytes(p)))
+            .collect())
+    }
+
     /// The id of the tree a snapshot taken now would hold, without making one. Equal ids mean
     /// equal contents (and executable bits).
     pub fn tree_now(&self) -> Result<String, CheckpointError> {

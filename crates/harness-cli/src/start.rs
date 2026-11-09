@@ -305,6 +305,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
             model.edit_format,
             sandboxes.clone(),
             config.request.local,
+            writable_roots.clone(),
             setup.paths.state_dir.join("tool-output").join(&run_id),
             cancel.clone(),
         ),

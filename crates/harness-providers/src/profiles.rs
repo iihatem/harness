@@ -54,6 +54,10 @@ fn window(tokens: u64) -> ProfileSettings {
 /// and the hosted providers' families.
 pub fn builtin_profiles() -> Vec<(&'static str, ProfileSettings)> {
     vec![
+        // Models that run in another program, which keeps its own context: the window is what the
+        // status line shows.
+        ("claude-code/*", window(200_000)),
+        ("codex/*", window(272_000)),
         // Qwen3-Coder: 256K tokens; Qwen recommends temperature 0.7 (with top_p 0.8, top_k 20).
         (
             "*/qwen3-coder*",

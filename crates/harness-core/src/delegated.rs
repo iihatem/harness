@@ -91,7 +91,7 @@ impl DelegatedOutcome {
 }
 
 /// What the child asks leave to do.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GateRequest {
     /// The child's id for the tool call.
     pub call_id: String,

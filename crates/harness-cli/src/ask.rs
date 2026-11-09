@@ -198,6 +198,8 @@ pub async fn run(
             terminal_safe_text(&final_text)
         );
     }
+    // The children that ended with the run are recorded in the session.
+    agent.end_session().await;
     agent.close().await;
     end_run(agent, sandbox_session);
     exit_code(reason, blocked)

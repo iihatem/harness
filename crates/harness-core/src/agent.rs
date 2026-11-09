@@ -611,12 +611,22 @@ impl Agent {
         }
     }
 
+    /// The session is ending: waits (a few seconds at most) for the children still ending to
+    /// report, then saves their records, so a child that finished after the last turn is in the
+    /// session too. Call it once nothing more will be started, after cancelling the children.
+    pub async fn end_session(&mut self) {
+        if let Some(records) = self.child_records.clone() {
+            records.settled(Duration::from_secs(3)).await;
+        }
+        self.flush_child_records();
+    }
+
     /// Saves the child records waiting for the session.
     fn flush_child_records(&mut self) {
         let Some(records) = &self.child_records else {
             return;
         };
-        for record in records.take() {
+        for record in records.take(self.session.id()) {
             let text = match record.kind {
                 crate::session::AgentRecordKind::Spawned => {
                     format!("[agent {} ({}) started]", record.agent, record.label)
@@ -980,6 +990,8 @@ impl Agent {
         if let Some(diagnostics) = &self.diagnostics {
             diagnostics.reset();
         }
+        // What the session left is written to it, not to the one that follows.
+        self.flush_child_records();
         self.session = session;
         if let Some(redactor) = &self.redactor {
             self.session.set_redactor(redactor.clone());

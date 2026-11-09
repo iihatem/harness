@@ -808,11 +808,12 @@ async fn the_parent_session_records_the_spawn_and_the_report() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions");
     let factory = scripted(dir.path(), vec![vec![Script::text("child text")]]);
+    let parent_session = Session::create(&sessions, dir.path());
     let mut p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
     p.ctx.sessions_dir = Some(sessions.clone());
+    p.ctx.session = parent_session.id().to_string();
     let (sup, _rx) = supervisor(factory, p.ctx);
     // The parent agent keeps the records the supervisor hands it.
-    let parent_session = Session::create(&sessions, dir.path());
     let parent_path = parent_session.path().map(Path::to_path_buf);
     let provider = MockProvider::new(vec![Script::text("parent text")]);
     let mut agent = common::agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path())
@@ -962,7 +963,7 @@ async fn a_child_that_panics_ends_failed_and_its_parent_hears_of_it() {
     ));
     assert!(
         sup.records()
-            .take()
+            .take("parent-session")
             .iter()
             .any(|r| { matches!(r.kind, harness_core::session::AgentRecordKind::Reported) })
     );
@@ -1204,4 +1205,67 @@ async fn a_child_that_edited_through_a_command_runs_the_gates() {
     assert_eq!(report.status, AgentStatus::Failed, "{report:?}");
     assert!(report.error.unwrap().contains("tests"));
     assert_eq!(report.files_changed, vec!["made.txt"]);
+}
+
+// ---- records reach the session they belong to -----------------------------------------------
+
+fn record_lines(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("agent_record"))
+        .map(String::from)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_child_that_ends_after_the_parents_last_turn_still_gets_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let (factory, started, _release) = held_factory(dir.path(), false);
+    let session = Session::create(&sessions, dir.path());
+    let mut p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
+    p.ctx.sessions_dir = Some(sessions.clone());
+    p.ctx.session = session.id().to_string();
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    let provider = MockProvider::new(vec![Script::text("parent text")]);
+    let mut agent = common::agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path())
+        .with_session(session)
+        .with_child_records(sup.records());
+    common::run(&mut agent, "hi").await;
+    // The turn is over; the child starts and is still running when the session ends.
+    let handle = sup.spawn(spec("late"));
+    started.notified().await;
+    sup.cancel_all();
+    agent.end_session().await;
+    let path = agent.session().path().unwrap().to_path_buf();
+    let records = record_lines(&path);
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert!(records[0].contains("spawned") && records[1].contains("reported"));
+    assert_eq!(wait(handle).await.status, AgentStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn moving_to_another_session_saves_the_records_in_the_one_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let factory = scripted(dir.path(), vec![vec![Script::text("child text")]]);
+    let session = Session::create(&sessions, dir.path());
+    let mut p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
+    p.ctx.sessions_dir = Some(sessions.clone());
+    p.ctx.session = session.id().to_string();
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    let provider = MockProvider::new(vec![]);
+    let mut agent = common::agent(provider, Mode::Auto, Arc::new(NonInteractive), dir.path())
+        .with_session(session)
+        .with_child_records(sup.records());
+    let first = agent.session().path().unwrap().to_path_buf();
+    wait(sup.spawn(spec("explore"))).await;
+    // `/new`: the next session is not given the first one's records.
+    let next = Session::create(&sessions, dir.path());
+    let second = next.path().unwrap().to_path_buf();
+    agent.start_session(next, None);
+    agent.end_session().await;
+    assert_eq!(record_lines(&first).len(), 2);
+    assert!(record_lines(&second).is_empty());
 }

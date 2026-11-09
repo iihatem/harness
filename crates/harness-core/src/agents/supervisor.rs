@@ -316,8 +316,21 @@ impl Supervisor {
         let (done, report) = watch::channel(None);
         let inner = self.inner.clone();
         let task_tag = tag.clone();
-        let workspace = spec.workspace.resolve(&lock(&self.inner.parent).workspace);
-        let task = tokio::spawn(run_child(inner.clone(), task_tag.clone(), spec, cancel));
+        let (workspace, parent_session) = {
+            let parent = lock(&self.inner.parent);
+            (
+                spec.workspace.resolve(&parent.workspace),
+                parent.session.clone(),
+            )
+        };
+        self.inner.records.expect_report();
+        let task = tokio::spawn(run_child(
+            inner.clone(),
+            parent_session.clone(),
+            task_tag.clone(),
+            spec,
+            cancel,
+        ));
         // A child that panics still ends: the registry says so, and its parent hears of it.
         tokio::spawn(async move {
             let report = match task.await {
@@ -337,7 +350,7 @@ impl Supervisor {
                         "the agent was stopped".into()
                     });
                     if inner.status(&task_tag.id).is_some_and(|s| !s.is_final()) {
-                        finish_child(&inner, &task_tag, report, None)
+                        finish_child(&inner, &parent_session, &task_tag, report, None)
                     } else {
                         report
                     }
@@ -359,6 +372,7 @@ struct Seen {
 /// Ends a child: its status, its `AgentFinished` event and the record its parent keeps.
 fn finish_child(
     inner: &Inner,
+    parent_session: &str,
     tag: &AgentTag,
     mut report: AgentReport,
     session: Option<String>,
@@ -373,26 +387,33 @@ fn finish_child(
             summary: crate::agents::report::cap_chars(&report.summary, 200).0,
         },
     ));
-    inner.records.push(AgentRecord {
-        agent: id.to_string(),
-        label: tag.label.clone(),
-        kind: AgentRecordKind::Reported,
-        session,
-        report: serde_json::to_value(&report).ok(),
-    });
+    inner.records.push(
+        parent_session,
+        AgentRecord {
+            agent: id.to_string(),
+            label: tag.label.clone(),
+            kind: AgentRecordKind::Reported,
+            session,
+            report: serde_json::to_value(&report).ok(),
+        },
+    );
     report
 }
 
 async fn run_child(
     inner: Arc<Inner>,
+    parent_session: String,
     tag: AgentTag,
     spec: AgentSpec,
     cancel: CancellationToken,
 ) -> AgentReport {
-    let parent = lock(&inner.parent).clone();
+    // The child belongs to the session its parent was in when it was spawned, whatever happens
+    // to the parent meanwhile.
+    let mut parent = lock(&inner.parent).clone();
+    parent.session = parent_session;
     let id = tag.id.clone();
     let finish = |inner: &Inner, report: AgentReport, session: Option<String>| {
-        finish_child(inner, &tag, report, session)
+        finish_child(inner, &parent.session, &tag, report, session)
     };
     let workspace = spec.workspace.resolve(&parent.workspace);
     let empty = |status, error: Option<String>| {
@@ -464,13 +485,16 @@ async fn run_child(
             },
         )) as Arc<dyn Meter>
     });
-    inner.records.push(AgentRecord {
-        agent: id.to_string(),
-        label: tag.label.clone(),
-        kind: AgentRecordKind::Spawned,
-        session: Some(session_id.clone()),
-        report: None,
-    });
+    inner.records.push(
+        &parent.session,
+        AgentRecord {
+            agent: id.to_string(),
+            label: tag.label.clone(),
+            kind: AgentRecordKind::Spawned,
+            session: Some(session_id.clone()),
+            report: None,
+        },
+    );
     // Cancelled while it is being built (a model's server may take a while to answer): it ends
     // here, and its place is free again.
     let built = tokio::select! {

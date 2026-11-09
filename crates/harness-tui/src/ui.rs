@@ -321,6 +321,8 @@ where
                     done,
                 });
             }
+            // The session is over: the children that ended with it are recorded in it.
+            agent.end_session().await;
         });
         let ui = Ui {
             app,

@@ -205,3 +205,39 @@ fn a_child_works_in_its_parents_workspace_and_a_path_naming_another_is_refused()
         "{refused}"
     );
 }
+
+#[test]
+fn a_childs_mode_follows_its_parents_narrowing_and_lifts_with_it() {
+    use harness_core::agents::perm::ChildPolicy;
+    use std::sync::Arc;
+    let ws = tempfile::tempdir().unwrap();
+    let parent = Arc::new(PermissionEngine::new(parent_config(
+        Mode::Auto,
+        ws.path(),
+        RuleSet::default(),
+    )));
+    let config = child_engine_config(
+        &parent_config(Mode::Auto, ws.path(), RuleSet::default()),
+        Mode::Auto,
+        None,
+        &RuleSet::default(),
+        &ChildWorkspace::parent(),
+    );
+    let child = ChildPolicy::new(PermissionEngine::new(config), parent.clone(), None);
+    assert_eq!(child.check(&write(ws.path())), Decision::Allow);
+    parent.set_mode(Mode::ReadOnly);
+    assert_eq!(child.mode(), Some(Mode::ReadOnly));
+    assert!(matches!(
+        child.check(&write(ws.path())),
+        Decision::Deny { .. }
+    ));
+    // The parent's wider mode never widens a child whose spec asked for less.
+    let own = ChildPolicy::new(
+        PermissionEngine::new(parent_config(Mode::Ask, ws.path(), RuleSet::default())),
+        parent.clone(),
+        Some(Mode::Ask),
+    );
+    parent.set_mode(Mode::FullAccess);
+    assert_eq!(own.mode(), Some(Mode::Ask));
+    assert_eq!(child.mode(), Some(Mode::FullAccess));
+}

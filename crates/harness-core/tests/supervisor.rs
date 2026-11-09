@@ -1094,3 +1094,35 @@ async fn a_budget_stop_ends_a_child_as_failed_and_says_which_budget() {
     assert!(seen.requests().is_empty());
     assert_eq!(*meter.asked.lock().unwrap(), vec!["parent-session"]);
 }
+
+#[tokio::test]
+async fn switching_the_parent_to_read_only_restricts_a_child_that_is_already_running() {
+    // The user approves the child's first write, and meanwhile puts the parent in read-only.
+    struct Switching(Arc<PermissionEngine>);
+    #[async_trait]
+    impl Approver for Switching {
+        async fn decide(&self, _r: &ApprovalRequest) -> ApprovalDecision {
+            harness_core::permission::PermissionPolicy::set_mode(&*self.0, Mode::ReadOnly);
+            ApprovalDecision::Approve
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let factory = scripted(
+        dir.path(),
+        vec![vec![
+            put("c1", "first.txt"),
+            put("c2", "second.txt"),
+            Script::text("tried both"),
+        ]],
+    );
+    let mut p = parent(dir.path(), Mode::Ask, Arc::new(NonInteractive));
+    p.ctx.approver = Arc::new(Switching(p.engine.clone()));
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    let report = wait(sup.spawn(spec("writer"))).await;
+    assert_eq!(report.status, AgentStatus::Done);
+    assert!(dir.path().join("first.txt").exists());
+    assert!(
+        !dir.path().join("second.txt").exists(),
+        "a read-only parent stops its running child's next write"
+    );
+}

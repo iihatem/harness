@@ -74,9 +74,10 @@ impl AgentSpec {
 pub struct ChildSetup {
     pub tag: AgentTag,
     pub spec: AgentSpec,
-    /// Its permissions: narrowed from its parent's, with grants of its own.
-    pub policy: Arc<PermissionEngine>,
-    /// The mode of `policy` now, to choose the sandbox with.
+    /// Its permissions: narrowed from its parent's, with grants of its own, and following the
+    /// parent's mode while it runs ([`perm::ChildPolicy`]).
+    pub policy: Arc<dyn PermissionPolicy>,
+    /// The mode of `policy` when it starts, to choose the sandbox with.
     pub mode: Mode,
     /// Asks the user (or fails, when there is none) on the child's behalf.
     pub approver: Arc<dyn Approver>,
@@ -441,7 +442,11 @@ async fn run_child(
         &spec.workspace,
     );
     let mode = config.mode;
-    let policy = Arc::new(PermissionEngine::new(config));
+    let policy: Arc<dyn PermissionPolicy> = Arc::new(perm::ChildPolicy::new(
+        PermissionEngine::new(config),
+        parent.policy.clone(),
+        spec.mode,
+    ));
     let failure = Arc::new(Mutex::new(None));
     let approver = Arc::new(ChildApprover {
         tag: tag.clone(),

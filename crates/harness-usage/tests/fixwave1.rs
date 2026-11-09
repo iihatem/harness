@@ -52,6 +52,7 @@ fn record(t: u64, session: &str) -> LedgerRecord {
         window: None,
         agent: None,
         parent: None,
+        label: None,
     }
 }
 

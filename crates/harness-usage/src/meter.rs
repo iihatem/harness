@@ -378,6 +378,7 @@ impl Meter for UsageMeter {
                 .remove(&agent_key(scope)),
             agent: scope.map(|s| s.agent.clone()),
             parent: scope.map(|s| s.parent.clone()),
+            label: scope.map(|s| s.label.clone()),
         };
         if let Some(usd) = cost.billed_usd.filter(|usd| *usd > 0.0) {
             // A child's spend is kept under the session that pays for it.

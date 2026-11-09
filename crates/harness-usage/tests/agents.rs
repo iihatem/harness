@@ -57,6 +57,7 @@ fn request(session: &str, tokens: u64) -> RequestRecord {
 fn scope() -> AgentScope {
     AgentScope {
         agent: "a1".into(),
+        label: "explore".into(),
         parent: "parent".into(),
     }
 }
@@ -137,6 +138,7 @@ fn a_sibling_sessions_spend_does_not_count() {
         &request("other-child", 9),
         Some(&AgentScope {
             agent: "a1".into(),
+            label: "explore".into(),
             parent: "other-parent".into(),
         }),
     );
@@ -215,7 +217,7 @@ fn usage_can_be_grouped_by_agent_with_the_main_agent_as_main() {
         .iter()
         .map(|r| (r.key.as_str(), r.requests))
         .collect();
-    assert_eq!(keys, vec![("a1", 2), ("main", 1)]);
+    assert_eq!(keys, vec![("a1 (explore) child", 2), ("main", 1)]);
     assert_eq!(report.total.requests, 3);
 }
 
@@ -271,5 +273,48 @@ fn a_child_leaves_the_eighty_percent_warning_to_the_main_agent() {
         m.check_budget("parent", AccountKind::ApiKey)
             .warnings
             .is_empty()
+    );
+}
+
+#[test]
+fn by_agent_keeps_two_sessions_children_with_the_same_id_apart_and_names_them() {
+    use harness_usage::store::{Group, Query, Store};
+    let data = tempfile::tempdir().unwrap();
+    let m = meter(data.path(), Budgets::default());
+    let child = |parent: &str, label: &str| AgentScope {
+        agent: "a1".into(),
+        label: label.into(),
+        parent: parent.into(),
+    };
+    // Two runs each spawned an `a1`; the first spent twice.
+    m.record_request_as(
+        &request("20261109T000000Z-aaaaaaaa", 1),
+        Some(&child("p1", "explore")),
+    );
+    m.record_request_as(
+        &request("20261109T000000Z-aaaaaaaa", 1),
+        Some(&child("p1", "explore")),
+    );
+    m.record_request_as(
+        &request("20261109T000001Z-bbbbbbbb", 5),
+        Some(&child("p2", "review")),
+    );
+    m.record_request(&request("main", 1));
+    let dirs = Dirs::under(data.path());
+    let mut store = Store::open(&dirs).unwrap();
+    store.sync().unwrap();
+    let report = store.report(&Query::all(Group::Agent)).unwrap();
+    let rows: Vec<(&str, u64)> = report
+        .rows
+        .iter()
+        .map(|r| (r.key.as_str(), r.requests))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("a1 (explore) aaaaaaaa", 2),
+            ("a1 (review) bbbbbbbb", 1),
+            ("main", 1)
+        ]
     );
 }

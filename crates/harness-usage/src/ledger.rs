@@ -49,6 +49,9 @@ pub struct LedgerRecord {
     /// The session of the agent that spawned `agent`: its budgets pay for the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// The name shown for `agent`, so a report can say which child it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// `YYYY-MM` of a time in seconds since the epoch: the month whose file a record goes in.

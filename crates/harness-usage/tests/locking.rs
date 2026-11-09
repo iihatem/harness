@@ -47,6 +47,7 @@ fn record(t: u64) -> LedgerRecord {
         window: None,
         agent: None,
         parent: None,
+        label: None,
     }
 }
 

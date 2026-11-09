@@ -42,6 +42,7 @@ fn record(
         window: None,
         agent: None,
         parent: None,
+        label: None,
     }
 }
 

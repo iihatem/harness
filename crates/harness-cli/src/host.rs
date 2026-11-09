@@ -427,6 +427,7 @@ pub mod tests {
                 window: None,
                 agent: None,
                 parent: None,
+                label: None,
             })
             .unwrap();
         let report = host.usage_report("provider").await.join("\n");

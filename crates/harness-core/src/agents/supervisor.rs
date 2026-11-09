@@ -481,6 +481,12 @@ async fn run_child(
             meter,
             AgentScope {
                 agent: id.to_string(),
+                label: tag
+                    .label
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(40)
+                    .collect(),
                 parent: parent.session.clone(),
             },
         )) as Arc<dyn Meter>

@@ -116,6 +116,7 @@ mod tests {
             inner.clone(),
             AgentScope {
                 agent: "a1".into(),
+                label: "explore".into(),
                 parent: "parent-session".into(),
             },
         );
@@ -133,6 +134,7 @@ mod tests {
         let inner = Arc::new(Recording::default());
         let scope = AgentScope {
             agent: "a1".into(),
+            label: "explore".into(),
             parent: "parent-session".into(),
         };
         let scoped = ScopedMeter::new(inner.clone(), scope.clone());

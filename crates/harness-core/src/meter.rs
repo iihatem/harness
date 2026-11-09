@@ -320,6 +320,8 @@ pub struct TurnRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentScope {
     pub agent: String,
+    /// The name shown for it.
+    pub label: String,
     /// The parent's session: the one whose budgets the child's spend counts towards.
     pub parent: String,
 }

@@ -1197,6 +1197,7 @@ impl Agent {
             note,
             plan,
             attribution,
+            agent_record: None,
         });
         self.history.push(message);
         self.history_ids.push(id.clone());

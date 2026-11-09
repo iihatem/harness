@@ -798,6 +798,7 @@ mod tests {
             note: false,
             plan: None,
             attribution: None,
+            agent_record: None,
         });
         let path = session.path().unwrap().to_path_buf();
         let policy = Arc::new(PermissionEngine::new(EngineConfig {

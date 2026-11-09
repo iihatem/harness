@@ -156,6 +156,7 @@ fn message(message: Message) -> EntryKind {
         note: false,
         plan: None,
         attribution: None,
+        agent_record: None,
     }
 }
 

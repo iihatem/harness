@@ -561,6 +561,7 @@ pub mod tests {
             note: false,
             plan: None,
             attribution: None,
+            agent_record: None,
         });
         let id = opened.session.id().to_string();
         drop(opened);
@@ -604,6 +605,7 @@ pub mod tests {
             note: false,
             plan: None,
             attribution: None,
+            agent_record: None,
         });
         let id = opened.session.id().to_string();
         drop(opened);

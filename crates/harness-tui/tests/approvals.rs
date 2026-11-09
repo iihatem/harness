@@ -196,6 +196,7 @@ fn request(command: &str) -> ApprovalRequest {
         reason: format!("run `{command}`"),
         kind: ApprovalKind::Action,
         kept_for_session: true,
+        agent: None,
     }
 }
 
@@ -1030,6 +1031,7 @@ fn servers_request(dir: &Path) -> ApprovalRequest {
         reason: SERVERS_QUESTION.into(),
         kind: ApprovalKind::StartServers,
         kept_for_session: false,
+        agent: None,
     }
 }
 
@@ -1165,4 +1167,624 @@ async fn the_offer_to_resume_waits_while_the_language_server_question_asks() {
     press(&mut ui, KeyCode::Char('y'));
     assert!(ui.app().resume_waiting());
     ui.finish().await.unwrap();
+}
+
+// ---- M3a: one queue of approvals, each labelled with the agent that asked ---------------------
+
+fn request_from(command: &str, id: &str, label: &str) -> ApprovalRequest {
+    ApprovalRequest {
+        call_id: format!("{id}/c1"),
+        agent: Some(harness_core::agents::AgentTag {
+            id: harness_core::agents::AgentId(id.into()),
+            label: label.into(),
+        }),
+        ..request(command)
+    }
+}
+
+type Answer = oneshot::Receiver<ApprovalDecision>;
+type Asking = mpsc::UnboundedSender<(ApprovalRequest, oneshot::Sender<ApprovalDecision>)>;
+
+fn ask(requests: &Asking, request: ApprovalRequest) -> Answer {
+    let (reply, answer) = oneshot::channel();
+    requests.send((request, reply)).unwrap();
+    answer
+}
+
+fn queue_ui() -> (Ui<TestBackend>, Asking, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (requests, approvals) = mpsc::unbounded_channel();
+    let ui = start_with(
+        MockProvider::new(vec![]),
+        dir.path(),
+        Mode::Ask,
+        Some(approvals),
+    );
+    (ui, requests, dir)
+}
+
+/// Lets the session take in what was sent, and draws.
+async fn take_in(ui: &mut Ui<TestBackend>, pending: usize) {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ui.until(move |app| app.pending_approvals() >= pending),
+    )
+    .await
+    .expect("the requests arrive")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_second_request_waits_behind_the_first_and_neither_is_dropped() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let mut first = ask(&requests, request_from("echo one", "a1", "explore"));
+    let mut second = ask(&requests, request_from("echo two", "a2", "review"));
+    take_in(&mut ui, 2).await;
+    ui.draw().unwrap();
+    assert_eq!(ui.app().pending_approvals(), 2);
+    assert!(!is_approval(first.try_recv()) && !is_approval(second.try_recv()));
+    // The first asked is the one shown.
+    assert!(
+        screen(&ui).iter().any(|r| r.contains("echo one")),
+        "{:#?}",
+        screen(&ui)
+    );
+    until_armed(&ui).await;
+    tokio::time::sleep(ARMING_DELAY).await;
+    press(&mut ui, KeyCode::Char('y'));
+    assert!(matches!(first.try_recv(), Ok(ApprovalDecision::Approve)));
+    // Now the second is shown, and still undecided.
+    assert_eq!(ui.app().pending_approvals(), 1);
+    ui.draw().unwrap();
+    assert!(screen(&ui).iter().any(|r| r.contains("echo two")));
+    assert!(second.try_recv().is_err());
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn each_prompt_names_the_agent_that_asked() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let _first = ask(&requests, request_from("echo one", "a1", "explore"));
+    let _second = ask(&requests, request("echo main"));
+    take_in(&mut ui, 2).await;
+    ui.draw().unwrap();
+    let shown = screen(&ui);
+    assert!(
+        shown.iter().any(|r| r.contains("a1 (explore)")),
+        "{shown:#?}"
+    );
+    assert!(
+        shown.iter().any(|r| r.contains("1 more waiting")),
+        "{shown:#?}"
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_main_agents_prompt_has_no_agent_label() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let _a = ask(&requests, request("echo main"));
+    take_in(&mut ui, 1).await;
+    ui.draw().unwrap();
+    assert!(
+        !screen(&ui)
+            .iter()
+            .any(|r| r.contains("(explore)") || r.contains("more waiting"))
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_next_prompt_takes_keys_only_after_the_user_pauses_again() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let mut first = ask(&requests, request_from("echo one", "a1", "x"));
+    let mut second = ask(&requests, request_from("echo two", "a2", "y"));
+    take_in(&mut ui, 2).await;
+    ui.draw().unwrap();
+    until_armed(&ui).await;
+    tokio::time::sleep(ARMING_DELAY).await;
+    press(&mut ui, KeyCode::Char('y'));
+    assert!(matches!(first.try_recv(), Ok(ApprovalDecision::Approve)));
+    // A second `y` straight after is typed ahead for the input, not an answer for the next one.
+    press(&mut ui, KeyCode::Char('y'));
+    assert!(
+        second.try_recv().is_err(),
+        "a typed-ahead key answered the next prompt"
+    );
+    assert_eq!(ui.app().pending_approvals(), 1);
+    assert_eq!(ui.app().editor().text(), "y");
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_prompt_whose_agent_went_away_leaves_the_queue() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let first = ask(&requests, request_from("echo one", "a1", "x"));
+    let mut second = ask(&requests, request_from("echo two", "a2", "y"));
+    take_in(&mut ui, 2).await;
+    // The first agent was cancelled: nobody waits for its answer.
+    drop(first);
+    ui.draw().unwrap();
+    assert_eq!(ui.app().pending_approvals(), 1);
+    assert!(screen(&ui).iter().any(|r| r.contains("echo two")));
+    assert!(second.try_recv().is_err());
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn esc_denies_the_whole_queue_and_stops_the_turn() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let mut first = ask(&requests, request_from("echo one", "a1", "x"));
+    let mut second = ask(&requests, request_from("echo two", "a2", "y"));
+    take_in(&mut ui, 2).await;
+    ui.draw().unwrap();
+    until_armed(&ui).await;
+    tokio::time::sleep(ARMING_DELAY).await;
+    press(&mut ui, KeyCode::Esc);
+    // Stopping the turn cancels the children too: nothing is left asking.
+    assert!(matches!(
+        first.try_recv(),
+        Ok(ApprovalDecision::Deny { .. })
+    ));
+    assert!(matches!(
+        second.try_recv(),
+        Ok(ApprovalDecision::Deny { .. })
+    ));
+    assert_eq!(ui.app().pending_approvals(), 0);
+    ui.finish().await.unwrap();
+}
+
+// ---- M3a: a line for each running child agent, above the input --------------------------------
+
+fn info(
+    id: &str,
+    label: &str,
+    status: harness_core::agents::AgentStatus,
+    model: Option<&str>,
+    activity: Option<&str>,
+) -> harness_core::agents::AgentInfo {
+    harness_core::agents::AgentInfo {
+        tag: harness_core::agents::AgentTag {
+            id: harness_core::agents::AgentId(id.into()),
+            label: label.into(),
+        },
+        status,
+        model: model.map(String::from),
+        tool_calls: 0,
+        activity: activity.map(String::from),
+        summary: None,
+        error: None,
+        started: None,
+        background: false,
+        worktree: None,
+    }
+}
+
+#[tokio::test]
+async fn a_running_child_has_a_line_with_its_label_status_and_model() {
+    use harness_core::agents::AgentStatus::*;
+    let (mut ui, _requests, _dir) = queue_ui();
+    ui.app_mut().set_children(vec![
+        info("a1", "explore", Working, Some("mock/m1"), Some("grep")),
+        info("a2", "review", NeedsInput, Some("mock/m2"), None),
+        info("a3", "later", Queued, None, None),
+        info("a4", "finished", Done, Some("mock/m1"), None),
+    ]);
+    ui.draw().unwrap();
+    let shown = screen(&ui);
+    let line = |label: &str| shown.iter().find(|r| r.contains(label)).cloned();
+    let one = line("explore").unwrap_or_else(|| panic!("{shown:#?}"));
+    assert!(
+        one.contains("a1") && one.contains("working") && one.contains("mock/m1"),
+        "{one}"
+    );
+    assert!(one.contains("grep"), "{one}");
+    assert!(line("review").unwrap().contains("needs input"));
+    assert!(line("later").unwrap().contains("queued"));
+    // One that has ended is not running any more: it has its result line in the transcript, once,
+    // and no line of the live kind.
+    let ended: Vec<&String> = shown.iter().filter(|r| r.contains("finished")).collect();
+    assert_eq!(ended.len(), 1, "{shown:#?}");
+    assert!(
+        ended[0].contains("done") && !ended[0].contains("working"),
+        "{ended:?}"
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_children_no_lines() {
+    let (mut ui, _requests, _dir) = queue_ui();
+    ui.app_mut().set_children(Vec::new());
+    ui.draw().unwrap();
+    assert!(!screen(&ui).iter().any(|r| r.contains("working")));
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_session_follows_a_supervisor() {
+    use harness_core::{
+        agents::{
+            AgentFactory, AgentSpec, ChildSetup, Endpoint, Limits, ParentContext, Supervisor,
+        },
+        engine::EngineConfig,
+    };
+    use tokio_util::sync::CancellationToken;
+    struct Slow(Arc<tokio::sync::Notify>);
+    #[async_trait]
+    impl AgentFactory for Slow {
+        fn endpoint(&self, _spec: &AgentSpec) -> Endpoint {
+            Endpoint {
+                key: "x".into(),
+                local: false,
+                delegated: false,
+            }
+        }
+        async fn build(&self, setup: ChildSetup) -> Result<Agent, String> {
+            let release = self.0.clone();
+            struct Hold(Arc<tokio::sync::Notify>);
+            impl harness_core::provider::Provider for Hold {
+                fn stream(
+                    &self,
+                    _r: harness_core::message::ChatRequest,
+                ) -> harness_core::provider::ProviderStream {
+                    use futures::StreamExt;
+                    let n = self.0.clone();
+                    futures::stream::once(async move {
+                        n.notified().await;
+                        futures::stream::iter(vec![Ok(
+                            harness_core::provider::ProviderEvent::Finished(
+                                harness_core::provider::FinishReason::Stop,
+                            ),
+                        )])
+                    })
+                    .flatten()
+                    .boxed()
+                }
+            }
+            let dir = std::env::temp_dir();
+            Ok(Agent::new(
+                Arc::new(Hold(release)),
+                ToolRegistry::new(vec![]),
+                setup.policy,
+                setup.approver,
+                AgentConfig::new("mock/m", "m", "s", dir.join("out")),
+                ToolContext::new(&dir),
+            ))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_requests, approvals) = mpsc::unbounded_channel();
+    let mut ui = start_with(
+        MockProvider::new(vec![]),
+        dir.path(),
+        Mode::Ask,
+        Some(approvals),
+    );
+    let release = Arc::new(tokio::sync::Notify::new());
+    let config = EngineConfig {
+        mode: Mode::Ask,
+        workspace: dir.path().to_path_buf(),
+        read_dirs: vec![],
+        rules: RuleSet::default(),
+        sandbox_available: true,
+        writes_need_approval: false,
+    };
+    let engine = Arc::new(PermissionEngine::new(config.clone()));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (approver, _) = ChannelApprover::new();
+    let sup = Supervisor::new(
+        Limits::default(),
+        Arc::new(Slow(release.clone())),
+        ParentContext {
+            session: "p".into(),
+            cancel: CancellationToken::new(),
+            policy: engine,
+            engine: config,
+            approver,
+            meter: None,
+            sessions_dir: None,
+            workspace: dir.path().to_path_buf(),
+        },
+        tx,
+    );
+    ui.watch_agents(sup.clone());
+    let handle = sup.spawn(AgentSpec::new("explore", "look"));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ui.until(|app| app.children().iter().any(|c| c.tag.label == "explore")),
+    )
+    .await
+    .expect("the line appears")
+    .unwrap();
+    ui.draw().unwrap();
+    assert!(
+        screen(&ui).iter().any(|r| r.contains("explore")),
+        "{:#?}",
+        screen(&ui)
+    );
+    release.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("the child ends");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ui.until(|app| app.children().iter().all(|c| c.status.is_final())),
+    )
+    .await
+    .expect("the line goes")
+    .unwrap();
+    ui.draw().unwrap();
+    // No live line is left: the one row that names it is its result in the transcript.
+    let rows: Vec<String> = screen(&ui)
+        .into_iter()
+        .filter(|r| r.contains("explore"))
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0].contains("done") && !rows[0].contains("working"),
+        "{rows:?}"
+    );
+    // Leaving the session cancels the children still running.
+    let straggler = sup.spawn(AgentSpec::new("straggler", "look"));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ui.until(|app| app.children().iter().any(|c| c.tag.label == "straggler")),
+    )
+    .await
+    .expect("the line appears")
+    .unwrap();
+    ui.finish().await.unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(10), straggler.wait())
+        .await
+        .expect("leaving cancelled the child");
+    assert_eq!(report.status, harness_core::agents::AgentStatus::Cancelled);
+}
+
+// ---- M3a fix wave 1 --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_key_after_the_agent_was_cancelled_does_not_answer_its_closed_prompt() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let first = ask(&requests, request_from("echo one", "a1", "x"));
+    take_in(&mut ui, 1).await;
+    ui.draw().unwrap();
+    until_armed(&ui).await;
+    tokio::time::sleep(ARMING_DELAY).await;
+    // The agent is cancelled and nothing redraws before the key arrives.
+    drop(first);
+    press(&mut ui, KeyCode::Char('y'));
+    assert_eq!(ui.app().pending_approvals(), 0);
+    let shown = everything(&ui);
+    assert!(
+        !shown.iter().any(|r| r.contains("approved")),
+        "an approval was noted for a prompt nobody waited for: {shown:#?}"
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_second_request_does_not_make_the_prompt_shown_wait_for_a_pause_again() {
+    let (mut ui, requests, _dir) = queue_ui();
+    let mut first = ask(&requests, request_from("echo one", "a1", "x"));
+    take_in(&mut ui, 1).await;
+    ui.draw().unwrap();
+    until_armed(&ui).await;
+    tokio::time::sleep(ARMING_DELAY).await;
+    // Another agent asks while the first prompt already takes keys.
+    let _second = ask(&requests, request_from("echo two", "a2", "y"));
+    take_in(&mut ui, 2).await;
+    press(&mut ui, KeyCode::Char('y'));
+    assert!(
+        matches!(first.try_recv(), Ok(ApprovalDecision::Approve)),
+        "a request that queued behind it reset its arming"
+    );
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn esc_while_a_turn_runs_cancels_the_children_it_started() {
+    use harness_core::agents::{
+        AgentFactory, AgentSpec, AgentStatus, ChildSetup, Endpoint, Limits, ParentContext,
+        Supervisor,
+    };
+    use tokio_util::sync::CancellationToken;
+    /// A child that is never finished being built.
+    struct Never;
+    #[async_trait]
+    impl AgentFactory for Never {
+        fn endpoint(&self, _spec: &AgentSpec) -> Endpoint {
+            Endpoint {
+                key: "x".into(),
+                local: false,
+                delegated: false,
+            }
+        }
+        async fn build(&self, _setup: ChildSetup) -> Result<Agent, String> {
+            std::future::pending().await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut ui = start(
+        MockProvider::new(vec![Script::Hang(vec![
+            harness_core::provider::ProviderEvent::TextDelta("working on it".into()),
+        ])]),
+        dir.path(),
+        Mode::Auto,
+    );
+    let config = EngineConfig {
+        mode: Mode::Auto,
+        workspace: dir.path().to_path_buf(),
+        read_dirs: vec![],
+        rules: RuleSet::default(),
+        sandbox_available: true,
+        writes_need_approval: false,
+    };
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (approver, _) = ChannelApprover::new();
+    let sup = Supervisor::new(
+        Limits::default(),
+        Arc::new(Never),
+        ParentContext {
+            session: "p".into(),
+            cancel: CancellationToken::new(),
+            policy: Arc::new(PermissionEngine::new(config.clone())),
+            engine: config,
+            approver,
+            meter: None,
+            sessions_dir: None,
+            workspace: dir.path().to_path_buf(),
+        },
+        tx,
+    );
+    ui.watch_agents(sup.clone());
+    let child = sup.spawn(AgentSpec::new("explore", "look"));
+    send(&mut ui, "go");
+    tokio::time::timeout(Duration::from_secs(10), ui.until(|app| app.busy()))
+        .await
+        .expect("the turn runs")
+        .unwrap();
+    press(&mut ui, KeyCode::Esc);
+    let report = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("Esc ended the child");
+    assert_eq!(report.status, AgentStatus::Cancelled);
+    ui.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn at_most_a_few_child_lines_show_and_the_rest_are_counted() {
+    use harness_core::agents::AgentStatus::*;
+    let (mut ui, _requests, _dir) = queue_ui();
+    let mut children = vec![info("a1", "waiting", NeedsInput, Some("mock/m1"), None)];
+    for n in 2..=9 {
+        children.push(info(
+            &format!("a{n}"),
+            &format!("job{n}"),
+            Queued,
+            None,
+            None,
+        ));
+    }
+    children.push(info(
+        "a10",
+        &"a very long label ".repeat(10),
+        Working,
+        Some("mock/m1"),
+        None,
+    ));
+    ui.app_mut().set_children(children);
+    ui.draw().unwrap();
+    let shown = screen(&ui);
+    let lines = shown.iter().filter(|r| r.contains('◦')).count();
+    assert_eq!(lines, 5, "{shown:#?}");
+    assert!(
+        shown.iter().any(|r| r.contains("more agents")),
+        "{shown:#?}"
+    );
+    // The one that needs an answer is first in line, and a long label is cut.
+    assert!(shown.iter().any(|r| r.contains("waiting")));
+    assert!(
+        !shown
+            .iter()
+            .any(|r| r.contains("a very long label a very long label a very long label")),
+        "{shown:#?}"
+    );
+    ui.finish().await.unwrap();
+}
+
+// ---- M3c: the two questions a delegated model asks -------------------------------------------
+
+fn delegate_question(dir: &Path, kind: ApprovalKind, text: &str) -> Asked {
+    let (requests, approvals) = mpsc::unbounded_channel();
+    let ui = start_with(MockProvider::new(vec![]), dir, Mode::Ask, Some(approvals));
+    let (reply, answer) = oneshot::channel();
+    requests
+        .send((
+            ApprovalRequest {
+                call_id: String::new(),
+                tool: "delegate".into(),
+                arguments: serde_json::Value::Null,
+                action: Action::Bash(String::new()),
+                reason: text.into(),
+                kind,
+                kept_for_session: false,
+                agent: None,
+            },
+            reply,
+        ))
+        .unwrap();
+    (ui, answer, requests)
+}
+
+// Esc is no answer: the outcome says the question comes again, not that the key will be used.
+#[tokio::test]
+async fn esc_on_the_opt_in_says_it_will_be_asked_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ui, mut answer, _requests) = delegate_question(
+        dir.path(),
+        ApprovalKind::DelegateOptIn,
+        "Use your Claude subscription for claude-code models?",
+    );
+    until_server_question(&mut ui).await;
+    press(&mut ui, KeyCode::Esc);
+    assert_eq!(
+        answer.try_recv(),
+        Ok(ApprovalDecision::Deny {
+            feedback: Some(harness_core::agent::STOPPED_BY_USER.into())
+        })
+    );
+    ui.draw().unwrap();
+    let shown = screen(&ui).join("\n");
+    assert!(shown.contains("asks again at the next turn"), "{shown}");
+    assert!(
+        !shown.contains("will use your Anthropic API key"),
+        "{shown}"
+    );
+    ui.finish().await.unwrap();
+}
+
+// Both are plain yes or no questions: no "approve?" lead, no "for this session" key, `y` is yes,
+// `n` and Enter are no at once, and the outcome says what the answer means.
+#[tokio::test]
+async fn the_opt_in_and_full_access_questions_are_plain_yes_or_no() {
+    for (kind, text, yes, no) in [
+        (
+            ApprovalKind::DelegateOptIn,
+            "Use your Claude subscription for claude-code models?",
+            "claude-code will use your Claude subscription",
+            "claude-code will use your Anthropic API key",
+        ),
+        (
+            ApprovalKind::DelegateFullAccess,
+            "Run claude-code in full-access mode for this session?",
+            "full-access confirmed for this session",
+            "full-access was not confirmed",
+        ),
+    ] {
+        for (code, expected, outcome) in [
+            (KeyCode::Char('y'), ApprovalDecision::Approve, yes),
+            (
+                KeyCode::Enter,
+                ApprovalDecision::Deny { feedback: None },
+                no,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut ui, mut answer, _requests) = delegate_question(dir.path(), kind, text);
+            until_server_question(&mut ui).await;
+            let shown = screen(&ui).join("\n");
+            assert!(shown.contains(text), "{shown}");
+            assert!(!shown.contains("approve?"), "{shown}");
+            assert!(!shown.contains("for this session  "), "{shown}");
+            assert!(shown.contains("[n] no (or Enter)"), "{shown}");
+            press(&mut ui, code);
+            assert_eq!(answer.try_recv(), Ok(expected), "{kind:?} {code:?}");
+            ui.draw().unwrap();
+            let shown = screen(&ui).join("\n");
+            assert!(shown.contains(outcome), "{kind:?}: {shown}");
+            assert!(!shown.contains("tell the model"), "{shown}");
+            ui.finish().await.unwrap();
+        }
+    }
 }

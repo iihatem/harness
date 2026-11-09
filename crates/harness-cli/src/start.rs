@@ -57,6 +57,124 @@ pub struct Started {
     pub diagnostics: Arc<harness_lsp::LspDiagnostics>,
     /// Makes the models of roles ready: the agent's, and the host's for `/model --role`.
     pub resolver: Arc<crate::routes::CliResolver>,
+    /// What child agents are made from, and what they inherit; see [`Started::supervisor`].
+    children: ChildKit,
+}
+
+/// What a session keeps for the child agents it may run.
+pub struct ChildKit {
+    factory: Arc<crate::children::CliFactory>,
+    engine: EngineConfig,
+    approver: Arc<dyn Approver>,
+    sessions_dir: Option<std::path::PathBuf>,
+    session_id: String,
+    workspace: std::path::PathBuf,
+    limits: harness_core::agents::Limits,
+    /// The definitions the model may start, and the limits on starting them.
+    subagents: crate::subagents::Subagents,
+    /// Where agents that ask for isolation get their worktrees; none outside a git repository.
+    worktrees: Option<Arc<harness_core::worktree::Worktrees>>,
+    /// Why there are none, when it is not just that the project has no git repository.
+    worktrees_why: Option<String>,
+}
+
+impl Started {
+    /// The supervisor of the session's child agents. Their events go to `sink`; cancelling
+    /// `cancel` cancels the children spawned without a token of their own. The agent keeps the
+    /// supervisor's records of them in its session when given its
+    /// [`records`](harness_core::agents::Supervisor::records), as [`with_supervisor`] does.
+    pub fn supervisor(
+        &self,
+        sink: tokio::sync::mpsc::UnboundedSender<harness_core::agents::AgentEnvelope>,
+        cancel: CancellationToken,
+    ) -> Arc<harness_core::agents::Supervisor> {
+        let kit = &self.children;
+        let supervisor = harness_core::agents::Supervisor::new(
+            kit.limits,
+            kit.factory.clone(),
+            harness_core::agents::ParentContext {
+                session: kit.session_id.clone(),
+                cancel,
+                policy: self.policy.clone(),
+                engine: kit.engine.clone(),
+                approver: kit.approver.clone(),
+                meter: Some(self.meter.clone()),
+                sessions_dir: kit.sessions_dir.clone(),
+                workspace: kit.workspace.clone(),
+            },
+            sink,
+        );
+        if let Some(worktrees) = &kit.worktrees {
+            supervisor.set_worktrees(worktrees.clone());
+        } else if let Some(why) = &kit.worktrees_why {
+            supervisor.set_worktrees_unavailable(why.clone());
+        }
+        supervisor
+    }
+
+    /// Children that run in Claude Code or Codex are not asked to confirm `full-access` (the
+    /// user did, for a headless run, with `--yes-full-access`).
+    pub fn confirm_children_full_access(&self) {
+        self.children.factory.confirm_full_access();
+    }
+
+    /// Nobody can be asked a question in this run (`harness ask`).
+    pub fn children_headless(&self) {
+        self.children.factory.set_headless();
+    }
+
+    /// The worktrees agents are isolated in, when the project is in a git repository.
+    pub fn worktrees(&self) -> Option<Arc<harness_core::worktree::Worktrees>> {
+        self.children.worktrees.clone()
+    }
+}
+
+impl Started {
+    /// The agents the model may start, for `/agents`; none when `[agents] spawn` is off.
+    pub fn agent_definitions(&self) -> Option<Arc<harness_core::agents::Definitions>> {
+        let subagents = &self.children.subagents;
+        subagents.spawn.then(|| subagents.definitions.clone())
+    }
+
+    /// The tool that lets the model start subagents under `supervisor`; none when
+    /// `[agents] spawn` is off. It reads the model and roles of the session's agent as they are.
+    /// `wait_for_background` is for a run that ends with its turn: agents meant to run in the
+    /// background are waited for.
+    pub fn spawn_tool(
+        &self,
+        supervisor: &Arc<harness_core::agents::Supervisor>,
+        wait_for_background: bool,
+    ) -> Option<Arc<dyn harness_core::tool::Tool>> {
+        let subagents = &self.children.subagents;
+        if !subagents.spawn {
+            return None;
+        }
+        let settings = harness_core::agents::SpawnSettings {
+            parent: self.children.factory.parent_model(),
+            wait_for_background,
+            ..subagents.settings.clone()
+        };
+        let tool: Arc<dyn harness_core::tool::Tool> = harness_core::agents::SpawnAgentsTool::new(
+            supervisor,
+            subagents.definitions.clone(),
+            settings,
+        );
+        Some(tool)
+    }
+}
+
+/// `agent` keeping the records `supervisor` makes of its children in its session, and offering
+/// the model `spawn` (from [`Started::spawn_tool`]), when there is one, to start them.
+pub fn with_supervisor(
+    agent: Agent,
+    supervisor: &harness_core::agents::Supervisor,
+    spawn: Option<Arc<dyn harness_core::tool::Tool>>,
+) -> Agent {
+    let agent = agent.with_child_records(supervisor.records());
+    match spawn {
+        Some(spawn) => agent.with_extra_tool(spawn),
+        None => agent,
+    }
 }
 
 /// The model a session starts on when it is not chosen another way: the `--model` flag, then
@@ -94,7 +212,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     if mode == Mode::FullAccess {
         notices.warn("full-access mode: commands run without approval or sandbox");
     }
-    let output_dir = setup.paths.state_dir.join("tool-output").join(run_id);
+    let output_dir = setup.paths.state_dir.join("tool-output").join(&run_id);
     let env_says_none = std::env::var("HARNESS_SANDBOX").as_deref() == Ok("none");
     let sandbox_disabled_by_env = env_says_none && mode != Mode::FullAccess;
     // Write access to `/`, `$HOME` or an ancestor of it would cover the user's dotfiles. Plan and
@@ -139,11 +257,9 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     let mut said = warning.clone();
     // From here on, however the run is left, the sandbox's session ends: on Linux that ends what
     // sandboxed commands left running, and checks git metadata once more.
-    let session_sandbox = if interactive {
-        detected
-    } else {
-        sandbox.clone()
-    };
+    // Every sandbox a child agent may be given, whatever its mode: one in a narrower mode than the
+    // session's may use a sandbox the session's own mode does not.
+    let session_sandbox = detected;
     let sandbox_session = SessionEnd::new(session_sandbox.clone());
     let sandboxed = sandbox.is_some();
     if mode != Mode::FullAccess && !sandboxed && warning.is_none() {
@@ -167,7 +283,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         .filter(|warning| interactive && said.as_ref() != Some(warning));
     let mut read_dirs = setup.config.read_dirs.clone();
     read_dirs.push(output_dir.clone());
-    let mut policy = PermissionEngine::new(EngineConfig {
+    let engine_config = EngineConfig {
         mode,
         workspace: setup.workspace.clone(),
         read_dirs,
@@ -178,7 +294,8 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         },
         sandbox_available: sandboxed,
         writes_need_approval: workspace_too_broad,
-    });
+    };
+    let mut policy = PermissionEngine::new(engine_config.clone());
     if let Some(why) = lack.unsandboxed {
         policy = policy.with_unsandboxed_reason(why);
     }
@@ -215,6 +332,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         output_dir,
     );
     config.edit_section = Some(prompt::edit_section(model.edit_format));
+    config.instructions = crate::context::instructions_text(setup);
     config.context_window = context_window;
     config.request = model.request;
     config.text_tool_calls = model.text_tool_calls;
@@ -248,6 +366,46 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     );
     let diagnostics = crate::lsp::diagnostics(setup, interactive.then(|| approver.clone()));
     let resolver = crate::routes::CliResolver::new(setup.clone());
+    let subagents = crate::subagents::load(setup, notices);
+    let (worktrees, worktrees_why) = match crate::worktrees::open_or_why(setup) {
+        Ok(found) => (Some(found), None),
+        Err(e) => (None, crate::worktrees::unavailable_reason(&e)),
+    };
+    let children = ChildKit {
+        factory: crate::children::CliFactory::new(
+            setup.clone(),
+            resolver.clone(),
+            resolved.provider.clone(),
+            config.clone(),
+            model.edit_format,
+            sandboxes.clone(),
+            config.request.local,
+            writable_roots.clone(),
+            lack.unsandboxed.map(String::from),
+            setup.paths.state_dir.join("tool-output").join(&run_id),
+            cancel.clone(),
+        ),
+        engine: engine_config,
+        approver: approver.clone(),
+        sessions_dir: session
+            .path()
+            .and_then(|path| path.parent())
+            .map(std::path::Path::to_path_buf),
+        session_id: session.id().to_string(),
+        workspace: setup.workspace.clone(),
+        limits: {
+            let a = setup.config.agents;
+            harness_core::agents::Limits {
+                per_local: a.per_local as usize,
+                per_hosted: a.per_hosted as usize,
+                per_delegated: a.per_delegated as usize,
+                total: a.max_total as usize,
+            }
+        },
+        subagents,
+        worktrees,
+        worktrees_why,
+    };
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin_for(model.edit_format),
@@ -264,7 +422,9 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     .with_diagnostics(diagnostics.clone())
     .with_roles(setup.config.roles.clone())
     .with_escalation(setup.config.escalation_to.clone())
-    .with_resolver(resolver.clone());
+    .with_resolver(resolver.clone())
+    // Children that name no model are built from the one the session is on at that moment.
+    .with_model_cell(children.factory.parent_model());
     if interactive {
         agent = agent.with_sandboxes(sandboxes);
     }
@@ -278,6 +438,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         meter,
         diagnostics,
         resolver,
+        children,
     })
 }
 
@@ -478,7 +639,7 @@ pub async fn tool_context(
 
 /// Starts `sandbox`'s session for `workspace`, off the async runtime: it may walk the whole
 /// workspace. Should it fail, the first command reads what it needs.
-async fn start_sandbox_session(workspace: &Path, sandbox: Arc<dyn CommandSandbox>) {
+pub(crate) async fn start_sandbox_session(workspace: &Path, sandbox: Arc<dyn CommandSandbox>) {
     let workspace = workspace.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || sandbox.start_session(&workspace)).await;
 }
@@ -798,6 +959,7 @@ mod tests {
             note: false,
             plan: None,
             attribution: None,
+            agent_record: None,
         });
         let path = session.path().unwrap().to_path_buf();
         let policy = Arc::new(PermissionEngine::new(EngineConfig {

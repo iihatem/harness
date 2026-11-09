@@ -46,6 +46,10 @@ pub enum EntryKind {
         version: u32,
         started_at: String,
         cwd: PathBuf,
+        /// For a child agent's session, the session and agent it belongs to. A harness that does
+        /// not know the field ignores it, and lists the file as any other session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lineage: Option<Lineage>,
     },
     Message {
         message: Message,
@@ -63,6 +67,12 @@ pub enum EntryKind {
         /// role's, when it is not. A harness that does not know the field ignores it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attribution: Option<Attribution>,
+        /// Set on a record of a child agent kept beside the conversation (see
+        /// [`Session::append_aside`]). A harness that does not know the field reads it as the
+        /// note it also is (`[agent a1 (x) reported]`, a user message): harmless, but on the
+        /// branch of a build before M3a if it is the last entry of the file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_record: Option<AgentRecord>,
     },
     /// A summary that replaces the conversation before `first_kept` (all of it when `None`) on
     /// this branch. The summarized entries stay in the file.
@@ -103,9 +113,55 @@ pub enum EntryKind {
     Version { version: u32 },
 }
 
+/// Where a child agent's session came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lineage {
+    /// The session of the agent that spawned it.
+    pub parent: String,
+    /// The child's id in its supervisor.
+    pub agent: String,
+    /// The name shown for it.
+    pub label: String,
+}
+
+/// What a record of a child agent says happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRecordKind {
+    Spawned,
+    Reported,
+}
+
+/// A parent session's record of a child: that it was spawned, and what it reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRecord {
+    pub agent: String,
+    pub label: String,
+    pub kind: AgentRecordKind,
+    /// The child's own session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// The child's report, for `Reported`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<serde_json::Value>,
+}
+
+impl EntryKind {
+    /// Whether this is a record of a child, which is on no branch.
+    fn is_aside(&self) -> bool {
+        matches!(
+            self,
+            EntryKind::Message {
+                agent_record: Some(_),
+                ..
+            }
+        )
+    }
+}
+
 /// Which role an assistant message was written for, and why its model is not the one that role is
 /// configured to use; for a Build message, its hand-off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attribution {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +169,24 @@ pub struct Attribution {
     /// On the message that asks to build a plan: how the turn got the conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<Handoff>,
+    /// On an assistant message written by an external agent program: which one, and its own
+    /// session, so the next turn can continue it. A harness that does not know the field ignores
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate: Option<Box<DelegateMark>>,
+}
+
+/// An external agent's session, as recorded on the assistant message it wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateMark {
+    /// `<provider>/<model>` it answered as.
+    pub model: String,
+    /// Its own id for the session.
+    pub session: String,
+    /// Its running cost total for the session so far, an estimate in millionths of a US dollar
+    /// (the baseline of the next turn's cost).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_total_micros: Option<u64>,
 }
 
 /// What a rewind restores.
@@ -196,6 +270,24 @@ impl Session {
         )
     }
 
+    /// A new session for a child agent, saved as `<dir>/<id>.jsonl` like any other, with its
+    /// parent named in its first line.
+    pub fn create_child(dir: &Path, cwd: &Path, lineage: Lineage) -> Session {
+        let mut session = Session::create(dir, cwd);
+        if let EntryKind::Session { lineage: slot, .. } = &mut session.entries[0].kind {
+            *slot = Some(lineage);
+        }
+        session
+    }
+
+    /// For a child agent's session, where it came from.
+    pub fn lineage(&self) -> Option<&Lineage> {
+        match &self.entries[0].kind {
+            EntryKind::Session { lineage, .. } => lineage.as_ref(),
+            _ => None,
+        }
+    }
+
     fn with_header(id: String, cwd: &Path, store: Option<Store>) -> Session {
         let header = Entry {
             id: id.clone(),
@@ -204,6 +296,7 @@ impl Session {
                 version: FORMAT_VERSION,
                 started_at: time::timestamp(time::now_unix()),
                 cwd: cwd.to_path_buf(),
+                lineage: None,
             },
         };
         Session {
@@ -300,7 +393,13 @@ impl Session {
             ));
         }
         let id = id.clone();
-        let leaf = entries.last().map(|e| e.id.clone()).unwrap_or(id.clone());
+        // Records of children are on no branch: the leaf is the last entry that is not one.
+        let leaf = entries
+            .iter()
+            .rev()
+            .find(|e| !e.kind.is_aside())
+            .map(|e| e.id.clone())
+            .unwrap_or(id.clone());
         let index = entries
             .iter()
             .enumerate()
@@ -376,6 +475,16 @@ impl Session {
         id
     }
 
+    /// Saves `kind` (a record of a child agent) under the current leaf without making it the
+    /// leaf: it joins no branch and no conversation, and reopening the file finds the leaf where
+    /// it was. Returns its id.
+    pub fn append_aside(&mut self, kind: EntryKind) -> String {
+        let leaf = self.leaf.clone();
+        let id = self.push(&leaf, kind);
+        self.save();
+        id
+    }
+
     /// Adds `kind` under `parent` to the entries, with a new id, which it returns.
     fn push(&mut self, parent: &str, kind: EntryKind) -> String {
         let id = loop {
@@ -418,6 +527,45 @@ impl Session {
     /// Warnings about saving the session (such as a file that cannot be locked), each once.
     pub fn take_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.warnings)
+    }
+
+    /// The external agent session the next turn on `model` may continue: the one named on the last
+    /// assistant message of the active branch, when that message was written by `model` and the
+    /// file has no rewind after it (a rewind restores files the child's context still assumes
+    /// are changed).
+    pub fn delegate_resume(&self, model: &str) -> Option<DelegateMark> {
+        let branch = self.branch();
+        let last = branch.iter().rev().find(|entry| {
+            matches!(
+                &entry.kind,
+                EntryKind::Message {
+                    message: Message::Assistant { .. },
+                    ..
+                }
+            )
+        })?;
+        let EntryKind::Message {
+            attribution:
+                Some(Attribution {
+                    delegate: Some(mark),
+                    ..
+                }),
+            ..
+        } = &last.kind
+        else {
+            return None;
+        };
+        if mark.model != model {
+            return None;
+        }
+        let at = *self.index.get(&last.id)?;
+        let rewound = self.entries[at + 1..].iter().any(|entry| {
+            matches!(
+                entry.kind,
+                EntryKind::Rewind { .. } | EntryKind::UndoRewind { .. }
+            )
+        });
+        (!rewound).then(|| (**mark).clone())
     }
 
     /// The entries from the session's first line to the leaf.
@@ -567,24 +715,59 @@ pub fn list(dir: &Path) -> Vec<SessionSummary> {
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|path| summary(&path))
+        .filter_map(|path| summary(&path, false))
         .collect();
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then(b.id.cmp(&a.id)));
     out
 }
 
+/// The sessions in `dir` of the child agents spawned by session `parent`, oldest first.
+pub fn children_of(dir: &Path, parent: &str) -> Vec<SessionSummary> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SessionSummary> = read
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .filter_map(|path| {
+            let found = summary(&path, true)?;
+            let file = std::fs::File::open(&path).ok()?;
+            let header: Entry =
+                serde_json::from_str(&BufReader::new(file).lines().next()?.ok()?).ok()?;
+            match header.kind {
+                EntryKind::Session {
+                    lineage: Some(l), ..
+                } if l.parent == parent => Some(found),
+                _ => None,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 /// What `--resume` lists about the session file at `path`; `None` when it is not one that
 /// [`Session::open`] would open.
-fn summary(path: &Path) -> Option<SessionSummary> {
+fn summary(path: &Path, children: bool) -> Option<SessionSummary> {
     let id = file_id(path)?;
     let file = open_regular(OpenOptions::new().read(true), path).ok()??;
     let modified = file.metadata().ok()?.modified().ok()?;
     let mut lines = BufReader::new(file).lines();
     let header: Entry = serde_json::from_str(&lines.next()?.ok()?).ok()?;
-    let EntryKind::Session { started_at, .. } = header.kind else {
+    let EntryKind::Session {
+        started_at,
+        lineage,
+        ..
+    } = header.kind
+    else {
         return None;
     };
     if header.id != id {
+        return None;
+    }
+    // A child agent's session belongs to its parent's: it is not offered for `--resume`.
+    if lineage.is_some() && !children {
         return None;
     }
     let first_message =

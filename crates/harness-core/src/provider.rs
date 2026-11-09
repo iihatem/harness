@@ -271,4 +271,10 @@ pub trait Provider: Send + Sync {
     fn windows(&self) -> Option<BoxFuture<'static, Result<WindowSnapshot, String>>> {
         None
     }
+
+    /// For a model that runs in another agent program (Claude Code, Codex): the agent runs its
+    /// turns through this instead of sending requests to [`stream`](Self::stream).
+    fn delegated(&self) -> Option<std::sync::Arc<dyn crate::delegated::DelegateTurns>> {
+        None
+    }
 }

@@ -89,6 +89,12 @@ pub struct Picker {
     empty: String,
     /// Dim lines under the list, such as what a choice cannot undo.
     footer: Vec<String>,
+    /// Lines shown above the list, to scroll with Page Up and Page Down (the list keeps Up and
+    /// Down): a diff, say, for the choice of what to do with it.
+    preview: Vec<Line<'static>>,
+    preview_top: usize,
+    /// How many rows the preview had, as last drawn.
+    preview_rows: Cell<usize>,
     filter: String,
     /// The items the filter keeps, as indices into `items`, best first.
     shown: Vec<usize>,
@@ -118,6 +124,9 @@ impl Picker {
             waiting: waiting.to_string(),
             empty: "nothing to choose from".into(),
             footer: Vec::new(),
+            preview: Vec::new(),
+            preview_top: 0,
+            preview_rows: Cell::new(PAGE),
             filter: String::new(),
             shown: Vec::new(),
             selected: 0,
@@ -131,6 +140,12 @@ impl Picker {
     /// Lines shown under the list.
     pub fn with_footer(mut self, footer: Vec<String>) -> Self {
         self.footer = footer;
+        self
+    }
+
+    /// Lines shown above the list, scrolled with Page Up and Page Down.
+    pub fn with_preview(mut self, preview: Vec<Line<'static>>) -> Self {
+        self.preview = preview;
         self
     }
 
@@ -215,6 +230,15 @@ impl Picker {
             KeyCode::Char('p') if ctrl => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => self.selected = (self.selected + 1).min(last),
             KeyCode::Char('n') if ctrl => self.selected = (self.selected + 1).min(last),
+            KeyCode::PageUp if !self.preview.is_empty() => {
+                let rows = self.preview_rows.get().max(2) - 1;
+                self.preview_top = self.preview_top.saturating_sub(rows);
+            }
+            KeyCode::PageDown if !self.preview.is_empty() => {
+                let rows = self.preview_rows.get().max(2) - 1;
+                let furthest = self.preview.len().saturating_sub(self.preview_rows.get());
+                self.preview_top = (self.preview_top + rows).min(furthest);
+            }
             KeyCode::PageUp => self.selected = self.selected.saturating_sub(page),
             KeyCode::PageDown => self.selected = (self.selected + page).min(last),
             KeyCode::Home => self.selected = 0,
@@ -273,12 +297,35 @@ impl Picker {
             }
         }
         below.push(Line::from(Span::styled(
-            "↑↓ move · Enter choose · Esc close",
+            if self.preview.is_empty() {
+                "↑↓ move · Enter choose · Esc close"
+            } else {
+                "↑↓ move · Enter choose · PgUp PgDn scroll · Esc close"
+            },
             theme.dim(),
         )));
-        let rows = (area.height as usize)
-            .saturating_sub(lines.len() + below.len())
-            .max(1);
+        let rows = if self.preview.is_empty() {
+            (area.height as usize)
+                .saturating_sub(lines.len() + below.len())
+                .max(1)
+        } else {
+            // The choices keep a few rows; the preview has the rest.
+            let choices = self.shown.len().clamp(1, 6);
+            let preview_rows = (area.height as usize)
+                .saturating_sub(lines.len() + below.len() + choices + 1)
+                .max(1);
+            self.preview_rows.set(preview_rows);
+            let furthest = self.preview.len().saturating_sub(preview_rows);
+            let top = self.preview_top.min(furthest);
+            lines.extend(self.preview.iter().skip(top).take(preview_rows).cloned());
+            lines.extend(std::iter::repeat_n(
+                Line::default(),
+                preview_rows
+                    .saturating_sub(self.preview.len().saturating_sub(top).min(preview_rows)),
+            ));
+            lines.push(Line::default());
+            choices
+        };
         self.rows.set(rows);
         lines.extend(self.list(rows, width, theme));
         let fill = (area.height as usize).saturating_sub(lines.len() + below.len());

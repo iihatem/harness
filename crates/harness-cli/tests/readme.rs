@@ -130,3 +130,123 @@ fn the_readme_documents_roles_hand_off_fallback_and_escalation() {
         assert!(trust.contains(word), "the trust paragraph omits {word}");
     }
 }
+
+#[test]
+fn the_readme_documents_subagents() {
+    let text = readme();
+    for word in [
+        "spawn_agents",
+        "/agents",
+        ".harness/agents/",
+        ".claude/agents/",
+        "max_spawns_per_turn",
+        "permissionMode",
+        "explore",
+        "`[roles] background`",
+        "`model: inherit` means the parent's current model",
+        "`sonnet`",
+        "is ignored with one note",
+        "never turned into a paid API model",
+        "may name only a model already in play",
+        "`[agents] spawn = false`",
+        "`apply_patch`",
+        "`hashline_edit`",
+        "whether or not the directory is trusted",
+        "start a new session",
+        "\"unchecked\"",
+        "A subagent may run in Claude Code or Codex",
+        "`per_delegated`",
+        "always works in a worktree",
+        "cannot narrow them",
+        "`spawn_agents` is not used",
+    ] {
+        assert!(text.contains(word), "the README does not mention {word}");
+    }
+}
+
+#[test]
+fn the_example_sets_the_agent_limits_and_the_delegation_settings_as_the_code_defaults_have_them() {
+    let blocks = toml_blocks(&readme()).join("\n");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, &blocks).unwrap();
+    let file = config::parse_file(&path).unwrap().unwrap();
+    let a = &file.agents;
+    // Every key of `[agents]` the README names is there, and shows the default.
+    let d = config::Agents::default();
+    assert_eq!(a.spawn, Some(d.spawn));
+    assert_eq!(a.per_local, Some(d.per_local));
+    assert_eq!(a.per_hosted, Some(d.per_hosted));
+    assert_eq!(a.per_delegated, Some(d.per_delegated));
+    assert_eq!(a.max_total, Some(d.max_total));
+    assert_eq!(a.max_spawns_per_turn, Some(d.max_spawns_per_turn));
+    // `[delegate]` and `[delegate.claude]`.
+    assert_eq!(file.delegate.allow_untested, Some(false));
+    assert_eq!(file.delegate.claude.use_subscription, Some(true));
+    // The whole example is accepted as a configuration, with no warning.
+    let trust = harness_config::trust::TrustStore::load(&dir.path().join("data")).unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let loaded = config::load(&path, &workspace, &trust).unwrap();
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(loaded.agents, d);
+}
+
+#[test]
+fn the_readme_reads_top_to_bottom() {
+    let text = readme();
+    // The status says what is built, not what comes next.
+    let status = text
+        .lines()
+        .find(|line| line.starts_with("> **Status"))
+        .unwrap();
+    for word in ["Milestone 1", "Milestone 2", "Milestone 3", "pending"] {
+        assert!(status.contains(word), "the status omits {word}");
+    }
+    assert!(!text.contains("comes next"), "a shipped feature is future");
+    // Each part has its own section, with a worked example.
+    for heading in [
+        "## Subagents",
+        "## Claude Code and Codex",
+        "## Worktrees and background agents",
+        "## The interactive terminal in detail",
+    ] {
+        assert!(text.lines().any(|l| l == heading), "no {heading}");
+    }
+    for word in [
+        "**Example.**",
+        "/bg ",
+        "/results",
+        "harness worktrees clean",
+    ] {
+        assert!(text.contains(word), "the README does not mention {word}");
+    }
+    // "What works today" stays a list of short bullets.
+    let start = text.find("## What works today").unwrap();
+    let end = text[start..].find("**Sandboxed by default.**").unwrap() + start;
+    for line in text[start..end].lines().filter(|l| l.starts_with("- ")) {
+        assert!(line.len() < 1300, "too long for the list: {}", &line[..60]);
+    }
+}
+
+#[test]
+fn the_readme_names_the_csv_columns_that_say_which_agent_made_a_request() {
+    // The last columns of `usage export --format csv`, as the code writes them.
+    let source = include_str!("../../harness-usage/src/export.rs");
+    let header = source
+        .lines()
+        .find_map(|l| l.strip_prefix("const CSV_HEADER: &str = \""))
+        .and_then(|l| l.strip_suffix("\";"))
+        .expect("the CSV header is in export.rs");
+    let columns: Vec<&str> = header.split(',').collect();
+    let last = columns[columns.len() - 3..].join(",");
+    assert!(
+        readme().contains(&last),
+        "the README does not name the columns {last}"
+    );
+    // And what the delegation section says about limits that the code does not have.
+    let text = readme();
+    for word in ["ignores `max_steps`", "`143` or `129`", "Git 2.31 or newer"] {
+        assert!(text.contains(word), "the README does not mention {word}");
+    }
+}

@@ -18,7 +18,7 @@ use crate::{
 };
 
 /// The cache's layout version: a cache of another version is replaced.
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 3;
 
 /// What a report is grouped by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +27,8 @@ pub enum Group {
     Provider,
     Day,
     Project,
+    /// The child agent that made the request; the main agent's are `main`.
+    Agent,
 }
 
 impl Group {
@@ -37,26 +39,43 @@ impl Group {
             Group::Provider => "provider",
             Group::Day => "day",
             Group::Project => "project",
+            Group::Agent => "agent",
         }
     }
 
-    /// Reads `model`, `provider`, `day` or `project`.
+    /// Reads `model`, `provider`, `day`, `project` or `agent`.
     pub fn parse(text: &str) -> Option<Group> {
         match text {
             "model" => Some(Group::Model),
             "provider" => Some(Group::Provider),
             "day" => Some(Group::Day),
             "project" => Some(Group::Project),
+            "agent" => Some(Group::Agent),
             _ => None,
         }
     }
 
+    /// What a row is named: for a child agent its id, its label and a short form of its
+    /// session, so two sessions' `a1` are told apart.
     fn column(self) -> &'static str {
         match self {
             Group::Model => "model",
             Group::Provider => "provider",
             Group::Day => "day",
             Group::Project => "project",
+            Group::Agent => {
+                "COALESCE(agent || CASE WHEN label IS NULL OR label = '' THEN '' \
+                 ELSE ' (' || label || ')' END || ' ' || substr(session, -8), 'main')"
+            }
+        }
+    }
+
+    /// What rows are grouped on: what `column` shows is not always all of it (a child agent is
+    /// its id and its own session, whatever its label).
+    fn grouping(self) -> &'static str {
+        match self {
+            Group::Agent => "COALESCE(agent || ' ' || session, 'main')",
+            other => other.column(),
         }
     }
 }
@@ -279,6 +298,7 @@ impl Store {
     /// The report for `query`, from what the cache holds (call [`sync`](Self::sync) first).
     pub fn report(&self, query: &Query) -> Result<Report> {
         let column = query.by.column();
+        let grouping = query.by.grouping();
         let sql = format!(
             "SELECT {column},
                 COUNT(*),
@@ -290,7 +310,7 @@ impl Store {
                 SUM(CASE WHEN list IS NULL THEN 1 ELSE 0 END)
              FROM requests
              WHERE (?1 IS NULL OR day >= ?1) AND (?2 IS NULL OR day <= ?2)
-             GROUP BY {column} ORDER BY {column}"
+             GROUP BY {grouping} ORDER BY {column}"
         );
         let mut stmt = self.db.prepare(&sql)?;
         let rows = stmt.query_map(params![query.since, query.until], |r| {
@@ -370,10 +390,10 @@ impl Store {
         })
     }
 
-    /// What `session` has been billed, in USD: API-key requests only; an unpriced request cannot
-    /// be counted.
+    /// What `session` has been billed, in USD, the requests of the child agents it spawned
+    /// included: API-key requests only; an unpriced request cannot be counted.
     pub fn session_spent(&self, session: &str) -> Result<f64> {
-        self.spent("session = ?1", session)
+        self.spent("(session = ?1 OR parent = ?1)", session)
     }
 
     /// What was billed on the UTC day `day` (`YYYY-MM-DD`).
@@ -483,10 +503,12 @@ fn open_db(path: &std::path::Path) -> std::result::Result<Connection, OpenError>
                  cache_write INTEGER NOT NULL, cache_write_1h INTEGER NOT NULL,
                  output INTEGER NOT NULL, reasoning INTEGER NOT NULL,
                  billed REAL, list REAL, price TEXT, ms INTEGER NOT NULL,
-                 outcome TEXT NOT NULL, window TEXT
+                 outcome TEXT NOT NULL, window TEXT,
+                 agent TEXT, parent TEXT, label TEXT
              );
              CREATE INDEX requests_day ON requests (day);
              CREATE INDEX requests_session ON requests (session);
+             CREATE INDEX requests_parent ON requests (parent);
              CREATE TABLE files (name TEXT PRIMARY KEY, offset INTEGER NOT NULL);",
             )?;
             tx.pragma_update(None, "user_version", SCHEMA)?;
@@ -510,8 +532,8 @@ fn insert(tx: &rusqlite::Transaction<'_>, file: &str, r: &LedgerRecord) -> Resul
     tx.execute(
         "INSERT INTO requests (file, t, day, session, project, role, model, provider, account,
             input, cache_read, cache_write, cache_write_1h, output, reasoning,
-            billed, list, price, ms, outcome, window)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            billed, list, price, ms, outcome, window, agent, parent, label)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             file,
             r.t as i64,
@@ -534,6 +556,9 @@ fn insert(tx: &rusqlite::Transaction<'_>, file: &str, r: &LedgerRecord) -> Resul
             r.ms as i64,
             r.outcome,
             r.window,
+            r.agent,
+            r.parent,
+            r.label,
         ],
     )?;
     Ok(())

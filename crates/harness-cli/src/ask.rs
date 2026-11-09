@@ -8,6 +8,7 @@ use std::{
 use harness_config::config;
 use harness_core::{
     agent::NonInteractive,
+    agents::{AgentEnvelope, AgentId},
     event::{AgentEvent, TurnEndReason},
     permission::Mode,
     redact::{EventRedactor, Redactor},
@@ -31,12 +32,58 @@ pub async fn run(
     prompt_text: String,
     json: bool,
     debug: bool,
+    yes_full_access: bool,
+) -> u8 {
+    // The signal that stopped the run, as the exit code a shell reports for it: 0 while none
+    // has. A run that ended because of it exits with that code instead of 130.
+    let signalled = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let code = run_until_signalled(
+        model_flag,
+        mode_flag,
+        session,
+        prompt_text,
+        json,
+        debug,
+        yes_full_access,
+        signalled.clone(),
+    )
+    .await;
+    match signalled.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => code,
+        signal if code == 130 => signal,
+        _ => code,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_until_signalled(
+    model_flag: Option<String>,
+    mode_flag: Option<Mode>,
+    session: crate::sessions::Choice,
+    prompt_text: String,
+    json: bool,
+    debug: bool,
+    yes_full_access: bool,
+    signalled: Arc<std::sync::atomic::AtomicU8>,
 ) -> u8 {
     // Registered as the very first thing this function does (a plain synchronous call, not an
     // awaited future): once it returns, the OS delivers SIGINT to tokio's signal driver instead of
     // the default disposition, even before the `sigint.recv()` task below gets its first poll.
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("failed to install a SIGINT handler");
+    // SIGTERM and SIGHUP stop the run like Ctrl+C does: the program a delegated model runs in
+    // lives in a process group of its own, so nothing else would stop it (or what it started)
+    // when harness is stopped. A hangup that harness was started ignoring (`nohup`) stays so.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to install a SIGTERM handler");
+    let mut sighup = if crate::interactive::ignored(nix::libc::SIGHUP) {
+        None
+    } else {
+        Some(
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("failed to install a SIGHUP handler"),
+        )
+    };
     let setup = match setup::load() {
         Ok(setup) => Arc::new(setup),
         Err(message) => {
@@ -91,17 +138,52 @@ pub async fn run(
         }
     };
 
-    // Ctrl+C must be honoured from here on: the piped-stdin wait below can block for seconds (the
+    // Ctrl+C must be honoured from here on (also while the program of a delegated model is
+    // looked for, which can take seconds): the piped-stdin wait below can block for seconds (the
     // first-data timeout) or indefinitely (the unbounded read-to-EOF phase once data has started
     // arriving but the pipe never closes, e.g. `tail -f | harness ask ...`). So the cancellation
     // token and its SIGINT listener are wired up before that wait, not after it.
     let cancel = CancellationToken::new();
     let on_ctrl_c = cancel.clone();
     tokio::spawn(async move {
-        if sigint.recv().await.is_some() {
+        let hangup = async {
+            match sighup.as_mut() {
+                Some(hangup) => hangup.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let code = tokio::select! {
+            got = sigint.recv() => got.map(|()| 130),
+            got = sigterm.recv() => got.map(|()| 143),
+            got = hangup => got.map(|()| 129),
+        };
+        if let Some(code) = code {
+            if code != 130 {
+                signalled.store(code, std::sync::atomic::Ordering::SeqCst);
+            }
             on_ctrl_c.cancel();
         }
     });
+
+    let found = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return exit_code(TurnEndReason::Interrupted, false),
+        found = crate::delegate::ready(&setup, &resolved.id) => found,
+    };
+    if let Err(why) = found {
+        eprintln!("error: {}", terminal_safe(&why));
+        return 2;
+    }
+    // Nobody can be asked here: a Claude Code model whose subscription question is unanswered
+    // and that has no API key is refused like a hosted model with no key, before any turn.
+    if let Some(why) = resolved
+        .provider
+        .delegated()
+        .and_then(|program| program.unusable_unasked())
+    {
+        eprintln!("error: {}", terminal_safe(&why));
+        return 2;
+    }
 
     // Only read (and potentially block on) stdin once we know we're actually going to run: a
     // missing model must exit 2 promptly even if a pipe into stdin is still open.
@@ -130,12 +212,7 @@ pub async fn run(
     } else {
         None
     };
-    let Some(Started {
-        mut agent,
-        sandbox_session,
-        policy,
-        ..
-    }) = start::start(
+    let Some(started) = start::start(
         Request {
             setup: &setup,
             mode,
@@ -152,6 +229,27 @@ pub async fn run(
     else {
         return exit_code(TurnEndReason::Interrupted, false);
     };
+    // The main agent's events, and those of any child a supervisor runs, reach the renderer in
+    // one stream of envelopes.
+    let (tx, rx) = mpsc::unbounded_channel();
+    let rx = with_credential_warnings(rx, setup.credentials.clone());
+    let (envelopes, rx) = wrap_main(rx);
+    started.children_headless();
+    if yes_full_access {
+        started.confirm_children_full_access();
+    }
+    let supervisor = started.supervisor(envelopes.clone(), cancel.clone());
+    let spawn = started.spawn_tool(&supervisor, true);
+    let Started {
+        agent,
+        sandbox_session,
+        policy,
+        ..
+    } = started;
+    let mut agent = start::with_supervisor(agent, &supervisor, spawn);
+    if yes_full_access {
+        agent.confirm_full_access();
+    }
     // `with_piped_stdin` returns the prompt with any piped text appended.
     let turn = crate::slash::turn_input(
         &typed,
@@ -163,8 +261,6 @@ pub async fn run(
     crate::slash::print_messages(&turn.messages, &mut notices);
     let turn = turn.input;
 
-    let (tx, rx) = mpsc::unbounded_channel();
-    let rx = with_credential_warnings(rx, setup.credentials.clone());
     let renderer = tokio::spawn(render(
         rx,
         json,
@@ -175,6 +271,10 @@ pub async fn run(
     ));
     let reason = agent.run_turn(turn, &tx, cancel).await;
     drop(tx);
+    // Children still running end with the run, and the renderer ends once they have.
+    supervisor.stop_all();
+    drop(supervisor);
+    drop(envelopes);
     let (final_text, blocked) = renderer.await.unwrap_or_default();
     if !json && !final_text.is_empty() {
         // A closed stdout pipe must not panic (and so must not lose `blocked`/the exit code). The
@@ -187,6 +287,8 @@ pub async fn run(
             terminal_safe_text(&final_text)
         );
     }
+    // The children that ended with the run are recorded in the session.
+    agent.end_session().await;
     agent.close().await;
     end_run(agent, sandbox_session);
     exit_code(reason, blocked)
@@ -315,6 +417,25 @@ async fn with_piped_stdin(
     }
 }
 
+/// Wraps the main agent's events as envelopes, in a stream children's envelopes can join through
+/// the returned sender. The stream ends when both the main agent's events and every clone of the
+/// sender are gone.
+fn wrap_main(
+    mut events: mpsc::UnboundedReceiver<AgentEvent>,
+) -> (
+    mpsc::UnboundedSender<AgentEnvelope>,
+    mpsc::UnboundedReceiver<AgentEnvelope>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let out = tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let _ = out.send(AgentEnvelope::main(event));
+        }
+    });
+    (tx, rx)
+}
+
 /// How often what the credential store warns about is looked for while no event comes.
 const CREDENTIAL_WARNINGS_EVERY: Duration = Duration::from_millis(250);
 
@@ -382,7 +503,7 @@ fn open_log(
 /// `stdout_broken` and cancels the run so it stops promptly, but keeps draining events (so `blocked`
 /// is still tracked correctly) until the channel closes.
 async fn render(
-    mut rx: mpsc::UnboundedReceiver<AgentEvent>,
+    mut rx: mpsc::UnboundedReceiver<AgentEnvelope>,
     json: bool,
     cancel: CancellationToken,
     redactor: Arc<Redactor>,
@@ -398,7 +519,9 @@ async fn render(
             );
         }
     }
-    let mut events = EventRedactor::new(redactor.clone());
+    // One redactor for each agent: streamed text of agents that run at once does not mix.
+    let mut redactors: std::collections::HashMap<Option<AgentId>, EventRedactor> =
+        std::collections::HashMap::new();
     let mut shown = Shown {
         json,
         cancel,
@@ -409,13 +532,19 @@ async fn render(
         writes: std::collections::HashMap::new(),
         stdout_broken: false,
     };
-    while let Some(event) = rx.recv().await {
-        for event in events.push(event) {
-            shown.show(event);
+    while let Some(envelope) = rx.recv().await {
+        let AgentEnvelope { agent, event } = envelope;
+        let redactor = redactors
+            .entry(agent.clone())
+            .or_insert_with(|| EventRedactor::new(shown.redactor.clone()));
+        for event in redactor.push(event) {
+            shown.show(&agent, event);
         }
     }
-    for event in events.finish() {
-        shown.show(event);
+    for (agent, mut redactor) in redactors {
+        for event in redactor.finish() {
+            shown.show(&agent, event);
+        }
     }
     (shown.last_text, shown.blocked)
 }
@@ -434,16 +563,58 @@ struct Shown {
 }
 
 impl Shown {
-    /// Shows `event`, already redacted: as a line of NDJSON and of the log, or on the terminal.
-    fn show(&mut self, event: AgentEvent) {
+    /// Shows `event` of `agent` (`None`: the main agent), already redacted: as a line of NDJSON
+    /// and of the log, or on the terminal. Only the main agent's events decide the answer and the
+    /// exit code: a child's blocked action fails the child, and its parent hears of it.
+    fn show(&mut self, agent: &Option<AgentId>, event: AgentEvent) {
         let json = self.json;
-        let line = serde_json::to_string(&event).expect("events serialize");
+        let envelope = AgentEnvelope {
+            agent: agent.clone(),
+            event,
+        };
+        let line = serde_json::to_string(&envelope).expect("events serialize");
+        let AgentEnvelope { event, .. } = envelope;
         if let Some(file) = self.log.as_mut() {
             let _ = writeln!(file, "{line}");
         }
         if json && !self.stdout_broken && writeln!(std::io::stdout().lock(), "{line}").is_err() {
             self.stdout_broken = true;
             self.cancel.cancel();
+        }
+        if let Some(agent) = agent {
+            if !json {
+                match &event {
+                    AgentEvent::AgentStarted { label, model } if model.is_empty() => {
+                        eprintln!("agent {agent} ({}) never started", terminal_safe(label));
+                    }
+                    AgentEvent::AgentStarted { label, model } => eprintln!(
+                        "agent {agent} ({}) started on {}",
+                        terminal_safe(label),
+                        terminal_safe(model)
+                    ),
+                    // Why a child failed, for a run that is not `--json` (the parent is told as
+                    // well, as the result of its call).
+                    AgentEvent::Error { message, .. } => eprintln!(
+                        "agent {agent} error: {}",
+                        terminal_safe(message.lines().next().unwrap_or_default())
+                    ),
+                    AgentEvent::ActionBlocked { reason, .. } => eprintln!(
+                        "agent {agent} blocked: {}",
+                        terminal_safe(reason.lines().next().unwrap_or_default())
+                    ),
+                    AgentEvent::AgentFinished { status, branch, .. } => {
+                        eprintln!("agent {agent} {}", status.as_str());
+                        if let Some(branch) = branch {
+                            eprintln!(
+                                "agent {agent} left its changes on the branch {} (not applied: review it with git, or in an interactive session)",
+                                terminal_safe(branch)
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return;
         }
         match &event {
             AgentEvent::AssistantMessage { content, .. } if !content.is_empty() => {
@@ -639,6 +810,62 @@ mod tests {
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&state.path().join("logs")), 0o700);
         assert_eq!(mode(&path), 0o600);
+    }
+
+    async fn rendered(envelopes: Vec<AgentEnvelope>) -> (String, bool) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for envelope in envelopes {
+            tx.send(envelope).unwrap();
+        }
+        drop(tx);
+        render(
+            rx,
+            false,
+            CancellationToken::new(),
+            Arc::new(Redactor::default()),
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    fn assistant(content: &str) -> AgentEvent {
+        AgentEvent::AssistantMessage {
+            content: content.into(),
+            model: "m/x".into(),
+            role: harness_core::role::Role::Main,
+            switch_reason: None,
+        }
+    }
+
+    // M3a: a child's events do not decide the answer or the exit code.
+    #[tokio::test]
+    async fn a_childs_blocked_action_and_text_do_not_change_the_mains_result() {
+        let child = AgentId("a1".into());
+        let (text, blocked) = rendered(vec![
+            AgentEnvelope::main(assistant("main answer")),
+            AgentEnvelope::child(&child, assistant("child answer")),
+            AgentEnvelope::child(
+                &child,
+                AgentEvent::ActionBlocked {
+                    id: "c".into(),
+                    reason: "needs approval".into(),
+                },
+            ),
+        ])
+        .await;
+        assert_eq!(text, "main answer");
+        assert!(!blocked, "exit 3 is for the main agent's blocked actions");
+    }
+
+    #[tokio::test]
+    async fn the_mains_blocked_action_still_counts() {
+        let (_, blocked) = rendered(vec![AgentEnvelope::main(AgentEvent::ActionBlocked {
+            id: "c".into(),
+            reason: "r".into(),
+        })])
+        .await;
+        assert!(blocked);
     }
 
     #[test]

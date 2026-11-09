@@ -309,6 +309,124 @@ pub struct OutcomeSettings {
     pub enabled: Option<bool>,
 }
 
+/// `[agents]`: how many agents run at once, and how deep and how many they spawn (global config
+/// only: a project cannot make harness spend more). A limit that is not set has its default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsSettings {
+    /// At once on one local server (default 1).
+    pub per_local: Option<u32>,
+    /// At once on one hosted provider (default 3).
+    pub per_hosted: Option<u32>,
+    /// At once in one agent program, Claude Code and Codex each (default 2).
+    pub per_delegated: Option<u32>,
+    /// At once in all (default 4).
+    pub max_total: Option<u32>,
+    /// How deep agents may spawn agents (default 1: a subagent spawns none).
+    pub max_depth: Option<u32>,
+    /// Spawns in one turn (default 10).
+    pub max_spawns_per_turn: Option<u32>,
+    /// Whether the model is offered the tool that starts subagents (default true). A project
+    /// may set it to false, never to true.
+    pub spawn: Option<bool>,
+}
+
+impl AgentsSettings {
+    fn problem(&self) -> Option<String> {
+        [
+            ("per_local", self.per_local),
+            ("per_hosted", self.per_hosted),
+            ("per_delegated", self.per_delegated),
+            ("max_total", self.max_total),
+            ("max_depth", self.max_depth),
+            ("max_spawns_per_turn", self.max_spawns_per_turn),
+        ]
+        .into_iter()
+        .find_map(|(name, value)| {
+            (value == Some(0)).then(|| format!("agents.{name} must be a number above 0"))
+        })
+    }
+}
+
+/// `[delegate]`: how `claude-code/*` and `codex/*` models run (global config only: a project must
+/// not opt the user in to using their subscription, or accept an untested version).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateSettings {
+    /// Run a program whose version is outside the range harness was tested with.
+    pub allow_untested: Option<bool>,
+    #[serde(default)]
+    pub claude: ClaudeDelegateSettings,
+}
+
+/// `[delegate.claude]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeDelegateSettings {
+    /// `true`: `claude-code/*` models run on the user's Claude subscription through the `claude`
+    /// program they signed in to. `false`: they use the Anthropic API key. Not set: asked the
+    /// first time one is used (the answer is kept by harness, not in this file).
+    pub use_subscription: Option<bool>,
+}
+
+/// The effective `[delegate]` settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Delegate {
+    pub allow_untested: bool,
+    pub claude_subscription: Option<bool>,
+}
+
+impl From<&DelegateSettings> for Delegate {
+    fn from(s: &DelegateSettings) -> Self {
+        Delegate {
+            allow_untested: s.allow_untested.unwrap_or(false),
+            claude_subscription: s.claude.use_subscription,
+        }
+    }
+}
+
+/// The effective `[agents]` limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Agents {
+    pub per_local: u32,
+    pub per_hosted: u32,
+    pub per_delegated: u32,
+    pub max_total: u32,
+    pub max_depth: u32,
+    pub max_spawns_per_turn: u32,
+    /// Whether the main agent has the tool that starts subagents.
+    pub spawn: bool,
+}
+
+impl Default for Agents {
+    fn default() -> Self {
+        Agents {
+            per_local: 1,
+            per_hosted: 3,
+            per_delegated: 2,
+            max_total: 4,
+            max_depth: 1,
+            max_spawns_per_turn: 10,
+            spawn: true,
+        }
+    }
+}
+
+impl From<&AgentsSettings> for Agents {
+    fn from(s: &AgentsSettings) -> Self {
+        let d = Agents::default();
+        Agents {
+            per_local: s.per_local.unwrap_or(d.per_local),
+            per_hosted: s.per_hosted.unwrap_or(d.per_hosted),
+            per_delegated: s.per_delegated.unwrap_or(d.per_delegated),
+            max_total: s.max_total.unwrap_or(d.max_total),
+            max_depth: s.max_depth.unwrap_or(d.max_depth),
+            max_spawns_per_turn: s.max_spawns_per_turn.unwrap_or(d.max_spawns_per_turn),
+            spawn: s.spawn.unwrap_or(d.spawn),
+        }
+    }
+}
+
 /// `[budgets]`: money limits on billed cost, in USD. A budget that is not set has no limit.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -760,6 +878,10 @@ pub struct ConfigFile {
     pub fallback: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub escalation: EscalationSettings,
+    #[serde(default)]
+    pub agents: AgentsSettings,
+    #[serde(default)]
+    pub delegate: DelegateSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -812,6 +934,10 @@ pub struct Config {
     pub fallback: BTreeMap<String, Vec<String>>,
     /// The model `/escalate` switches to, when set: the global config's, or a trusted project's.
     pub escalation_to: Option<String>,
+    /// `[agents]` (global config only).
+    pub agents: Agents,
+    /// `[delegate]` (global config only).
+    pub delegate: Delegate,
     /// Whether the user trusted this workspace with its project settings as they are now
     /// (`harness trust`), so that their widening settings apply. A workspace with no such
     /// settings can be trusted too. A project command file's `model` applies only then.
@@ -1087,6 +1213,7 @@ pub fn load(
             .or_else(|| g.roles.problem())
             .or_else(|| fallback_problem(&g.fallback))
             .or_else(|| g.escalation.problem())
+            .or_else(|| g.agents.problem())
     }) {
         return Err(ConfigError::Parse {
             path: global_file.to_path_buf(),
@@ -1117,6 +1244,15 @@ pub fn load(
         roles = global.roles;
         cfg.fallback = global.fallback;
         cfg.escalation_to = global.escalation.to;
+        cfg.agents = Agents::from(&global.agents);
+        if cfg.agents.max_depth > 1 {
+            cfg.warnings.push(format!(
+                "{}: agents.max_depth = {} has no effect: a subagent never starts subagents, so nesting is one level deep",
+                global_file.display(),
+                cfg.agents.max_depth
+            ));
+        }
+        cfg.delegate = Delegate::from(&global.delegate);
         cfg.lsp.overlaid(&global.lsp, true);
     }
     let path = project_file(workspace);
@@ -1160,6 +1296,31 @@ pub fn load(
         if project.outcomes != OutcomeSettings::default() {
             cfg.warnings.push(format!(
                 "{}: ignoring [outcomes]: it is read from the global config only",
+                path.display()
+            ));
+        }
+        // The one thing a project may do here is turn the tool off: that spends nothing.
+        let project_agents = AgentsSettings {
+            spawn: None,
+            ..project.agents.clone()
+        };
+        if project_agents != AgentsSettings::default() {
+            cfg.warnings.push(format!(
+                "{}: ignoring [agents]: it is read from the global config only (except `spawn = false`)",
+                path.display()
+            ));
+        }
+        match project.agents.spawn {
+            Some(false) => cfg.agents.spawn = false,
+            Some(true) => cfg.warnings.push(format!(
+                "{}: ignoring agents.spawn = true: a project can turn subagents off, not on",
+                path.display()
+            )),
+            None => {}
+        }
+        if project.delegate != DelegateSettings::default() {
+            cfg.warnings.push(format!(
+                "{}: ignoring [delegate]: it is read from the global config only, so a cloned repository cannot opt you in to using your subscription",
                 path.display()
             ));
         }

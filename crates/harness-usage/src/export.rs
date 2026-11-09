@@ -34,7 +34,7 @@ impl Format {
     }
 }
 
-const CSV_HEADER: &str = "t,time,session,project,role,model,account,input,cache_read,cache_write,cache_write_1h,output,reasoning,billed_usd,list_usd,price,ms,outcome,window";
+const CSV_HEADER: &str = "t,time,session,project,role,model,account,input,cache_read,cache_write,cache_write_1h,output,reasoning,billed_usd,list_usd,price,ms,outcome,window,agent,parent,label";
 
 /// A CSV cell: quoted when it holds a comma, a quote or a line break.
 fn cell(text: &str) -> String {
@@ -70,6 +70,9 @@ fn csv_row(r: &LedgerRecord) -> String {
         r.ms.to_string(),
         cell(&r.outcome),
         cell(r.window.as_deref().unwrap_or_default()),
+        cell(r.agent.as_deref().unwrap_or_default()),
+        cell(r.parent.as_deref().unwrap_or_default()),
+        cell(r.label.as_deref().unwrap_or_default()),
     ];
     cells.join(",")
 }

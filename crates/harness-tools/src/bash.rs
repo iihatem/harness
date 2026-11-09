@@ -147,6 +147,7 @@ async fn run_command(
 ) -> ToolOutput {
     let mut child = match cmd
         .current_dir(&ctx.workspace)
+        .envs(ctx.env.iter().map(|(k, v)| (k, v)))
         .env_remove("BASH_ENV")
         .env_remove("ENV")
         .stdin(Stdio::null())

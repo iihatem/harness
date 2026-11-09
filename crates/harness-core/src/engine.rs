@@ -64,7 +64,7 @@ pub struct PermissionEngine {
     /// change it with the mode.
     sandbox_available: AtomicBool,
     /// Why shell commands have no sandbox, said when asking about one.
-    unsandboxed: String,
+    unsandboxed: Mutex<String>,
     writes_need_approval: bool,
     /// Where `<workspace>/.git` sends git when it is a symlink or a `gitdir:` file, resolved.
     /// Writes under it are guarded like writes under `.git`.
@@ -300,7 +300,7 @@ impl PermissionEngine {
             deny_paths,
             confirm_paths,
             sandbox_available: AtomicBool::new(config.sandbox_available),
-            unsandboxed: "no sandbox is available on this system".into(),
+            unsandboxed: Mutex::new("no sandbox is available on this system".into()),
             writes_need_approval: config.writes_need_approval,
             session_bash: Mutex::new(Vec::new()),
             session_paths: Mutex::new(HashSet::new()),
@@ -310,9 +310,13 @@ impl PermissionEngine {
 
     /// Says why shell commands have no sandbox, in the reason for asking about each one, when
     /// it is not that the system has none: the workspace is too broad, say.
-    pub fn with_unsandboxed_reason(mut self, why: impl Into<String>) -> Self {
-        self.unsandboxed = format!("no sandbox: {}", why.into());
+    pub fn with_unsandboxed_reason(self, why: impl Into<String>) -> Self {
+        self.set_unsandboxed_reason(&why.into());
         self
+    }
+
+    fn set_unsandboxed_reason(&self, why: &str) {
+        *self.unsandboxed.lock().expect("reason lock") = format!("no sandbox: {why}");
     }
 
     pub fn mode(&self) -> Mode {
@@ -576,7 +580,8 @@ impl PermissionEngine {
                 )
             }
             _ if !self.sandboxed() => {
-                Decision::Ask(format!("run `{}` ({})", short(command), self.unsandboxed))
+                let why = self.unsandboxed.lock().expect("reason lock").clone();
+                Decision::Ask(format!("run `{}` ({why})", short(command)))
             }
             Verdict::Ask { reason, .. } => Decision::Ask(reason),
             Verdict::Allow => Decision::Allow,
@@ -584,6 +589,32 @@ impl PermissionEngine {
                 Decision::Ask(format!("run `{}`", short(command)))
             }
             Verdict::Unlisted => Decision::Allow,
+        }
+    }
+
+    /// [`check_bash`](Self::check_bash) for a command that runs outside harness's sandbox (a
+    /// delegated program's): the sandbox never makes an unlisted command safe, so it asks unless
+    /// an allow rule (config, turn or session) covers it, and plan and read-only mode refuse it.
+    fn check_bash_unsandboxed(&self, command: &str, mode: Mode) -> Decision {
+        let rules = self.bash_rules();
+        match harness_shell::evaluate(command, &rules, &self.workspace) {
+            Verdict::Deny { reason } => Decision::Deny(reason),
+            Verdict::Ask {
+                reason,
+                may_deny: true,
+                ..
+            } if mode == Mode::FullAccess => Decision::Ask(reason),
+            _ if mode == Mode::FullAccess => Decision::Allow,
+            _ if matches!(mode, Mode::Plan | Mode::ReadOnly) => Decision::Deny(
+                "shell commands of a delegated program are not sandboxed by harness, so they are not allowed in plan and read-only mode"
+                    .into(),
+            ),
+            Verdict::Ask { reason, .. } => Decision::Ask(reason),
+            Verdict::Allow => Decision::Allow,
+            Verdict::Unlisted => Decision::Ask(format!(
+                "run `{}` (harness cannot sandbox a delegated program's commands)",
+                short(command)
+            )),
         }
     }
 
@@ -707,6 +738,14 @@ impl PermissionPolicy for PermissionEngine {
         }
     }
 
+    fn check_unsandboxed(&self, action: &Action) -> Decision {
+        let mode = self.mode();
+        match action {
+            Action::Bash(command) => self.check_bash_unsandboxed(command, mode),
+            other => self.check(other),
+        }
+    }
+
     fn remember(&self, action: &Action) -> bool {
         let mode = self.mode();
         match action {
@@ -731,6 +770,10 @@ impl PermissionPolicy for PermissionEngine {
 
     fn set_sandbox_available(&self, available: bool) {
         self.sandbox_available.store(available, Ordering::SeqCst);
+    }
+
+    fn set_unsandboxed_reason(&self, why: &str) {
+        PermissionEngine::set_unsandboxed_reason(self, why);
     }
 
     fn mode(&self) -> Option<Mode> {

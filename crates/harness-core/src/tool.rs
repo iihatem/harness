@@ -109,6 +109,12 @@ pub struct ToolContext {
     pub access: FsAccess,
     /// Set by the agent for a user-approved re-run outside the sandbox.
     pub unsandboxed: bool,
+    /// Which of its user turns the agent is in: the same for every call of a turn, different
+    /// for each turn (a tool that limits what one turn may do counts by it). 0 outside a turn.
+    pub turn: u64,
+    /// Variables every shell command of this agent gets besides harness's own environment: in a
+    /// worktree, who the agent is and its port offset.
+    pub env: Vec<(String, String)>,
 }
 
 impl ToolContext {
@@ -122,7 +128,15 @@ impl ToolContext {
             sandbox: None,
             access: FsAccess::WorkspaceWrite,
             unsandboxed: false,
+            turn: 0,
+            env: Vec::new(),
         }
+    }
+
+    /// `self` whose shell commands also get `env`.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
+        self
     }
 
     /// Resolves a path argument against the workspace, following symlinks.
@@ -156,6 +170,12 @@ pub trait Tool: Send + Sync {
     /// (verification gates, language-server diagnostics). Tools that change no file return none.
     fn changed_paths(&self, _args: &Value, _ctx: &ToolContext) -> Vec<PathBuf> {
         Vec::new()
+    }
+    /// Whether running this call may change the workspace through something other than its own
+    /// action (a tool that starts agents which edit the checkout it works in): the turn's
+    /// checkpoint is taken before it runs, so a rewind restores what they changed.
+    fn changes_workspace(&self, _args: &Value) -> bool {
+        false
     }
 }
 
@@ -270,5 +290,19 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.iter().find(|t| t.spec().name == name).cloned()
+    }
+
+    /// These tools and `tool` after them; unchanged when one of that name is there already.
+    pub fn with(mut self, tool: Arc<dyn Tool>) -> Self {
+        if self.get(&tool.spec().name).is_none() {
+            self.tools.push(tool);
+        }
+        self
+    }
+
+    /// These tools without the ones named `names`.
+    pub fn without(mut self, names: &[String]) -> Self {
+        self.tools.retain(|t| !names.contains(&t.spec().name));
+        self
     }
 }

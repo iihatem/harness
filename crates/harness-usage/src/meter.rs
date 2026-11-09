@@ -8,8 +8,8 @@ use std::{
 use harness_core::{
     message::Buckets,
     meter::{
-        AccountKind, Avoided, BudgetKind, BudgetNotice, BudgetStatus, Meter, RequestCost,
-        RequestRecord, TurnRecord, WindowSnapshot,
+        AccountKind, AgentScope, Avoided, BudgetKind, BudgetNotice, BudgetStatus, Meter,
+        RequestCost, RequestDetail, RequestRecord, TurnRecord, WindowSnapshot,
     },
     time::civil_date,
     time::now_unix,
@@ -49,6 +49,19 @@ pub fn avoided_for(pricing: &Pricing, baseline: &str, buckets: &Buckets) -> Avoi
     }
 }
 
+/// The window snapshots: the one each agent's request in flight has seen (the main agent's under
+/// the empty key), and the last one written.
+#[derive(Default)]
+struct Windows {
+    seen: std::collections::HashMap<String, String>,
+    written: Option<String>,
+}
+
+/// The key of an agent in [`Windows`]: the main agent has none.
+fn agent_key(scope: Option<&AgentScope>) -> String {
+    scope.map_or_else(String::new, |s| format!("{}/{}", s.parent, s.agent))
+}
+
 /// Keeps the ledger.
 pub struct UsageMeter {
     ledger: Ledger,
@@ -65,9 +78,9 @@ pub struct UsageMeter {
     spent_here: Mutex<Vec<(u64, String, f64)>>,
     /// The budgets as configured, which `/new` and `/resume` return the session budget to.
     configured: Mutex<Budgets>,
-    /// The snapshot the request in flight has seen, to name in its record, and the last one
-    /// written, so a snapshot repeated by every response is written once.
-    window: Mutex<(Option<String>, Option<String>)>,
+    /// The snapshot each agent's request in flight has seen, to name in its record, and the last
+    /// one written, so a snapshot repeated by every response is written once.
+    window: Mutex<Windows>,
     dirs: Dirs,
     outcomes: OutcomeLog,
     /// Whether turns are written to the outcome log (`[outcomes] enabled`).
@@ -93,7 +106,7 @@ impl UsageMeter {
             warned_kinds: Mutex::new(Default::default()),
             spent_here: Mutex::new(Vec::new()),
             configured: Mutex::new(Budgets::default()),
-            window: Mutex::new((None, None)),
+            window: Mutex::new(Windows::default()),
             dirs: Dirs::under(data),
             outcomes: OutcomeLog::new(&Dirs::under(data).outcomes),
             outcomes_enabled: true,
@@ -256,23 +269,31 @@ impl UsageMeter {
         model: &str,
         account: AccountKind,
         buckets: &Buckets,
+        estimated_usd: Option<f64>,
     ) -> (RequestCost, Option<String>) {
         let none_sent = buckets.priced_total() == 0;
         let priced = self.pricing.price_of(model);
+        // A delegated program's own estimate stands in for the table's price: the program knows
+        // what its own requests were, and the table does not know its models.
+        let estimated = estimated_usd.filter(|usd| usd.is_finite() && *usd >= 0.0);
         let list = match account {
             AccountKind::Local => Some(0.0),
+            _ if estimated.is_some() => estimated,
             _ if none_sent => Some(0.0),
             _ => priced.as_ref().and_then(|(price, _)| price.cost(buckets)),
         };
         let billed = match account {
             AccountKind::ApiKey => list,
-            AccountKind::Subscription | AccountKind::Local => Some(0.0),
+            AccountKind::Subscription | AccountKind::Local | AccountKind::Delegated => Some(0.0),
         };
         let avoided = match (&self.baseline, account) {
-            (Some(_), AccountKind::ApiKey) | (None, _) => Avoided::NotApplicable,
+            // A delegated program's tokens are not what a baseline model would have billed.
+            (Some(_), AccountKind::ApiKey | AccountKind::Delegated) | (None, _) => {
+                Avoided::NotApplicable
+            }
             (Some(baseline), _) => avoided_for(&self.pricing, baseline, buckets),
         };
-        let source = (account != AccountKind::Local && !none_sent)
+        let source = (account != AccountKind::Local && !none_sent && estimated.is_none())
             .then(|| priced.map(|(_, source)| source.label()))
             .flatten();
         (
@@ -309,9 +330,46 @@ impl UsageMeter {
 
 impl Meter for UsageMeter {
     fn record_request(&self, request: &RequestRecord) -> RequestCost {
-        let account = AccountKind::of(&request.model, request.local);
+        self.record_request_as(request, None)
+    }
+
+    fn record_turn_as(&self, turn: &TurnRecord, scope: Option<&AgentScope>) {
+        if !self.outcomes_enabled {
+            return;
+        }
+        let mut record = OutcomeRecord::of(turn, &self.project);
+        record.agent = scope.map(|s| s.agent.clone());
+        record.parent = scope.map(|s| s.parent.clone());
+        if let Err(e) = self.outcomes.append(&record) {
+            self.warn(
+                "outcomes",
+                format!(
+                    "cannot write the outcome log in {}: {e}",
+                    self.dirs.outcomes.display()
+                ),
+            );
+        }
+    }
+
+    fn record_request_as(
+        &self,
+        request: &RequestRecord,
+        scope: Option<&AgentScope>,
+    ) -> RequestCost {
+        self.record_request_detailed(request, scope, &RequestDetail::default())
+    }
+
+    fn record_request_detailed(
+        &self,
+        request: &RequestRecord,
+        scope: Option<&AgentScope>,
+        detail: &RequestDetail,
+    ) -> RequestCost {
+        let account = detail
+            .account
+            .unwrap_or_else(|| AccountKind::of(&request.model, request.local));
         let buckets = request.usage.buckets();
-        let (cost, price) = self.cost_of(&request.model, account, &buckets);
+        let (cost, price) = self.cost_of(&request.model, account, &buckets, detail.estimated_usd);
         let record = LedgerRecord {
             v: VERSION,
             t: (self.clock)(),
@@ -335,14 +393,19 @@ impl Meter for UsageMeter {
                 .window
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .0
-                .take(),
+                .seen
+                .remove(&agent_key(scope)),
+            agent: scope.map(|s| s.agent.clone()),
+            parent: scope.map(|s| s.parent.clone()),
+            label: scope.map(|s| s.label.clone()),
         };
         if let Some(usd) = cost.billed_usd.filter(|usd| *usd > 0.0) {
+            // A child's spend is kept under the session that pays for it.
+            let paying = scope.map_or(record.session.clone(), |s| s.parent.clone());
             self.spent_here
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push((record.t, record.session.clone(), usd));
+                .push((record.t, paying, usd));
         }
         if let Err(e) = self.ledger.append(&record) {
             self.warn(
@@ -357,16 +420,21 @@ impl Meter for UsageMeter {
     }
 
     fn record_window(&self, snapshot: &WindowSnapshot) {
+        self.record_window_as(snapshot, None)
+    }
+
+    fn record_window_as(&self, snapshot: &WindowSnapshot, scope: Option<&AgentScope>) {
         let id = snapshot.id();
+        let key = agent_key(scope);
         let mut window = self.window.lock().unwrap_or_else(|e| e.into_inner());
-        if window.1.as_deref() == Some(id.as_str()) {
-            window.0 = Some(id);
+        if window.written.as_deref() == Some(id.as_str()) {
+            window.seen.insert(key, id);
             return;
         }
         match self.ledger.append_window(snapshot) {
             Ok(()) => {
-                window.0 = Some(id.clone());
-                window.1 = Some(id);
+                window.seen.insert(key, id.clone());
+                window.written = Some(id);
             }
             Err(e) => {
                 // Not written, so no record names it, and it is tried again when seen again.
@@ -383,19 +451,7 @@ impl Meter for UsageMeter {
     }
 
     fn record_turn(&self, turn: &TurnRecord) {
-        if !self.outcomes_enabled {
-            return;
-        }
-        let record = OutcomeRecord::of(turn, &self.project);
-        if let Err(e) = self.outcomes.append(&record) {
-            self.warn(
-                "outcomes",
-                format!(
-                    "cannot write the outcome log in {}: {e}",
-                    self.dirs.outcomes.display()
-                ),
-            );
-        }
+        self.record_turn_as(turn, None)
     }
 
     fn turns_rewound(&self, session: &str, turns: &[String]) {
@@ -414,6 +470,15 @@ impl Meter for UsageMeter {
     }
 
     fn check_budget(&self, session: &str, account: AccountKind) -> BudgetStatus {
+        self.check_budget_as(session, account, None)
+    }
+
+    fn check_budget_as(
+        &self,
+        session: &str,
+        account: AccountKind,
+        scope: Option<&AgentScope>,
+    ) -> BudgetStatus {
         let budgets = self.budgets();
         let mut status = BudgetStatus::default();
         // One read of the ledger for all the budgets that are set, and none when none is.
@@ -454,11 +519,13 @@ impl Meter for UsageMeter {
                     BudgetKind::Monthly => civil_date((self.clock)())[..7].to_string(),
                 };
                 let key = format!("{}:{period}:{limit}", kind.name());
-                if self
-                    .warned
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(key)
+                // A child leaves the warning for the main agent, whose events are shown.
+                if scope.is_none()
+                    && self
+                        .warned
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key)
                 {
                     status.warnings.push(notice);
                 }

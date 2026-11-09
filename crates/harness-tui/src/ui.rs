@@ -145,6 +145,8 @@ enum Background {
     Budget(Result<Vec<String>, String>),
     /// The window as the provider said it at the reset of a usage limit.
     ResumeCheck(Result<WindowSnapshot, String>),
+    /// What a review action came to.
+    Review(crate::review::Reviewed),
     /// What `/usage` asked for: the provider's windows (when it has any) and the ledger's report.
     Usage {
         windows: Option<Result<WindowSnapshot, String>>,
@@ -197,6 +199,26 @@ pub struct Ui<B: Backend> {
     background: mpsc::UnboundedReceiver<Background>,
     /// The provider the session's model runs on, asked where its usage windows stand.
     provider: Arc<dyn Provider>,
+    /// The supervisor of the session's child agents, and its changes, when it has one.
+    agents: Option<AgentsWatch>,
+}
+
+/// A supervisor the session shows the children of.
+struct AgentsWatch {
+    supervisor: Arc<harness_core::agents::Supervisor>,
+    changes: tokio::sync::watch::Receiver<u64>,
+    /// How many children had ended when the results of worktrees were last read.
+    ended: usize,
+}
+
+/// Resolves when the supervisor's children change; never when there is none.
+async fn agents_changed(watch: &mut Option<AgentsWatch>) {
+    if let Some(watch) = watch
+        && watch.changes.changed().await.is_ok()
+    {
+        return;
+    }
+    std::future::pending().await
 }
 
 impl<B> Ui<B>
@@ -303,6 +325,8 @@ where
                     done,
                 });
             }
+            // The session is over: the children that ended with it are recorded in it.
+            agent.end_session().await;
         });
         let ui = Ui {
             app,
@@ -324,6 +348,7 @@ where
             background_tx,
             background,
             provider,
+            agents: None,
         };
         // A subscription's windows are asked for once as the session starts, never on a timer.
         ui.poll_windows();
@@ -367,6 +392,85 @@ where
         self.draw()
     }
 
+    /// Shows the child agents `supervisor` runs, a line each above the input, as they change.
+    pub fn watch_agents(&mut self, supervisor: Arc<harness_core::agents::Supervisor>) {
+        let changes = supervisor.subscribe();
+        self.app.set_children(supervisor.snapshot());
+        self.agents = Some(AgentsWatch {
+            supervisor,
+            changes,
+            ended: 0,
+        });
+        self.refresh_results();
+    }
+
+    /// Reads what the worktrees hold again: the results waiting for review.
+    pub fn refresh_results(&mut self) {
+        let Some(worktrees) = self.agents.as_ref().and_then(|w| w.supervisor.worktrees()) else {
+            return;
+        };
+        self.app.set_results(worktrees.records());
+    }
+
+    /// Starts the `general` agent on `task` in the background, in a worktree of its own.
+    fn start_background(&mut self, task: &str) {
+        let Some(watch) = &self.agents else {
+            self.app.push_error("this session cannot start agents");
+            return;
+        };
+        if watch.supervisor.worktrees().is_none() {
+            self.app.push_error(
+                "a background agent works in a worktree, and that needs the project to be in a git repository with a commit: there is none",
+            );
+            return;
+        }
+        let Some(def) = self
+            .app
+            .agent_definitions()
+            .and_then(|definitions| definitions.get("general"))
+        else {
+            self.app.push_error("there is no `general` agent to run it");
+            return;
+        };
+        let mut spec = harness_core::agents::definition_spec(def, task);
+        spec.model = def.model.clone();
+        spec.isolation = true;
+        spec.background = true;
+        let handle = watch.supervisor.spawn(spec);
+        self.app.push_note(&format!(
+            "started {} ({}) in the background, in its own worktree and branch: /agents lists it, and /results looks at what it changed once it is done",
+            handle.tag.id, handle.tag.label
+        ));
+    }
+
+    /// Takes in a change of the children.
+    fn children_changed(&mut self) -> io::Result<Flow> {
+        let mut reread = false;
+        let mut notices = Vec::new();
+        if let Some(watch) = &mut self.agents {
+            let children = watch.supervisor.snapshot();
+            let ended = children.iter().filter(|c| c.status.is_final()).count();
+            reread = ended != watch.ended;
+            watch.ended = ended;
+            self.app.set_children(children);
+            // What the supervisor says the user should know (changes not committed that a
+            // worktree lacks, a copy that stopped), once each.
+            notices = watch.supervisor.take_notices();
+        }
+        for notice in notices {
+            self.show(AgentEvent::Warning { message: notice });
+        }
+        // An agent that ended has left a result, or removed its worktree.
+        if reread {
+            self.refresh_results();
+        }
+        // The user chose to wait for the agents, and the last has ended.
+        if self.app.quit_ready() {
+            return Ok(Flow::Quit);
+        }
+        self.draw_soon().map(|()| Flow::Continue)
+    }
+
     pub fn app(&self) -> &App {
         &self.app
     }
@@ -397,6 +501,8 @@ where
     pub fn draw(&mut self) -> io::Result<()> {
         self.drawn_at = Some(tokio::time::Instant::now());
         self.redraw = false;
+        // An approval whose agent was cancelled meanwhile has nobody waiting for its answer.
+        self.app.prune_prompts();
         self.notify();
         if let Some(picker) = self.app.picker() {
             // Finished lines wait for the inline screen.
@@ -576,9 +682,31 @@ where
                 }
                 Flow::Continue
             }
+            Action::Review(review) => {
+                let Some(worktrees) = self.agents.as_ref().and_then(|w| w.supervisor.worktrees())
+                else {
+                    self.app.review_done(crate::review::Reviewed::Failed(
+                        "there are no worktrees in this session".into(),
+                    ));
+                    return Ok(Flow::Continue);
+                };
+                let tx = self.background_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = tx.send(Background::Review(do_review(&worktrees, review)));
+                });
+                Flow::Continue
+            }
+            Action::Background(task) => {
+                self.start_background(&task);
+                Flow::Continue
+            }
             Action::Interrupt => {
                 if let Some(cancel) = &self.cancel {
                     cancel.cancel();
+                }
+                // Stopping the turn stops the agents it started.
+                if let Some(watch) = &self.agents {
+                    watch.supervisor.cancel_all();
                 }
                 Flow::Continue
             }
@@ -793,6 +921,10 @@ where
         let (points, can_undo) = update.rewind;
         self.app.set_rewind(points, can_undo);
         self.app.set_session_id(&update.session);
+        // Children spawned from now on belong to the session the agent is in.
+        if let Some(watch) = &self.agents {
+            watch.supervisor.set_parent_session(&update.session);
+        }
         if let Some(done) = update.done {
             self.app.on_done(done);
         }
@@ -900,6 +1032,10 @@ where
                 });
                 self.next_actions()?;
             }
+            Background::Review(done) => {
+                self.app.review_done(done);
+                self.refresh_results();
+            }
             Background::Budget(result) => self.app.on_budget(result),
             Background::ResumeCheck(result) => {
                 if let Some(action) = self.app.on_resume_check(result) {
@@ -931,6 +1067,7 @@ where
             Some(update) = self.updates.recv() => self.update(update),
             Some(done) = self.background.recv() => self.background(done),
             Some((request, reply)) = self.approvals.recv() => self.approval(request, reply).await,
+            _ = agents_changed(&mut self.agents) => self.children_changed(),
             _ = tokio::time::sleep_until(redraw_at), if redraw => {
                 self.draw().map(|()| Flow::Continue)
             }
@@ -1079,6 +1216,7 @@ where
                     None => self.approval(request, reply).await?,
                     Some(ending) => return Ok(ending),
                 },
+                _ = agents_changed(&mut self.agents) => self.children_changed()?,
                 // Drawn after the keys waiting.
                 _ = tokio::time::sleep_until(redraw_at), if redraw => match self.keys(None, input).await? {
                     None => self.draw().map(|()| Flow::Continue)?,
@@ -1099,6 +1237,16 @@ where
     /// as if the user had left) fails it, saying so.
     pub async fn finish(&mut self) -> io::Result<()> {
         self.app.deny_waiting();
+        // The session is over: background agents too (the user was asked).
+        if let Some(watch) = &self.agents {
+            watch.supervisor.stop_all();
+            // They commit what they changed and release their worktrees as they end: a moment
+            // is given for that, so what is left is settled, not found failed at the next start.
+            watch
+                .supervisor
+                .settled(std::time::Duration::from_secs(5))
+                .await;
+        }
         self.approvals.close();
         // Dropping a reply denies it.
         while self.approvals.try_recv().is_ok() {}
@@ -1127,6 +1275,65 @@ where
         let finished = self.app.transcript.take_finished();
         let written = self.term.insert(&finished).and_then(|()| self.term.clear());
         stopped.and(written)
+    }
+}
+
+/// Does what the user chose for a result, with git, off the session's tasks.
+fn do_review(
+    worktrees: &harness_core::worktree::Worktrees,
+    review: crate::review::Review,
+) -> crate::review::Reviewed {
+    use crate::review::{PATCH_BYTES, Review, Reviewed, Shown};
+    let record = |name: &str| worktrees.records().into_iter().find(|r| r.name == name);
+    match review {
+        Review::Show(name) => {
+            let Some(record) = record(&name) else {
+                return Reviewed::Failed(format!("{name} is no longer there"));
+            };
+            match worktrees.diff(&name, PATCH_BYTES) {
+                Ok(diff) => Reviewed::Shown(Box::new(Shown {
+                    overlaps: worktrees.overlaps(&name),
+                    record,
+                    diff,
+                })),
+                Err(e) => Reviewed::Failed(e.to_string()),
+            }
+        }
+        Review::Apply(name) => match worktrees.apply(&name) {
+            Ok(applied) => Reviewed::Applied(format!(
+                "applied {} to {} ({} file{}, commit {}); {}",
+                name,
+                applied.branch,
+                applied.files.len(),
+                if applied.files.len() == 1 { "" } else { "s" },
+                &applied.commit[..applied.commit.len().min(10)],
+                applied
+                    .note
+                    .as_deref()
+                    .unwrap_or("its worktree and branch are removed"),
+            )),
+            Err(e) => Reviewed::Failed(e.to_string()),
+        },
+        Review::Keep(name) => {
+            let branch = record(&name).map(|r| r.branch);
+            match worktrees.keep(&name) {
+                Ok(()) => Reviewed::Kept(format!(
+                    "kept the branch {}: its worktree is removed, and the branch is yours (harness will not remove it)",
+                    branch.unwrap_or(name)
+                )),
+                Err(e) => Reviewed::Failed(e.to_string()),
+            }
+        }
+        Review::Discard(name) => {
+            let branch = record(&name).map(|r| r.branch);
+            match worktrees.discard(&name) {
+                Ok(()) => Reviewed::Discarded(format!(
+                    "discarded {}: its worktree and branch are removed",
+                    branch.unwrap_or(name)
+                )),
+                Err(e) => Reviewed::Failed(e.to_string()),
+            }
+        }
     }
 }
 

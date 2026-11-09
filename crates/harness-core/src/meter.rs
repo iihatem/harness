@@ -20,6 +20,10 @@ pub enum AccountKind {
     Subscription,
     /// A server of the user's own: free.
     Local,
+    /// A turn run by another agent program (Claude Code, Codex) on the user's own sign-in to it:
+    /// no per-token bill, and the program's own cost figure, where it gives one, is an estimate.
+    /// A delegated run on the user's API key is `ApiKey`.
+    Delegated,
 }
 
 impl AccountKind {
@@ -30,6 +34,8 @@ impl AccountKind {
             AccountKind::Local
         } else if model_id.split('/').next() == Some("chatgpt") {
             AccountKind::Subscription
+        } else if matches!(model_id.split('/').next(), Some("claude-code" | "codex")) {
+            AccountKind::Delegated
         } else {
             AccountKind::ApiKey
         }
@@ -41,6 +47,7 @@ impl AccountKind {
             AccountKind::ApiKey => "api_key",
             AccountKind::Subscription => "subscription",
             AccountKind::Local => "local",
+            AccountKind::Delegated => "delegated",
         }
     }
 }
@@ -62,6 +69,18 @@ pub struct RequestRecord {
     pub duration: Duration,
     /// `ok`, or `error:<kind>` (see `ProviderError::kind`).
     pub outcome: String,
+}
+
+/// What a request's record needs that the model's id and token counts do not give: set for a
+/// turn run by another agent program.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RequestDetail {
+    /// The account that pays, when it is not the one the model's id says (a delegated run on an
+    /// API key).
+    pub account: Option<AccountKind>,
+    /// What the program estimated the run cost, in USD: its own figure, never looked up in a
+    /// price table.
+    pub estimated_usd: Option<f64>,
 }
 
 /// How long after it was observed a window snapshot is shown as stale, in seconds.
@@ -316,10 +335,49 @@ pub struct TurnRecord {
     pub handoff: Option<HandoffRecord>,
 }
 
+/// A child agent as the ledger names it: its id, and the session of the agent that spawned it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentScope {
+    pub agent: String,
+    /// The name shown for it.
+    pub label: String,
+    /// The parent's session: the one whose budgets the child's spend counts towards.
+    pub parent: String,
+}
+
 /// Where the runtime reports what each model request took. Implemented by `harness-usage`.
 pub trait Meter: Send + Sync {
     /// Records `request`, and says what it cost.
     fn record_request(&self, request: &RequestRecord) -> RequestCost;
+
+    /// Records `request` made by the child agent `scope` names (`None`: the main agent). A meter
+    /// that does not keep who made a request records it as any other.
+    fn record_request_as(
+        &self,
+        request: &RequestRecord,
+        scope: Option<&AgentScope>,
+    ) -> RequestCost {
+        let _ = scope;
+        self.record_request(request)
+    }
+
+    /// Records `request` with what only a delegated run knows (see [`RequestDetail`]). A meter
+    /// that does not use the detail records it as any other.
+    fn record_request_detailed(
+        &self,
+        request: &RequestRecord,
+        scope: Option<&AgentScope>,
+        detail: &RequestDetail,
+    ) -> RequestCost {
+        let _ = detail;
+        self.record_request_as(request, scope)
+    }
+
+    /// Records a finished turn of the child agent `scope` names (`None`: the main agent).
+    fn record_turn_as(&self, turn: &TurnRecord, scope: Option<&AgentScope>) {
+        let _ = scope;
+        self.record_turn(turn)
+    }
 
     /// Asked before each model request in `session`, which `account` pays for: whether a money
     /// budget allows it. A reached budget refuses only an `ApiKey` request. The meter says each
@@ -328,9 +386,30 @@ pub trait Meter: Send + Sync {
         BudgetStatus::default()
     }
 
+    /// Like [`check_budget`](Self::check_budget), asked by the child agent `scope` names (`None`:
+    /// the main agent). A child never takes the 80% warnings, which are the main agent's to
+    /// show: a meter that tells them once leaves them for the main agent's next check.
+    fn check_budget_as(
+        &self,
+        session: &str,
+        account: AccountKind,
+        scope: Option<&AgentScope>,
+    ) -> BudgetStatus {
+        let _ = scope;
+        self.check_budget(session, account)
+    }
+
     /// A window snapshot the provider reported during a request that has not ended yet: the
     /// meter keeps it, and names it in that request's record.
     fn record_window(&self, _snapshot: &WindowSnapshot) {}
+
+    /// Like [`record_window`](Self::record_window), for a request of the child agent `scope`
+    /// names (`None`: the main agent): the snapshot is named in that agent's next record, not
+    /// whichever agent's request is recorded first.
+    fn record_window_as(&self, snapshot: &WindowSnapshot, scope: Option<&AgentScope>) {
+        let _ = scope;
+        self.record_window(snapshot)
+    }
 
     /// Records a finished turn.
     fn record_turn(&self, _turn: &TurnRecord) {}
@@ -362,5 +441,14 @@ mod tests {
             AccountKind::Local
         );
         assert_eq!(AccountKind::of("mine/x", true), AccountKind::Local);
+        assert_eq!(
+            AccountKind::of("claude-code/sonnet", false),
+            AccountKind::Delegated
+        );
+        assert_eq!(
+            AccountKind::of("codex/gpt-5", false),
+            AccountKind::Delegated
+        );
+        assert_eq!(AccountKind::Delegated.as_str(), "delegated");
     }
 }

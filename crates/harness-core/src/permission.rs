@@ -27,6 +27,15 @@ impl Mode {
         self.rank() <= other.rank()
     }
 
+    /// The mode that grants no more than either `self` or `other`.
+    pub fn narrower(self, other: Mode) -> Mode {
+        if self.grants_at_most(other) {
+            self
+        } else {
+            other
+        }
+    }
+
     fn rank(self) -> u8 {
         match self {
             Mode::Plan | Mode::ReadOnly => 0,
@@ -170,6 +179,15 @@ pub fn resolve_path(workspace: &Path, path: &Path) -> PathBuf {
 pub trait PermissionPolicy: Send + Sync {
     fn check(&self, action: &Action) -> Decision;
 
+    /// What [`check`](Self::check) says when the action runs outside harness's own sandbox, as a
+    /// delegated program's commands do: nothing is confined, so a command is judged as it is
+    /// when this machine has no sandbox. Only an explicit allow rule (or a session approval)
+    /// lets an unlisted command run, and shell commands are refused in plan and read-only mode.
+    /// Policies that do not tell the two apart answer as `check` does.
+    fn check_unsandboxed(&self, action: &Action) -> Decision {
+        self.check(action)
+    }
+
     /// Records that the user approved `action` for the rest of the session. Returns whether anything
     /// was remembered (destructive commands never are).
     fn remember(&self, _action: &Action) -> bool {
@@ -191,6 +209,10 @@ pub trait PermissionPolicy: Send + Sync {
     /// Whether shell commands run in an OS sandbox from now on. Internal to the agent, like
     /// [`set_mode`](Self::set_mode), which it goes with.
     fn set_sandbox_available(&self, _available: bool) {}
+
+    /// Says why shell commands have no sandbox, in the reason for asking about each one. For a
+    /// child's policy, which the parent's own reason does not reach.
+    fn set_unsandboxed_reason(&self, _why: &str) {}
 
     /// Adds rules for the current turn only, or with `None` removes them. They never override
     /// deny rules, destructive-command confirmation or the sandbox.

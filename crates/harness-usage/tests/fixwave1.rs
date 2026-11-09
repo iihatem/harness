@@ -50,6 +50,9 @@ fn record(t: u64, session: &str) -> LedgerRecord {
         ms: 7,
         outcome: "ok".into(),
         window: None,
+        agent: None,
+        parent: None,
+        label: None,
     }
 }
 

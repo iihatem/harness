@@ -45,16 +45,18 @@ impl Setup {
             credentials: &self.credentials,
             redactor: &self.redactor,
             env: &self.env,
+            delegate: crate::delegate::settings(self),
         }
     }
 }
 
 /// API keys from the environment, then from the credential store (`harness auth add`).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Keys<'a> {
     credentials: &'a Arc<Credentials>,
     redactor: &'a Arc<Redactor>,
     env: &'a Env,
+    delegate: harness_providers::delegated::DelegateSettings,
 }
 
 impl Secrets for Keys<'_> {
@@ -76,6 +78,10 @@ impl Secrets for Keys<'_> {
 
     fn redactor(&self) -> Option<Arc<Redactor>> {
         Some(self.redactor.clone())
+    }
+
+    fn delegate(&self) -> harness_providers::delegated::DelegateSettings {
+        self.delegate.clone()
     }
 }
 

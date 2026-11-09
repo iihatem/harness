@@ -30,6 +30,34 @@ pub fn dir(setup: &Setup) -> PathBuf {
         .join(project_key(&project_root(&setup.workspace)))
 }
 
+/// The project's shadow repository, where every session's checkpoints are kept.
+fn shadow_repository(setup: &Setup) -> PathBuf {
+    let key = project_key(&project_root(&setup.workspace));
+    setup
+        .paths
+        .data_dir
+        .join("checkpoints")
+        .join(format!("{key}.git"))
+}
+
+/// The checkpoints of a child agent's session `session_id`, in the same repository: what the
+/// child changed is told by comparing the workspace with its snapshot. `None` when they cannot
+/// work; the child's report then holds only what its tools say they changed. Nothing is pruned
+/// here: the session that spawned it did. `root` is where the child works: the session's
+/// workspace, or the worktree made for it (whose changes are told from its own snapshot).
+pub fn child_checkpoints(
+    setup: &Setup,
+    session_id: &str,
+    writable: &[PathBuf],
+    root: &std::path::Path,
+) -> Option<Arc<Checkpoints>> {
+    let gitdir = shadow_repository(setup);
+    checkpoint::check_location(&gitdir, root, writable)
+        .and_then(|()| Checkpoints::open(&gitdir, root, session_id))
+        .ok()
+        .map(Arc::new)
+}
+
 /// The checkpoints of `session`, in the project's shadow repository. `None`, after a warning,
 /// when they cannot work (no `git` on `PATH`, the repository cannot be created, or it is inside
 /// the workspace or one of the `writable` directories sandboxed commands can write to).
@@ -39,12 +67,7 @@ pub fn checkpoints(
     writable: &[PathBuf],
     notices: &mut Notices,
 ) -> Option<Arc<Checkpoints>> {
-    let key = project_key(&project_root(&setup.workspace));
-    let gitdir = setup
-        .paths
-        .data_dir
-        .join("checkpoints")
-        .join(format!("{key}.git"));
+    let gitdir = shadow_repository(setup);
     let opened = checkpoint::check_location(&gitdir, &setup.workspace, writable)
         .and_then(|()| Checkpoints::open(&gitdir, &setup.workspace, session.id()));
     match opened {
@@ -114,6 +137,15 @@ pub fn open_listing(
     Ok(session)
 }
 
+/// What a listing says of a session: the start of the user's first message. A session in which
+/// only a background agent ran has none: it is listed as the picker lists it, not with a blank.
+fn listed_title(first_message: Option<&str>) -> String {
+    match first_message.and_then(|message| message.lines().next()) {
+        Some(line) if !line.trim().is_empty() => line.chars().take(72).collect(),
+        _ => "(no message)".to_string(),
+    }
+}
+
 /// `harness --resume` without an id and without a terminal: prints each session of this
 /// project, most recent first, with its id, start time and first message. On a terminal the
 /// interactive session opens with the session picker instead.
@@ -131,15 +163,7 @@ pub fn print_list() -> u8 {
         return 0;
     }
     for summary in listed {
-        let first: String = summary
-            .first_message
-            .unwrap_or_default()
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .take(72)
-            .collect();
+        let first = listed_title(summary.first_message.as_deref());
         println!(
             "{}  {}  {}",
             terminal_safe(&summary.id),
@@ -149,4 +173,17 @@ pub fn print_list() -> u8 {
     }
     println!("Continue one with: harness --resume <id>, or harness --resume <id> ask \"...\"");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listed_title;
+
+    #[test]
+    fn a_session_with_no_user_message_is_not_listed_with_a_blank() {
+        assert_eq!(listed_title(None), "(no message)");
+        assert_eq!(listed_title(Some("")), "(no message)");
+        assert_eq!(listed_title(Some("fix it\nand more")), "fix it");
+        assert_eq!(listed_title(Some(&"x".repeat(100))).chars().count(), 72);
+    }
 }

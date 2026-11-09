@@ -16,12 +16,14 @@ default = ["chatgpt-login"]
 chatgpt-login = ["harness-providers/chatgpt-login"]
 
 [dependencies]
+async-trait.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 futures.workspace = true
 harness-config.workspace = true
 harness-context.workspace = true
 harness-core.workspace = true
+harness-delegate.workspace = true
 harness-lsp.workspace = true
 harness-providers.workspace = true
 harness-sandbox.workspace = true

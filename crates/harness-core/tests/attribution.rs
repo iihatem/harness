@@ -96,7 +96,9 @@ fn saved(session: &Session) -> Vec<(Role, Option<SwitchReason>)> {
                 attribution,
                 ..
             } => {
-                let a = attribution.expect("an assistant message is attributed");
+                let a = attribution
+                    .clone()
+                    .expect("an assistant message is attributed");
                 Some((a.role, a.switch_reason))
             }
             _ => None,

@@ -98,6 +98,7 @@ fn saved(dir: &Path, workspace: &Path, exchanges: &[(&str, &str)]) -> String {
                 note: false,
                 plan: None,
                 attribution: None,
+                agent_record: None,
             });
         }
     }

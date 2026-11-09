@@ -246,6 +246,7 @@ impl Host for CliHost {
                 () = cancel.cancelled() => return Err("stopped".to_string()),
                 resolved = resolving => resolved.map_err(|e| format!("resolving it failed: {e}"))??,
             };
+            crate::delegate::ready(&setup, &resolved.id).await?;
             let model = crate::start::model_setup(&setup, &resolved, &cancel)
                 .await
                 .ok_or("stopped")?;
@@ -425,6 +426,9 @@ pub mod tests {
                 ms: 1,
                 outcome: "ok".into(),
                 window: None,
+                agent: None,
+                parent: None,
+                label: None,
             })
             .unwrap();
         let report = host.usage_report("provider").await.join("\n");
@@ -559,6 +563,7 @@ pub mod tests {
             note: false,
             plan: None,
             attribution: None,
+            agent_record: None,
         });
         let id = opened.session.id().to_string();
         drop(opened);
@@ -602,6 +607,7 @@ pub mod tests {
             note: false,
             plan: None,
             attribution: None,
+            agent_record: None,
         });
         let id = opened.session.id().to_string();
         drop(opened);

@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::{sync::mpsc::UnboundedSender, time::Instant};
 use tokio_util::sync::CancellationToken;
 
+mod delegated;
 mod gates;
 
 use crate::{
@@ -102,6 +103,13 @@ pub struct AgentConfig {
     /// The text of the system prompt that describes how the model edits files, when the prompt
     /// has one: a switch to a model with another edit format replaces it.
     pub edit_section: Option<String>,
+    /// The project's instruction files as harness loaded them, for a model that runs in another
+    /// agent program (which gets them in a file of its own, not in harness's system prompt).
+    pub instructions: Option<String>,
+    /// What a child agent's definition says of it (the subagent preamble, the definition's text),
+    /// for a model that runs in another agent program, which gets it in front of the task: such a
+    /// program has no system prompt of harness's.
+    pub brief: Option<String>,
 }
 
 impl AgentConfig {
@@ -124,6 +132,8 @@ impl AgentConfig {
             request: RequestOptions::default(),
             text_tool_calls: false,
             edit_section: None,
+            instructions: None,
+            brief: None,
         }
     }
 }
@@ -188,6 +198,26 @@ pub enum ApprovalKind {
     /// yes or no, kept with the workspace's trust record, so it is asked once. The request's
     /// `reason` is the question.
     StartServers,
+    /// Whether `claude-code/*` models may run on the user's Claude subscription (through the
+    /// `claude` program the user signed in to) rather than on an API key. The request's `reason`
+    /// is the disclosure and the question. Yes or no.
+    DelegateOptIn,
+    /// Whether a delegated agent may run in `full-access` mode in this session: with no approvals
+    /// and no sandbox of its own. Asked once per session. The request's `reason` is the question.
+    DelegateFullAccess,
+}
+
+impl ApprovalKind {
+    /// Whether the approval is a plain question (yes, or no with no reason asked for) rather than
+    /// a request to run an action.
+    pub fn is_question(self) -> bool {
+        matches!(
+            self,
+            ApprovalKind::StartServers
+                | ApprovalKind::DelegateOptIn
+                | ApprovalKind::DelegateFullAccess
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,7 +233,13 @@ pub struct ApprovalRequest {
     /// Whether approving it for the session would be kept. When it would not (destructive
     /// commands, and others the policy always asks about), such an approval applies once.
     pub kept_for_session: bool,
+    /// The child agent that asks, when it is not the main agent: its id and the name shown for it.
+    pub agent: Option<crate::agents::AgentTag>,
 }
+
+/// The feedback of the `Deny` an approver gives when the user pressed Esc on a prompt: the turn
+/// is being stopped, which is not an answer to a question the prompt asked.
+pub const STOPPED_BY_USER: &str = "the user stopped the turn";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
@@ -410,6 +446,9 @@ pub struct Agent {
     stats: Stats,
     /// The sandbox for each mode, when switching modes also switches the sandbox.
     sandboxes: Option<Sandboxes>,
+    /// The mode `ctx`'s sandbox and access are for: what the policy says changes under a child
+    /// whose parent switches mode, and the next command then gets the new mode's.
+    sandbox_mode: Option<Mode>,
     /// Input the user sends while a turn runs.
     steering: Option<Steering>,
     /// Told about every model request, for the usage ledger.
@@ -463,6 +502,20 @@ pub struct Agent {
     /// The plan the user approved, while the Build turn that implements it runs: a compaction
     /// summarizes around it and keeps it as written.
     turn_plan: Option<String>,
+    /// What the tools called since the log was last taken did, for a child's report.
+    tool_log: crate::agents::ToolLog,
+    /// Whether `tool_log` is kept: only an agent whose log is taken keeps it.
+    keep_tool_log: bool,
+    /// Records of child agents to save in the session, from the supervisor.
+    child_records: Option<crate::agents::AgentRecords>,
+    /// Where the model the agent answers with now is published, for children to be built from.
+    model_cell: Option<crate::agents::ParentModel>,
+    /// Tools this agent has besides its model's: they stay when a model switch changes the rest.
+    extra_tools: Vec<Arc<dyn Tool>>,
+    /// Counts the user turns run, for [`ToolContext::turn`].
+    turn_serial: u64,
+    /// Whether the user confirmed `full-access` for delegated agents in this session.
+    full_access_confirmed: bool,
 }
 
 impl Agent {
@@ -504,6 +557,7 @@ impl Agent {
             redactor: None,
             stats: Stats::default(),
             sandboxes: None,
+            sandbox_mode: None,
             steering: None,
             meter: None,
             turn_started: None,
@@ -530,6 +584,187 @@ impl Agent {
             escalation: EscalationState::default(),
             handoff_stash: None,
             turn_plan: None,
+            tool_log: crate::agents::ToolLog::default(),
+            keep_tool_log: false,
+            child_records: None,
+            model_cell: None,
+            extra_tools: Vec::new(),
+            turn_serial: 0,
+            full_access_confirmed: false,
+        }
+    }
+
+    /// Publishes the model the agent answers with, now and whenever it changes (`/model`, a
+    /// role's model for a turn, a fallback), into `cell`: children that name no model of their own
+    /// are built from it.
+    pub fn with_model_cell(mut self, cell: crate::agents::ParentModel) -> Self {
+        self.model_cell = Some(cell);
+        self.publish_model();
+        self
+    }
+
+    /// Says which model the agent answers with now.
+    fn publish_model(&self) {
+        let Some(cell) = &self.model_cell else {
+            return;
+        };
+        let (provider, id, name, context_window, request, text_tool_calls, local) =
+            match &self.turn_model {
+                Some(turn) => (
+                    turn.provider.clone(),
+                    turn.id.clone(),
+                    turn.name.clone(),
+                    turn.context_window.unwrap_or(self.config.context_window),
+                    turn.options(),
+                    turn.text_tool_calls,
+                    turn.local,
+                ),
+                None => (
+                    self.provider.clone(),
+                    self.config.model_id.clone(),
+                    self.config.model_name.clone(),
+                    self.config.context_window,
+                    self.config.request.clone(),
+                    self.config.text_tool_calls,
+                    self.config.request.local,
+                ),
+            };
+        let role_id = |role| self.roles.get(role).map(|(id, _)| id.clone());
+        cell.set_roles(crate::agents::RoleModels {
+            plan: role_id(Role::Plan),
+            build: role_id(Role::Build),
+            background: role_id(Role::Background),
+        });
+        cell.set(crate::agents::CurrentModel {
+            provider,
+            id,
+            name,
+            context_window,
+            request,
+            text_tool_calls,
+            local,
+            // Without the extra tools: what a child is built from is not given them.
+            tools: self.tools.clone().without(
+                &self
+                    .extra_tools
+                    .iter()
+                    .map(|tool| tool.spec().name)
+                    .collect::<Vec<_>>(),
+            ),
+            system_prompt: self.config.system_prompt.clone(),
+            edit_section: self.config.edit_section.clone(),
+        });
+    }
+
+    /// Offers `tool` besides the model's own tools, through model switches and turns on other
+    /// models. Children made from this agent's model are not given it.
+    pub fn with_extra_tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.extra_tools.push(tool);
+        let tools = self.tools.clone();
+        self.set_tools(tools);
+        self.publish_model();
+        self
+    }
+
+    /// Saves the records of child agents that `records` holds in the session, beside the
+    /// conversation, at the end of each tool call and each turn.
+    pub fn with_child_records(mut self, records: crate::agents::AgentRecords) -> Self {
+        self.child_records = Some(records);
+        self
+    }
+
+    /// Starts keeping the tool log, for [`take_tool_log`](Self::take_tool_log). An agent that
+    /// does not keep it (the main agent) holds nothing for its calls.
+    pub fn keep_tool_log(&mut self) {
+        self.keep_tool_log = true;
+    }
+
+    /// What the tools called since this was last taken did: how many calls, which files they
+    /// changed, which commands ran. A child's report is made from it.
+    pub fn take_tool_log(&mut self) -> crate::agents::ToolLog {
+        std::mem::take(&mut self.tool_log)
+    }
+
+    /// The files that differ now from the workspace as it was at this turn's checkpoint, as
+    /// absolute paths: by comparing the workspace with it, so what `bash` changed counts (the
+    /// decision of M2, P4). `None` where there is no checkpoint to compare with (none was made,
+    /// the agent has no checkpoints, or the comparison failed), in which case only the tool log
+    /// knows.
+    pub async fn files_changed_in_workspace(&self) -> Option<Vec<PathBuf>> {
+        let checkpoints = self.checkpoints.clone()?;
+        let baseline = self.turn_baseline.clone()?;
+        let workspace = checkpoints.workspace().to_path_buf();
+        let files = tokio::task::spawn_blocking(move || checkpoints.files_changed_since(&baseline))
+            .await
+            .ok()?
+            .ok()?;
+        Some(files.into_iter().map(|file| workspace.join(file)).collect())
+    }
+
+    /// Notes one tool call in the log.
+    fn log_call(&mut self, call: &ToolCall, raw: &ToolOutput) {
+        if !self.keep_tool_log {
+            return;
+        }
+        self.tool_log.calls += 1;
+        if raw.blocked {
+            return;
+        }
+        let Some(tool) = self.tools.get(&call.name) else {
+            return;
+        };
+        let text = if call.arguments.trim().is_empty() {
+            "{}"
+        } else {
+            call.arguments.as_str()
+        };
+        let Ok(args) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        if let Action::Bash(command) = tool.action(&args, &self.ctx) {
+            self.tool_log.commands.push(command);
+        }
+        if !raw.is_error {
+            for path in tool.changed_paths(&args, &self.ctx) {
+                if !self.tool_log.files_changed.contains(&path) {
+                    self.tool_log.files_changed.push(path);
+                }
+            }
+        }
+    }
+
+    /// The session is ending: waits (a few seconds at most) for the children still ending to
+    /// report, then saves their records, so a child that finished after the last turn is in the
+    /// session too. Call it once nothing more will be started, after cancelling the children.
+    pub async fn end_session(&mut self) {
+        if let Some(records) = self.child_records.clone() {
+            records.settled(Duration::from_secs(3)).await;
+        }
+        self.flush_child_records();
+    }
+
+    /// Saves the child records waiting for the session.
+    fn flush_child_records(&mut self) {
+        let Some(records) = &self.child_records else {
+            return;
+        };
+        for record in records.take(self.session.id()) {
+            let text = match record.kind {
+                crate::session::AgentRecordKind::Spawned => {
+                    format!("[agent {} ({}) started]", record.agent, record.label)
+                }
+                crate::session::AgentRecordKind::Reported => {
+                    format!("[agent {} ({}) reported]", record.agent, record.label)
+                }
+            };
+            self.session.append_aside(EntryKind::Message {
+                message: Message::User { content: text },
+                display: None,
+                note: true,
+                plan: None,
+                attribution: None,
+                agent_record: Some(record),
+            });
         }
     }
 
@@ -549,13 +784,16 @@ impl Agent {
     /// Sets the models of the roles from the configuration.
     pub fn with_roles(mut self, config: RoleConfig) -> Self {
         self.roles = RoleTable::from_config(&config);
+        self.publish_model();
         self
     }
 
     /// Sets the model of `role` for the session, as `/model --role` does: `plan`, `build` or
     /// `background`. `false` for `main`, which `switch_model` changes.
     pub fn set_role_model(&mut self, role: Role, id: &str) -> bool {
-        self.roles.set(role, id)
+        let set = self.roles.set(role, id);
+        self.publish_model();
+        set
     }
 
     /// The model `role` runs on now: its own, or the session's.
@@ -733,6 +971,10 @@ impl Agent {
     }
 
     fn set_tools(&mut self, tools: ToolRegistry) {
+        let tools = self
+            .extra_tools
+            .iter()
+            .fold(tools, |tools, tool| tools.with(tool.clone()));
         self.validators = validators_of(&tools);
         self.tools = tools;
     }
@@ -830,7 +1072,27 @@ impl Agent {
     /// started with.
     pub fn with_sandboxes(mut self, sandboxes: Sandboxes) -> Self {
         self.sandboxes = Some(sandboxes);
+        // What the context was made for is the mode the policy is in now.
+        self.sandbox_mode = self.policy.mode();
         self
+    }
+
+    /// A child's mode follows its parent's, narrower only: when the policy's mode is no longer
+    /// the one the sandbox and the access of commands were made for, they are taken for the
+    /// mode it is now, before the next call is checked. (The engine allows a command in plan or
+    /// read-only mode because the sandbox it runs in cannot write.)
+    fn follow_policy_mode(&mut self) {
+        let (Some(sandboxes), Some(mode)) = (&self.sandboxes, self.policy.mode()) else {
+            return;
+        };
+        if self.sandbox_mode == Some(mode) {
+            return;
+        }
+        self.sandbox_mode = Some(mode);
+        self.ctx.sandbox = sandboxes.for_mode(mode);
+        self.policy
+            .set_sandbox_available(self.ctx.sandbox.is_some());
+        self.ctx.access = mode.fs_access();
     }
 
     /// Gives the model what the user sends through `steering` while a turn runs, with the
@@ -877,6 +1139,8 @@ impl Agent {
         if let Some(diagnostics) = &self.diagnostics {
             diagnostics.reset();
         }
+        // What the session left is written to it, not to the one that follows.
+        self.flush_child_records();
         self.session = session;
         if let Some(redactor) = &self.redactor {
             self.session.set_redactor(redactor.clone());
@@ -1195,6 +1459,7 @@ impl Agent {
             note,
             plan,
             attribution,
+            agent_record: None,
         });
         self.history.push(message);
         self.history_ids.push(id.clone());
@@ -1251,6 +1516,7 @@ impl Agent {
         self.auto_compaction_paused = false;
         self.model_chosen_by_user = true;
         self.main_reason = Some(reason);
+        self.publish_model();
         AgentEvent::ModelSwitched {
             from,
             to: self.config.model_id.clone(),
@@ -1290,6 +1556,7 @@ impl Agent {
         }
         self.policy.set_mode(mode);
         self.ctx.access = mode.fs_access();
+        self.sandbox_mode = Some(mode);
         self.record(
             Message::User {
                 content: mode_note(mode, self.ctx.sandbox.is_some()),
@@ -1309,6 +1576,8 @@ impl Agent {
     ) -> TurnEndReason {
         let input = input.into();
         self.ctx.cancel = cancel.clone();
+        self.turn_serial += 1;
+        self.ctx.turn = self.turn_serial;
         self.invalid_calls = 0;
         self.stats = Stats::default();
         self.retry_count
@@ -1416,6 +1685,7 @@ impl Agent {
         if let Some((_, _, _, tools, section)) = session_format.clone() {
             self.use_edit_format(tools, section);
         }
+        self.publish_model();
         self.turn_plan = input.plan.clone().filter(|_| role == Role::Build);
         let reason = self.turn(input, events, cancel).await;
         self.turn_plan = None;
@@ -1427,6 +1697,7 @@ impl Agent {
         self.ctx.access = access;
         self.policy.set_turn_rules(None);
         self.turn_model = None;
+        self.publish_model();
         reason
     }
 
@@ -1481,11 +1752,21 @@ impl Agent {
         let _ = events.send(AgentEvent::TurnStarted);
         self.message_recorded = false;
         let content = self.user_message(input.parts, events).await;
+        let delegate = self.active_delegate();
         let plan = input.plan.clone();
+        // A Build message that only points at the plan above would send a delegated child nothing
+        // to build: it is given the plan itself, whole (the session keeps the message as it was).
+        let task = delegate.as_ref().map(|_| match &plan {
+            Some(plan) if !content.contains(plan.as_str()) => {
+                format!("Implement this plan:\n\n{plan}")
+            }
+            _ => content.clone(),
+        });
         let attribution = self.turn_handoff.map(|handoff| Attribution {
             role: Role::Build,
             switch_reason: None,
             handoff: Some(handoff),
+            delegate: None,
         });
         self.turn_entry = self.record_entry(
             Message::User { content },
@@ -1501,6 +1782,12 @@ impl Agent {
         }
         if cancel.is_cancelled() {
             return self.finish(TurnEndReason::Interrupted, events);
+        }
+        // A model that runs in another agent program does not go through the request loop.
+        if let (Some(delegate), Some(task)) = (delegate, task) {
+            return self
+                .delegated_turn(delegate, task, plan, events, cancel)
+                .await;
         }
 
         let mut auto_compaction_failed = false;
@@ -2328,6 +2615,7 @@ impl Agent {
         self.reported_usage = None;
         self.turn_reason = Some(SwitchReason::Fallback);
         self.turn_model = Some(model);
+        self.publish_model();
         true
     }
 
@@ -2550,6 +2838,7 @@ impl Agent {
             role: self.turn_role,
             switch_reason: self.turn_reason,
             handoff: None,
+            delegate: None,
         };
         self.record_entry(message, None, false, None, Some(attribution));
     }
@@ -2592,6 +2881,7 @@ impl Agent {
         events: &UnboundedSender<AgentEvent>,
     ) -> TurnEndReason {
         self.end_handoff();
+        self.flush_child_records();
         for message in self.warnings.drain(..) {
             let _ = events.send(AgentEvent::Warning { message });
         }
@@ -2731,6 +3021,7 @@ impl Agent {
         });
         let invalid_before = self.invalid_calls;
         let raw = self.execute_inner(call, events).await;
+        self.log_call(call, &raw);
         self.watch_for_escalation(call, &raw, invalid_before, events);
         let mut content = limit_output(
             &raw.content,
@@ -2753,6 +3044,7 @@ impl Agent {
             output: output.content.clone(),
             is_error: output.is_error,
         });
+        self.flush_child_records();
         output
     }
 
@@ -2761,6 +3053,7 @@ impl Agent {
         call: &ToolCall,
         events: &UnboundedSender<AgentEvent>,
     ) -> ToolOutput {
+        self.follow_policy_mode();
         let Some(tool) = self.tools.get(&call.name) else {
             self.invalid_calls += 1;
             let names: Vec<String> = self.tools.specs().into_iter().map(|s| s.name).collect();
@@ -2805,7 +3098,8 @@ impl Agent {
         if actions.is_empty() {
             actions.push(tool.action(&args, &self.ctx));
         }
-        let mutating = actions.iter().any(|a| self.is_mutating(a));
+        let mutating = actions.iter().any(|a| self.is_mutating(a))
+            || (self.ctx.access == FsAccess::WorkspaceWrite && tool.changes_workspace(&args));
         let mut checked: Vec<(Action, Decision)> = actions
             .into_iter()
             .map(|a| {
@@ -2860,6 +3154,7 @@ impl Agent {
                     tool: call.name.clone(),
                     arguments: args.clone(),
                     kept_for_session: self.policy.can_remember(&action),
+                    agent: None,
                     action,
                     reason: reason.clone(),
                     kind: ApprovalKind::Action,
@@ -2987,6 +3282,7 @@ impl Agent {
             reason,
             kind: ApprovalKind::RunUnsandboxed,
             kept_for_session: false,
+            agent: None,
         };
         let Some(decision) = self.ask(&request, events).await else {
             return ToolOutput::error(STOPPED_BEFORE_RUNNING);
@@ -3041,6 +3337,7 @@ impl Agent {
             reason,
             kind: ApprovalKind::RunUnsandboxed,
             kept_for_session: false,
+            agent: None,
         };
         let Some(decision) = self.ask(&request, events).await else {
             return ToolOutput {

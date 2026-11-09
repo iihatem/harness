@@ -1217,6 +1217,79 @@ mod tests {
         assert_eq!(snapshot(registry), (vec![], 0));
     }
 
+    // M3a: several agents run commands in one process, all in this one registry. One agent's
+    // command ending (its registration dropped, and the reaper run) takes nothing from another's
+    // that is still running or still waited for.
+    #[test]
+    fn one_agents_command_ending_leaves_anothers_registered() {
+        let registry = leaked();
+        let (mut parent, mut child_a, mut child_b) = (
+            Registration::new_in(registry),
+            Registration::new_in(registry),
+            Registration::new_in(registry),
+        );
+        parent.started(10);
+        child_a.started(20);
+        child_b.started(30);
+        let me = 1;
+        let zombie = |pid| p(pid, me, pid, b'Z');
+        drop(child_a);
+        let state = registry.lock().unwrap();
+        // The ended command's pid may be reaped; the others are still their waiters'.
+        assert!(may_reap(&zombie(20), me, 0, &state));
+        assert!(!may_reap(&zombie(10), me, 0, &state));
+        assert!(!may_reap(&zombie(30), me, 0, &state));
+        drop(state);
+        // A command another agent is about to spawn holds off all reaping.
+        let _pending = Registration::new_in(registry);
+        assert_eq!(snapshot(registry), (vec![(10, 1), (30, 1)], 1));
+        drop(parent);
+        drop(child_b);
+    }
+
+    // The same on Linux, with real processes: the end of one agent's command, and the reaper
+    // that follows it, leave a sibling's running survivor alone.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn reaping_after_one_agents_command_leaves_a_siblings_running_process_alone() {
+        use std::os::unix::process::CommandExt;
+        let _serial = serial();
+        // A sibling's command, still running in a session of its own.
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        // SAFETY: `setsid` is async-signal-safe, and nothing else runs in the child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut sibling = command.spawn().expect("spawn sh");
+        let mut sibling_registration = Registration::new();
+        sibling_registration.started(sibling.id());
+        // This agent's command ended: its zombie is reaped by the look that follows.
+        // Never waited for here: its being a zombie is what `look_and_reap` is checked on.
+        #[allow(clippy::zombie_processes)]
+        let ended = zombie_in_its_own_session();
+        let ended_dir = Path::new("/proc").join(ended.id().to_string());
+        look_and_reap();
+        assert_eq!(read_stat(&ended_dir), None, "the ended command was reaped");
+        let dir = Path::new("/proc").join(sibling.id().to_string());
+        assert!(
+            read_stat(&dir).is_some_and(|proc| proc.live()),
+            "the sibling's running command was touched"
+        );
+        assert!(sibling.try_wait().expect("still its waiter").is_none());
+        sibling.kill().ok();
+        sibling.wait().ok();
+        drop(sibling_registration);
+    }
+
     #[test]
     fn started_again_moves_the_registration_to_the_new_pid() {
         let registry = leaked();

@@ -2,6 +2,7 @@
 //! only a small live region at the bottom (the input, what is streaming, prompts) is redrawn.
 //! This crate draws with `ratatui`; `harness-cli` sets up the session and starts it.
 
+pub mod agents;
 pub mod app;
 pub mod approval;
 pub mod complete;
@@ -14,6 +15,7 @@ pub mod markdown;
 pub mod notify;
 pub mod picker;
 pub mod plan;
+pub mod review;
 pub mod status;
 pub mod style;
 pub mod terminal;

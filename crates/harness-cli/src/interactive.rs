@@ -268,6 +268,11 @@ pub async fn run(
             return 2;
         }
     };
+    // A delegated model's program is looked for now, not at the first turn.
+    if let Err(why) = crate::delegate::ready(&setup, &resolved.id).await {
+        eprintln!("error: {}", terminal_safe(&why));
+        return 2;
+    }
     let model = resolved.id.clone();
     let mode = mode_flag
         .or(setup.config.mode)
@@ -282,17 +287,7 @@ pub async fn run(
     }
     let (approver, approvals) = ChannelApprover::new();
     // Nothing cancels the start: Ctrl+C before the terminal UI ends the process.
-    let Some(Started {
-        agent,
-        sandbox_session,
-        policy,
-        window_note,
-        write_mode_warning,
-        writable,
-        meter,
-        diagnostics,
-        resolver,
-    }) = start::start(
+    let Some(started) = start::start(
         Request {
             setup: &setup,
             mode,
@@ -309,6 +304,71 @@ pub async fn run(
     else {
         return 130;
     };
+    // Agents an earlier harness left running when it died are failed, their edits committed so
+    // they can be reviewed, and their stale locks released.
+    if let Some(worktrees) = started.worktrees() {
+        let listing = worktrees.clone();
+        let ended = tokio::task::spawn_blocking(move || {
+            let ended = worktrees.reconcile();
+            // Those that changed nothing were removed; those with a result are reviewed with
+            // /results and /agents; the rest (its changes could not be committed) are left as
+            // they were, and `harness worktrees` lists them.
+            let records = listing.records();
+            let mut ready = 0;
+            let mut left = 0;
+            for name in &ended {
+                match records.iter().find(|r| &r.name == name) {
+                    Some(r) if r.outcome.is_some() => ready += 1,
+                    Some(_) => left += 1,
+                    None => {}
+                }
+            }
+            (ended.len(), ready, left)
+        })
+        .await
+        .unwrap_or_default();
+        let (ended, ready, left) = ended;
+        if ready + left > 0 {
+            let plural = |n: usize| if n == 1 { "" } else { "s" };
+            let mut text = format!(
+                "{ended} agent{} of an earlier session ended while it ran",
+                plural(ended)
+            );
+            if ready > 0 {
+                text.push_str(&format!(
+                    ": /agents lists {ready} with changes, and /results shows what {} changed",
+                    if ready == 1 { "it" } else { "they" }
+                ));
+            }
+            if left > 0 {
+                text.push_str(&format!(
+                    "; {left} could not have {} changes saved: `harness worktrees` lists {}",
+                    if left == 1 { "its" } else { "their" },
+                    if left == 1 { "it" } else { "them" }
+                ));
+            }
+            notices.note(&text);
+        }
+    }
+    // The session's child agents: the panel, a line for each above the input and their approvals
+    // in the queue show them; their events themselves are not shown.
+    let (child_events, _) = tokio::sync::mpsc::unbounded_channel();
+    let supervisor = started.supervisor(child_events, CancellationToken::new());
+    let spawn = started.spawn_tool(&supervisor, false);
+    let definitions = started.agent_definitions();
+    let Started {
+        agent,
+        sandbox_session,
+        policy,
+        window_note,
+        write_mode_warning,
+        writable,
+        meter,
+        diagnostics,
+        resolver,
+        ..
+    } = started;
+    let agent = start::with_supervisor(agent, &supervisor, spawn);
     let unsaved_default = first_run.then(|| model.clone());
     let history = agent.rewind_points().into_iter().map(|p| p.text).collect();
     let options = Options {
@@ -352,6 +412,8 @@ pub async fn run(
         write_mode_warning,
         pick_session,
         first_run,
+        supervisor,
+        definitions,
     )
     .await;
     // The language servers stop before the sandbox's session ends.
@@ -410,7 +472,7 @@ fn shutdown_signals() -> std::io::Result<impl Future<Output = Ending>> {
 }
 
 /// Whether this process ignores `signal`.
-fn ignored(signal: nix::libc::c_int) -> bool {
+pub(crate) fn ignored(signal: nix::libc::c_int) -> bool {
     // SAFETY: an all-zero `sigaction` is valid for the call to overwrite; with no new action
     // given, `sigaction` only reads the current one.
     let mut current: nix::libc::sigaction = unsafe { std::mem::zeroed() };
@@ -430,6 +492,8 @@ async fn terminal_session(
     write_mode_warning: Option<String>,
     pick_session: bool,
     first_run: bool,
+    supervisor: Arc<harness_core::agents::Supervisor>,
+    definitions: Option<Arc<harness_core::agents::Definitions>>,
 ) -> std::io::Result<Ending> {
     // From here on, a hangup or SIGTERM ends the session rather than harness.
     let shutdown = shutdown_signals()?;
@@ -478,6 +542,10 @@ async fn terminal_session(
     let mut ui = Ui::start(agent, host, term, options, approvals)
         .with_redactor(redactor)
         .with_cursor_query(input.cursor_query());
+    ui.watch_agents(supervisor);
+    if let Some(definitions) = definitions {
+        ui.app_mut().set_agent_definitions((*definitions).clone());
+    }
     ui.app_mut().set_write_mode_warning(write_mode_warning);
     if first_run {
         ui.app_mut().set_first_run_model();

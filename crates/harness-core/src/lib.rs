@@ -1,8 +1,10 @@
 //! Core agent runtime for harness: provider-neutral messages, events, permissions, and the agent loop.
 
 pub mod agent;
+pub mod agents;
 pub mod checkpoint;
 pub mod compaction;
+pub mod delegated;
 pub mod diag;
 pub mod edit_format;
 pub mod engine;
@@ -24,3 +26,4 @@ pub mod time;
 pub mod tokens;
 pub mod tool;
 pub mod turn;
+pub mod worktree;

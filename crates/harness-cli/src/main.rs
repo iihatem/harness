@@ -1,6 +1,8 @@
 mod ask;
 mod auth;
+mod children;
 mod context;
+mod delegate;
 mod doctor;
 mod gates;
 mod host;
@@ -17,9 +19,11 @@ mod sessions;
 mod setup;
 mod slash;
 mod start;
+mod subagents;
 mod term;
 mod trust;
 mod usage;
+mod worktrees;
 
 use std::{io::IsTerminal, process::ExitCode};
 
@@ -46,6 +50,10 @@ struct Cli {
     /// the state directory
     #[arg(long, global = true)]
     debug: bool,
+    /// Only with `ask`: confirm `full-access` mode for a claude-code or codex model, which would
+    /// otherwise ask (a headless run cannot be asked)
+    #[arg(long, global = true)]
+    yes_full_access: bool,
     /// Resume the session with this id; without an id, list this project's sessions
     #[arg(
         long,
@@ -57,6 +65,27 @@ struct Cli {
     resume: Option<Option<String>>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum WorktreesCommand {
+    /// Remove the worktrees and branches harness made that have nothing left to review: finished
+    /// agents that changed nothing, and those of a harness that died. Results not applied stay;
+    /// a running agent's, anything harness did not make, and any worktree that holds changes or
+    /// commits saved nowhere else are never touched (they are listed)
+    Clean {
+        /// Also remove results that were not applied or kept, once their commits are on another
+        /// branch (combine with --discard-unsaved to remove those that are not)
+        #[arg(long)]
+        all: bool,
+        /// With --all: also remove worktrees and branches whose changes or commits exist nowhere
+        /// else, losing them. Lists them and asks first
+        #[arg(long, requires = "all")]
+        discard_unsaved: bool,
+        /// Do not ask: needed for --discard-unsaved without a terminal
+        #[arg(long, requires = "discard_unsaved")]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -110,18 +139,24 @@ enum Command {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+    /// List the git worktrees harness made for agents, with their state; `worktrees clean`
+    /// removes the ones that are finished and have nothing to review
+    Worktrees {
+        #[command(subcommand)]
+        command: Option<WorktreesCommand>,
+    },
     /// Update the price table the cost figures use (the only time harness connects to models.dev)
     Pricing {
         #[command(subcommand)]
         command: PricingCommand,
     },
-    /// Report model usage and cost from the local ledger, by model, provider, day or project;
+    /// Report model usage and cost from the local ledger, by model, provider, day, project or agent;
     /// `usage export` and `usage forget` handle the data
     #[command(args_conflicts_with_subcommands = true)]
     Usage {
         #[command(subcommand)]
         command: Option<UsageCommand>,
-        /// What to group by: model, provider, day or project
+        /// What to group by: model, provider, day, project or agent
         #[arg(long, default_value = "model")]
         by: String,
         /// Only requests on or after this UTC date (YYYY-MM-DD)
@@ -238,6 +273,7 @@ fn command_line(command: &Command) -> &'static str {
         Command::Sandbox { .. } => "harness sandbox doctor",
         Command::Usage { .. } => "harness usage",
         Command::Pricing { .. } => "harness pricing update",
+        Command::Worktrees { .. } => "harness worktrees",
     }
 }
 
@@ -312,6 +348,12 @@ fn main() -> ExitCode {
         (None, true) => sessions::Choice::Continue,
         (None, false) => sessions::Choice::New,
     };
+    if cli.yes_full_access && !matches!(cli.command, Some(Command::Ask { .. })) {
+        eprintln!(
+            "error: --yes-full-access only works with `harness ask`: the terminal asks for the confirmation itself"
+        );
+        return ExitCode::from(2);
+    }
     // Before the runtime starts its threads: see `interactive::prepare`.
     if cli.command.is_none()
         && let Some(code) = interactive::prepare()
@@ -329,6 +371,7 @@ fn main() -> ExitCode {
                     prompt.join(" "),
                     json,
                     cli.debug,
+                    cli.yes_full_access,
                 )
                 .await
             }
@@ -365,6 +408,15 @@ fn main() -> ExitCode {
                 command: Some(UsageCommand::Forget { before, all }),
                 ..
             }) => usage::forget(before.as_deref(), all),
+            Some(Command::Worktrees { command: None }) => worktrees::list(),
+            Some(Command::Worktrees {
+                command:
+                    Some(WorktreesCommand::Clean {
+                        all,
+                        discard_unsaved,
+                        yes,
+                    }),
+            }) => worktrees::clean(all, discard_unsaved, yes),
             Some(Command::Pricing {
                 command: PricingCommand::Update,
             }) => pricing::update().await,

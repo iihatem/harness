@@ -5,6 +5,7 @@ pub mod anthropic_messages;
 pub mod chatgpt;
 pub mod codex_windows;
 pub mod credentials;
+pub mod delegated;
 pub mod discovery;
 mod http;
 pub mod openai_chat;

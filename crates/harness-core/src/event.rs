@@ -240,4 +240,20 @@ pub enum AgentEvent {
         kind: ErrorKind,
         message: String,
     },
+    /// A child agent started (sent in its own envelope). A child that ended before it had a
+    /// model (cancelled while it waited its turn) is announced just before its end, with an
+    /// empty `model`.
+    AgentStarted {
+        label: String,
+        model: String,
+    },
+    /// A child agent ended: `summary` is the start of its report.
+    AgentFinished {
+        status: crate::agents::AgentStatus,
+        summary: String,
+        /// The branch its changes were committed on, when it worked in a worktree and changed
+        /// something (headless runs report it; they never apply it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+    },
 }

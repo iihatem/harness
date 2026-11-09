@@ -199,6 +199,7 @@ impl ServerConsent for AskThroughApprover {
             reason: SERVERS_QUESTION.into(),
             kind: ApprovalKind::StartServers,
             kept_for_session: false,
+            agent: None,
         };
         let yes = match self.approver.decide(&request).await {
             ApprovalDecision::Approve | ApprovalDecision::ApproveForSession => true,

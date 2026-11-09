@@ -54,6 +54,12 @@ pub struct OutcomeRecord {
     pub handoff: Option<Value>,
     /// `rewound`, `interrupted` or `continued`, from what the user did next.
     pub user_signal: String,
+    /// The child agent the turn is of; absent for the main agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The session of the agent that spawned it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 impl OutcomeRecord {
@@ -96,6 +102,8 @@ impl OutcomeRecord {
                 "continued"
             }
             .to_string(),
+            agent: None,
+            parent: None,
         }
     }
 }

@@ -2448,3 +2448,95 @@ async fn t17_a_symlinked_or_gitfile_git_gets_the_same_protections() {
 
     c.finish();
 }
+
+// ---- M3d: the worktree of an agent ----------------------------------------------------------
+
+/// An agent in a worktree harness made is sandboxed with the worktree as its workspace: it can
+/// read git state, but cannot write any (its gitdir is in the main checkout's `.git`, outside the
+/// workspace), and cannot change the main checkout.
+#[tokio::test]
+async fn in_a_worktree_git_can_be_read_but_not_written() {
+    if skip_if_nested("in_a_worktree_git_can_be_read_but_not_written") {
+        return;
+    }
+    use harness_core::worktree::{Request, Worktrees, testing};
+    // Not in the temp directory: the sandbox lets commands write there, which is not where a
+    // repository and harness's data directory are.
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(&base).unwrap();
+    let main = tempfile::tempdir_in(&base).unwrap();
+    testing::init_repo(main.path());
+    let home = tempfile::tempdir_in(&base).unwrap();
+    let worktrees = Worktrees::new(main.path(), home.path().join("p")).unwrap();
+    let wt = worktrees
+        .create(&Request {
+            agent: "a1",
+            label: "general",
+            task: "task",
+        })
+        .unwrap()
+        .worktree;
+    let policy = workspace_write(&wt.workspace().canonicalize().unwrap());
+    let cwd = wt.workspace();
+    // Reading git state works, and so do ordinary edits.
+    let (code, out) = run(&policy, "git", &["log", "--oneline", "-1"], &cwd).await;
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("initial"), "{out}");
+    let (code, out) = run(&policy, "git", &["status", "--short"], &cwd).await;
+    assert_eq!(code, Some(0), "{out}");
+    let (code, out) = run(&policy, "sh", &["-c", "echo x > made.txt"], &cwd).await;
+    assert_eq!(code, Some(0), "{out}");
+    // Writing git state does not: not a commit, not a branch, not a ref, not the gitdir itself.
+    let (code, out) = run(&policy, "git", &["add", "-A"], &cwd).await;
+    assert_ne!(code, Some(0), "git add wrote the index: {out}");
+    let (code, out) = run(
+        &policy,
+        "git",
+        &[
+            "-c",
+            "user.name=a",
+            "-c",
+            "user.email=a@b",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "x",
+        ],
+        &cwd,
+    )
+    .await;
+    assert_ne!(code, Some(0), "git commit worked: {out}");
+    let (code, _) = run(&policy, "git", &["branch", "sneaky"], &cwd).await;
+    assert_ne!(code, Some(0));
+    let (code, _) = run(
+        &policy,
+        "git",
+        &["update-ref", "refs/heads/sneaky", "HEAD"],
+        &cwd,
+    )
+    .await;
+    assert_ne!(code, Some(0));
+    let main_path = main.path().canonicalize().unwrap();
+    let (code, _) = run(
+        &policy,
+        "sh",
+        &[
+            "-c",
+            &format!("echo x > '{}/escaped.txt'", main_path.display()),
+        ],
+        &cwd,
+    )
+    .await;
+    assert_ne!(code, Some(0));
+    assert!(!main.path().join("escaped.txt").exists());
+    assert_eq!(
+        testing::git(main.path(), &["branch", "--list", "sneaky"]).trim(),
+        ""
+    );
+    assert_eq!(
+        testing::git(&wt.path, &["rev-parse", "HEAD"]).trim(),
+        wt.base,
+        "the worktree's HEAD did not move"
+    );
+}

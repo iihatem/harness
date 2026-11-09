@@ -12,6 +12,7 @@ fn user(text: &str) -> EntryKind {
         note: false,
         plan: None,
         attribution: None,
+        agent_record: None,
     }
 }
 
@@ -26,6 +27,7 @@ fn assistant(text: &str) -> EntryKind {
         note: false,
         plan: None,
         attribution: None,
+        agent_record: None,
     }
 }
 
@@ -176,6 +178,7 @@ fn sessions_are_listed_most_recent_first_with_their_first_message() {
         note: false,
         plan: None,
         attribution: None,
+        agent_record: None,
     });
     std::thread::sleep(std::time::Duration::from_millis(20));
     let mut newer = Session::create(dir.path(), Path::new("/work"));
@@ -187,6 +190,7 @@ fn sessions_are_listed_most_recent_first_with_their_first_message() {
         note: true,
         plan: None,
         attribution: None,
+        agent_record: None,
     });
     newer.append(user("fix the tests"));
     let listed = session::list(dir.path());

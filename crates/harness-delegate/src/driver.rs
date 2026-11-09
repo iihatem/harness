@@ -49,6 +49,9 @@ pub struct Out {
     /// closes stdin if asked, and ends the child if it lingers.
     pub finished: bool,
     pub close_stdin: bool,
+    /// Also stop the child: the escalation clock starts (the protocol already wrote whatever
+    /// polite request there is). For a cancelled approval, or a run that cannot go on.
+    pub stop: bool,
 }
 
 /// One transport's wire format, as a state machine.
@@ -205,6 +208,14 @@ impl<P: Protocol> Run<P> {
     }
 }
 
+fn ladder_for<P: Protocol>(protocol: &P, grace: Duration) -> Ladder {
+    Ladder {
+        steps: protocol.escalation(),
+        next: 0,
+        at: Instant::now() + grace,
+    }
+}
+
 fn signal_group(pid: i32, signal: Signal) {
     let _ = killpg(Pid::from_raw(pid), signal);
 }
@@ -340,7 +351,12 @@ async fn drive<P: Protocol>(
                 Some(ControlCommand::Answer { id, answer, reply }) => {
                     match run.protocol.on_answer(&id, answer) {
                         Ok(out) => {
+                            let stop = out.stop;
                             run.apply(out);
+                            if stop {
+                                interrupted = true;
+                                ladder = Some(ladder_for(&run.protocol, config.grace));
+                            }
                             let _ = reply.send(Ok(()));
                         }
                         Err(e) => {
@@ -353,11 +369,7 @@ async fn drive<P: Protocol>(
                         interrupted = true;
                         let out = run.protocol.on_interrupt();
                         run.apply(out);
-                        ladder = Some(Ladder {
-                            steps: run.protocol.escalation(),
-                            next: 0,
-                            at: Instant::now() + config.grace,
-                        });
+                        ladder = Some(ladder_for(&run.protocol, config.grace));
                     }
                 }
             },
@@ -371,7 +383,11 @@ async fn drive<P: Protocol>(
                 Some(Line::Text(text)) if text.trim().is_empty() => {}
                 Some(Line::Text(text)) => {
                     let out = run.protocol.on_line(&text);
+                    let stop = out.stop;
                     run.apply(out);
+                    if stop {
+                        ladder = Some(ladder_for(&run.protocol, config.grace));
+                    }
                 }
             },
             status = child.wait(), if exit.is_none() => {

@@ -103,6 +103,11 @@ pub enum DelegateEvent {
         arguments: String,
     },
     ApprovalNeeded(DelegateApproval),
+    /// The child no longer waits for the approval `id` (its turn was interrupted, or it was
+    /// answered elsewhere): a prompt for it should go away. An answer that comes late is ignored.
+    ApprovalWithdrawn {
+        id: String,
+    },
     ToolCallFinished {
         id: String,
         output: String,

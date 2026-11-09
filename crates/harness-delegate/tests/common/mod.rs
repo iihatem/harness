@@ -156,6 +156,13 @@ impl Protocol for Toy {
     }
 
     fn on_answer(&mut self, id: &str, _answer: ApprovalAnswer) -> Result<Out, DelegateError> {
+        if id == "stop" {
+            return Ok(Out {
+                writes: vec!["STOPPING".into()],
+                stop: true,
+                ..Out::default()
+            });
+        }
         if id != "x" {
             return Err(DelegateError::UnknownApproval(id.to_string()));
         }

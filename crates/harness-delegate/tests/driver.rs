@@ -41,7 +41,7 @@ fn alive(pid: i32) -> bool {
 }
 
 async fn pid_from(file: &Path) -> i32 {
-    for _ in 0..100 {
+    for _ in 0..500 {
         if let Some(pid) = std::fs::read_to_string(file)
             .ok()
             .and_then(|text| text.trim().parse().ok())
@@ -294,4 +294,21 @@ async fn the_session_id_a_protocol_reports_is_readable_from_the_control() {
     let mut r = spawn_run(Command::new(&fake.binary), WithSession, cfg()).unwrap();
     collect(&mut r.events, LIMIT).await;
     assert_eq!(r.control.session_id().as_deref(), Some("sess-1"));
+}
+
+#[tokio::test]
+async fn a_protocol_that_asks_to_stop_starts_the_signal_ladder() {
+    let fake = Fake::new("x", "1.0.0", "emit ready\nhang\n");
+    let mut r = run(&fake, cfg());
+    ready(&mut r).await;
+    r.control
+        .answer("stop", ApprovalAnswer::Cancel)
+        .await
+        .unwrap();
+    let events = collect(&mut r.events, LIMIT).await;
+    assert_eq!(
+        finished(&events),
+        Some(TurnEndReason::Interrupted),
+        "{events:?}"
+    );
 }

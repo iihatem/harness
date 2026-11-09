@@ -19,3 +19,5 @@ pub mod redact;
 pub use backend::{
     BackendKind, DelegateBackend, DelegateError, DelegateRun, RunControl, StartRequest,
 };
+pub use claude::ClaudeBackend;
+pub use codex::CodexBackend;

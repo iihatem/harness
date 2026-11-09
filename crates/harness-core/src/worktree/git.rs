@@ -67,22 +67,31 @@ pub struct Git {
 impl Git {
     /// A runner for the repository (or worktree) at `dir`. Fails when `git` cannot be run there.
     pub fn open(dir: &Path) -> Result<Git, GitError> {
-        let mut git = Git {
+        Ok(Git {
             cwd: dir.to_path_buf(),
-            overrides: Vec::new(),
-        };
-        let configured = git.run(&[
+            overrides: Self::discover(dir)?,
+        })
+    }
+
+    /// The `-c` settings that switch off the filter drivers and merge drivers the configuration
+    /// of the repository at `dir` has now.
+    fn discover(dir: &Path) -> Result<Vec<String>, GitError> {
+        let args = [
             "config",
             "--null",
             "--get-regexp",
             r"^(filter\..*\.(clean|smudge|process|required)|merge\..*\.driver)$",
-        ]);
+        ];
+        let output = Self::build(dir, &[], &args)
+            .output()
+            .map_err(|e| Self::failure(&args, None, e.to_string().as_bytes()))?;
         // Exit 1 is "no such key": nothing to override.
-        let text = match configured {
-            Ok(text) => text,
-            Err(e) if e.code == Some(1) => String::new(),
-            Err(e) => return Err(e),
+        let text = match output.status.code() {
+            Some(0) => String::from_utf8_lossy(&output.stdout).into_owned(),
+            Some(1) => String::new(),
+            code => return Err(Self::failure(&args, code, &output.stderr)),
         };
+        let mut overrides = Vec::new();
         for entry in text.split('\0').filter(|e| !e.is_empty()) {
             let key = entry.split('\n').next().unwrap_or(entry);
             let value = if key.starts_with("merge.") {
@@ -94,9 +103,9 @@ impl Git {
             } else {
                 ""
             };
-            git.overrides.push(format!("{key}={value}"));
+            overrides.push(format!("{key}={value}"));
         }
-        Ok(git)
+        Ok(overrides)
     }
 
     /// The same runner for another directory of the same repository (a worktree).
@@ -112,20 +121,32 @@ impl Git {
         &self.cwd
     }
 
-    /// The command for `git args`, not yet run.
+    /// The command for `git args`, not yet run, as the configuration was when this runner was
+    /// made ([`run`](Self::run) reads it again each time).
     pub fn command(&self, args: &[&str]) -> Command {
+        Self::build(&self.cwd, &self.overrides, args)
+    }
+
+    /// The command for the configuration as it is now: a driver added to it since is switched
+    /// off as well.
+    fn fresh(&self, args: &[&str]) -> Command {
+        let overrides = Self::discover(&self.cwd).unwrap_or_else(|_| self.overrides.clone());
+        Self::build(&self.cwd, &overrides, args)
+    }
+
+    fn build(cwd: &Path, overrides: &[String], args: &[&str]) -> Command {
         let mut command = Command::new("git");
         command.arg("--no-pager");
         for setting in FIXED
             .iter()
             .map(|s| s.to_string())
-            .chain(self.overrides.iter().cloned())
+            .chain(overrides.iter().cloned())
         {
             command.arg("-c").arg(setting);
         }
         command
             .args(args)
-            .current_dir(&self.cwd)
+            .current_dir(cwd)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_PAGER", "cat")
@@ -153,7 +174,7 @@ impl Git {
 
     /// [`run`](Self::run) with more environment variables.
     pub fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<String, GitError> {
-        let mut command = self.command(args);
+        let mut command = self.fresh(args);
         command.envs(env.iter().copied());
         let output = command
             .output()
@@ -169,7 +190,7 @@ impl Git {
     /// (the command is then stopped).
     pub fn run_capped(&self, args: &[&str], cap: usize) -> Result<(String, bool), GitError> {
         let mut child = self
-            .command(args)
+            .fresh(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()

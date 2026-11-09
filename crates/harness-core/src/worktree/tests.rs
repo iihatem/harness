@@ -6,13 +6,13 @@ use crate::{
     worktree::testing::{git, init_repo, write},
 };
 
-struct Fixture {
-    repo: tempfile::TempDir,
-    home: tempfile::TempDir,
-    wts: Worktrees,
+pub(super) struct Fixture {
+    pub(super) repo: tempfile::TempDir,
+    pub(super) home: tempfile::TempDir,
+    pub(super) wts: Worktrees,
 }
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let home = tempfile::tempdir().unwrap();
@@ -20,7 +20,7 @@ fn fixture() -> Fixture {
     Fixture { repo, home, wts }
 }
 
-fn request<'a>(agent: &'a str, label: &'a str, task: &'a str) -> Request<'a> {
+pub(super) fn request<'a>(agent: &'a str, label: &'a str, task: &'a str) -> Request<'a> {
     Request { agent, label, task }
 }
 

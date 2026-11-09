@@ -9,8 +9,11 @@
 pub mod git;
 pub mod include;
 pub mod record;
+pub mod review;
 pub mod testing;
 
+#[cfg(test)]
+mod review_tests;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +25,7 @@ use std::{
 pub use git::{Git, GitError};
 pub use include::Included;
 pub use record::Record;
+pub use review::{Applied, Diff, Outcome, Overlap, author_of};
 
 /// The file in a worktree's git admin directory that says harness made it.
 const MARKER: &str = "harness-managed";
@@ -46,6 +50,15 @@ pub enum WorktreeError {
     /// Held by a running agent (or by someone who is not harness).
     #[error("worktree {name} is locked ({reason}), so it was left alone")]
     Locked { name: String, reason: String },
+    /// Applying the branch to the main checkout conflicts; nothing was changed.
+    #[error(
+        "applying {branch} conflicts in {}; nothing was changed, and the branch and its worktree are kept",
+        files.join(", ")
+    )]
+    Conflict { branch: String, files: Vec<String> },
+    /// The main checkout is in a state where the result cannot be applied now.
+    #[error("{0}")]
+    Refused(String),
     /// Not something harness made, as far as its own records and markers say.
     #[error("{name} is not a worktree harness made ({why}), so it was left alone")]
     NotOurs { name: String, why: String },
@@ -475,10 +488,9 @@ impl Worktrees {
         released
     }
 
-    /// Removes the worktree `name`, its branch and its record, if harness made it and nothing
-    /// holds it: a locked worktree (a running agent) and anything the records and the marker do
-    /// not agree is harness's are left alone.
-    pub fn remove(&self, name: &str) -> Result<(), WorktreeError> {
+    /// The record of the worktree `name`, when it is one harness made: a name it gives, a
+    /// record that names the places harness uses.
+    fn own(&self, name: &str) -> Result<Record, WorktreeError> {
         let not_ours = |why: &str| WorktreeError::NotOurs {
             name: name.to_string(),
             why: why.to_string(),
@@ -496,14 +508,23 @@ impl Worktrees {
         {
             return Err(not_ours("its record names another place"));
         }
+        Ok(record)
+    }
+
+    /// Takes the directory of the worktree of `record` away, if harness made it and nothing
+    /// holds it. Its branch and record stay.
+    fn remove_directory(&self, record: &Record) -> Result<(), WorktreeError> {
         let path = &record.path;
         if path.exists() {
             if !self.is_marked(path) {
-                return Err(not_ours("it has no harness marker"));
+                return Err(WorktreeError::NotOurs {
+                    name: record.name.clone(),
+                    why: "it has no harness marker".into(),
+                });
             }
             if let Some(reason) = self.lock_reason_at(path) {
                 return Err(WorktreeError::Locked {
-                    name: name.to_string(),
+                    name: record.name.clone(),
                     reason,
                 });
             }
@@ -512,9 +533,32 @@ impl Worktrees {
         } else {
             let _ = self.git.run(&["worktree", "prune"]);
         }
+        Ok(())
+    }
+
+    /// Removes the worktree `name`, its branch and its record, if harness made it and nothing
+    /// holds it: a locked worktree (a running agent) and anything the records and the marker do
+    /// not agree is harness's are left alone.
+    pub fn remove(&self, name: &str) -> Result<(), WorktreeError> {
+        let record = self.own(name)?;
+        self.remove_directory(&record)?;
         if self.branch_exists(&record.branch) {
             self.git.run(&["branch", "-D", &record.branch])?;
         }
+        let _ = std::fs::remove_file(self.record_path(name));
+        Ok(())
+    }
+
+    /// Throws the result of `name` away: the worktree, the branch and the record.
+    pub fn discard(&self, name: &str) -> Result<(), WorktreeError> {
+        self.remove(name)
+    }
+
+    /// Keeps the branch of `name` for the user and removes the worktree and the record: the
+    /// branch is the user's from now on, and harness never removes it.
+    pub fn keep(&self, name: &str) -> Result<(), WorktreeError> {
+        let record = self.own(name)?;
+        self.remove_directory(&record)?;
         let _ = std::fs::remove_file(self.record_path(name));
         Ok(())
     }

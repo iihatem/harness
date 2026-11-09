@@ -27,11 +27,12 @@ impl Meter for ScopedMeter {
     }
 
     fn check_budget(&self, _session: &str, account: AccountKind) -> BudgetStatus {
-        self.inner.check_budget(&self.scope.parent, account)
+        self.inner
+            .check_budget_as(&self.scope.parent, account, Some(&self.scope))
     }
 
     fn record_window(&self, snapshot: &WindowSnapshot) {
-        self.inner.record_window(snapshot)
+        self.inner.record_window_as(snapshot, Some(&self.scope))
     }
 
     fn record_turn(&self, turn: &TurnRecord) {
@@ -58,6 +59,8 @@ mod tests {
     struct Recording {
         requests: Mutex<Vec<(String, Option<AgentScope>)>>,
         checked: Mutex<Vec<String>>,
+        /// The agents whose window snapshots and budget checks were asked for.
+        scoped: Mutex<Vec<Option<AgentScope>>>,
     }
 
     impl Meter for Recording {
@@ -79,6 +82,18 @@ mod tests {
         fn check_budget(&self, session: &str, _a: AccountKind) -> BudgetStatus {
             self.checked.lock().unwrap().push(session.into());
             BudgetStatus::default()
+        }
+        fn check_budget_as(
+            &self,
+            session: &str,
+            account: AccountKind,
+            scope: Option<&AgentScope>,
+        ) -> BudgetStatus {
+            self.scoped.lock().unwrap().push(scope.cloned());
+            self.check_budget(session, account)
+        }
+        fn record_window_as(&self, _s: &WindowSnapshot, scope: Option<&AgentScope>) {
+            self.scoped.lock().unwrap().push(scope.cloned());
         }
     }
 
@@ -111,6 +126,25 @@ mod tests {
         assert_eq!(requests[0].1.as_ref().unwrap().agent, "a1");
         assert_eq!(requests[0].1.as_ref().unwrap().parent, "parent-session");
         assert_eq!(*inner.checked.lock().unwrap(), vec!["parent-session"]);
+    }
+
+    #[test]
+    fn a_childs_window_snapshots_and_budget_checks_name_it() {
+        let inner = Arc::new(Recording::default());
+        let scope = AgentScope {
+            agent: "a1".into(),
+            parent: "parent-session".into(),
+        };
+        let scoped = ScopedMeter::new(inner.clone(), scope.clone());
+        scoped.record_window(&WindowSnapshot {
+            windows: Vec::new(),
+            observed_at: 0,
+        });
+        scoped.check_budget("child-session", AccountKind::ApiKey);
+        assert_eq!(
+            *inner.scoped.lock().unwrap(),
+            vec![Some(scope.clone()), Some(scope)]
+        );
     }
 
     #[test]

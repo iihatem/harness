@@ -353,9 +353,30 @@ pub trait Meter: Send + Sync {
         BudgetStatus::default()
     }
 
+    /// Like [`check_budget`](Self::check_budget), asked by the child agent `scope` names (`None`:
+    /// the main agent). A child never takes the 80% warnings, which are the main agent's to
+    /// show: a meter that tells them once leaves them for the main agent's next check.
+    fn check_budget_as(
+        &self,
+        session: &str,
+        account: AccountKind,
+        scope: Option<&AgentScope>,
+    ) -> BudgetStatus {
+        let _ = scope;
+        self.check_budget(session, account)
+    }
+
     /// A window snapshot the provider reported during a request that has not ended yet: the
     /// meter keeps it, and names it in that request's record.
     fn record_window(&self, _snapshot: &WindowSnapshot) {}
+
+    /// Like [`record_window`](Self::record_window), for a request of the child agent `scope`
+    /// names (`None`: the main agent): the snapshot is named in that agent's next record, not
+    /// whichever agent's request is recorded first.
+    fn record_window_as(&self, snapshot: &WindowSnapshot, scope: Option<&AgentScope>) {
+        let _ = scope;
+        self.record_window(snapshot)
+    }
 
     /// Records a finished turn.
     fn record_turn(&self, _turn: &TurnRecord) {}

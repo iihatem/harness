@@ -49,6 +49,19 @@ pub fn avoided_for(pricing: &Pricing, baseline: &str, buckets: &Buckets) -> Avoi
     }
 }
 
+/// The window snapshots: the one each agent's request in flight has seen (the main agent's under
+/// the empty key), and the last one written.
+#[derive(Default)]
+struct Windows {
+    seen: std::collections::HashMap<String, String>,
+    written: Option<String>,
+}
+
+/// The key of an agent in [`Windows`]: the main agent has none.
+fn agent_key(scope: Option<&AgentScope>) -> String {
+    scope.map_or_else(String::new, |s| format!("{}/{}", s.parent, s.agent))
+}
+
 /// Keeps the ledger.
 pub struct UsageMeter {
     ledger: Ledger,
@@ -65,9 +78,9 @@ pub struct UsageMeter {
     spent_here: Mutex<Vec<(u64, String, f64)>>,
     /// The budgets as configured, which `/new` and `/resume` return the session budget to.
     configured: Mutex<Budgets>,
-    /// The snapshot the request in flight has seen, to name in its record, and the last one
-    /// written, so a snapshot repeated by every response is written once.
-    window: Mutex<(Option<String>, Option<String>)>,
+    /// The snapshot each agent's request in flight has seen, to name in its record, and the last
+    /// one written, so a snapshot repeated by every response is written once.
+    window: Mutex<Windows>,
     dirs: Dirs,
     outcomes: OutcomeLog,
     /// Whether turns are written to the outcome log (`[outcomes] enabled`).
@@ -93,7 +106,7 @@ impl UsageMeter {
             warned_kinds: Mutex::new(Default::default()),
             spent_here: Mutex::new(Vec::new()),
             configured: Mutex::new(Budgets::default()),
-            window: Mutex::new((None, None)),
+            window: Mutex::new(Windows::default()),
             dirs: Dirs::under(data),
             outcomes: OutcomeLog::new(&Dirs::under(data).outcomes),
             outcomes_enabled: true,
@@ -361,8 +374,8 @@ impl Meter for UsageMeter {
                 .window
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .0
-                .take(),
+                .seen
+                .remove(&agent_key(scope)),
             agent: scope.map(|s| s.agent.clone()),
             parent: scope.map(|s| s.parent.clone()),
         };
@@ -387,16 +400,21 @@ impl Meter for UsageMeter {
     }
 
     fn record_window(&self, snapshot: &WindowSnapshot) {
+        self.record_window_as(snapshot, None)
+    }
+
+    fn record_window_as(&self, snapshot: &WindowSnapshot, scope: Option<&AgentScope>) {
         let id = snapshot.id();
+        let key = agent_key(scope);
         let mut window = self.window.lock().unwrap_or_else(|e| e.into_inner());
-        if window.1.as_deref() == Some(id.as_str()) {
-            window.0 = Some(id);
+        if window.written.as_deref() == Some(id.as_str()) {
+            window.seen.insert(key, id);
             return;
         }
         match self.ledger.append_window(snapshot) {
             Ok(()) => {
-                window.0 = Some(id.clone());
-                window.1 = Some(id);
+                window.seen.insert(key, id.clone());
+                window.written = Some(id);
             }
             Err(e) => {
                 // Not written, so no record names it, and it is tried again when seen again.
@@ -432,6 +450,15 @@ impl Meter for UsageMeter {
     }
 
     fn check_budget(&self, session: &str, account: AccountKind) -> BudgetStatus {
+        self.check_budget_as(session, account, None)
+    }
+
+    fn check_budget_as(
+        &self,
+        session: &str,
+        account: AccountKind,
+        scope: Option<&AgentScope>,
+    ) -> BudgetStatus {
         let budgets = self.budgets();
         let mut status = BudgetStatus::default();
         // One read of the ledger for all the budgets that are set, and none when none is.
@@ -472,11 +499,13 @@ impl Meter for UsageMeter {
                     BudgetKind::Monthly => civil_date((self.clock)())[..7].to_string(),
                 };
                 let key = format!("{}:{period}:{limit}", kind.name());
-                if self
-                    .warned
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(key)
+                // A child leaves the warning for the main agent, whose events are shown.
+                if scope.is_none()
+                    && self
+                        .warned
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key)
                 {
                     status.warnings.push(notice);
                 }

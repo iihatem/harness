@@ -218,3 +218,58 @@ fn usage_can_be_grouped_by_agent_with_the_main_agent_as_main() {
     assert_eq!(keys, vec![("a1", 2), ("main", 1)]);
     assert_eq!(report.total.requests, 3);
 }
+
+fn window(percent: f64) -> harness_core::meter::WindowSnapshot {
+    use harness_core::meter::{Window, WindowSnapshot, WindowSource};
+    WindowSnapshot {
+        windows: vec![Window {
+            window_minutes: Some(300),
+            used_percent: Some(percent),
+            resets_at: Some(1_790_946_000),
+            source: WindowSource::Header,
+        }],
+        observed_at: 1_790_942_400,
+    }
+}
+
+#[test]
+fn a_window_snapshot_is_named_by_the_agent_that_saw_it_and_not_by_whoever_records_first() {
+    let data = tempfile::tempdir().unwrap();
+    let m = meter(data.path(), Budgets::default());
+    let (childs, mains) = (window(30.0), window(60.0));
+    // Both requests are in flight; each saw its own snapshot; the main agent's ends first.
+    m.record_window_as(&childs, Some(&scope()));
+    m.record_window(&mains);
+    m.record_request(&request("main-session", 1));
+    m.record_request_as(&request("child", 1), Some(&scope()));
+    let records = records(data.path());
+    assert_eq!(records[0].window.as_deref(), Some(mains.id().as_str()));
+    assert_eq!(records[1].window.as_deref(), Some(childs.id().as_str()));
+}
+
+#[test]
+fn a_child_leaves_the_eighty_percent_warning_to_the_main_agent() {
+    let data = tempfile::tempdir().unwrap();
+    let m = meter(
+        data.path(),
+        Budgets {
+            session_usd: Some(10.0),
+            ..Budgets::default()
+        },
+    );
+    m.record_request_as(&request("child", 8), Some(&scope()));
+    // The child checks first, and is told nothing of it.
+    let childs = m.check_budget_as("parent", AccountKind::ApiKey, Some(&scope()));
+    assert!(
+        childs.warnings.is_empty() && childs.stop.is_none(),
+        "{childs:?}"
+    );
+    // The main agent's next check says it, once.
+    let first = m.check_budget("parent", AccountKind::ApiKey);
+    assert_eq!(first.warnings.len(), 1, "{first:?}");
+    assert!(
+        m.check_budget("parent", AccountKind::ApiKey)
+            .warnings
+            .is_empty()
+    );
+}

@@ -92,6 +92,7 @@ impl Worktrees {
         label: &str,
         task: &str,
     ) -> Result<Option<Outcome>, WorktreeError> {
+        self.check_gitdir(&wt.path)?;
         let git = self.git.at(&wt.path);
         let on = git
             .run(&["symbolic-ref", "--quiet", "HEAD"])
@@ -232,6 +233,7 @@ impl Worktrees {
             files = committed;
         }
         if record.path.exists()
+            && self.check_gitdir(&record.path).is_ok()
             && let Ok(status) = self
                 .git
                 .at(&record.path)

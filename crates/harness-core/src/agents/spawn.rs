@@ -171,9 +171,9 @@ impl SpawnAgentsTool {
     }
 
     /// Where and how `def` runs for `entry`: an agent that can write works in a worktree when
-    /// the entry or the definition says so, and always when it runs in the background (it
-    /// would otherwise change the checkout while the user works); one that cannot write never
-    /// gets one.
+    /// the entry or the definition says so (an entry cannot decline what the definition
+    /// requires), and always when it runs in the background (it would otherwise change the
+    /// checkout while the user works); one that cannot write never gets one.
     fn plan_for(&self, def: &AgentDefinition, entry: &Entry) -> Plan {
         let asked = match entry.isolation.as_deref() {
             Some("worktree") => Some(true),
@@ -184,7 +184,9 @@ impl SpawnAgentsTool {
         let in_background = def.background == Some(true);
         let writes = !def.is_read_only();
         Plan {
-            isolation: writes && (asked.unwrap_or(by_definition) || in_background),
+            // `none` keeps an agent in the checkout, but never takes a worktree away from one its
+            // definition (the project's own) requires.
+            isolation: writes && (by_definition || asked == Some(true) || in_background),
             background: in_background && !self.settings.wait_for_background,
             read_only_asked: !writes && asked == Some(true),
         }
@@ -251,7 +253,7 @@ fn tool_spec(definitions: &Definitions, max_per_turn: u32) -> ToolSpec {
                             "agent": {"type": "string", "enum": definitions.names()},
                             "task": {"type": "string", "description": "What it must do, written to stand alone."},
                             "model": {"type": "string", "description": "Optional `<provider>/<model>`, to use a model other than the agent's default."},
-                            "isolation": {"type": "string", "enum": ["worktree", "none"], "description": "Optional. `worktree` gives an agent that edits files its own git worktree and branch; `none` keeps it in the checkout."}
+                            "isolation": {"type": "string", "enum": ["worktree", "none"], "description": "Optional. `worktree` gives an agent that edits files its own git worktree and branch; `none` keeps it in the checkout, unless its definition always gives it a worktree."}
                         },
                         "required": ["agent", "task"],
                         "additionalProperties": false

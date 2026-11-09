@@ -494,3 +494,86 @@ fn an_agent_that_died_having_changed_nothing_leaves_nothing_to_review() {
             .is_empty()
     );
 }
+
+#[test]
+fn a_pid_that_does_not_fit_is_never_probed_as_a_process_group() {
+    // 4294967295 as an i32 is -1: `kill(-1, 0)` asks about every process.
+    assert!(!process_alive(u32::MAX));
+    assert!(!process_alive(i32::MAX as u32 + 1));
+    assert!(!process_alive(0));
+    assert!(process_alive(std::process::id()));
+}
+
+#[test]
+fn a_worktree_whose_git_file_points_elsewhere_is_not_acted_on() {
+    let f = fixture();
+    let wt = f
+        .wts
+        .create(&request("a1", "general", "redirected"))
+        .unwrap()
+        .worktree;
+    write(&wt.path, "src/new.rs", "x\n");
+    // The agent (or anything else) rewrote the gitfile to point at the main repository.
+    let main_git = f.repo.path().join(".git");
+    std::fs::write(
+        wt.path.join(".git"),
+        format!("gitdir: {}\n", main_git.display()),
+    )
+    .unwrap();
+    let before = git(f.repo.path(), &["rev-parse", "HEAD"]);
+    let error = f
+        .wts
+        .commit_result(&wt, "general", "redirected")
+        .unwrap_err();
+    assert!(error.to_string().contains("git directory"), "{error}");
+    assert_eq!(git(f.repo.path(), &["rev-parse", "HEAD"]), before);
+    assert_eq!(git(f.repo.path(), &["status", "--porcelain"]).trim(), "");
+}
+
+#[test]
+fn a_repository_git_does_not_trust_is_said_not_called_no_repository() {
+    let error = GitError {
+        args: "rev-parse --show-toplevel".into(),
+        code: Some(128),
+        stderr: "fatal: detected dubious ownership in repository at '/x'".into(),
+    };
+    let said = not_a_repository("/x", &error);
+    assert!(said.to_string().contains("safe.directory"), "{said}");
+    let plain = GitError {
+        args: "rev-parse".into(),
+        code: Some(128),
+        stderr: "fatal: not a git repository".into(),
+    };
+    assert!(matches!(
+        not_a_repository("/x", &plain),
+        WorktreeError::NotARepository(_)
+    ));
+}
+
+#[test]
+fn when_every_port_slot_is_taken_no_worktree_is_made() {
+    let f = fixture();
+    for slot in 1..=PORT_SLOTS {
+        let mut record = Record::new(
+            &format!("n{slot}"),
+            &format!("harness/n{slot}"),
+            &f.wts.home().join(format!("n{slot}")),
+            "0000",
+            "a0",
+            "general",
+            "t",
+        );
+        record.port_offset = slot * 100;
+        f.wts.write_record(&record).unwrap();
+    }
+    let error = f
+        .wts
+        .create(&request("a1", "general", "one too many"))
+        .unwrap_err();
+    assert!(error.to_string().contains("port"), "{error}");
+    assert!(
+        git(f.repo.path(), &["branch", "--list", "harness/one*"])
+            .trim()
+            .is_empty()
+    );
+}

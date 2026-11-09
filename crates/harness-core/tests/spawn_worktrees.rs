@@ -195,7 +195,7 @@ async fn a_definition_with_isolation_worktree_works_in_a_worktree_and_the_report
 }
 
 #[tokio::test]
-async fn an_entry_can_ask_for_a_worktree_and_can_decline_one_a_definition_asks_for() {
+async fn an_entry_can_ask_for_a_worktree_but_cannot_decline_one_a_definition_requires() {
     let mut def = editing("builder");
     def.isolation = Some("worktree".into());
     let rig = rig(
@@ -213,7 +213,10 @@ async fn an_entry_can_ask_for_a_worktree_and_can_decline_one_a_definition_asks_f
         .await;
     assert!(!out.is_error, "{}", out.content);
     let isolated: Vec<bool> = rig.specs().iter().map(|s| s.isolation).collect();
-    assert_eq!(isolated.iter().filter(|i| **i).count(), 1, "{isolated:?}");
+    // `none` does not take away what the definition requires: the entry that asked for one and
+    // the `builder` have worktrees, the plain entry that did not has none.
+    assert_eq!(isolated.len(), 3);
+    assert_eq!(isolated.iter().filter(|i| **i).count(), 2, "{isolated:?}");
     let schema = rig.tool.spec().parameters;
     assert_eq!(
         schema["properties"]["agents"]["items"]["properties"]["isolation"]["enum"],

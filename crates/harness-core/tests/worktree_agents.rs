@@ -58,6 +58,10 @@ impl AgentFactory for Factory {
             .pop_front()
             .ok_or("no script left")?;
         let workspace = setup.spec.workspace.resolve(&self.main);
+        if setup.spec.task.contains("PANIC") {
+            std::fs::write(workspace.join("lost.txt"), "work before the crash\n").unwrap();
+            panic!("the factory crashed");
+        }
         let config = AgentConfig::new("mock/m1", "m1", "prompt", workspace.join(".spill-out"));
         let tools = ToolRegistry::new(vec![Arc::new(Echo), Arc::new(Put), Arc::new(Sh)]);
         let mode = setup.mode;
@@ -251,6 +255,46 @@ async fn a_child_that_committed_itself_leaves_a_result_and_its_worktree_and_bran
     let record = f.wts.records().remove(0);
     assert_eq!(record.outcome.as_ref(), Some(&outcome));
     assert!(record.path.exists());
+}
+
+#[tokio::test]
+async fn a_child_that_panics_still_has_its_worktree_settled_and_its_work_kept() {
+    let f = fixture(vec![vec![Script::text("never used")]], true);
+    let report = wait(f.sup.spawn(isolated("PANIC"))).await;
+    assert_eq!(report.status, AgentStatus::Failed);
+    assert!(report.error.as_deref().unwrap().contains("crashed"));
+    // Not locked by this live harness for good, recorded as failed, and what it wrote is saved.
+    assert!(!git(f.main.path(), &["worktree", "list", "--porcelain"]).contains("locked"));
+    let record = f.wts.records().remove(0);
+    assert_eq!(record.status, AgentStatus::Failed);
+    let outcome = record.outcome.expect("its edits were committed");
+    assert_eq!(outcome.files, vec!["lost.txt".to_string()]);
+    let info = f.sup.snapshot().remove(0);
+    assert_eq!(
+        info.worktree.as_ref().and_then(|w| w.outcome.as_ref()),
+        Some(&outcome)
+    );
+}
+
+#[tokio::test]
+async fn the_agents_session_is_in_its_record_while_it_runs() {
+    let f = fixture(vec![vec![Script::Hang(vec![])]], true);
+    let mut spec = isolated("general");
+    spec.background = true;
+    let handle = f.sup.spawn(spec);
+    let started = std::time::Instant::now();
+    let record = loop {
+        if let Some(record) = f.wts.records().into_iter().next()
+            && record.session.is_some()
+        {
+            break record;
+        }
+        assert!(started.elapsed() < WAIT, "no session in the record");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(record.status, AgentStatus::Working);
+    f.sup.stop_all();
+    let _ = wait(handle).await;
 }
 
 #[tokio::test]

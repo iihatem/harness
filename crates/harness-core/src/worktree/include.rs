@@ -151,8 +151,9 @@ impl Copier<'_> {
         }
     }
 
-    /// Inside a listed directory everything is copied, but for what git does not ignore
-    /// (a negated pattern in `.gitignore` would show here) and for links.
+    /// Inside a directory git ignores as a whole, and the list names, everything is copied, but
+    /// for links. (What git does not ignore is never reached: a directory with such files in
+    /// it is not listed as one by git, only the files it does ignore are.)
     fn visit_whole(&mut self, rel: &Path) {
         if self.full {
             return;
@@ -306,6 +307,24 @@ mod tests {
         assert!(!wt.join("config/dev.local").exists(), "negated");
         assert!(wt.join("secret.key").exists(), "anchored at the root");
         assert_eq!(done.copied, 2);
+    }
+
+    #[test]
+    fn in_a_listed_directory_only_what_git_ignores_is_copied() {
+        let (repo, dest) = project("cache/\n");
+        // `cache/*` ignores everything in it but `keep.txt`, which git does not ignore.
+        write(repo.path(), ".gitignore", "cache/*\n!cache/keep.txt\n");
+        write(repo.path(), "cache/ignored.bin", "ignored\n");
+        write(repo.path(), "cache/keep.txt", "not ignored\n");
+        write(repo.path(), "cache/deep/inner.bin", "ignored too\n");
+        let done = copy(&repo, &dest);
+        let wt = dest.path().join("wt");
+        assert!(wt.join("cache/ignored.bin").exists());
+        assert!(wt.join("cache/deep/inner.bin").exists());
+        assert!(
+            !wt.join("cache/keep.txt").exists(),
+            "git does not ignore it: {done:?}"
+        );
     }
 
     #[test]

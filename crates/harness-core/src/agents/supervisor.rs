@@ -417,6 +417,7 @@ impl Supervisor {
             )
         };
         self.inner.records.expect_report();
+        let task_text = spec.task.clone();
         let task = tokio::spawn(run_child(
             inner.clone(),
             parent_session.clone(),
@@ -443,6 +444,23 @@ impl Supervisor {
                         "the agent was stopped".into()
                     });
                     if inner.status(&task_tag.id).is_some_and(|s| !s.is_final()) {
+                        // Its worktree is settled too: what it had changed is committed, and
+                        // the lock this process holds released.
+                        let worktree = lock(&inner.registry)
+                            .entries
+                            .iter()
+                            .find(|e| e.info.tag.id == task_tag.id)
+                            .and_then(|e| e.info.worktree.as_ref().map(|w| w.name.clone()))
+                            .and_then(|name| lock(&inner.worktrees).clone()?.worktree(&name));
+                        let report = settle_worktree(
+                            &inner,
+                            &task_tag.id,
+                            worktree.as_ref(),
+                            &task_tag.label,
+                            &task_text,
+                            report,
+                        )
+                        .await;
                         finish_child(&inner, &parent_session, &task_tag, report, None)
                     } else {
                         report
@@ -733,6 +751,11 @@ async fn run_child(
         None => Session::in_memory(&workspace),
     };
     let session_id = session.id().to_string();
+    // Its record names the session from the start, so a crash does not lose the link.
+    if let (Some(wt), Some(wts)) = (&worktree, lock(&inner.worktrees).clone()) {
+        let session_id = session_id.clone();
+        let _ = wts.update_record(&wt.name, |record| record.session = Some(session_id));
+    }
     let config = perm::child_engine_config(
         &parent.engine,
         live_mode,

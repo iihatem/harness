@@ -18,8 +18,22 @@ use std::{
     ffi::OsString,
     io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
+
+/// How long one git command may run before it is killed: long enough for a checkout of a large
+/// repository, short enough that a hung git (a stale lock waited on, a dead network
+/// filesystem) does not block harness for good.
+const TIME_LIMIT: Duration = Duration::from_secs(300);
+/// The most output [`Git::run`] keeps; a command that prints more is stopped and fails.
+const OUTPUT_CAP: usize = 64 * 1024 * 1024;
+/// The most of git's complaints that are kept.
+const STDERR_CAP: usize = 64 * 1024;
 
 /// Variables that are removed even when harness's environment does not have them: the ones that
 /// would point git at another repository, index, editor or program, or at other configuration.
@@ -70,6 +84,17 @@ const FIXED: [(&str, &str); 11] = [
 /// external diff drivers.
 const DRIVER_KEYS: &str = r"^(filter\..*\.(clean|smudge|process|required)|merge\..*\.driver|diff\..*\.(textconv|command))$";
 
+/// What [`Git::exec`] saw of a command.
+struct Executed {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// There was more output than the cap.
+    over: bool,
+    /// It ran past its time limit and was killed.
+    timed_out: bool,
+}
+
 /// The names of the variables harness's own environment has.
 fn inherited() -> Vec<OsString> {
     std::env::vars_os().map(|(name, _)| name).collect()
@@ -90,6 +115,8 @@ pub struct GitError {
 #[derive(Debug, Clone)]
 pub struct Git {
     cwd: PathBuf,
+    limit: Duration,
+    cap: usize,
     /// (key, value) for each driver the repository configures, as the configuration was when
     /// this runner was made.
     overrides: Vec<(String, String)>,
@@ -133,7 +160,74 @@ impl Git {
     pub fn open(dir: &Path) -> Result<Git, GitError> {
         Ok(Git {
             cwd: dir.to_path_buf(),
+            limit: TIME_LIMIT,
+            cap: OUTPUT_CAP,
             overrides: Self::discover(dir)?,
+        })
+    }
+
+    /// The same runner with another time limit per command and cap on what [`run`](Self::run)
+    /// keeps of the output.
+    pub fn with_limits(mut self, limit: Duration, cap: usize) -> Git {
+        self.limit = limit;
+        self.cap = cap;
+        self
+    }
+
+    /// Runs `command` (its stdin is closed already) for at most `limit`, keeping at most `cap`
+    /// bytes of its output: more than that stops it, and `over` says so. Output is read as it
+    /// comes, so a command that fills a pipe does not stall.
+    fn exec(mut command: Command, limit: Duration, cap: usize) -> std::io::Result<Executed> {
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let over = Arc::new(AtomicBool::new(false));
+        let mut stdout = child.stdout.take().expect("stdout is piped");
+        let mut stderr = child.stderr.take().expect("stderr is piped");
+        let flag = over.clone();
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            let _ = (&mut stdout).take(cap as u64 + 1).read_to_end(&mut kept);
+            if kept.len() > cap {
+                kept.truncate(cap);
+                flag.store(true, Ordering::SeqCst);
+            }
+            // Whatever more there is is read and dropped (unless the command is killed first).
+            let _ = out_tx.send(kept);
+            let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+        });
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            let _ = (&mut stderr).take(STDERR_CAP as u64).read_to_end(&mut kept);
+            let _ = err_tx.send(kept);
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        });
+        let started = Instant::now();
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if over.load(Ordering::SeqCst) || started.elapsed() >= limit {
+                timed_out = !over.load(Ordering::SeqCst);
+                let _ = child.kill();
+                break child.wait()?;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        // A process the command left behind may hold the pipes open: what was read is enough.
+        let grace = Duration::from_millis(1000);
+        let stdout = out_rx.recv_timeout(grace).unwrap_or_default();
+        let stderr = err_rx.recv_timeout(grace).unwrap_or_default();
+        Ok(Executed {
+            status,
+            stdout,
+            stderr,
+            over: over.load(Ordering::SeqCst),
+            timed_out,
         })
     }
 
@@ -142,9 +236,15 @@ impl Git {
         overrides: &[(String, String)],
     ) -> Result<Vec<(String, String)>, GitError> {
         let args = ["config", "--null", "--get-regexp", DRIVER_KEYS];
-        let output = Self::build(dir, overrides, &args, &inherited())
-            .output()
-            .map_err(|e| Self::failure(&args, None, e.to_string().as_bytes()))?;
+        let output = Self::exec(
+            Self::build(dir, overrides, &args, &inherited()),
+            TIME_LIMIT,
+            OUTPUT_CAP,
+        )
+        .map_err(|e| Self::failure(&args, None, e.to_string().as_bytes()))?;
+        if output.timed_out || output.over {
+            return Err(Self::stopped(&args, &output));
+        }
         // Exit 1 is "no such key": nothing to override.
         match output.status.code() {
             Some(0) => Ok(parse_listing(&String::from_utf8_lossy(&output.stdout))),
@@ -197,6 +297,8 @@ impl Git {
     pub fn at(&self, dir: &Path) -> Git {
         Git {
             cwd: dir.to_path_buf(),
+            limit: self.limit,
+            cap: self.cap,
             overrides: self.overrides.clone(),
         }
     }
@@ -266,6 +368,15 @@ impl Git {
         }
     }
 
+    fn stopped(args: &[&str], output: &Executed) -> GitError {
+        let why: &[u8] = if output.timed_out {
+            b"it ran too long and was stopped"
+        } else {
+            b"it printed too much and was stopped"
+        };
+        Self::failure(args, None, why)
+    }
+
     fn refused(why: &str) -> GitError {
         GitError {
             args: "config".into(),
@@ -283,9 +394,11 @@ impl Git {
     pub fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<String, GitError> {
         let mut command = self.fresh(args)?;
         command.envs(env.iter().copied());
-        let output = command
-            .output()
+        let output = Self::exec(command, self.limit, self.cap)
             .map_err(|e| Self::failure(args, None, e.to_string().as_bytes()))?;
+        if output.timed_out || output.over {
+            return Err(Self::stopped(args, &output));
+        }
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         } else {
@@ -296,29 +409,19 @@ impl Git {
     /// Runs `git args` and returns at most `cap` bytes of its output and whether there was more
     /// (the command is then stopped).
     pub fn run_capped(&self, args: &[&str], cap: usize) -> Result<(String, bool), GitError> {
-        let mut child = self
-            .fresh(args)?
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+        let output = Self::exec(self.fresh(args)?, self.limit, cap)
             .map_err(|e| Self::failure(args, None, e.to_string().as_bytes()))?;
-        let mut out = Vec::new();
-        let mut stdout = child.stdout.take().expect("stdout is piped");
-        let _ = (&mut stdout).take(cap as u64 + 1).read_to_end(&mut out);
-        let cut = out.len() > cap;
-        if cut {
-            out.truncate(cap);
-            let _ = child.kill();
+        if output.timed_out {
+            return Err(Self::stopped(args, &output));
         }
-        drop(stdout);
-        let status = child
-            .wait()
-            .map_err(|e| Self::failure(args, None, e.to_string().as_bytes()))?;
-        if !cut && !status.success() {
-            return Err(Self::failure(args, status.code(), b""));
+        if !output.over && !output.status.success() {
+            return Err(Self::failure(args, output.status.code(), &output.stderr));
         }
         // A cut may end inside a character.
-        Ok((String::from_utf8_lossy(&out).into_owned(), cut))
+        Ok((
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            output.over,
+        ))
     }
 
     /// The user's name and email from their git configuration, when both are set.
@@ -646,5 +749,38 @@ mod tests {
         let (whole, cut) = git.run_capped(&["status", "--porcelain"], 1000).unwrap();
         assert!(!cut);
         assert!(whole.contains("big.txt"));
+    }
+
+    #[test]
+    fn a_command_that_hangs_is_killed_at_its_time_limit() {
+        let dir = repo();
+        // An alias of the repository that never ends: the command asked for is the alias.
+        plain(dir.path(), &["config", "alias.hang", "!sleep 30"]);
+        let git = Git::open(dir.path())
+            .unwrap()
+            .with_limits(Duration::from_millis(300), OUTPUT_CAP);
+        let started = Instant::now();
+        let error = git.run(&["hang"]).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(error.to_string().contains("too long"), "{error}");
+        // The same for the capped runner.
+        let error = git.run_capped(&["hang"], 100).unwrap_err();
+        assert!(error.to_string().contains("too long"), "{error}");
+    }
+
+    #[test]
+    fn a_command_that_prints_too_much_is_stopped_and_fails() {
+        let dir = repo();
+        write(dir.path(), "big.txt", &"line of text\n".repeat(5000));
+        let git = Git::open(dir.path()).unwrap().with_limits(TIME_LIMIT, 1000);
+        git.run(&["add", "-A"]).unwrap();
+        let error = git.run(&["diff", "--cached", "--no-ext-diff"]).unwrap_err();
+        assert!(error.to_string().contains("too much"), "{error}");
+        // Output under the cap is kept whole.
+        assert!(git.run(&["rev-parse", "HEAD"]).is_ok());
     }
 }

@@ -67,6 +67,17 @@ pub enum WorktreeError {
     NotOurs { name: String, why: String },
 }
 
+/// What to say when git could not open `dir`: it is not a repository, or git does not trust who
+/// owns it.
+fn not_a_repository(dir: &str, error: &GitError) -> WorktreeError {
+    if error.stderr.contains("dubious ownership") {
+        return WorktreeError::Refused(format!(
+            "git does not trust the owner of the repository at {dir}, so agents cannot be isolated in worktrees there: `git config --global --add safe.directory {dir}` says it is yours"
+        ));
+    }
+    WorktreeError::NotARepository(dir.to_string())
+}
+
 fn io(context: &str, e: std::io::Error) -> WorktreeError {
     WorktreeError::Io(format!("{context}: {e}"))
 }
@@ -162,7 +173,11 @@ pub fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None) {
+    // A pid that does not fit an i32 would be a negative one, which asks about a process group.
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
         Ok(()) => true,
         Err(nix::errno::Errno::EPERM) => true,
         Err(_) => false,
@@ -208,15 +223,15 @@ fn base_name(label: &str, task: &str) -> String {
 impl Worktrees {
     /// The worktrees of the repository `dir` is in, kept in `home`.
     pub fn new(dir: &Path, home: PathBuf) -> Result<Worktrees, WorktreeError> {
-        let not_repo = || WorktreeError::NotARepository(dir.display().to_string());
-        let probe = Git::open(dir).map_err(|_| not_repo())?;
+        let shown = dir.display().to_string();
+        let probe = Git::open(dir).map_err(|e| not_a_repository(&shown, &e))?;
         let root = probe
             .run(&["rev-parse", "--show-toplevel"])
-            .map_err(|_| not_repo())?;
+            .map_err(|e| not_a_repository(&shown, &e))?;
         let root = PathBuf::from(root.trim());
         let prefix = probe
             .run(&["rev-parse", "--show-prefix"])
-            .map_err(|_| not_repo())?;
+            .map_err(|e| not_a_repository(&shown, &e))?;
         // The settings to override are those of the repository's own configuration.
         let git = Git::open(&root)?;
         Ok(Worktrees {
@@ -227,6 +242,15 @@ impl Worktrees {
             said: AtomicBool::new(false),
             creating: std::sync::Mutex::new(()),
         })
+    }
+
+    /// The worktree `name` as harness made it, while its directory is there.
+    pub fn worktree(&self, name: &str) -> Option<Worktree> {
+        let record = self.own(name).ok()?;
+        record
+            .path
+            .exists()
+            .then(|| Worktree::from_record(&record, &self.prefix))
     }
 
     /// The directory the worktrees are in.
@@ -373,12 +397,13 @@ impl Worktrees {
         count
     }
 
-    fn lowest_free_offset(&self) -> u16 {
+    /// The lowest port offset no record uses; none when all are in use (two worktrees would
+    /// then share ports).
+    fn lowest_free_offset(&self) -> Option<u16> {
         let used: Vec<u16> = self.records().iter().map(|r| r.port_offset).collect();
         (1..=PORT_SLOTS)
             .map(|slot| slot * 100)
             .find(|offset| !used.contains(offset))
-            .unwrap_or(100)
     }
 
     /// Makes a worktree for an agent, on a new branch from the local HEAD, locked, marked, and
@@ -399,12 +424,20 @@ impl Worktrees {
         let branch = format!("harness/{name}");
         let path = self.home.join(&name);
         let uncommitted = self.uncommitted();
+        let offset = self.lowest_free_offset().ok_or_else(|| {
+            WorktreeError::Refused(format!(
+                "all {PORT_SLOTS} port offsets are in use by worktrees harness made: remove some with `harness worktrees clean`"
+            ))
+        })?;
         let reason = format!("{LOCK_PREFIX}{}", std::process::id());
         let path_text = path.to_string_lossy().into_owned();
-        self.git.run(&[
-            "worktree", "add", "--lock", "--reason", &reason, "-b", &branch, &path_text, &base,
-        ])?;
+        self.git
+            .run(&["worktree", "add", "-b", &branch, &path_text, &base])?;
         let finished = (|| {
+            // Locked with a reason in a command of its own: `add --lock --reason` needs a newer
+            // git than `add` and `lock --reason` do.
+            self.git
+                .run(&["worktree", "lock", "--reason", &reason, &path_text])?;
             let admin = self.admin_dir(&path)?;
             std::fs::write(
                 admin.join(MARKER),
@@ -416,7 +449,6 @@ impl Worktrees {
             )
             .map_err(|e| io("marking the worktree", e))?;
             let included = include::copy_included(&self.git, &self.root, &path);
-            let offset = self.lowest_free_offset();
             let mut record = Record::new(
                 &name,
                 &branch,
@@ -428,9 +460,9 @@ impl Worktrees {
             );
             record.port_offset = offset;
             self.write_record(&record)?;
-            Ok::<_, WorktreeError>((offset, included))
+            Ok::<_, WorktreeError>(included)
         })();
-        let (offset, included) = match finished {
+        let included = match finished {
             Ok(done) => done,
             Err(e) => {
                 // Do not leave a half-made worktree behind.
@@ -468,6 +500,46 @@ impl Worktrees {
             .at(path)
             .run(&["rev-parse", "--absolute-git-dir"])?;
         Ok(PathBuf::from(text.trim()))
+    }
+
+    /// Checks that git, run in the worktree at `path`, acts on the admin directory harness made
+    /// for it, and not on another repository its `.git` file was pointed at: that directory is
+    /// one of the main repository's worktrees and carries harness's marker for this path.
+    pub(crate) fn check_gitdir(&self, path: &Path) -> Result<(), WorktreeError> {
+        let wrong = || {
+            WorktreeError::Refused(format!(
+                "the git directory of {} is not the one harness made for it, so nothing was done there",
+                path.display()
+            ))
+        };
+        let admin = self
+            .git
+            .at(path)
+            .run(&["rev-parse", "--absolute-git-dir"])
+            .map_err(|_| wrong())?;
+        let common = self
+            .git
+            .run(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .map_err(|_| wrong())?;
+        let canon = |p: &str| std::fs::canonicalize(p.trim()).map_err(|_| wrong());
+        let admin = canon(&admin)?;
+        let worktrees = canon(&common)?.join("worktrees");
+        if admin.parent() != Some(worktrees.as_path()) {
+            return Err(wrong());
+        }
+        let marker = std::fs::read_to_string(admin.join(MARKER)).map_err(|_| wrong())?;
+        let marked_path = marker
+            .lines()
+            .find_map(|l| l.strip_prefix("path "))
+            .map(PathBuf::from)
+            .ok_or_else(wrong)?;
+        if !marker.starts_with("harness 1")
+            || !Self::same_path(&marked_path, path)
+            || !path.exists()
+        {
+            return Err(wrong());
+        }
+        Ok(())
     }
 
     /// Whether the worktree at `path` carries harness's marker.
@@ -589,9 +661,8 @@ impl Worktrees {
         Ok(record)
     }
 
-    /// Takes the directory of the worktree of `record` away, if harness made it and nothing
-    /// holds it. Its branch and record stay.
-    fn remove_directory(&self, record: &Record) -> Result<(), WorktreeError> {
+    /// Whether the directory of `record` is harness's and nothing holds it.
+    fn removable(&self, record: &Record) -> Result<(), WorktreeError> {
         let path = &record.path;
         if path.exists() {
             if !self.is_marked(path) {
@@ -606,6 +677,16 @@ impl Worktrees {
                     reason,
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Takes the directory of the worktree of `record` away, if harness made it and nothing
+    /// holds it. Its branch and record stay.
+    fn remove_directory(&self, record: &Record) -> Result<(), WorktreeError> {
+        let path = &record.path;
+        if path.exists() {
+            self.removable(record)?;
             self.git
                 .run(&["worktree", "remove", "--force", &path.to_string_lossy()])?;
         } else {
@@ -620,6 +701,9 @@ impl Worktrees {
     pub fn unsaved(&self, record: &Record) -> Option<String> {
         let unreadable = || Some("could not be checked for unsaved work".to_string());
         if record.path.exists() {
+            if self.check_gitdir(&record.path).is_err() {
+                return Some("does not have the git directory harness made for it".into());
+            }
             let inside = self.git.at(&record.path);
             match inside.run(&["status", "--porcelain=v1", "-z"]) {
                 Ok(status) if status.is_empty() => {}
@@ -677,6 +761,7 @@ impl Worktrees {
     /// ([`Worktrees::unsaved`]); [`Worktrees::discard`] is the user's choice to lose it.
     pub fn remove(&self, name: &str) -> Result<(), WorktreeError> {
         let record = self.own(name)?;
+        self.removable(&record)?;
         if let Some(what) = self.unsaved(&record) {
             return Err(WorktreeError::Unsaved {
                 name: name.to_string(),

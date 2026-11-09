@@ -122,3 +122,12 @@ fn without_detail_a_delegated_models_id_still_says_delegated() {
     assert_eq!(cost.account, AccountKind::Delegated);
     assert_eq!(cost.billed_usd, Some(0.0));
 }
+
+#[test]
+fn a_delegated_run_is_never_counted_as_avoided_spend_whatever_the_baseline() {
+    let data = tempfile::tempdir().unwrap();
+    let cost = meter(data.path())
+        .with_baseline(Some("anthropic/claude-sonnet-4-5".into()))
+        .record_request_detailed(&request("codex/gpt-5-codex"), None, &delegated(None));
+    assert_eq!(cost.avoided, Avoided::NotApplicable);
+}

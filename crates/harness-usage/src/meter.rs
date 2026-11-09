@@ -287,7 +287,10 @@ impl UsageMeter {
             AccountKind::Subscription | AccountKind::Local | AccountKind::Delegated => Some(0.0),
         };
         let avoided = match (&self.baseline, account) {
-            (Some(_), AccountKind::ApiKey) | (None, _) => Avoided::NotApplicable,
+            // A delegated program's tokens are not what a baseline model would have billed.
+            (Some(_), AccountKind::ApiKey | AccountKind::Delegated) | (None, _) => {
+                Avoided::NotApplicable
+            }
             (Some(baseline), _) => avoided_for(&self.pricing, baseline, buckets),
         };
         let source = (account != AccountKind::Local && !none_sent && estimated.is_none())

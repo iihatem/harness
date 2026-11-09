@@ -114,6 +114,8 @@ struct Gate {
     yes: Option<bool>,
     /// Whether a `None` answer is the user's Esc.
     esc: bool,
+    /// How long a question waits for its answer.
+    delay: Duration,
 }
 
 impl Gate {
@@ -125,6 +127,7 @@ impl Gate {
             confirmed: Mutex::new(Vec::new()),
             yes: Some(true),
             esc: false,
+            delay: Duration::ZERO,
         }
     }
 }
@@ -140,6 +143,7 @@ impl ApprovalGate for Gate {
     }
     async fn confirm(&self, kind: ApprovalKind, question: String) -> Option<bool> {
         self.confirmed.lock().unwrap().push((kind, question));
+        tokio::time::sleep(self.delay).await;
         self.yes
     }
     fn stopped(&self) -> bool {
@@ -216,6 +220,8 @@ async fn a_claude_turn_becomes_the_agents_events_and_an_outcome() {
     assert_eq!(outcome.session_id.as_deref(), Some("sess-9"));
     assert_eq!(outcome.texts, ["Hello there"]);
     assert_eq!(outcome.tool_calls, 1);
+    // What a report lists as the commands it ran: the shell calls, as the program said them.
+    assert_eq!(outcome.commands, ["cargo test"]);
     assert_eq!(outcome.estimated_usd, Some(0.25));
     assert_eq!(outcome.cost_total_usd, Some(0.25));
     assert_eq!(outcome.usage.output_tokens, 5);
@@ -749,4 +755,47 @@ async fn an_answer_that_could_not_be_kept_is_said_not_claimed() {
         )),
         "{events:?}"
     );
+}
+
+#[tokio::test]
+async fn two_children_on_one_model_ask_the_opt_in_once() {
+    let store = Arc::new(Store::default());
+    let p = DelegatedProvider::new(
+        "claude-code",
+        "sonnet",
+        DelegateSettings {
+            store: Some(store.clone()),
+            ..DelegateSettings::default()
+        },
+        Some(api_key()),
+    )
+    .unwrap();
+    let mut gate = Gate::new(GateAnswer::Allow);
+    gate.delay = Duration::from_millis(100);
+    let (a, b) = (p.delegated().unwrap(), p.delegated().unwrap());
+    let (first, second) = tokio::join!(a.prepare(&gate), b.prepare(&gate));
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(gate.confirmed.lock().unwrap().len(), 1, "asked twice");
+}
+
+#[tokio::test]
+async fn an_answer_given_since_the_model_was_made_is_not_asked_again() {
+    let store = Arc::new(Store::default());
+    let p = DelegatedProvider::new(
+        "claude-code",
+        "sonnet",
+        DelegateSettings {
+            store: Some(store.clone()),
+            ..DelegateSettings::default()
+        },
+        Some(api_key()),
+    )
+    .unwrap();
+    // Another model of the program (another child) was answered after this one was made.
+    store.set(true).unwrap();
+    let gate = Gate::new(GateAnswer::Allow);
+    p.delegated().unwrap().prepare(&gate).await.unwrap();
+    assert!(gate.confirmed.lock().unwrap().is_empty());
+    assert_eq!(p.delegated().unwrap().account(), AccountKind::Delegated);
 }

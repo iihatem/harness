@@ -67,6 +67,8 @@ pub struct DelegatedOutcome {
     pub texts: Vec<String>,
     /// Tool calls the child made, and the files they changed.
     pub tool_calls: u32,
+    /// The shell commands it ran, as it said them.
+    pub commands: Vec<String>,
     pub changed: Vec<String>,
     /// Where the account's usage windows last stood, when the child said: the ledger's record of
     /// the turn names them.
@@ -84,6 +86,7 @@ impl DelegatedOutcome {
             usage: Usage::default(),
             texts: Vec::new(),
             tool_calls: 0,
+            commands: Vec::new(),
             changed: Vec::new(),
             windows: None,
         }

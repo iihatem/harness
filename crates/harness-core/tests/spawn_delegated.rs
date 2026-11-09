@@ -13,7 +13,10 @@ use std::{
 
 use async_trait::async_trait;
 use harness_core::{
-    agent::{Agent, AgentConfig, NonInteractive},
+    agent::{
+        Agent, AgentConfig, ApprovalDecision, ApprovalKind, ApprovalRequest, Approver,
+        NonInteractive,
+    },
     agents::{
         AgentFactory, AgentReport, AgentSpec, AgentStatus, ChildSetup, Endpoint, Limits,
         ParentContext, Supervisor,
@@ -21,7 +24,8 @@ use harness_core::{
     delegated::{ApprovalGate, DelegateTurns, DelegatedOutcome, DelegatedTurn},
     engine::{EngineConfig, PermissionEngine, RuleSet},
     event::{AgentEvent, TurnEndReason},
-    meter::AccountKind,
+    message::Usage,
+    meter::{AccountKind, Avoided, BudgetStatus, Meter, RequestCost, RequestRecord},
     permission::Mode,
     provider::{Provider, ProviderStream},
     testing::{MockProvider, Script},
@@ -44,6 +48,12 @@ struct Step {
     /// Waits for this before it ends.
     hold: Option<Arc<Notify>>,
     texts: Vec<&'static str>,
+    tool_calls: u32,
+    commands: Vec<&'static str>,
+    changed: Vec<&'static str>,
+    usage: Usage,
+    /// Asks this plain question through the gate, and records the answer.
+    ask: Option<ApprovalKind>,
 }
 
 #[derive(Default)]
@@ -52,6 +62,7 @@ struct Program {
     runs: Mutex<Vec<DelegatedTurn>>,
     running: Mutex<u32>,
     peak: Mutex<u32>,
+    answers: Mutex<Vec<Option<bool>>>,
 }
 
 impl Program {
@@ -84,7 +95,7 @@ impl DelegateTurns for Program {
     async fn run(
         &self,
         turn: DelegatedTurn,
-        _gate: &dyn ApprovalGate,
+        gate: &dyn ApprovalGate,
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: CancellationToken,
     ) -> DelegatedOutcome {
@@ -97,6 +108,10 @@ impl DelegateTurns for Program {
             *peak = (*peak).max(*running);
         }
         let step = self.steps.lock().unwrap().pop_front().unwrap_or_default();
+        if let Some(kind) = step.ask {
+            let answer = gate.confirm(kind, "may it?".into()).await;
+            self.answers.lock().unwrap().push(answer);
+        }
         if let Some((path, text)) = step.writes {
             std::fs::write(workspace.join(path), text).unwrap();
         }
@@ -114,7 +129,10 @@ impl DelegateTurns for Program {
         *self.running.lock().unwrap() -= 1;
         let mut outcome = DelegatedOutcome::ended(TurnEndReason::Completed);
         outcome.texts = step.texts.iter().map(|t| t.to_string()).collect();
-        outcome.tool_calls = u32::from(step.writes.is_some());
+        outcome.tool_calls = step.tool_calls + u32::from(step.writes.is_some());
+        outcome.commands = step.commands.iter().map(|c| c.to_string()).collect();
+        outcome.changed = step.changed.iter().map(|c| c.to_string()).collect();
+        outcome.usage = step.usage;
         outcome
     }
 }
@@ -166,15 +184,23 @@ impl AgentFactory for Factory {
         };
         let name = model.split('/').nth(1).unwrap_or("m1").to_string();
         let mode = setup.mode;
-        Ok(Agent::new(
+        let mut config = AgentConfig::new(model, name, "prompt", workspace.join(".spill"));
+        // What `CliFactory` does: the definition's text goes to the program with the task.
+        config.brief = setup.spec.instructions.clone();
+        config.instructions = Some("PROJECT-INSTRUCTIONS".into());
+        let mut agent = Agent::new(
             provider,
             ToolRegistry::new(vec![]),
             setup.policy,
             setup.approver,
-            AgentConfig::new(model, name, "prompt", workspace.join(".spill")),
+            config,
             ToolContext::new(&workspace).with_sandbox(None, mode.fs_access()),
         )
-        .with_session(setup.session))
+        .with_session(setup.session);
+        if let Some(meter) = setup.meter {
+            agent = agent.with_meter(meter);
+        }
+        Ok(agent)
     }
 }
 
@@ -187,6 +213,22 @@ struct Rig {
 }
 
 fn rig(steps: Vec<Step>, limits: Limits, with_worktrees: bool) -> Rig {
+    rig_with(
+        steps,
+        limits,
+        with_worktrees,
+        Arc::new(NonInteractive),
+        None,
+    )
+}
+
+fn rig_with(
+    steps: Vec<Step>,
+    limits: Limits,
+    with_worktrees: bool,
+    approver: Arc<dyn Approver>,
+    meter: Option<Arc<dyn Meter>>,
+) -> Rig {
     let main = tempfile::tempdir().unwrap();
     init_repo(main.path());
     let home = tempfile::tempdir().unwrap();
@@ -213,8 +255,8 @@ fn rig(steps: Vec<Step>, limits: Limits, with_worktrees: bool) -> Rig {
             cancel: CancellationToken::new(),
             policy: Arc::new(PermissionEngine::new(config.clone())),
             engine: config,
-            approver: Arc::new(NonInteractive),
-            meter: None,
+            approver,
+            meter,
             sessions_dir: None,
             workspace: main.path().to_path_buf(),
         },
@@ -387,4 +429,215 @@ async fn a_program_runs_at_most_its_limit_of_children_at_once_and_the_rest_wait(
     }
     assert_eq!(*rig.program.peak.lock().unwrap(), 2);
     let _ = &rig.factory;
+}
+
+// ---- what the program is told, and what its report says --------------------------------------
+
+#[tokio::test]
+async fn the_program_is_given_the_definitions_text_the_project_instructions_and_the_task_only() {
+    let rig = rig(vec![Step::default()], limits(), true);
+    let mut spec = spec("codex/gpt-5", "TASK-TEXT: fix the parser");
+    spec.mode = Some(Mode::ReadOnly);
+    spec.instructions = Some("BODY-TEXT: you review code".into());
+    report(&rig, spec).await;
+    let runs = rig.program.runs();
+    let task = &runs[0].task;
+    assert!(task.contains("BODY-TEXT: you review code"), "{task}");
+    assert!(task.contains("TASK-TEXT: fix the parser"), "{task}");
+    assert!(
+        task.find("BODY-TEXT").unwrap() < task.find("TASK-TEXT").unwrap(),
+        "{task}"
+    );
+    // The project's instructions keep their own route (a file for Claude, AGENTS.md for Codex).
+    assert_eq!(
+        runs[0].instructions.as_deref(),
+        Some("PROJECT-INSTRUCTIONS")
+    );
+    // Nothing of any conversation: a fresh child has no earlier messages to summarise.
+    assert!(!task.contains("earlier conversation"), "{task}");
+}
+
+#[tokio::test]
+async fn the_report_is_made_from_the_programs_tool_events_and_flags_a_done_without_any() {
+    let rig = rig(
+        vec![
+            Step {
+                tool_calls: 3,
+                commands: vec!["cargo test"],
+                changed: vec!["src/new.rs"],
+                texts: vec!["did it"],
+                ..Step::default()
+            },
+            Step {
+                texts: vec!["trust me"],
+                ..Step::default()
+            },
+        ],
+        limits(),
+        true,
+    );
+    let mut first = spec("codex/gpt-5", "do it");
+    first.mode = Some(Mode::ReadOnly);
+    let a = report(&rig, first).await;
+    assert_eq!(a.tool_calls, 3, "{a:?}");
+    assert_eq!(a.commands_run, ["cargo test"]);
+    assert_eq!(a.files_changed, ["src/new.rs"]);
+    assert!(a.flags.is_empty(), "{a:?}");
+    let mut second = spec("codex/gpt-5", "say it");
+    second.mode = Some(Mode::ReadOnly);
+    let b = report(&rig, second).await;
+    assert_eq!(b.tool_calls, 0);
+    assert!(
+        b.flags
+            .contains(&harness_core::agents::ReportFlag::NoToolCalls),
+        "{b:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_file_the_program_changed_in_its_worktree_is_listed_once() {
+    let rig = rig(
+        vec![Step {
+            writes: Some(("src/new.rs", "x\n")),
+            tool_calls: 1,
+            changed: vec!["src/new.rs"],
+            ..Step::default()
+        }],
+        limits(),
+        true,
+    );
+    let report = report(&rig, spec("codex/gpt-5", "add")).await;
+    assert_eq!(report.files_changed, ["src/new.rs"], "{report:?}");
+}
+
+struct Billed;
+
+impl Meter for Billed {
+    fn record_request(&self, _r: &RequestRecord) -> RequestCost {
+        RequestCost {
+            account: AccountKind::ApiKey,
+            billed_usd: Some(0.5),
+            list_usd: Some(0.5),
+            avoided: Avoided::NotApplicable,
+        }
+    }
+    fn check_budget(&self, _s: &str, _a: AccountKind) -> BudgetStatus {
+        BudgetStatus::default()
+    }
+}
+
+#[tokio::test]
+async fn what_the_program_used_is_in_the_childs_report() {
+    let rig = rig_with(
+        vec![Step {
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                ..Usage::default()
+            },
+            ..Step::default()
+        }],
+        limits(),
+        true,
+        Arc::new(NonInteractive),
+        Some(Arc::new(Billed)),
+    );
+    let mut spec = spec("codex/gpt-5", "look");
+    spec.mode = Some(Mode::ReadOnly);
+    let usage = report(&rig, spec).await.usage.expect("it used something");
+    assert_eq!(
+        (usage.requests, usage.input_tokens, usage.output_tokens),
+        (1, 100, 20)
+    );
+    assert_eq!(usage.billed_usd, Some(0.5));
+}
+
+// ---- questions a child puts -------------------------------------------------------------------
+
+/// Answers a question with `decision`; records who asked.
+struct Answers {
+    decision: ApprovalDecision,
+    asked: Mutex<Vec<ApprovalRequest>>,
+}
+
+#[async_trait]
+impl Approver for Answers {
+    async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
+        self.asked.lock().unwrap().push(request.clone());
+        self.decision.clone()
+    }
+}
+
+#[tokio::test]
+async fn a_childs_question_reaches_the_queue_labelled_with_the_child() {
+    let approver = Arc::new(Answers {
+        decision: ApprovalDecision::Approve,
+        asked: Mutex::new(Vec::new()),
+    });
+    let rig = rig_with(
+        vec![Step {
+            ask: Some(ApprovalKind::DelegateOptIn),
+            ..Step::default()
+        }],
+        limits(),
+        true,
+        approver.clone(),
+        None,
+    );
+    let mut spec = spec("claude-code/sonnet", "look");
+    spec.mode = Some(Mode::ReadOnly);
+    let report = report(&rig, spec).await;
+    assert_eq!(report.status, AgentStatus::Done, "{report:?}");
+    let asked = approver.asked.lock().unwrap();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].kind, ApprovalKind::DelegateOptIn);
+    assert_eq!(asked[0].agent.as_ref().unwrap().label, "builder");
+    assert_eq!(rig.program.answers.lock().unwrap().as_slice(), [Some(true)]);
+}
+
+#[tokio::test]
+async fn a_question_nobody_can_answer_does_not_fail_the_child_the_program_decides() {
+    // Headless: the program's own rule (the API key, or an error saying how to opt in) applies.
+    let rig = rig(
+        vec![Step {
+            ask: Some(ApprovalKind::DelegateOptIn),
+            ..Step::default()
+        }],
+        limits(),
+        true,
+    );
+    let mut spec = spec("claude-code/sonnet", "look");
+    spec.mode = Some(Mode::ReadOnly);
+    let report = report(&rig, spec).await;
+    assert_eq!(report.status, AgentStatus::Done, "{report:?}");
+    assert_eq!(rig.program.answers.lock().unwrap().as_slice(), [None]);
+}
+
+#[tokio::test]
+async fn esc_on_the_opt_in_leaves_it_undecided_and_fails_that_child_with_the_reason() {
+    let approver = Arc::new(Answers {
+        decision: ApprovalDecision::Deny {
+            feedback: Some(harness_core::agent::STOPPED_BY_USER.into()),
+        },
+        asked: Mutex::new(Vec::new()),
+    });
+    let rig = rig_with(
+        vec![Step {
+            ask: Some(ApprovalKind::DelegateOptIn),
+            ..Step::default()
+        }],
+        limits(),
+        true,
+        approver,
+        None,
+    );
+    let mut spec = spec("claude-code/sonnet", "look");
+    spec.mode = Some(Mode::ReadOnly);
+    let report = report(&rig, spec).await;
+    assert_eq!(report.status, AgentStatus::Failed, "{report:?}");
+    let error = report.error.unwrap();
+    assert!(
+        error.contains("subscription") && error.contains("unanswered"),
+        "{error}"
+    );
 }

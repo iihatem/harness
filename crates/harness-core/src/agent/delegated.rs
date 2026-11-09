@@ -226,6 +226,17 @@ fn summarize(history: &[Message], plan: Option<&str>) -> Option<String> {
     Some(lines.join("\n\n"))
 }
 
+/// `task` with what the agent's definition says of it in front, for a program that has no system
+/// prompt of harness's.
+fn with_brief(brief: Option<&str>, task: String) -> String {
+    match brief.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(brief) => format!(
+            "[harness: you were started as a subagent by another agent. Your instructions follow; the task comes after them.]\n\n{brief}\n\n[end of your instructions. Your task:]\n\n{task}"
+        ),
+        None => task,
+    }
+}
+
 /// The task for a child that starts fresh: the earlier conversation, written by harness, then
 /// the user's request.
 fn fresh_task(history: &[Message], task: &str, plan: Option<&str>) -> String {
@@ -351,11 +362,14 @@ impl Agent {
         let resume = self.session.delegate_resume(&model_id);
         let before = self.history.len().saturating_sub(1);
         let turn = DelegatedTurn {
-            task: if resume.is_some() {
-                task
-            } else {
-                fresh_task(&self.history[..before], &task, plan.as_deref())
-            },
+            task: with_brief(
+                self.config.brief.as_deref(),
+                if resume.is_some() {
+                    task
+                } else {
+                    fresh_task(&self.history[..before], &task, plan.as_deref())
+                },
+            ),
             model: model_name,
             model_id: model_id.clone(),
             mode,
@@ -443,6 +457,20 @@ impl Agent {
         self.stats.usage.cached_tokens += outcome.usage.cached_tokens;
         self.stats.usage.reasoning_tokens += outcome.usage.reasoning_tokens;
         self.stats.tool_calls += outcome.tool_calls;
+        // A child's report is made from what the program's tools did, as the in-process tools'
+        // log would be.
+        if self.keep_tool_log {
+            self.tool_log.calls += outcome.tool_calls;
+            self.tool_log
+                .commands
+                .extend(outcome.commands.iter().cloned());
+            for path in &outcome.changed {
+                let path = self.ctx.workspace.join(path);
+                if !self.tool_log.files_changed.contains(&path) {
+                    self.tool_log.files_changed.push(path);
+                }
+            }
+        }
         self.turn_changed |= !outcome.changed.is_empty();
         let Some(meter) = &self.meter else {
             return;

@@ -22,7 +22,7 @@ use tokio::sync::{mpsc::UnboundedSender, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::{Agent, ApprovalDecision, ApprovalRequest, Approver},
+    agent::{Agent, ApprovalDecision, ApprovalKind, ApprovalRequest, Approver, STOPPED_BY_USER},
     agents::{
         AgentEnvelope, AgentId, AgentRecords, AgentReport, AgentStatus, AgentTag, ChildWorkspace,
         Endpoint, Limits, ScopedMeter, ToolLog, perm, sched::Scheduler,
@@ -107,6 +107,12 @@ pub trait AgentFactory: Send + Sync {
     /// Where the child's requests will go, for the concurrency limits: known before the child is
     /// built, so a child that has to wait does not load a model it is not yet using.
     fn endpoint(&self, spec: &AgentSpec) -> Endpoint;
+
+    /// Whether `model` can be used for a child now, or why not: for a model that runs in another
+    /// program (installed, in its tested range, not refused). Asked before anything starts.
+    async fn usable(&self, _model: &str) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Builds the child. The supervisor runs one turn of it with `spec.task`.
     async fn build(&self, setup: ChildSetup) -> Result<Agent, String>;
@@ -385,6 +391,11 @@ impl Supervisor {
         })
         .await
         .is_ok()
+    }
+
+    /// Whether `model` can be used for a child now (see [`AgentFactory::usable`]).
+    pub async fn model_usable(&self, model: &str) -> Result<(), String> {
+        self.inner.factory.usable(model).await
     }
 
     /// Spawns a child under the parent's own token.
@@ -1001,7 +1012,17 @@ impl Approver for ChildApprover {
             self.supervisor
                 .update(id, |info| info.status = AgentStatus::Working);
         }
-        if decision == ApprovalDecision::Unavailable {
+        // A plain question (the Claude opt-in, full-access): nobody to answer is not a failure of
+        // the child, the program has a rule for it (the API key, or an error saying how to
+        // opt in). Esc on the opt-in leaves it undecided, and that child fails with the reason.
+        if request.kind == ApprovalKind::DelegateOptIn
+            && matches!(&decision, ApprovalDecision::Deny { feedback: Some(f) } if f == STOPPED_BY_USER)
+        {
+            *lock(&self.failure) = Some(
+                "the question about using your Claude subscription was left unanswered (Esc), so it did not run: it is asked again next time".into(),
+            );
+            self.cancel.cancel();
+        } else if decision == ApprovalDecision::Unavailable && !request.kind.is_question() {
             *lock(&self.failure) = Some(format!(
                 "it needed approval ({}) and no one could answer",
                 request.reason

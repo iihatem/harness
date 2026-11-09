@@ -49,6 +49,9 @@ struct Inner {
     unasked: AtomicBool,
     /// Why the answer to the question could not be kept, said at the next run.
     unkept: Mutex<Option<String>>,
+    /// Held while the opt-in is asked: children running at once ask it once, the others take the
+    /// answer.
+    asking: tokio::sync::Mutex<()>,
 }
 
 /// A model that runs in `claude` or `codex`.
@@ -99,6 +102,7 @@ impl DelegatedProvider {
                 said: AtomicBool::new(false),
                 unasked: AtomicBool::new(false),
                 unkept: Mutex::new(None),
+                asking: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -206,6 +210,14 @@ impl DelegateTurns for Inner {
     }
 
     async fn prepare(&self, gate: &dyn ApprovalGate) -> Result<(), String> {
+        let _asking = self.asking.lock().await;
+        // An answer given since this model was made (by another child) decides.
+        if let Some(yes) = self.settings.store.as_ref().and_then(|store| store.get()) {
+            let mut auth = self.auth.lock().expect("auth lock");
+            if let Auth::Undecided { key } = &*auth {
+                *auth = optin::claude_auth(Some(yes), key.clone());
+            }
+        }
         let key = match &*self.auth.lock().expect("auth lock") {
             Auth::Undecided { key } => key.clone(),
             Auth::Unusable(why) => return Err(why.clone()),
@@ -339,6 +351,9 @@ impl DelegateTurns for Inner {
                         }
                         DelegateEvent::ToolCallRequested { id, name, arguments } => {
                             outcome.tool_calls += 1;
+                            if let Some(command) = shell_command(&name, &arguments) {
+                                outcome.commands.push(command);
+                            }
                             let _ = events.send(AgentEvent::ToolCallRequested { id, name, arguments });
                         }
                         DelegateEvent::ApprovalNeeded(approval) => {
@@ -435,6 +450,18 @@ impl DelegateTurns for Inner {
         }
         outcome
     }
+}
+
+/// The command of a shell call of the program (Claude's `Bash`, Codex's `command`).
+fn shell_command(name: &str, arguments: &str) -> Option<String> {
+    if !matches!(name, "Bash" | "command" | "bash") {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get("command")?
+        .as_str()
+        .map(String::from)
 }
 
 fn add(total: &mut Usage, usage: &Usage) {

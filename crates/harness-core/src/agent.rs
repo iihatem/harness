@@ -106,6 +106,10 @@ pub struct AgentConfig {
     /// The project's instruction files as harness loaded them, for a model that runs in another
     /// agent program (which gets them in a file of its own, not in harness's system prompt).
     pub instructions: Option<String>,
+    /// What a child agent's definition says of it (the subagent preamble, the definition's text),
+    /// for a model that runs in another agent program, which gets it in front of the task: such a
+    /// program has no system prompt of harness's.
+    pub brief: Option<String>,
 }
 
 impl AgentConfig {
@@ -129,6 +133,7 @@ impl AgentConfig {
             text_tool_calls: false,
             edit_section: None,
             instructions: None,
+            brief: None,
         }
     }
 }

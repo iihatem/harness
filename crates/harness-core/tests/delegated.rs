@@ -156,6 +156,7 @@ impl DelegateTurns for Delegate {
             usage: step.usage,
             texts: step.texts.iter().map(|t| t.to_string()).collect(),
             tool_calls: step.tool_calls,
+            commands: Vec::new(),
             changed: step.changed.iter().map(|c| c.to_string()).collect(),
             windows: step.windows.clone(),
         }

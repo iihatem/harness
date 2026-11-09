@@ -163,3 +163,68 @@ fn the_readme_documents_subagents() {
         assert!(text.contains(word), "the README does not mention {word}");
     }
 }
+
+#[test]
+fn the_example_sets_the_agent_limits_and_the_delegation_settings_as_the_code_defaults_have_them() {
+    let blocks = toml_blocks(&readme()).join("\n");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, &blocks).unwrap();
+    let file = config::parse_file(&path).unwrap().unwrap();
+    let a = &file.agents;
+    // Every key of `[agents]` the README names is there, and shows the default.
+    let d = config::Agents::default();
+    assert_eq!(a.spawn, Some(d.spawn));
+    assert_eq!(a.per_local, Some(d.per_local));
+    assert_eq!(a.per_hosted, Some(d.per_hosted));
+    assert_eq!(a.per_delegated, Some(d.per_delegated));
+    assert_eq!(a.max_total, Some(d.max_total));
+    assert_eq!(a.max_spawns_per_turn, Some(d.max_spawns_per_turn));
+    // `[delegate]` and `[delegate.claude]`.
+    assert_eq!(file.delegate.allow_untested, Some(false));
+    assert_eq!(file.delegate.claude.use_subscription, Some(true));
+    // The whole example is accepted as a configuration, with no warning.
+    let trust = harness_config::trust::TrustStore::load(&dir.path().join("data")).unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let loaded = config::load(&path, &workspace, &trust).unwrap();
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(loaded.agents, d);
+}
+
+#[test]
+fn the_readme_reads_top_to_bottom() {
+    let text = readme();
+    // The status says what is built, not what comes next.
+    let status = text
+        .lines()
+        .find(|line| line.starts_with("> **Status"))
+        .unwrap();
+    for word in ["Milestone 1", "Milestone 2", "Milestone 3", "pending"] {
+        assert!(status.contains(word), "the status omits {word}");
+    }
+    assert!(!text.contains("comes next"), "a shipped feature is future");
+    // Each part has its own section, with a worked example.
+    for heading in [
+        "## Subagents",
+        "## Claude Code and Codex",
+        "## Worktrees and background agents",
+        "## The interactive terminal in detail",
+    ] {
+        assert!(text.lines().any(|l| l == heading), "no {heading}");
+    }
+    for word in [
+        "**Example.**",
+        "/bg ",
+        "/results",
+        "harness worktrees clean",
+    ] {
+        assert!(text.contains(word), "the README does not mention {word}");
+    }
+    // "What works today" stays a list of short bullets.
+    let start = text.find("## What works today").unwrap();
+    let end = text[start..].find("**Sandboxed by default.**").unwrap() + start;
+    for line in text[start..end].lines().filter(|l| l.starts_with("- ")) {
+        assert!(line.len() < 1300, "too long for the list: {}", &line[..60]);
+    }
+}

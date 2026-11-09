@@ -66,3 +66,27 @@ fn a_project_cannot_set_them() {
         cfg.warnings
     );
 }
+
+#[test]
+fn spawn_is_on_by_default_and_the_global_config_can_turn_it_off() {
+    assert!(load("", "").unwrap().agents.spawn);
+    assert!(!load("[agents]\nspawn = false\n", "").unwrap().agents.spawn);
+}
+
+#[test]
+fn a_project_can_turn_spawn_off_but_never_on() {
+    let off = load("", "[agents]\nspawn = false\n").unwrap();
+    assert!(!off.agents.spawn);
+    assert!(
+        off.warnings.iter().all(|w| !w.contains("[agents]")),
+        "{:?}",
+        off.warnings
+    );
+    let still_off = load("[agents]\nspawn = false\n", "[agents]\nspawn = true\n").unwrap();
+    assert!(!still_off.agents.spawn);
+    assert!(
+        still_off.warnings.iter().any(|w| w.contains("spawn")),
+        "{:?}",
+        still_off.warnings
+    );
+}

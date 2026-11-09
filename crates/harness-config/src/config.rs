@@ -324,6 +324,9 @@ pub struct AgentsSettings {
     pub max_depth: Option<u32>,
     /// Spawns in one turn (default 10).
     pub max_spawns_per_turn: Option<u32>,
+    /// Whether the model is offered the tool that starts subagents (default true). A project
+    /// may set it to false, never to true.
+    pub spawn: Option<bool>,
 }
 
 impl AgentsSettings {
@@ -350,6 +353,8 @@ pub struct Agents {
     pub max_total: u32,
     pub max_depth: u32,
     pub max_spawns_per_turn: u32,
+    /// Whether the main agent has the tool that starts subagents.
+    pub spawn: bool,
 }
 
 impl Default for Agents {
@@ -360,6 +365,7 @@ impl Default for Agents {
             max_total: 4,
             max_depth: 1,
             max_spawns_per_turn: 10,
+            spawn: true,
         }
     }
 }
@@ -373,6 +379,7 @@ impl From<&AgentsSettings> for Agents {
             max_total: s.max_total.unwrap_or(d.max_total),
             max_depth: s.max_depth.unwrap_or(d.max_depth),
             max_spawns_per_turn: s.max_spawns_per_turn.unwrap_or(d.max_spawns_per_turn),
+            spawn: s.spawn.unwrap_or(d.spawn),
         }
     }
 }
@@ -1238,11 +1245,24 @@ pub fn load(
                 path.display()
             ));
         }
-        if project.agents != AgentsSettings::default() {
+        // The one thing a project may do here is turn the tool off: that spends nothing.
+        let project_agents = AgentsSettings {
+            spawn: None,
+            ..project.agents.clone()
+        };
+        if project_agents != AgentsSettings::default() {
             cfg.warnings.push(format!(
-                "{}: ignoring [agents]: it is read from the global config only",
+                "{}: ignoring [agents]: it is read from the global config only (except `spawn = false`)",
                 path.display()
             ));
+        }
+        match project.agents.spawn {
+            Some(false) => cfg.agents.spawn = false,
+            Some(true) => cfg.warnings.push(format!(
+                "{}: ignoring agents.spawn = true: a project can turn subagents off, not on",
+                path.display()
+            )),
+            None => {}
         }
         if project.usage != UsageSettings::default() {
             cfg.warnings.push(format!(

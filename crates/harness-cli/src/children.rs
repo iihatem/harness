@@ -98,6 +98,26 @@ impl CliFactory {
     }
 }
 
+/// The system prompt of a child: its parent's `prompt`, with the edit section of the parent's
+/// model (`parent_section`) swapped for that of the child's own (`own_section`) when they differ
+/// and the first is in the prompt, then the child's `instructions` after a gap.
+fn child_prompt(
+    prompt: &str,
+    parent_section: Option<&str>,
+    own_section: Option<&str>,
+    instructions: Option<&str>,
+) -> String {
+    let mut prompt = match (parent_section, own_section) {
+        (Some(old), Some(new)) if old != new => prompt.replacen(old, new, 1),
+        _ => prompt.to_string(),
+    };
+    if let Some(instructions) = instructions.map(str::trim).filter(|i| !i.is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(instructions);
+    }
+    prompt
+}
+
 /// The model a spec runs on when it names one other than its parent's.
 fn own_model<'a>(spec: &'a AgentSpec, parent: &CurrentModel) -> Option<&'a str> {
     spec.model.as_deref().filter(|id| *id != parent.id)
@@ -157,12 +177,28 @@ impl AgentFactory for CliFactory {
                     config.request = request;
                 }
                 config.text_tool_calls = model.text_tool_calls;
-                config.edit_section = model.edit_section.clone();
+                // Its own edit format: the prompt describes the tool it has.
+                config.system_prompt = child_prompt(
+                    &config.system_prompt,
+                    parent.edit_section.as_deref(),
+                    model.edit_section.as_deref(),
+                    None,
+                );
+                config.edit_section = model.edit_section.clone().or(parent.edit_section.clone());
                 let tools = model.tools.clone().unwrap_or_else(|| parent.tools.clone());
                 (model.provider.clone(), tools)
             }
             None => (parent.provider.clone(), parent.tools.clone()),
         };
+        config.system_prompt = child_prompt(
+            &config.system_prompt,
+            None,
+            None,
+            spec.instructions.as_deref(),
+        );
+        // Whatever the parent's model offers, a child cannot start subagents: nesting is one
+        // level deep.
+        tools = tools.without(&[harness_core::agents::SPAWN_TOOL.to_string()]);
         if let Some(names) = &spec.tools {
             let allowed: Vec<Arc<dyn Tool>> = tools
                 .specs()
@@ -455,6 +491,118 @@ mod tests {
         let report = sup.spawn(AgentSpec::new("writer", "write it")).wait().await;
         assert_eq!(report.status, AgentStatus::Done, "{report:?}");
         assert_eq!(report.files_changed, vec!["made.txt"], "{report:?}");
+    }
+
+    #[test]
+    fn a_childs_prompt_follows_its_models_edit_format_and_ends_with_its_instructions() {
+        let old = "Edit with `edit`.\n";
+        let new = "Edit with `apply_patch`.\n";
+        let prompt = format!("You are an agent.\n{old}Project notes.");
+        // Another model's format replaces the section, where it was.
+        assert_eq!(
+            super::child_prompt(&prompt, Some(old), Some(new), None),
+            format!("You are an agent.\n{new}Project notes.")
+        );
+        // The same format, no section known, or one that is not in the prompt: unchanged.
+        assert_eq!(
+            super::child_prompt(&prompt, Some(old), Some(old), None),
+            prompt
+        );
+        assert_eq!(super::child_prompt(&prompt, None, Some(new), None), prompt);
+        assert_eq!(
+            super::child_prompt(&prompt, Some("gone"), Some(new), None),
+            prompt
+        );
+        // Its instructions come after, with a gap.
+        assert_eq!(
+            super::child_prompt("base", None, None, Some("be brief")),
+            "base\n\nbe brief"
+        );
+        assert_eq!(super::child_prompt("base", None, None, Some("  ")), "base");
+    }
+
+    #[tokio::test]
+    async fn a_childs_instructions_come_after_its_parents_prompt_and_replace_nothing() {
+        let f = fixture("", vec![Script::text("ok")]);
+        let (ctx, _rx, _a) = parent(&f, Mode::ReadOnly);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let sup = Supervisor::new(Limits::default(), f.factory.clone(), ctx, tx);
+        let mut spec = AgentSpec::new("explore", "where is main?");
+        spec.instructions = Some("You only look.".into());
+        sup.spawn(spec).wait().await;
+        assert_eq!(
+            f.provider.requests()[0].system,
+            "the parent's prompt\n\nYou only look."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_is_never_offered_the_tool_that_starts_subagents() {
+        use harness_core::{
+            agent::{Agent, SessionModel},
+            agents::SPAWN_TOOL,
+            message::{RequestOptions, ToolSpec},
+            permission::Action,
+            tool::{Tool, ToolContext, ToolOutput, ToolRegistry},
+        };
+        struct Named(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for Named {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.0.into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            fn action(&self, _: &serde_json::Value, ctx: &ToolContext) -> Action {
+                Action::Read(ctx.workspace.clone())
+            }
+            async fn run(&self, _: serde_json::Value, _: &ToolContext) -> ToolOutput {
+                ToolOutput::ok("")
+            }
+        }
+        let f = fixture("", vec![Script::text("ok")]);
+        // Whatever the parent's model offers, the child is not given the spawn tool.
+        let mut parent_agent = Agent::new(
+            f.provider.clone(),
+            ToolRegistry::new(Vec::new()),
+            Arc::new(PermissionEngine::new(EngineConfig {
+                mode: Mode::Auto,
+                workspace: f.workspace.clone(),
+                read_dirs: vec![],
+                rules: RuleSet::default(),
+                sandbox_available: false,
+                writes_need_approval: false,
+            })),
+            Arc::new(harness_core::agent::NonInteractive),
+            AgentConfig::new("openai/gpt-5", "gpt-5", "p", f.workspace.join("out")),
+            ToolContext::new(&f.workspace),
+        )
+        .with_model_cell(f.factory.parent_model());
+        parent_agent.switch_model(SessionModel {
+            provider: f.provider.clone(),
+            id: "openai/gpt-5".into(),
+            name: "gpt-5".into(),
+            context_window: 100_000,
+            request: RequestOptions::default(),
+            text_tool_calls: false,
+            tools: Some(ToolRegistry::new(vec![
+                Arc::new(Named("read")),
+                Arc::new(Named(SPAWN_TOOL)),
+            ])),
+            edit_section: None,
+        });
+        let (ctx, _rx, _a) = parent(&f, Mode::Auto);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let sup = Supervisor::new(Limits::default(), f.factory.clone(), ctx, tx);
+        sup.spawn(AgentSpec::new("x", "y")).wait().await;
+        let names: Vec<String> = f.provider.requests()[0]
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        assert_eq!(names, ["read"]);
     }
 
     #[tokio::test]

@@ -87,6 +87,19 @@ pub struct Worktree {
 }
 
 impl Worktree {
+    /// The worktree a record describes.
+    fn from_record(record: &Record, prefix: &Path) -> Worktree {
+        Worktree {
+            name: record.name.clone(),
+            branch: record.branch.clone(),
+            path: record.path.clone(),
+            base: record.base.clone(),
+            port_offset: record.port_offset,
+            agent: record.agent.clone(),
+            prefix: prefix.to_path_buf(),
+        }
+    }
+
     /// The directory the agent works in.
     pub fn workspace(&self) -> PathBuf {
         self.path.join(&self.prefix)
@@ -253,6 +266,53 @@ impl Worktrees {
         std::fs::write(&tmp, text).map_err(|e| io("writing a worktree record", e))?;
         std::fs::rename(&tmp, self.record_path(&record.name))
             .map_err(|e| io("writing a worktree record", e))
+    }
+
+    /// Changes the record of `name` with `change` and writes it.
+    pub fn update_record(
+        &self,
+        name: &str,
+        change: impl FnOnce(&mut Record),
+    ) -> Result<(), WorktreeError> {
+        let mut record = self.own(name)?;
+        change(&mut record);
+        self.write_record(&record)
+    }
+
+    /// Settles what a harness that is gone left: agents it had running are failed ("harness
+    /// ended"), their stale locks released and whatever they had changed committed (so it can
+    /// be reviewed like any other result). Returns the names.
+    pub fn reconcile(&self) -> Vec<String> {
+        use crate::agents::AgentStatus;
+        let mut fixed = Vec::new();
+        let orphans: Vec<Record> = self
+            .records()
+            .into_iter()
+            .filter(|r| !r.status.is_final() && !process_alive(r.pid))
+            .collect();
+        if orphans.is_empty() {
+            return fixed;
+        }
+        self.release_stale_locks();
+        for record in orphans {
+            let mut outcome = None;
+            if record.path.exists() && self.is_marked(&record.path) {
+                let wt = Worktree::from_record(&record, &self.prefix);
+                outcome = self
+                    .commit_result(&wt, &record.label, &record.task)
+                    .ok()
+                    .flatten();
+            }
+            let updated = self.update_record(&record.name, |r| {
+                r.status = AgentStatus::Failed;
+                r.error = Some("harness ended while it ran".into());
+                r.outcome = outcome;
+            });
+            if updated.is_ok() {
+                fixed.push(record.name);
+            }
+        }
+        fixed
     }
 
     fn branch_exists(&self, branch: &str) -> bool {

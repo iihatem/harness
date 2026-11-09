@@ -359,3 +359,107 @@ fn a_new_worktree_gets_the_ignored_files_the_list_names() {
     );
     assert_eq!(made.included.copied, 1);
 }
+
+#[test]
+fn a_record_keeps_what_the_agent_did_and_is_read_back() {
+    let f = fixture();
+    let wt = f
+        .wts
+        .create(&request("a1", "general", "task"))
+        .unwrap()
+        .worktree;
+    f.wts
+        .update_record(&wt.name, |r| {
+            r.status = crate::agents::AgentStatus::Done;
+            r.summary = Some("all done".into());
+            r.session = Some("sess-1".into());
+            r.model = Some("openai/gpt-5".into());
+            r.tool_calls = 7;
+            r.background = true;
+        })
+        .unwrap();
+    let record = &f.wts.records()[0];
+    assert_eq!(record.status, crate::agents::AgentStatus::Done);
+    assert_eq!(record.summary.as_deref(), Some("all done"));
+    assert_eq!(record.session.as_deref(), Some("sess-1"));
+    assert_eq!((record.tool_calls, record.background), (7, true));
+}
+
+#[test]
+fn a_record_written_before_these_fields_existed_still_reads() {
+    let f = fixture();
+    let old = serde_json::json!({
+        "name": "old", "branch": "harness/old", "path": "/x/old", "base": "abc",
+        "agent": "a1", "label": "general", "task": "t"
+    });
+    std::fs::create_dir_all(f.wts.home()).unwrap();
+    std::fs::write(f.wts.home().join("old.json"), old.to_string()).unwrap();
+    let records = f.wts.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, crate::agents::AgentStatus::Working);
+    assert!(records[0].outcome.is_none());
+}
+
+#[test]
+fn an_agent_whose_harness_died_is_failed_its_lock_released_and_its_edits_saved() {
+    let f = fixture();
+    let dead = f
+        .wts
+        .create(&request("a1", "general", "dead"))
+        .unwrap()
+        .worktree;
+    write(&dead.path, "src/new.rs", "pub fn two() {}\n");
+    let live = f
+        .wts
+        .create(&request("a2", "general", "live"))
+        .unwrap()
+        .worktree;
+    let finished = f
+        .wts
+        .create(&request("a3", "general", "finished"))
+        .unwrap()
+        .worktree;
+    f.wts.release(&finished).unwrap();
+    f.wts
+        .update_record(&finished.name, |r| {
+            r.status = crate::agents::AgentStatus::Done
+        })
+        .unwrap();
+    // The first was made by a harness that is gone.
+    let gone = dead_pid();
+    f.wts.update_record(&dead.name, |r| r.pid = gone).unwrap();
+    git(&dead.path, &["worktree", "unlock", "."]);
+    git(
+        &dead.path,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            &format!("harness pid {gone}"),
+            ".",
+        ],
+    );
+    let fixed = f.wts.reconcile();
+    assert_eq!(fixed, vec![dead.name.clone()]);
+    let by = |name: &str| {
+        f.wts
+            .records()
+            .into_iter()
+            .find(|r| r.name == name)
+            .unwrap()
+    };
+    let record = by(&dead.name);
+    assert_eq!(record.status, crate::agents::AgentStatus::Failed);
+    assert!(
+        record.error.as_deref().unwrap().contains("harness ended"),
+        "{:?}",
+        record.error
+    );
+    assert_eq!(
+        record.outcome.as_ref().unwrap().files,
+        vec!["src/new.rs".to_string()]
+    );
+    assert!(f.wts.lock_reason(&dead).is_none());
+    assert_eq!(by(&live.name).status, crate::agents::AgentStatus::Working);
+    assert_eq!(by(&finished.name).status, crate::agents::AgentStatus::Done);
+}

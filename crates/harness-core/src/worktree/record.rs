@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::review::Outcome;
+use crate::agents::AgentStatus;
+
 /// One worktree harness made.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -28,6 +31,31 @@ pub struct Record {
     /// When it was made, in seconds since the epoch.
     #[serde(default)]
     pub created: u64,
+    /// How its agent is doing; kept up to date while it runs, so that after a restart the
+    /// listing says how it ended.
+    #[serde(default = "working")]
+    pub status: AgentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The agent's own session, with its whole transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub tool_calls: u32,
+    /// It was started to run in the background.
+    #[serde(default)]
+    pub background: bool,
+    /// What it left, committed on its branch; `None` while it runs or when it changed nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
+}
+
+fn working() -> AgentStatus {
+    AgentStatus::Working
 }
 
 impl Record {
@@ -53,6 +81,14 @@ impl Record {
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
+            status: AgentStatus::Working,
+            summary: None,
+            error: None,
+            session: None,
+            model: None,
+            tool_calls: 0,
+            background: false,
+            outcome: None,
         }
     }
 }

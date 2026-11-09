@@ -2,8 +2,7 @@
 //! never wider. The child gets a permission engine of its own, so what the user allows for the
 //! session while it runs is remembered by that engine alone.
 
-use std::path::PathBuf;
-
+use super::workspace::ChildWorkspace;
 use crate::{
     engine::{EngineConfig, RuleSet},
     permission::Mode,
@@ -40,17 +39,17 @@ pub fn child_rules(parent: &RuleSet, own: &RuleSet) -> RuleSet {
 
 /// The engine settings of a child, from its parent's `parent` (its rules and paths), the mode
 /// the parent is in now (`parent_mode`), and the child's spec: its mode (`None`: the parent's),
-/// its own rules and its workspace (`None`: the parent's).
+/// its own rules and its workspace (the parent's, or one harness made for it).
 pub fn child_engine_config(
     parent: &EngineConfig,
     parent_mode: Mode,
     own_mode: Option<Mode>,
     own_rules: &RuleSet,
-    workspace: Option<PathBuf>,
+    workspace: &ChildWorkspace,
 ) -> EngineConfig {
     EngineConfig {
         mode: own_mode.map_or(parent_mode, |own| parent_mode.narrower(own)),
-        workspace: workspace.unwrap_or_else(|| parent.workspace.clone()),
+        workspace: workspace.resolve(&parent.workspace),
         read_dirs: parent.read_dirs.clone(),
         rules: child_rules(&parent.rules, own_rules),
         sandbox_available: parent.sandbox_available,

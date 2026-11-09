@@ -5,7 +5,10 @@
 use std::path::Path;
 
 use harness_core::{
-    agents::perm::{child_engine_config, child_rules},
+    agents::{
+        ChildWorkspace,
+        perm::{child_engine_config, child_rules},
+    },
     engine::{EngineConfig, PermissionEngine, RuleSet},
     permission::{Action, Decision, Mode, PermissionPolicy},
 };
@@ -61,7 +64,7 @@ fn a_child_in_a_wider_mode_than_its_parent_gets_the_parents() {
         Mode::Ask,
         Some(Mode::Auto),
         &RuleSet::default(),
-        None,
+        &ChildWorkspace::parent(),
     );
     assert_eq!(config.mode, Mode::Ask);
     let child = PermissionEngine::new(config);
@@ -77,7 +80,7 @@ fn a_read_only_parent_makes_a_read_only_child_whatever_the_spec_says() {
             Mode::ReadOnly,
             Some(own),
             &RuleSet::default(),
-            None,
+            &ChildWorkspace::parent(),
         );
         let child = PermissionEngine::new(config);
         assert!(
@@ -95,7 +98,7 @@ fn a_narrower_spec_narrows_the_child() {
         Mode::Auto,
         Some(Mode::ReadOnly),
         &RuleSet::default(),
-        None,
+        &ChildWorkspace::parent(),
     );
     assert_eq!(config.mode, Mode::ReadOnly);
 }
@@ -108,7 +111,7 @@ fn the_parents_live_mode_counts_not_the_one_it_started_in() {
         Mode::Plan,
         None,
         &RuleSet::default(),
-        None,
+        &ChildWorkspace::parent(),
     );
     assert_eq!(config.mode, Mode::Plan);
 }
@@ -147,7 +150,7 @@ fn the_parents_deny_rules_bind_the_child() {
         Mode::Auto,
         None,
         &RuleSet::default(),
-        None,
+        &ChildWorkspace::parent(),
     );
     let child = PermissionEngine::new(config);
     assert!(matches!(
@@ -167,7 +170,7 @@ fn allow_for_session_given_to_a_child_never_reaches_the_parent_or_a_sibling() {
             Mode::Ask,
             None,
             &RuleSet::default(),
-            None,
+            &ChildWorkspace::parent(),
         ))
     };
     let (first, second) = (make(), make());
@@ -180,7 +183,7 @@ fn allow_for_session_given_to_a_child_never_reaches_the_parent_or_a_sibling() {
 }
 
 #[test]
-fn a_spec_can_move_the_child_to_another_workspace() {
+fn a_child_works_in_its_parents_workspace_and_a_path_naming_another_is_refused() {
     let ws = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     let config = child_engine_config(
@@ -188,7 +191,17 @@ fn a_spec_can_move_the_child_to_another_workspace() {
         Mode::Auto,
         None,
         &RuleSet::default(),
-        Some(other.path().to_path_buf()),
+        &ChildWorkspace::parent(),
     );
-    assert_eq!(config.workspace, other.path());
+    assert_eq!(config.workspace, ws.path());
+    // A path from a model or a definition is accepted only when it is the parent's own.
+    assert_eq!(
+        ChildWorkspace::from_path(ws.path(), ws.path()),
+        Ok(ChildWorkspace::parent())
+    );
+    let refused = ChildWorkspace::from_path(other.path(), ws.path()).unwrap_err();
+    assert!(
+        refused.to_string().contains("parent's workspace"),
+        "{refused}"
+    );
 }

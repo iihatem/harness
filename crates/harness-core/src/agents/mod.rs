@@ -9,6 +9,7 @@ pub mod records;
 pub mod report;
 pub mod sched;
 pub mod supervisor;
+pub mod workspace;
 
 pub use identity::{AgentEnvelope, AgentId, AgentStatus, AgentTag, qualify_call_id};
 pub use meter::ScopedMeter;
@@ -18,3 +19,4 @@ pub use sched::{Endpoint, Limits};
 pub use supervisor::{
     AgentFactory, AgentHandle, AgentInfo, AgentSpec, ChildSetup, ParentContext, Supervisor,
 };
+pub use workspace::{ChildWorkspace, WorkspaceRefused};

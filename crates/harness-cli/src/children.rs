@@ -138,10 +138,7 @@ impl AgentFactory for CliFactory {
                 .collect();
             tools = ToolRegistry::new(allowed);
         }
-        let workspace = spec
-            .workspace
-            .clone()
-            .unwrap_or_else(|| self.setup.workspace.clone());
+        let workspace = spec.workspace.resolve(&self.setup.workspace);
         let sandbox = self.sandboxes.for_mode(mode);
         harness_core::permission::PermissionPolicy::set_sandbox_available(
             &*policy,

@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     agent::{Agent, ApprovalDecision, ApprovalRequest, Approver},
     agents::{
-        AgentEnvelope, AgentId, AgentRecords, AgentReport, AgentStatus, AgentTag, Endpoint, Limits,
-        ScopedMeter, ToolLog, perm, sched::Scheduler,
+        AgentEnvelope, AgentId, AgentRecords, AgentReport, AgentStatus, AgentTag, ChildWorkspace,
+        Endpoint, Limits, ScopedMeter, ToolLog, perm, sched::Scheduler,
     },
     engine::{EngineConfig, PermissionEngine, RuleSet},
     event::{AgentEvent, TurnEndReason},
@@ -53,8 +53,8 @@ pub struct AgentSpec {
     pub mode: Option<Mode>,
     /// Rules of its own. Never wider than its parent's.
     pub rules: RuleSet,
-    /// Where it works, when it is not its parent's workspace.
-    pub workspace: Option<PathBuf>,
+    /// Where it works: its parent's workspace, or one harness made for it. Never a free path.
+    pub workspace: ChildWorkspace,
     pub max_steps: Option<u32>,
     /// The role its turn runs for, which picks its model when `model` does not.
     pub role: Option<Role>,
@@ -357,10 +357,7 @@ async fn run_child(
         });
         report
     };
-    let workspace = spec
-        .workspace
-        .clone()
-        .unwrap_or_else(|| parent.workspace.clone());
+    let workspace = spec.workspace.resolve(&parent.workspace);
     let empty = |status, error: Option<String>| {
         let mut report = AgentReport::build(
             id.as_str(),
@@ -405,7 +402,7 @@ async fn run_child(
         live_mode,
         spec.mode,
         &spec.rules,
-        spec.workspace.clone(),
+        &spec.workspace,
     );
     let mode = config.mode;
     let policy = Arc::new(PermissionEngine::new(config));

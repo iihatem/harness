@@ -38,8 +38,10 @@ impl Fake {
             &binary,
             format!(
                 "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '{version_line}'; exit 0; fi\n\
+                 pwd >> '{}/cwd.txt'\n\
                  if [ \"$1\" = \"mcp\" ]; then cat '{}/mcp.json' 2>/dev/null || echo '[]'; exit 0; fi\n\
                  FAKE_CHILD_SCRIPT='{}' FAKE_CHILD_LOG='{}' FAKE_CHILD_ENVDUMP='{}' exec '{FAKE}' \"$@\"\n",
+                dir.path().display(),
                 dir.path().display(),
                 script_path.display(),
                 log.display(),
@@ -82,6 +84,15 @@ impl Fake {
             .find_map(|l| l.strip_prefix("argv: ").map(String::from))
             .map(|a| a.split('\u{1f}').map(String::from).collect())
             .unwrap_or_default()
+    }
+
+    /// The directory each run of the program started in (`mcp list` and the server).
+    pub fn cwds(&self) -> Vec<PathBuf> {
+        std::fs::read_to_string(self.dir.path().join("cwd.txt"))
+            .unwrap_or_default()
+            .lines()
+            .map(PathBuf::from)
+            .collect()
     }
 
     pub fn env(&self) -> std::collections::BTreeMap<String, String> {

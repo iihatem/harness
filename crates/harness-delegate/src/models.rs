@@ -4,7 +4,7 @@
 //!
 //! The answers are best effort and checked only against what the schema and the help text say:
 //! a Codex that answers in a shape this does not read lists nothing (the caller says so), and a
-//! Claude whose help names no alias lists the three it has always had.
+//! Claude lists the aliases its help names and the three it has always had.
 
 use std::{ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
 
@@ -130,6 +130,7 @@ pub async fn claude_aliases(options: &ListOptions) -> Result<Vec<String>, Delega
         .process_group(0)
         .kill_on_drop(true);
     let mut child = command.spawn().map_err(spawn)?;
+    let group = child.id().and_then(|id| i32::try_from(id).ok());
     let mut stdout = child.stdout.take().expect("piped");
     let read = async {
         let mut bytes = Vec::new();
@@ -137,15 +138,29 @@ pub async fn claude_aliases(options: &ListOptions) -> Result<Vec<String>, Delega
         let _ = child.wait().await;
         String::from_utf8_lossy(&bytes).into_owned()
     };
-    let help = tokio::time::timeout(options.timeout, read)
-        .await
-        .unwrap_or_default();
-    let aliases = parse_claude_aliases(&help);
-    Ok(if aliases.is_empty() {
-        CLAUDE_DEFAULT_ALIASES.map(String::from).to_vec()
-    } else {
-        aliases
-    })
+    let Ok(help) = tokio::time::timeout(options.timeout, read).await else {
+        // A program that does not answer `--help` is not listed as usable, and is ended with
+        // whatever it started.
+        if let Some(group) = group {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(group),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        return Err(spawn(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "claude did not answer `--help` in time",
+        )));
+    };
+    // What the help names, then the usual three it did not name (`haiku` is an alias whether or
+    // not the help's example mentions it).
+    let mut aliases = parse_claude_aliases(&help);
+    for usual in CLAUDE_DEFAULT_ALIASES {
+        if !aliases.iter().any(|a| a == usual) {
+            aliases.push(usual.to_string());
+        }
+    }
+    Ok(aliases)
 }
 
 /// The model names in one `model/list` result: `data[]`, each with a `model` (else an `id`),
@@ -170,11 +185,17 @@ pub async fn codex_models(options: &ListOptions) -> Result<Vec<String>, Delegate
         binary: "codex".into(),
         source,
     };
+    // As a turn does: the user's own MCP servers are switched off by name, and the run is in a
+    // directory of its own, so no project config is read and nothing of the project is reached.
+    let env = options.env(BackendKind::Codex);
+    let neutral = tempfile::tempdir().map_err(spawn)?;
+    let servers = crate::codex::user_mcp_servers(&found.path, &env, neutral.path()).await;
     let mut command = Command::new(&found.path);
     command
-        .args(crate::codex::argv::build(&[]))
+        .args(crate::codex::argv::build(&servers))
+        .current_dir(neutral.path())
         .env_clear()
-        .envs(options.env(BackendKind::Codex))
+        .envs(env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

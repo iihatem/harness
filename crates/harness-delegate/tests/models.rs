@@ -49,7 +49,8 @@ async fn claude_aliases_come_from_help() {
     let script: String = CLAUDE_HELP.lines().map(|l| format!("emit {l}\n")).collect();
     let fake = Fake::new("claude", "2.1.312 (Claude Code)", &script);
     let aliases = claude_aliases(&options(&fake)).await.unwrap();
-    assert_eq!(aliases, ["sonnet", "opus"]);
+    // `haiku` is an alias though this help's example does not name it.
+    assert_eq!(aliases, ["sonnet", "opus", "haiku"]);
     assert_eq!(fake.argv(), ["--help"]);
 }
 
@@ -98,5 +99,52 @@ async fn an_untested_version_is_refused_unless_allowed() {
     assert!(matches!(
         codex_models(&options(&fake)).await,
         Err(DelegateError::VersionOutOfRange { .. })
+    ));
+}
+
+#[tokio::test]
+async fn the_listing_run_switches_the_users_mcp_servers_off_and_leaves_the_project() {
+    let script = "expect \"method\":\"initialize\"\n\
+        emit {\"id\":1,\"result\":{}}\nexpect \"method\":\"initialized\"\n\
+        expect \"method\":\"model/list\"\n\
+        emit {\"id\":2,\"result\":{\"data\":[{\"id\":\"x\",\"model\":\"gpt-5-codex\"}]}}\nuntil-eof\n";
+    let fake = Fake::new("codex", "codex-cli 0.154.0", script);
+    std::fs::write(
+        fake.path().join("mcp.json"),
+        r#"[{"name":"alpha"},{"name":"beta"}]"#,
+    )
+    .unwrap();
+    let project = std::env::current_dir().unwrap();
+    assert_eq!(
+        codex_models(&options(&fake)).await.unwrap(),
+        ["gpt-5-codex"]
+    );
+    let argv = fake.argv().join(" ");
+    assert!(
+        argv.contains(r#"mcp_servers={"alpha"={enabled=false},"beta"={enabled=false}}"#),
+        "{argv}"
+    );
+    let cwds = fake.cwds();
+    assert!(!cwds.is_empty());
+    for cwd in cwds {
+        let cwd = cwd.canonicalize().unwrap_or(cwd);
+        assert!(!cwd.starts_with(&project), "{cwd:?} is in the project");
+        assert!(
+            cwd.starts_with(std::env::temp_dir().canonicalize().unwrap()),
+            "{cwd:?} is not a temporary directory"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_claude_that_does_not_answer_help_is_not_listed_as_usable() {
+    let fake = Fake::new("claude", "2.1.312 (Claude Code)", "hang\n");
+    let slow = ListOptions {
+        timeout: Duration::from_millis(500),
+        ..options(&fake)
+    };
+    assert!(matches!(
+        claude_aliases(&slow).await,
+        Err(DelegateError::Spawn { .. })
     ));
 }

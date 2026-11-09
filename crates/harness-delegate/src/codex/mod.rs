@@ -85,7 +85,7 @@ impl DelegateBackend for CodexBackend {
 /// The names of the MCP servers codex would start for the user (`codex mcp list --json`, which
 /// reads the config but starts nothing). Best effort: when it cannot be run or read, there are
 /// no names, and the servers are not switched off (the plan lists this as a limit).
-async fn user_mcp_servers(
+pub(crate) async fn user_mcp_servers(
     binary: &std::path::Path,
     env: &[(std::ffi::OsString, std::ffi::OsString)],
     workspace: &std::path::Path,

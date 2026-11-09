@@ -773,3 +773,32 @@ async fn esc_on_the_opt_in_leaves_it_undecided_and_fails_that_child_with_the_rea
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn esc_on_a_childs_full_access_confirmation_fails_that_child_with_the_reason() {
+    let approver = Arc::new(Answers {
+        decision: ApprovalDecision::Deny {
+            feedback: Some(harness_core::agent::STOPPED_BY_USER.into()),
+        },
+        asked: Mutex::new(Vec::new()),
+    });
+    let rig = rig_with(
+        vec![Step {
+            ask: Some(ApprovalKind::DelegateFullAccess),
+            ..Step::default()
+        }],
+        limits(),
+        true,
+        approver,
+        None,
+    );
+    let mut spec = spec("codex/gpt-5", "look");
+    spec.mode = Some(Mode::ReadOnly);
+    let report = report(&rig, spec).await;
+    assert_eq!(report.status, AgentStatus::Failed, "{report:?}");
+    let error = report.error.expect("it says why");
+    assert!(
+        error.contains("full-access") && error.contains("unanswered"),
+        "{error}"
+    );
+}

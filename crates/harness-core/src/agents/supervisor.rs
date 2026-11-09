@@ -1035,14 +1035,20 @@ impl Approver for ChildApprover {
                 .update(id, |info| info.status = AgentStatus::Working);
         }
         // A plain question (the Claude opt-in, full-access): nobody to answer is not a failure of
-        // the child, the program has a rule for it (the API key, or an error saying how to
-        // opt in). Esc on the opt-in leaves it undecided, and that child fails with the reason.
-        if request.kind == ApprovalKind::DelegateOptIn
-            && matches!(&decision, ApprovalDecision::Deny { feedback: Some(f) } if f == STOPPED_BY_USER)
-        {
-            *lock(&self.failure) = Some(
-                "the question about using your Claude subscription was left unanswered (Esc), so it did not run: it is asked again next time".into(),
-            );
+        // the child, the program has a rule for it (the API key, or an error saying how to opt
+        // in). Esc leaves it undecided, and that child fails with the reason.
+        let left_open = matches!(&decision, ApprovalDecision::Deny { feedback: Some(f) } if f == STOPPED_BY_USER);
+        let esc_reason = match request.kind {
+            ApprovalKind::DelegateOptIn if left_open => Some(
+                "the question about using your Claude subscription was left unanswered (Esc), so it did not run: it is asked again next time",
+            ),
+            ApprovalKind::DelegateFullAccess if left_open => Some(
+                "the confirmation to run in full-access mode was left unanswered (Esc), so it did not run: it is asked again next time",
+            ),
+            _ => None,
+        };
+        if let Some(reason) = esc_reason {
+            *lock(&self.failure) = Some(reason.into());
             self.cancel.cancel();
         } else if decision == ApprovalDecision::Unavailable && !request.kind.is_question() {
             *lock(&self.failure) = Some(format!(

@@ -15,12 +15,18 @@ pub struct Frontmatter {
 /// Splits a command file into its frontmatter and its body. A file that does not start with a
 /// `---` line, or whose frontmatter is never closed, is all body.
 pub fn parse(text: &str) -> (Frontmatter, &str) {
+    let (yaml, body) = split(text);
+    (yaml.map(fields).unwrap_or_default(), body)
+}
+
+/// The YAML between the `---` lines at the top of `text`, when there is any, and the rest.
+fn split(text: &str) -> (Option<&str>, &str) {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let Some(rest) = text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"))
     else {
-        return (Frontmatter::default(), text);
+        return (None, text);
     };
     let mut offset = 0;
     let mut end = None;
@@ -32,14 +38,18 @@ pub fn parse(text: &str) -> (Frontmatter, &str) {
         offset += line.len();
     }
     let Some((yaml_end, body_start)) = end else {
-        return (Frontmatter::default(), text);
+        return (None, text);
     };
-    (fields(&rest[..yaml_end]), &rest[body_start..])
+    (Some(&rest[..yaml_end]), &rest[body_start..])
 }
 
-fn fields(yaml: &str) -> Frontmatter {
+/// One key of the frontmatter as written: the key, its value on the same line, and the indented
+/// lines (or `- item` lines) that follow it.
+type Entry<'a> = (String, &'a str, &'a [&'a str]);
+
+/// Calls `each` with every top-level `key: value` line of `yaml` and the lines that belong to it.
+fn entries(yaml: &str, mut each: impl FnMut(Entry<'_>)) {
     let lines: Vec<&str> = yaml.lines().collect();
-    let mut out = Frontmatter::default();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -60,16 +70,47 @@ fn fields(yaml: &str) -> Frontmatter {
         {
             i += 1;
         }
-        let block = &lines[start..i];
-        match key.trim() {
-            "description" => out.description = scalar(value, block),
-            "argument-hint" => out.argument_hint = scalar(value, block),
-            "model" => out.model = scalar(value, block),
-            "allowed-tools" => out.allowed_tools = list(value, block),
-            _ => {}
-        }
+        each((key.trim().to_string(), value, &lines[start..i]));
     }
+}
+
+fn fields(yaml: &str) -> Frontmatter {
+    let mut out = Frontmatter::default();
+    entries(yaml, |(key, value, block)| match key.as_str() {
+        "description" => out.description = scalar(value, block),
+        "argument-hint" => out.argument_hint = scalar(value, block),
+        "model" => out.model = scalar(value, block),
+        "allowed-tools" => out.allowed_tools = list(value, block),
+        _ => {}
+    });
     out
+}
+
+/// A key's value read both ways, for files whose keys are not known beforehand.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Raw {
+    /// As a scalar: plain, quoted, or a block scalar; `None` when empty.
+    pub text: Option<String>,
+    /// As a list: `[a, b]`, `- item` lines, or a comma-separated string.
+    pub list: Vec<String>,
+}
+
+/// Splits `text` like [`parse`], and gives every key of its frontmatter, in order, with its value.
+pub fn parse_map(text: &str) -> (Vec<(String, Raw)>, &str) {
+    let (yaml, body) = split(text);
+    let mut pairs = Vec::new();
+    if let Some(yaml) = yaml {
+        entries(yaml, |(key, value, block)| {
+            pairs.push((
+                key,
+                Raw {
+                    text: scalar(value, block),
+                    list: list(value, block),
+                },
+            ));
+        });
+    }
+    (pairs, body)
 }
 
 /// A scalar value: plain, quoted, or a `|`/`>` block scalar. Empty values are `None`.

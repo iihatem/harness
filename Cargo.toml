@@ -47,7 +47,7 @@ pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 regex = "1"
 # Bundled SQLite for the usage report cache (`harness-usage`): nothing needs installing.
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls"] }
 seccompiler = "=0.5.0"
 serde = { version = "1.0.229", features = ["derive"] }

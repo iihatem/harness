@@ -59,6 +59,9 @@ pub enum WorktreeError {
     /// The main checkout is in a state where the result cannot be applied now.
     #[error("{0}")]
     Refused(String),
+    /// Removing it would lose work that is saved nowhere else.
+    #[error("{name} was left alone: it {what}")]
+    Unsaved { name: String, what: String },
     /// Not something harness made, as far as its own records and markers say.
     #[error("{name} is not a worktree harness made ({why}), so it was left alone")]
     NotOurs { name: String, why: String },
@@ -298,13 +301,17 @@ impl Worktrees {
             .collect();
         for record in orphans {
             let mut outcome = None;
+            let mut error = "harness ended while it ran".to_string();
             if record.path.exists() && self.is_marked(&record.path) {
                 let wt = Worktree::from_record(&record, &self.prefix);
-                outcome = self
-                    .commit_result(&wt, &record.label, &record.task)
-                    .ok()
-                    .flatten();
-                // It had changed nothing: there is nothing to review or keep.
+                match self.commit_result(&wt, &record.label, &record.task) {
+                    Ok(found) => outcome = found,
+                    Err(e) => {
+                        error = format!("{error}; its changes could not be committed: {e}");
+                    }
+                }
+                // It had changed nothing: there is nothing to review or keep. (`remove` leaves
+                // a worktree that has anything unsaved.)
                 if outcome.is_none() && self.remove(&record.name).is_ok() {
                     fixed.push(record.name);
                     continue;
@@ -312,7 +319,7 @@ impl Worktrees {
             }
             let updated = self.update_record(&record.name, |r| {
                 r.status = AgentStatus::Failed;
-                r.error = Some("harness ended while it ran".into());
+                r.error = Some(error);
                 r.outcome = outcome;
             });
             if updated.is_ok() {
@@ -607,10 +614,81 @@ impl Worktrees {
         Ok(())
     }
 
+    /// Why removing the worktree of `record` would lose work: it holds changes that are not
+    /// committed, or commits that no other branch (or tag) has. `None` when everything in it is
+    /// saved somewhere else, or there is nothing in it. When git cannot say, it is not safe.
+    pub fn unsaved(&self, record: &Record) -> Option<String> {
+        let unreadable = || Some("could not be checked for unsaved work".to_string());
+        if record.path.exists() {
+            let inside = self.git.at(&record.path);
+            match inside.run(&["status", "--porcelain=v1", "-z"]) {
+                Ok(status) if status.is_empty() => {}
+                Ok(_) => return Some("has changes that are not committed".into()),
+                Err(_) => return unreadable(),
+            }
+            match inside.run(&["rev-parse", "HEAD"]) {
+                Ok(head) => {
+                    if let Some(why) = self.on_no_other_branch(record, head.trim()) {
+                        return Some(why);
+                    }
+                }
+                Err(_) => return unreadable(),
+            }
+        }
+        if self.branch_exists(&record.branch) {
+            match self.git.run(&[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("refs/heads/{}^{{commit}}", record.branch),
+            ]) {
+                Ok(tip) => return self.on_no_other_branch(record, tip.trim()),
+                Err(_) => return unreadable(),
+            }
+        }
+        None
+    }
+
+    /// Whether `commit` is past the base of `record` and no branch, remote branch or tag other
+    /// than the record's own has it.
+    fn on_no_other_branch(&self, record: &Record, commit: &str) -> Option<String> {
+        if commit == record.base {
+            return None;
+        }
+        let own = format!("refs/heads/{}", record.branch);
+        match self.git.run(&[
+            "for-each-ref",
+            "--contains",
+            commit,
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ]) {
+            Ok(refs) if refs.lines().any(|name| name != own) => None,
+            Ok(_) => Some("has commits that are on no other branch".into()),
+            Err(_) => Some("could not be checked for unsaved work".into()),
+        }
+    }
+
     /// Removes the worktree `name`, its branch and its record, if harness made it and nothing
     /// holds it: a locked worktree (a running agent) and anything the records and the marker do
-    /// not agree is harness's are left alone.
+    /// not agree is harness's are left alone, and so is one with work saved nowhere else
+    /// ([`Worktrees::unsaved`]); [`Worktrees::discard`] is the user's choice to lose it.
     pub fn remove(&self, name: &str) -> Result<(), WorktreeError> {
+        let record = self.own(name)?;
+        if let Some(what) = self.unsaved(&record) {
+            return Err(WorktreeError::Unsaved {
+                name: name.to_string(),
+                what,
+            });
+        }
+        self.remove_unchecked(name)
+    }
+
+    /// [`remove`](Self::remove) without looking for unsaved work: for what is applied (its
+    /// change is in the main checkout) and what the user chose to discard.
+    pub(crate) fn remove_unchecked(&self, name: &str) -> Result<(), WorktreeError> {
         let record = self.own(name)?;
         self.remove_directory(&record)?;
         if self.branch_exists(&record.branch) {
@@ -620,15 +698,34 @@ impl Worktrees {
         Ok(())
     }
 
-    /// Throws the result of `name` away: the worktree, the branch and the record.
+    /// Throws the result of `name` away, whatever it holds: the worktree, the branch and the
+    /// record. Only for when the user chose that for this one agent.
     pub fn discard(&self, name: &str) -> Result<(), WorktreeError> {
-        self.remove(name)
+        self.remove_unchecked(name)
     }
 
     /// Keeps the branch of `name` for the user and removes the worktree and the record: the
-    /// branch is the user's from now on, and harness never removes it.
+    /// branch is the user's from now on, and harness never removes it. What the worktree holds
+    /// uncommitted is committed on the branch first; when that cannot be done, nothing is
+    /// changed.
     pub fn keep(&self, name: &str) -> Result<(), WorktreeError> {
         let record = self.own(name)?;
+        if record.path.exists() {
+            if !self.is_marked(&record.path) {
+                return Err(WorktreeError::NotOurs {
+                    name: name.to_string(),
+                    why: "it has no harness marker".into(),
+                });
+            }
+            if let Some(reason) = self.lock_reason_at(&record.path) {
+                return Err(WorktreeError::Locked {
+                    name: name.to_string(),
+                    reason,
+                });
+            }
+            let wt = Worktree::from_record(&record, &self.prefix);
+            self.commit_result(&wt, &record.label, &record.task)?;
+        }
         self.remove_directory(&record)?;
         let _ = std::fs::remove_file(self.record_path(name));
         Ok(())

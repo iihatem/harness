@@ -1288,12 +1288,16 @@ fn do_review(
         }
         Review::Apply(name) => match worktrees.apply(&name) {
             Ok(applied) => Reviewed::Applied(format!(
-                "applied {} to {} ({} file{}, commit {}); its worktree and branch are removed",
+                "applied {} to {} ({} file{}, commit {}); {}",
                 name,
                 applied.branch,
                 applied.files.len(),
                 if applied.files.len() == 1 { "" } else { "s" },
                 &applied.commit[..applied.commit.len().min(10)],
+                applied
+                    .note
+                    .as_deref()
+                    .unwrap_or("its worktree and branch are removed"),
             )),
             Err(e) => Reviewed::Failed(e.to_string()),
         },

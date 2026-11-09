@@ -27,9 +27,10 @@ fn project() -> Result<(Arc<Worktrees>, Setup), String> {
     Ok((worktrees, setup))
 }
 
-fn state(record: &Record) -> String {
+fn state(record: &Record, unsaved: bool) -> String {
     use harness_core::agents::AgentStatus::*;
     match (record.status, &record.outcome) {
+        (Done | Failed | Cancelled, None) if unsaved => "ended, its changes are not saved".into(),
         (Done, Some(_)) => "ready for review".into(),
         (Done, None) => "done, nothing changed".into(),
         (Failed, Some(_)) => "failed, its changes kept".into(),
@@ -68,10 +69,13 @@ pub fn list() -> u8 {
         return 0;
     }
     for record in records {
+        let unsaved = record.status.is_final()
+            && record.outcome.is_none()
+            && worktrees.unsaved(&record).is_some();
         println!(
             "{}  {}  {}  {}",
             terminal_safe(&record.branch),
-            state(&record),
+            state(&record, unsaved),
             counts(&record),
             terminal_safe(&record.path.display().to_string())
         );
@@ -79,9 +83,34 @@ pub fn list() -> u8 {
     0
 }
 
-/// `harness worktrees clean`: removes what has nothing left to review. A running agent's
-/// worktree, a result not applied (without `all`) and anything harness did not make stay.
-pub fn clean(all: bool) -> u8 {
+/// Asks the user to confirm losing `lost`; `false` when they do not, or cannot be asked.
+fn confirm_loss(lost: &[(String, String)], yes: bool) -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+    println!("these hold work that exists nowhere else, and would be lost for good:");
+    for (branch, what) in lost {
+        println!("  {} ({})", terminal_safe(branch), terminal_safe(what));
+    }
+    if yes {
+        return true;
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "error: refusing to discard unsaved work without a terminal to ask on: nothing was removed (--yes says you are sure)"
+        );
+        return false;
+    }
+    print!("type \"discard\" to lose them: ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut answer);
+    answer.trim() == "discard"
+}
+
+/// `harness worktrees clean`: removes what has nothing left to review and nothing to lose. A
+/// running agent's worktree, a result not applied (without `all`), anything harness did not
+/// make and any worktree that holds changes or commits saved nowhere else stay (and the last are
+/// listed); `discard_unsaved` (with `all`) removes those too, after asking.
+pub fn clean(all: bool, discard_unsaved: bool, yes: bool) -> u8 {
     let (worktrees, _setup) = match project() {
         Ok(found) => found,
         Err(why) => {
@@ -96,12 +125,34 @@ pub fn clean(all: bool) -> u8 {
         println!("settled {name}: its agent was left running by a harness that ended");
     }
     let mut kept_results = 0;
+    let mut removable = Vec::new();
+    let mut unsaved = Vec::new();
     for record in worktrees.records() {
-        let removable = record.outcome.is_none() || all;
-        if !removable {
+        if !record.status.is_final() {
+            println!(
+                "left {} alone: its agent is running",
+                terminal_safe(&record.branch)
+            );
+        } else if record.outcome.is_some() && !all {
             kept_results += 1;
-            continue;
+        } else {
+            match worktrees.unsaved(&record) {
+                Some(what) => unsaved.push((record, what)),
+                None => removable.push(record),
+            }
         }
+    }
+    if discard_unsaved && !unsaved.is_empty() {
+        let lost: Vec<(String, String)> = unsaved
+            .iter()
+            .map(|(record, what)| (record.branch.clone(), what.clone()))
+            .collect();
+        if !confirm_loss(&lost, yes) {
+            println!("nothing was removed.");
+            return 2;
+        }
+    }
+    for record in removable {
         match worktrees.remove(&record.name) {
             Ok(()) => println!("removed {} and its branch", terminal_safe(&record.branch)),
             Err(e) => println!(
@@ -111,9 +162,27 @@ pub fn clean(all: bool) -> u8 {
             ),
         }
     }
+    for (record, what) in unsaved {
+        if discard_unsaved {
+            match worktrees.discard(&record.name) {
+                Ok(()) => println!("discarded {} and its branch", terminal_safe(&record.branch)),
+                Err(e) => println!(
+                    "left {} alone: {}",
+                    terminal_safe(&record.branch),
+                    terminal_safe(&e.to_string())
+                ),
+            }
+        } else {
+            println!(
+                "left {} alone: it {}",
+                terminal_safe(&record.branch),
+                terminal_safe(&what)
+            );
+        }
+    }
     if kept_results > 0 {
         println!(
-            "kept {kept_results} result{} that {} not applied or kept: /results in a session reviews {}; `harness worktrees clean --all` removes {} and the branches",
+            "kept {kept_results} result{} that {} not applied or kept: /results in a session reviews {}; `harness worktrees clean --all` removes {} and the branches once their commits are elsewhere",
             if kept_results == 1 { "" } else { "s" },
             if kept_results == 1 { "is" } else { "are" },
             if kept_results == 1 { "it" } else { "them" },

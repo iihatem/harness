@@ -66,11 +66,20 @@ struct Cli {
 enum WorktreesCommand {
     /// Remove the worktrees and branches harness made that have nothing left to review: finished
     /// agents that changed nothing, and those of a harness that died. Results not applied stay;
-    /// a running agent's, and anything harness did not make, are never touched
+    /// a running agent's, anything harness did not make, and any worktree that holds changes or
+    /// commits saved nowhere else are never touched (they are listed)
     Clean {
-        /// Also remove results that were not applied or kept (their branches are deleted)
+        /// Also remove results that were not applied or kept, once their commits are on another
+        /// branch (combine with --discard-unsaved to remove those that are not)
         #[arg(long)]
         all: bool,
+        /// With --all: also remove worktrees and branches whose changes or commits exist nowhere
+        /// else, losing them. Lists them and asks first
+        #[arg(long, requires = "all")]
+        discard_unsaved: bool,
+        /// Do not ask: needed for --discard-unsaved without a terminal
+        #[arg(long, requires = "discard_unsaved")]
+        yes: bool,
     },
 }
 
@@ -389,8 +398,13 @@ fn main() -> ExitCode {
             }) => usage::forget(before.as_deref(), all),
             Some(Command::Worktrees { command: None }) => worktrees::list(),
             Some(Command::Worktrees {
-                command: Some(WorktreesCommand::Clean { all }),
-            }) => worktrees::clean(all),
+                command:
+                    Some(WorktreesCommand::Clean {
+                        all,
+                        discard_unsaved,
+                        yes,
+                    }),
+            }) => worktrees::clean(all, discard_unsaved, yes),
             Some(Command::Pricing {
                 command: PricingCommand::Update,
             }) => pricing::update().await,

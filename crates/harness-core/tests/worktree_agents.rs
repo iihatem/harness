@@ -11,7 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use common::{Echo, Put};
+use common::{Echo, Put, Sh};
 use harness_core::{
     agent::{Agent, AgentConfig, NonInteractive},
     agents::{
@@ -59,7 +59,7 @@ impl AgentFactory for Factory {
             .ok_or("no script left")?;
         let workspace = setup.spec.workspace.resolve(&self.main);
         let config = AgentConfig::new("mock/m1", "m1", "prompt", workspace.join(".spill-out"));
-        let tools = ToolRegistry::new(vec![Arc::new(Echo), Arc::new(Put)]);
+        let tools = ToolRegistry::new(vec![Arc::new(Echo), Arc::new(Put), Arc::new(Sh)]);
         let mode = setup.mode;
         Ok(Agent::new(
             MockProvider::new(script),
@@ -225,6 +225,32 @@ async fn the_worktree_is_locked_while_the_child_runs() {
     let report = wait(handle).await;
     assert_eq!(report.status, AgentStatus::Cancelled);
     assert!(!git(f.main.path(), &["worktree", "list", "--porcelain"]).contains("locked"));
+}
+
+#[tokio::test]
+async fn a_child_that_committed_itself_leaves_a_result_and_its_worktree_and_branch() {
+    let f = fixture(
+        vec![vec![
+            Script::tool_call(
+                "call_h0",
+                "sh",
+                json!({"command": "echo 'pub fn two() {}' > two.rs && git add -A && git commit -q -m mine"}),
+            ),
+            Script::text("committed"),
+        ]],
+        true,
+    );
+    let report = wait(f.sup.spawn(isolated("general"))).await;
+    assert_eq!(report.status, AgentStatus::Done, "{:?}", report.error);
+    let outcome = report
+        .worktree
+        .clone()
+        .expect("commits it made itself are its result");
+    assert_eq!(outcome.files, vec!["two.rs".to_string()]);
+    assert!(branches(f.main.path()).contains(&outcome.branch));
+    let record = f.wts.records().remove(0);
+    assert_eq!(record.outcome.as_ref(), Some(&outcome));
+    assert!(record.path.exists());
 }
 
 #[tokio::test]

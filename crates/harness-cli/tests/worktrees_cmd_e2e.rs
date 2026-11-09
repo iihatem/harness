@@ -192,7 +192,16 @@ fn clean_removes_only_harnesss_own_finished_empty_and_stale_ones() {
     );
     assert!(env.branch_exists("mine"));
 
-    // `--all` takes the result too, and still leaves what is running and what is not harness's.
+    // `--all` alone does not take a result whose commits are on no other branch.
+    let out = env.cmd(&["worktrees", "clean", "--all"]);
+    assert!(out.status.success());
+    assert!(env.branch_exists(&pending));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no other branch"));
+    // Once they are on another branch it goes, and what is running and not harness's stays.
+    git(
+        env.ws.path(),
+        &["merge", "-q", "--ff-only", &format!("harness/{pending}")],
+    );
     let out = env.cmd(&["worktrees", "clean", "--all"]);
     assert!(
         out.status.success(),
@@ -202,4 +211,82 @@ fn clean_removes_only_harnesss_own_finished_empty_and_stale_ones() {
     assert!(!env.branch_exists(&pending));
     assert!(env.branch_exists(&running));
     assert!(foreign.exists() && env.branch_exists("foreign") && env.branch_exists("mine"));
+}
+
+/// An agent that ended with its changes still uncommitted in the worktree (the commit failed).
+fn make_unsaved(env: &Env, agent: &str) -> String {
+    let wt = env
+        .wts
+        .create(&Request {
+            agent,
+            label: "general",
+            task: "unsaved work",
+        })
+        .unwrap()
+        .worktree;
+    write(&wt.path, "src/precious.rs", "pub fn precious() {}\n");
+    env.wts.release(&wt).unwrap();
+    env.wts
+        .update_record(&wt.name, |r| {
+            r.status = AgentStatus::Failed;
+            r.error = Some("its changes could not be committed: x".into());
+        })
+        .unwrap();
+    wt.name
+}
+
+#[test]
+fn clean_never_removes_a_worktree_with_uncommitted_changes_and_lists_it() {
+    let env = Env::new();
+    let unsaved = make_unsaved(&env, "a1");
+    let path = env.wts.home().join(&unsaved);
+    let listed = String::from_utf8_lossy(&env.cmd(&["worktrees"]).stdout).into_owned();
+    assert!(listed.contains("not saved"), "{listed}");
+    for args in [
+        vec!["worktrees", "clean"],
+        vec!["worktrees", "clean", "--all"],
+    ] {
+        let out = env.cmd(&args);
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("left harness/") && text.contains("not committed"),
+            "{text}"
+        );
+        assert!(path.join("src/precious.rs").exists(), "{args:?}");
+        assert!(env.branch_exists(&unsaved));
+    }
+}
+
+#[test]
+fn discarding_unsaved_work_is_refused_without_a_terminal_unless_told_it_is_sure() {
+    let env = Env::new();
+    let unsaved = make_unsaved(&env, "a1");
+    let path = env.wts.home().join(&unsaved);
+    let out = env.cmd(&["worktrees", "clean", "--all", "--discard-unsaved"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(path.join("src/precious.rs").exists(), "nothing was removed");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("precious")
+            || String::from_utf8_lossy(&out.stdout).contains("harness/")
+    );
+    // `--discard-unsaved` alone, or `--yes` alone, is not accepted.
+    assert!(
+        !env.cmd(&["worktrees", "clean", "--discard-unsaved"])
+            .status
+            .success()
+    );
+    assert!(
+        !env.cmd(&["worktrees", "clean", "--all", "--yes"])
+            .status
+            .success()
+    );
+    assert!(path.exists());
+    let out = env.cmd(&["worktrees", "clean", "--all", "--discard-unsaved", "--yes"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!path.exists() && !env.branch_exists(&unsaved));
 }

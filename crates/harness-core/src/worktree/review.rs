@@ -48,6 +48,9 @@ pub struct Applied {
     /// The branch it was applied to.
     pub branch: String,
     pub files: Vec<String>,
+    /// Something that did not go as it should after the commit landed (the worktree or branch
+    /// could not be removed): the change is applied all the same.
+    pub note: Option<String>,
 }
 
 /// The name and email commits are made as: the user's, or harness's when git has none.
@@ -80,7 +83,9 @@ impl Worktrees {
     }
 
     /// Commits what the agent of `wt` changed on its branch, as the user, without running the
-    /// repository's hooks; `None` when it changed nothing (the worktree is left as it is).
+    /// repository's hooks. `None` only when it changed nothing: the tree is clean and its branch
+    /// is still at the commit it was made from. Commits the agent made itself are a result too.
+    /// Fails, changing nothing, when the worktree is no longer on its branch.
     pub fn commit_result(
         &self,
         wt: &Worktree,
@@ -88,11 +93,35 @@ impl Worktrees {
         task: &str,
     ) -> Result<Option<Outcome>, WorktreeError> {
         let git = self.git.at(&wt.path);
+        let on = git
+            .run(&["symbolic-ref", "--quiet", "HEAD"])
+            .map(|head| head.trim().to_string())
+            .unwrap_or_default();
+        if on != format!("refs/heads/{}", wt.branch) {
+            return Err(WorktreeError::Refused(format!(
+                "the worktree is no longer on its branch {}, so nothing was committed",
+                wt.branch
+            )));
+        }
         git.run(&["add", "-A"])?;
-        match git.run(&["diff", "--cached", "--quiet"]) {
-            Ok(_) => return Ok(None),
-            Err(e) if e.code == Some(1) => {}
+        let staged = match git.run(&[
+            "diff",
+            "--cached",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-textconv",
+        ]) {
+            Ok(_) => false,
+            Err(e) if e.code == Some(1) => true,
             Err(e) => return Err(e.into()),
+        };
+        if !staged {
+            // Nothing new to commit: the agent's own commits, if it made any, are the result.
+            let tip = git.run(&["rev-parse", "HEAD"])?.trim().to_string();
+            if tip == wt.base {
+                return Ok(None);
+            }
+            return self.outcome_of(&git, wt, tip).map(Some);
         }
         let (name, email) = author_of(self.git.identity());
         let subject = format!(
@@ -131,6 +160,16 @@ impl Worktrees {
             ],
         )?;
         let commit = git.run(&["rev-parse", "HEAD"])?.trim().to_string();
+        self.outcome_of(&git, wt, commit).map(Some)
+    }
+
+    /// What the commits from the base of `wt` to `commit` changed.
+    fn outcome_of(
+        &self,
+        git: &super::Git,
+        wt: &Worktree,
+        commit: String,
+    ) -> Result<Outcome, WorktreeError> {
         let numstat = git.run(&[
             "diff",
             "--numstat",
@@ -155,13 +194,13 @@ impl Worktrees {
                 files.push(path.to_string());
             }
         }
-        Ok(Some(Outcome {
+        Ok(Outcome {
             branch: wt.branch.clone(),
             commit,
             files,
             insertions,
             deletions,
-        }))
+        })
     }
 
     /// The changes of the branch of `name` since its base, at most `cap` bytes of patch.
@@ -344,11 +383,16 @@ impl Worktrees {
         }
         let commit = self.git.run(&["rev-parse", "HEAD"])?.trim().to_string();
         // Its change is on the branch now: the worktree and branch have nothing more to hold.
-        self.remove(name)?;
+        // (The commit has landed, so a cleanup that fails is said, not an error.)
+        let note = self
+            .remove_unchecked(name)
+            .err()
+            .map(|e| format!("applied, but its worktree or branch could not be removed: {e}"));
         Ok(Applied {
             commit,
             branch: current,
             files,
+            note,
         })
     }
 }

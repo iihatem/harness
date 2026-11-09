@@ -350,3 +350,168 @@ fn discarding_removes_the_worktree_the_branch_and_the_record() {
     );
     assert!(f.wts.records().is_empty());
 }
+
+/// A worktree whose agent committed `path` itself, on its branch, leaving the tree clean.
+fn committed_by_the_agent(f: &super::tests::Fixture, path: &str) -> Worktree {
+    let wt = f
+        .wts
+        .create(&request("a1", "general", "commits itself"))
+        .unwrap()
+        .worktree;
+    write(&wt.path, path, "pub fn two() -> u32 { 2 }\n");
+    git(&wt.path, &["add", "-A"]);
+    git(&wt.path, &["commit", "-q", "-m", "by the agent"]);
+    wt
+}
+
+#[test]
+fn commits_the_agent_made_itself_are_a_result_not_no_changes() {
+    let f = fixture();
+    let wt = committed_by_the_agent(&f, "src/two.rs");
+    let outcome = f
+        .wts
+        .commit_result(&wt, "general", "commits itself")
+        .unwrap()
+        .expect("a clean tree with commits is a result");
+    assert_eq!(outcome.files, vec!["src/two.rs".to_string()]);
+    assert_eq!(outcome.commit, head(&wt.path));
+    assert_eq!((outcome.insertions, outcome.deletions), (1, 0));
+    // The agent's commit and what it left uncommitted after are both in the result.
+    write(&wt.path, "src/three.rs", "pub fn three() {}\n");
+    let again = f
+        .wts
+        .commit_result(&wt, "general", "commits itself")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        again.files,
+        vec!["src/three.rs".to_string(), "src/two.rs".to_string()]
+    );
+    assert_ne!(again.commit, outcome.commit);
+}
+
+#[test]
+fn a_harness_that_died_after_the_agent_committed_keeps_the_commit() {
+    let f = fixture();
+    let wt = committed_by_the_agent(&f, "src/two.rs");
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let gone = child.id();
+    child.wait().unwrap();
+    f.wts.update_record(&wt.name, |r| r.pid = gone).unwrap();
+    git(&wt.path, &["worktree", "unlock", "."]);
+    git(
+        &wt.path,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            &format!("harness pid {gone}"),
+            ".",
+        ],
+    );
+    assert_eq!(f.wts.reconcile(), vec![wt.name.clone()]);
+    let record = f.wts.records().pop().expect("the record is kept");
+    assert_eq!(
+        record.outcome.unwrap().files,
+        vec!["src/two.rs".to_string()]
+    );
+    assert!(
+        !git(f.repo.path(), &["branch", "--list", "harness/*"])
+            .trim()
+            .is_empty()
+    );
+    assert!(wt.path.exists());
+}
+
+#[test]
+fn a_worktree_that_left_its_branch_is_not_committed_and_not_called_unchanged() {
+    let f = fixture();
+    let wt = f
+        .wts
+        .create(&request("a1", "general", "moved"))
+        .unwrap()
+        .worktree;
+    write(&wt.path, "src/two.rs", "x\n");
+    git(&wt.path, &["checkout", "-q", "--detach"]);
+    let error = f.wts.commit_result(&wt, "general", "moved").unwrap_err();
+    assert!(error.to_string().contains("branch"), "{error}");
+}
+
+#[test]
+fn removing_never_takes_uncommitted_work_or_commits_that_are_on_no_other_branch() {
+    let f = fixture();
+    // Uncommitted.
+    let dirty = f
+        .wts
+        .create(&request("a1", "general", "dirty"))
+        .unwrap()
+        .worktree;
+    f.wts.release(&dirty).unwrap();
+    write(&dirty.path, "src/new.rs", "x\n");
+    let error = f.wts.remove(&dirty.name).unwrap_err();
+    assert!(matches!(error, WorktreeError::Unsaved { .. }), "{error}");
+    assert!(dirty.path.exists());
+    assert!(std::fs::read_to_string(dirty.path.join("src/new.rs")).is_ok());
+    // Committed on the branch only.
+    let result = committed_by_the_agent(&f, "src/two.rs");
+    f.wts.release(&result).unwrap();
+    let error = f.wts.remove(&result.name).unwrap_err();
+    assert!(matches!(error, WorktreeError::Unsaved { .. }), "{error}");
+    assert!(result.path.exists());
+    // Once another branch has the commits, nothing is lost by removing it.
+    git(f.repo.path(), &["merge", "-q", "--ff-only", &result.branch]);
+    f.wts.remove(&result.name).unwrap();
+    assert!(!result.path.exists());
+    // The user chose to throw this one away: it goes.
+    f.wts.discard(&dirty.name).unwrap();
+    assert!(!dirty.path.exists());
+}
+
+#[test]
+fn keeping_commits_first_and_changes_nothing_when_the_commit_fails() {
+    let f = fixture();
+    let wt = f
+        .wts
+        .create(&request("a1", "general", "keep"))
+        .unwrap()
+        .worktree;
+    f.wts.release(&wt).unwrap();
+    write(&wt.path, "src/new.rs", "kept\n");
+    f.wts.keep(&wt.name).unwrap();
+    assert!(!wt.path.exists());
+    let shown = git(
+        f.repo.path(),
+        &["show", &format!("{}:src/new.rs", wt.branch)],
+    );
+    assert_eq!(shown, "kept\n");
+
+    // A commit that cannot be made: nothing is removed.
+    let stuck = f
+        .wts
+        .create(&request("a2", "general", "stuck"))
+        .unwrap()
+        .worktree;
+    f.wts.release(&stuck).unwrap();
+    write(&stuck.path, "src/other.rs", "unsaved\n");
+    git(&stuck.path, &["checkout", "-q", "--detach"]);
+    assert!(f.wts.keep(&stuck.name).is_err());
+    assert!(stuck.path.join("src/other.rs").exists());
+    assert!(f.wts.records().iter().any(|r| r.name == stuck.name));
+}
+
+#[test]
+fn an_apply_whose_cleanup_fails_still_reports_the_commit_that_landed() {
+    let f = fixture();
+    let wt = finished(&f, "apply", "README.md", "hello\nworld\n");
+    done(&f, &wt, "apply");
+    // Deleting the branch will fail: its ref is locked.
+    let lock = f
+        .repo
+        .path()
+        .join(format!(".git/refs/heads/{}.lock", wt.branch));
+    std::fs::write(&lock, "").unwrap();
+    let applied = f.wts.apply(&wt.name).expect("the commit landed");
+    assert_eq!(applied.commit, head(f.repo.path()));
+    assert!(applied.note.is_some(), "the leftover is said");
+    std::fs::remove_file(&lock).unwrap();
+}

@@ -96,6 +96,8 @@ pub struct ChildSetup {
     pub meter: Option<Arc<dyn Meter>>,
     /// Where its transcript is saved.
     pub session: Session,
+    /// Variables its shell commands get: in a worktree, who it is and its port offset.
+    pub env: Vec<(String, String)>,
 }
 
 /// Makes child agents. Implemented by the frontend, which knows the providers, tools, sandboxes
@@ -791,6 +793,7 @@ async fn run_child(
             approver,
             meter,
             session,
+            env: worktree.as_ref().map(Worktree::env).unwrap_or_default(),
         }) => built,
         _ = cancel.cancelled() => {
             drop(permit);

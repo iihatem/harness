@@ -118,6 +118,14 @@ fn child_prompt(
     prompt
 }
 
+/// Whether `workspace` is the session's own (however it is spelled).
+fn workspace_is_parents(workspace: &std::path::Path, parent: &std::path::Path) -> bool {
+    match (workspace.canonicalize(), parent.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => workspace == parent,
+    }
+}
+
 /// The model a spec runs on when it names one other than its parent's.
 fn own_model<'a>(spec: &'a AgentSpec, parent: &CurrentModel) -> Option<&'a str> {
     spec.model.as_deref().filter(|id| *id != parent.id)
@@ -146,6 +154,7 @@ impl AgentFactory for CliFactory {
             approver,
             meter,
             session,
+            env,
         } = child;
         // A child that names no model is built from the one its parent is on now (after `/model`,
         // a role's model, a fallback), the provider, window, request settings and side included.
@@ -219,11 +228,23 @@ impl AgentFactory for CliFactory {
         {
             harness_core::permission::PermissionPolicy::set_unsandboxed_reason(&*policy, why);
         }
-        let ctx = ToolContext::new(&workspace).with_sandbox(sandbox, mode.fs_access());
+        let in_worktree = !workspace_is_parents(&workspace, &self.setup.workspace);
+        // A worktree is a workspace the sandbox has not seen: on Linux its guard reads what it
+        // needs from it before any command can have changed it.
+        if in_worktree && let Some(sandbox) = &sandbox {
+            crate::start::start_sandbox_session(&workspace, sandbox.clone()).await;
+        }
+        let ctx = ToolContext::new(&workspace)
+            .with_sandbox(sandbox, mode.fs_access())
+            .with_env(env);
         // What it changes is told by comparing the workspace with a snapshot of its own, so what
         // a shell command edited counts, and the gates see it.
-        let checkpoints =
-            crate::sessions::child_checkpoints(&self.setup, session.id(), &self.writable);
+        let checkpoints = crate::sessions::child_checkpoints(
+            &self.setup,
+            session.id(),
+            &self.writable,
+            &workspace,
+        );
         let mut agent = Agent::new(provider, tools, policy, approver, config, ctx)
             .with_redactor(self.setup.redactor.clone())
             .with_session(session)
@@ -267,6 +288,15 @@ mod tests {
     }
 
     fn fixture(config: &str, script: Vec<Script>) -> Fixture {
+        fixture_with(config, |_| script, Sandboxes::default())
+    }
+
+    /// A fixture whose script is made once the workspace's path is known.
+    fn fixture_with(
+        config: &str,
+        script: impl FnOnce(&std::path::Path) -> Vec<Script>,
+        sandboxes: Sandboxes,
+    ) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let (home, workspace) = (dir.path().join("home"), dir.path().join("work"));
         std::fs::create_dir_all(home.join("config")).unwrap();
@@ -274,7 +304,7 @@ mod tests {
         std::fs::write(home.join("config/config.toml"), config).unwrap();
         let workspace = workspace.canonicalize().unwrap();
         let setup = setup_with(&home, &workspace, &[("OPENAI_API_KEY", "sk-test")]);
-        let provider = MockProvider::new(script);
+        let provider = MockProvider::new(script(&workspace));
         let template = AgentConfig::new(
             "openai/gpt-5",
             "gpt-5",
@@ -287,7 +317,7 @@ mod tests {
             provider.clone(),
             template,
             EditFormat::StrReplace,
-            Sandboxes::default(),
+            sandboxes,
             false,
             Vec::new(),
             Some("the sandbox is disabled by HARNESS_SANDBOX=none".into()),
@@ -616,5 +646,186 @@ mod tests {
         let report = sup.spawn(spec).wait().await;
         assert_eq!(report.status, AgentStatus::Failed);
         assert!(report.error.unwrap().contains("nowhere"));
+    }
+
+    // ---- worktrees --------------------------------------------------------------------------
+
+    use harness_core::worktree::{
+        Worktrees,
+        testing::{git, init_repo},
+    };
+
+    /// A supervisor over a fixture whose workspace is a git repository.
+    fn isolating(f: &Fixture, mode: Mode) -> (Arc<Supervisor>, Arc<Worktrees>) {
+        init_repo(&f.workspace);
+        let (mut ctx, _rx, _a) = parent(f, mode);
+        ctx.sessions_dir = Some(f.data.join("sessions"));
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let sup = Supervisor::new(Limits::default(), f.factory.clone(), ctx, tx);
+        let wts = Arc::new(Worktrees::new(&f.workspace, f.data.join("worktrees/p")).unwrap());
+        sup.set_worktrees(wts.clone());
+        (sup, wts)
+    }
+
+    fn isolated(label: &str) -> AgentSpec {
+        let mut spec = AgentSpec::new(label, "do it");
+        spec.isolation = true;
+        spec
+    }
+
+    #[tokio::test]
+    async fn an_isolated_child_works_in_its_worktree_and_its_commands_know_who_it_is() {
+        let f = fixture(
+            "",
+            vec![
+                Script::tool_call(
+                    "c1",
+                    "bash",
+                    serde_json::json!({"command": "echo \"$HARNESS_AGENT_ID/$HARNESS_PORT_OFFSET\" > ids.txt"}),
+                ),
+                Script::tool_call(
+                    "c2",
+                    "write",
+                    serde_json::json!({"path": "src/new.rs", "content": "pub fn two() {}\n"}),
+                ),
+                Script::text("done"),
+            ],
+        );
+        let (sup, wts) = isolating(&f, Mode::FullAccess);
+        let report = sup.spawn(isolated("writer")).wait().await;
+        assert_eq!(report.status, AgentStatus::Done, "{report:?}");
+        // Its edits are in the worktree, its checkpoint saw them (the shell's too), and the
+        // main checkout is as it was.
+        assert!(
+            report.files_changed.contains(&"ids.txt".to_string()),
+            "{report:?}"
+        );
+        assert!(
+            report.files_changed.contains(&"src/new.rs".to_string()),
+            "{report:?}"
+        );
+        assert!(!f.workspace.join("ids.txt").exists());
+        assert!(!f.workspace.join("src/new.rs").exists());
+        let outcome = report.worktree.expect("committed");
+        assert_eq!(
+            git(
+                &f.workspace,
+                &["show", &format!("{}:ids.txt", outcome.branch)]
+            ),
+            "a1/100\n"
+        );
+        assert!(outcome.files.contains(&"src/new.rs".to_string()));
+        assert_eq!(wts.records().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_isolated_child_cannot_write_outside_its_worktree_or_into_git() {
+        let f = fixture_with(
+            "",
+            |main| {
+                vec![
+                    // The main checkout, by its absolute path.
+                    Script::tool_call(
+                        "c1",
+                        "write",
+                        serde_json::json!({"path": main.join("outside.txt"), "content": "escaped\n"}),
+                    ),
+                    // Git's own files, where the worktree's `.git` is (a second child).
+                    Script::tool_call(
+                        "c2",
+                        "write",
+                        serde_json::json!({"path": ".git", "content": "gitdir: /elsewhere\n"}),
+                    ),
+                ]
+            },
+            Sandboxes::default(),
+        );
+        let (sup, wts) = isolating(&f, Mode::Auto);
+        let first = sup.spawn(isolated("writer")).wait().await;
+        // Nobody can answer the approval it needs, so it fails there.
+        assert_eq!(first.status, AgentStatus::Failed, "{first:?}");
+        assert!(
+            first
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("outside the workspace"),
+            "{first:?}"
+        );
+        assert!(
+            !f.workspace.join("outside.txt").exists(),
+            "wrote into the main checkout"
+        );
+        let second = sup.spawn(isolated("writer")).wait().await;
+        assert_eq!(second.status, AgentStatus::Failed, "{second:?}");
+        assert!(
+            second.error.as_deref().unwrap().contains(".git"),
+            "{second:?}"
+        );
+        assert_eq!(git(&f.workspace, &["status", "--porcelain"]).trim(), "");
+        // They changed nothing, so nothing was kept, and git finds the repository sound.
+        assert!(first.worktree.is_none() && second.worktree.is_none());
+        assert!(wts.records().is_empty());
+        assert_eq!(git(&f.workspace, &["worktree", "list"]).lines().count(), 1);
+        git(&f.workspace, &["fsck", "--no-progress"]);
+    }
+
+    #[derive(Debug, Default)]
+    struct Recording(std::sync::Mutex<Vec<std::path::PathBuf>>);
+
+    impl harness_core::tool::CommandSandbox for Recording {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        fn command(
+            &self,
+            _access: harness_core::permission::FsAccess,
+            _workspace: &std::path::Path,
+            program: &str,
+            args: &[&str],
+        ) -> std::io::Result<tokio::process::Command> {
+            let mut command = tokio::process::Command::new(program);
+            command.args(args).process_group(0);
+            Ok(command)
+        }
+        fn is_denial(&self, _code: Option<i32>, _output: &str) -> bool {
+            false
+        }
+        fn start_session(&self, workspace: &std::path::Path) {
+            self.0.lock().unwrap().push(workspace.to_path_buf());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sandbox_is_primed_for_each_worktree_a_child_works_in() {
+        let recording = Arc::new(Recording::default());
+        let sandboxes = Sandboxes {
+            read_only: None,
+            workspace_write: Some(recording.clone()),
+        };
+        let f = fixture_with(
+            "",
+            |_| {
+                vec![
+                    Script::tool_call(
+                        "c1",
+                        "write",
+                        serde_json::json!({"path": "a.txt", "content": "x\n"}),
+                    ),
+                    Script::text("ok"),
+                ]
+            },
+            sandboxes,
+        );
+        let (sup, wts) = isolating(&f, Mode::Auto);
+        let report = sup.spawn(isolated("writer")).wait().await;
+        assert_eq!(report.status, AgentStatus::Done, "{report:?}");
+        let primed = recording.0.lock().unwrap().clone();
+        assert_eq!(primed.len(), 1, "{primed:?}");
+        let record = wts.records().remove(0);
+        assert_eq!(
+            primed[0].canonicalize().unwrap(),
+            record.path.canonicalize().unwrap()
+        );
     }
 }

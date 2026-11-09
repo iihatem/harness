@@ -72,6 +72,8 @@ pub struct ChildKit {
     limits: harness_core::agents::Limits,
     /// The definitions the model may start, and the limits on starting them.
     subagents: crate::subagents::Subagents,
+    /// Where agents that ask for isolation get their worktrees; none outside a git repository.
+    worktrees: Option<Arc<harness_core::worktree::Worktrees>>,
 }
 
 impl Started {
@@ -85,7 +87,7 @@ impl Started {
         cancel: CancellationToken,
     ) -> Arc<harness_core::agents::Supervisor> {
         let kit = &self.children;
-        harness_core::agents::Supervisor::new(
+        let supervisor = harness_core::agents::Supervisor::new(
             kit.limits,
             kit.factory.clone(),
             harness_core::agents::ParentContext {
@@ -99,7 +101,16 @@ impl Started {
                 workspace: kit.workspace.clone(),
             },
             sink,
-        )
+        );
+        if let Some(worktrees) = &kit.worktrees {
+            supervisor.set_worktrees(worktrees.clone());
+        }
+        supervisor
+    }
+
+    /// The worktrees agents are isolated in, when the project is in a git repository.
+    pub fn worktrees(&self) -> Option<Arc<harness_core::worktree::Worktrees>> {
+        self.children.worktrees.clone()
     }
 }
 
@@ -112,9 +123,12 @@ impl Started {
 
     /// The tool that lets the model start subagents under `supervisor`; none when
     /// `[agents] spawn` is off. It reads the model and roles of the session's agent as they are.
+    /// `wait_for_background` is for a run that ends with its turn: agents meant to run in the
+    /// background are waited for.
     pub fn spawn_tool(
         &self,
         supervisor: &Arc<harness_core::agents::Supervisor>,
+        wait_for_background: bool,
     ) -> Option<Arc<dyn harness_core::tool::Tool>> {
         let subagents = &self.children.subagents;
         if !subagents.spawn {
@@ -122,6 +136,7 @@ impl Started {
         }
         let settings = harness_core::agents::SpawnSettings {
             parent: self.children.factory.parent_model(),
+            wait_for_background,
             ..subagents.settings.clone()
         };
         let tool: Arc<dyn harness_core::tool::Tool> = harness_core::agents::SpawnAgentsTool::new(
@@ -367,6 +382,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
             }
         },
         subagents,
+        worktrees: crate::worktrees::open(setup),
     };
     let mut agent = Agent::new(
         resolved.provider,
@@ -601,7 +617,7 @@ pub async fn tool_context(
 
 /// Starts `sandbox`'s session for `workspace`, off the async runtime: it may walk the whole
 /// workspace. Should it fail, the first command reads what it needs.
-async fn start_sandbox_session(workspace: &Path, sandbox: Arc<dyn CommandSandbox>) {
+pub(crate) async fn start_sandbox_session(workspace: &Path, sandbox: Arc<dyn CommandSandbox>) {
     let workspace = workspace.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || sandbox.start_session(&workspace)).await;
 }

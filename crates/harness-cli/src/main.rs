@@ -22,6 +22,7 @@ mod subagents;
 mod term;
 mod trust;
 mod usage;
+mod worktrees;
 
 use std::{io::IsTerminal, process::ExitCode};
 

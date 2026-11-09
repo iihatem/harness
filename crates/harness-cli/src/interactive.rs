@@ -299,11 +299,27 @@ pub async fn run(
     else {
         return 130;
     };
+    // Agents an earlier harness left running when it died are failed, their edits committed so
+    // they can be reviewed, and their stale locks released.
+    if let Some(worktrees) = started.worktrees() {
+        let ended = tokio::task::spawn_blocking(move || worktrees.reconcile())
+            .await
+            .unwrap_or_default();
+        if !ended.is_empty() {
+            notices.note(&format!(
+                "{} agent{} of an earlier session ended while it ran: /agents lists {}, and /review shows what {} changed",
+                ended.len(),
+                if ended.len() == 1 { "" } else { "s" },
+                if ended.len() == 1 { "it" } else { "them" },
+                if ended.len() == 1 { "it" } else { "they" },
+            ));
+        }
+    }
     // The session's child agents: nothing shows their events yet, only a line for each above
     // the input and their approvals in the queue.
     let (child_events, _) = tokio::sync::mpsc::unbounded_channel();
     let supervisor = started.supervisor(child_events, CancellationToken::new());
-    let spawn = started.spawn_tool(&supervisor);
+    let spawn = started.spawn_tool(&supervisor, false);
     let definitions = started.agent_definitions();
     let Started {
         agent,

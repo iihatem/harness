@@ -38,8 +38,75 @@ pub enum ReportFlag {
     ListTruncated,
 }
 
+/// What a child's model requests used.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReportUsage {
+    /// Model requests made.
+    pub requests: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    /// What was billed; `None` when a request had no price, so it is never a sum that left one
+    /// out.
+    pub billed_usd: Option<f64>,
+    /// What the same tokens cost at the table's price (an estimate); `None` likewise.
+    pub list_usd: Option<f64>,
+}
+
+/// Adds up what a child's requests used, as its [`ScopedMeter`](super::ScopedMeter) sees them.
+#[derive(Debug, Clone, Default)]
+pub struct UsageTally(std::sync::Arc<std::sync::Mutex<Tally>>);
+
+#[derive(Debug, Default)]
+struct Tally {
+    usage: ReportUsage,
+    /// A request with no price was seen.
+    billed_unknown: bool,
+    list_unknown: bool,
+}
+
+impl UsageTally {
+    pub(crate) fn add(&self, usage: &crate::message::Usage, cost: &crate::meter::RequestCost) {
+        let mut tally = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tally.usage.requests += 1;
+        tally.usage.input_tokens += usage.input_tokens;
+        tally.usage.output_tokens += usage.output_tokens;
+        tally.usage.cached_tokens += usage.cached_tokens;
+        match cost.billed_usd {
+            Some(usd) => *tally.usage.billed_usd.get_or_insert(0.0) += usd,
+            None => tally.billed_unknown = true,
+        }
+        match cost.list_usd {
+            Some(usd) => *tally.usage.list_usd.get_or_insert(0.0) += usd,
+            None => tally.list_unknown = true,
+        }
+    }
+
+    /// What was used so far; `None` when no request was made.
+    pub fn snapshot(&self) -> Option<ReportUsage> {
+        let tally = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tally.usage.requests == 0 {
+            return None;
+        }
+        let mut usage = tally.usage.clone();
+        if tally.billed_unknown {
+            usage.billed_usd = None;
+        }
+        if tally.list_unknown {
+            usage.list_usd = None;
+        }
+        Some(usage)
+    }
+}
+
 /// A child's result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentReport {
     pub agent: String,
     pub label: String,
@@ -58,6 +125,9 @@ pub struct AgentReport {
     /// The child's own session, where its whole transcript is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// What its model requests used, when a meter saw them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ReportUsage>,
 }
 
 /// `text` cut to `cap` characters; whether it was cut.
@@ -129,6 +199,7 @@ impl AgentReport {
             flags,
             error: None,
             session: None,
+            usage: None,
         }
     }
 }

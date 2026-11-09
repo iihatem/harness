@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use super::report::UsageTally;
 use crate::meter::{
     AccountKind, AgentScope, BudgetStatus, Meter, RequestCost, RequestRecord, TurnRecord,
     WindowSnapshot,
@@ -13,17 +14,29 @@ use crate::meter::{
 pub struct ScopedMeter {
     inner: Arc<dyn Meter>,
     scope: AgentScope,
+    tally: UsageTally,
 }
 
 impl ScopedMeter {
     pub fn new(inner: Arc<dyn Meter>, scope: AgentScope) -> Self {
-        ScopedMeter { inner, scope }
+        ScopedMeter {
+            inner,
+            scope,
+            tally: UsageTally::default(),
+        }
+    }
+
+    /// What this child's requests used, which its report says.
+    pub fn tally(&self) -> UsageTally {
+        self.tally.clone()
     }
 }
 
 impl Meter for ScopedMeter {
     fn record_request(&self, request: &RequestRecord) -> RequestCost {
-        self.inner.record_request_as(request, Some(&self.scope))
+        let cost = self.inner.record_request_as(request, Some(&self.scope));
+        self.tally.add(&request.usage, &cost);
+        cost
     }
 
     fn check_budget(&self, _session: &str, account: AccountKind) -> BudgetStatus {

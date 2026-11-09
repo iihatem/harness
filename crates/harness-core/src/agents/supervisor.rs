@@ -127,6 +127,10 @@ pub struct AgentInfo {
     pub tool_calls: u32,
     /// The tool it called last.
     pub activity: Option<String>,
+    /// Its final text, once it has ended (capped).
+    pub summary: Option<String>,
+    /// Why it failed or was stopped, once it has ended.
+    pub error: Option<String>,
     /// When it started working (it is not set while it waits for a place).
     pub started: Option<Instant>,
 }
@@ -306,6 +310,8 @@ impl Supervisor {
                     model: None,
                     tool_calls: 0,
                     activity: None,
+                    summary: None,
+                    error: None,
                     started: None,
                 },
                 cancel: cancel.clone(),
@@ -379,7 +385,12 @@ fn finish_child(
 ) -> AgentReport {
     let id = &tag.id;
     report.session = session.clone();
-    inner.update(id, |info| info.status = report.status);
+    inner.update(id, |info| {
+        info.status = report.status;
+        info.summary = Some(crate::agents::report::cap_chars(&report.summary, 400).0)
+            .filter(|summary| !summary.is_empty());
+        info.error = report.error.clone();
+    });
     let _ = inner.events.send(AgentEnvelope::child(
         id,
         AgentEvent::AgentFinished {
@@ -476,8 +487,9 @@ async fn run_child(
         cancel: cancel.clone(),
         failure: failure.clone(),
     });
+    let mut tally = None;
     let meter: Option<Arc<dyn Meter>> = parent.meter.clone().map(|meter| {
-        Arc::new(ScopedMeter::new(
+        let scoped = ScopedMeter::new(
             meter,
             AgentScope {
                 agent: id.to_string(),
@@ -489,7 +501,9 @@ async fn run_child(
                     .collect(),
                 parent: parent.session.clone(),
             },
-        )) as Arc<dyn Meter>
+        );
+        tally = Some(scoped.tally());
+        Arc::new(scoped) as Arc<dyn Meter>
     });
     inner.records.push(
         &parent.session,
@@ -629,6 +643,7 @@ async fn run_child(
         &workspace,
     );
     report.error = error;
+    report.usage = tally.and_then(|tally| tally.snapshot());
     finish(&inner, report, Some(session_id))
 }
 

@@ -1352,6 +1352,8 @@ fn info(
         model: model.map(String::from),
         tool_calls: 0,
         activity: activity.map(String::from),
+        summary: None,
+        error: None,
         started: None,
     }
 }

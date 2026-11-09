@@ -18,7 +18,7 @@ pub use identity::{AgentEnvelope, AgentId, AgentStatus, AgentTag, qualify_call_i
 pub use meter::ScopedMeter;
 pub use model::{CurrentModel, ParentModel};
 pub use records::AgentRecords;
-pub use report::{AgentReport, ReportFlag, ToolLog};
+pub use report::{AgentReport, ReportFlag, ReportUsage, ToolLog, UsageTally};
 pub use sched::{Endpoint, Limits};
 pub use supervisor::{
     AgentFactory, AgentHandle, AgentInfo, AgentSpec, ChildSetup, ParentContext, Supervisor,

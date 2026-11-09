@@ -1269,3 +1269,151 @@ async fn moving_to_another_session_saves_the_records_in_the_one_left() {
     assert_eq!(record_lines(&first).len(), 2);
     assert!(record_lines(&second).is_empty());
 }
+
+// ---- what a child used, and what its listing says --------------------------------------------
+
+/// A meter that prices every request the same, or not at all.
+struct Priced {
+    billed: Option<f64>,
+    list: Option<f64>,
+}
+
+impl Meter for Priced {
+    fn record_request(&self, _r: &RequestRecord) -> RequestCost {
+        RequestCost {
+            account: AccountKind::ApiKey,
+            billed_usd: self.billed,
+            list_usd: self.list,
+            avoided: harness_core::meter::Avoided::NotApplicable,
+        }
+    }
+    fn check_budget(&self, _s: &str, _a: AccountKind) -> BudgetStatus {
+        BudgetStatus::default()
+    }
+}
+
+fn used(
+    input: u64,
+    output: u64,
+    cached: u64,
+    finish: FinishReason,
+    event: ProviderEvent,
+) -> Script {
+    Script::Reply(vec![
+        Ok(event),
+        Ok(ProviderEvent::Usage(harness_core::message::Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: cached,
+            ..Default::default()
+        })),
+        Ok(ProviderEvent::Finished(finish)),
+    ])
+}
+
+fn two_requests() -> Vec<Script> {
+    vec![
+        used(
+            100,
+            10,
+            40,
+            FinishReason::ToolCalls,
+            ProviderEvent::ToolCall(harness_core::message::ToolCall {
+                id: "c1".into(),
+                name: "echo".into(),
+                arguments: json!({"text": "hi"}).to_string(),
+            }),
+        ),
+        used(
+            200,
+            20,
+            0,
+            FinishReason::Stop,
+            ProviderEvent::TextDelta("done".into()),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_childs_report_says_the_tokens_and_cost_of_its_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let factory = scripted(dir.path(), vec![two_requests()]);
+    let mut p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
+    p.ctx.meter = Some(Arc::new(Priced {
+        billed: Some(0.25),
+        list: Some(0.5),
+    }));
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    let report = wait(sup.spawn(spec("x"))).await;
+    let usage = report.usage.expect("the report has usage");
+    assert_eq!(usage.requests, 2);
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens, usage.cached_tokens),
+        (300, 30, 40)
+    );
+    assert_eq!(usage.billed_usd, Some(0.5));
+    assert_eq!(usage.list_usd, Some(1.0));
+}
+
+#[tokio::test]
+async fn a_request_with_no_price_makes_the_cost_unknown_never_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let factory = scripted(dir.path(), vec![two_requests()]);
+    let mut p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
+    p.ctx.meter = Some(Arc::new(Priced {
+        billed: None,
+        list: None,
+    }));
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    let usage = wait(sup.spawn(spec("x"))).await.usage.unwrap();
+    assert_eq!(usage.input_tokens, 300);
+    assert_eq!((usage.billed_usd, usage.list_usd), (None, None));
+}
+
+#[tokio::test]
+async fn without_a_meter_the_report_has_no_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let factory = scripted(dir.path(), vec![vec![Script::text("ok")]]);
+    let p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    assert_eq!(wait(sup.spawn(spec("x"))).await.usage, None);
+}
+
+#[test]
+fn a_report_written_before_usage_existed_still_reads() {
+    let old = r#"{"agent":"a1","label":"x","status":"done","summary":"s","files_changed":[],"commands_run":[],"tool_calls":0}"#;
+    let report: harness_core::agents::AgentReport = serde_json::from_str(old).unwrap();
+    assert_eq!(report.usage, None);
+    let json = serde_json::to_string(&report).unwrap();
+    assert!(!json.contains("usage"), "{json}");
+}
+
+#[tokio::test]
+async fn a_finished_childs_listing_carries_its_summary_and_its_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let factory = scripted(
+        dir.path(),
+        vec![
+            vec![Script::text("it is in main.rs\nand more")],
+            vec![Script::error(
+                harness_core::provider::ProviderError::Protocol("boom".into()),
+            )],
+        ],
+    );
+    let p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    wait(sup.spawn(spec("ok"))).await;
+    wait(sup.spawn(spec("bad"))).await;
+    let infos = sup.snapshot();
+    assert_eq!(
+        infos[0].summary.as_deref(),
+        Some("it is in main.rs\nand more")
+    );
+    assert_eq!(infos[0].error, None);
+    assert_eq!(infos[1].status, AgentStatus::Failed);
+    assert!(
+        infos[1].error.as_deref().unwrap().contains("boom"),
+        "{:?}",
+        infos[1]
+    );
+}

@@ -490,7 +490,7 @@ impl CodexProtocol {
             }
             "turn/completed" => self.turn_completed(&p["turn"]),
             "error" => {
-                let message = text(&p["error"]["message"]);
+                let message = error_text(&p["error"]);
                 if p["willRetry"].as_bool().unwrap_or(false) {
                     self.retries += 1;
                     events(vec![DelegateEvent::Retrying {
@@ -715,9 +715,9 @@ impl CodexProtocol {
             _ => TurnEndReason::Error,
         };
         if reason == TurnEndReason::Error {
-            let message = turn["error"]["message"]
-                .as_str()
-                .map(String::from)
+            let message = Some(turn["error"].clone())
+                .filter(|e| e["message"].is_string())
+                .map(|e| error_text(&e))
                 .or_else(|| self.last_error.take())
                 .unwrap_or_else(|| "codex ended the turn with an error".to_string());
             out.push(DelegateEvent::Error {
@@ -735,6 +735,18 @@ impl CodexProtocol {
             close_stdin: true,
             ..Out::default()
         }
+    }
+}
+
+/// A `TurnError` as one text: its message, and the extra details (the body of a failed HTTP
+/// request, say) when codex sends them and the message does not already say them.
+fn error_text(error: &Value) -> String {
+    let message = text(&error["message"]);
+    match error["additionalDetails"].as_str() {
+        Some(details) if !details.is_empty() && !message.contains(details) => {
+            format!("{message}: {details}")
+        }
+        _ => message,
     }
 }
 

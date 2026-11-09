@@ -46,9 +46,16 @@ impl ChildWorkspace {
     }
 
     /// A workspace that harness created for the child, for the parent's repository.
-    #[allow(dead_code, reason = "for the code that creates worktrees")]
+    #[cfg(test)]
     pub(crate) fn created(path: PathBuf) -> Self {
         ChildWorkspace(Choice::Created(path))
+    }
+
+    /// The directory of a worktree harness made for the child. The one way a path other than the
+    /// parent's enters a spec: only [`Worktrees::create`](crate::worktree::Worktrees::create)
+    /// makes a [`Worktree`].
+    pub fn worktree(worktree: &crate::worktree::Worktree) -> Self {
+        ChildWorkspace(Choice::Created(worktree.workspace()))
     }
 
     /// The workspace for a path someone named: only the parent's own is accepted (the same

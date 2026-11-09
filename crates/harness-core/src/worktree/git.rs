@@ -227,9 +227,17 @@ mod tests {
         let git = Git::open(dir.path()).unwrap();
         git.run(&["add", "-A"]).unwrap();
         git.run(&["commit", "-q", "-m", "x"]).unwrap();
-        git.run(&["worktree", "add", "-q", "-b", "side", "../side-tree"])
-            .unwrap();
-        let side = dir.path().join("../side-tree");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let side = elsewhere.path().join("side-tree");
+        git.run(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            side.to_str().unwrap(),
+        ])
+        .unwrap();
         assert!(side.join("a.txt").exists(), "the worktree was made");
         assert!(!marker.exists(), "a hook ran");
         // The hooks are there and a plain git runs them: the test would see it.
@@ -237,7 +245,6 @@ mod tests {
         plain(dir.path(), &["add", "-A"]);
         plain(dir.path(), &["commit", "-q", "-m", "y"]);
         assert!(marker.exists(), "the fixture's hooks work");
-        std::fs::remove_dir_all(side).unwrap();
     }
 
     #[test]
@@ -271,10 +278,18 @@ mod tests {
         let git = Git::open(dir.path()).unwrap();
         git.run(&["add", "-A"]).unwrap();
         git.run(&["commit", "-q", "-m", "x"]).unwrap();
-        git.run(&["worktree", "add", "-q", "-b", "side", "../side-tree2"])
-            .unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let side = elsewhere.path().join("side-tree");
+        git.run(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            side.to_str().unwrap(),
+        ])
+        .unwrap();
         assert!(!marker.exists(), "a filter driver ran");
-        std::fs::remove_dir_all(dir.path().join("../side-tree2")).unwrap();
     }
 
     #[test]

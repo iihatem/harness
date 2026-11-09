@@ -350,8 +350,8 @@ pub async fn run(
             notices.note(&text);
         }
     }
-    // The session's child agents: nothing shows their events yet, only a line for each above
-    // the input and their approvals in the queue.
+    // The session's child agents: the panel, a line for each above the input and their approvals
+    // in the queue show them; their events themselves are not shown.
     let (child_events, _) = tokio::sync::mpsc::unbounded_channel();
     let supervisor = started.supervisor(child_events, CancellationToken::new());
     let spawn = started.spawn_tool(&supervisor, false);
@@ -472,7 +472,7 @@ fn shutdown_signals() -> std::io::Result<impl Future<Output = Ending>> {
 }
 
 /// Whether this process ignores `signal`.
-fn ignored(signal: nix::libc::c_int) -> bool {
+pub(crate) fn ignored(signal: nix::libc::c_int) -> bool {
     // SAFETY: an all-zero `sigaction` is valid for the call to overwrite; with no new action
     // given, `sigaction` only reads the current one.
     let mut current: nix::libc::sigaction = unsafe { std::mem::zeroed() };

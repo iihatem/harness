@@ -34,11 +34,56 @@ pub async fn run(
     debug: bool,
     yes_full_access: bool,
 ) -> u8 {
+    // The signal that stopped the run, as the exit code a shell reports for it: 0 while none
+    // has. A run that ended because of it exits with that code instead of 130.
+    let signalled = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let code = run_until_signalled(
+        model_flag,
+        mode_flag,
+        session,
+        prompt_text,
+        json,
+        debug,
+        yes_full_access,
+        signalled.clone(),
+    )
+    .await;
+    match signalled.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => code,
+        signal if code == 130 => signal,
+        _ => code,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_until_signalled(
+    model_flag: Option<String>,
+    mode_flag: Option<Mode>,
+    session: crate::sessions::Choice,
+    prompt_text: String,
+    json: bool,
+    debug: bool,
+    yes_full_access: bool,
+    signalled: Arc<std::sync::atomic::AtomicU8>,
+) -> u8 {
     // Registered as the very first thing this function does (a plain synchronous call, not an
     // awaited future): once it returns, the OS delivers SIGINT to tokio's signal driver instead of
     // the default disposition, even before the `sigint.recv()` task below gets its first poll.
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("failed to install a SIGINT handler");
+    // SIGTERM and SIGHUP stop the run like Ctrl+C does: the program a delegated model runs in
+    // lives in a process group of its own, so nothing else would stop it (or what it started)
+    // when harness is stopped. A hangup that harness was started ignoring (`nohup`) stays so.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to install a SIGTERM handler");
+    let mut sighup = if crate::interactive::ignored(nix::libc::SIGHUP) {
+        None
+    } else {
+        Some(
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("failed to install a SIGHUP handler"),
+        )
+    };
     let setup = match setup::load() {
         Ok(setup) => Arc::new(setup),
         Err(message) => {
@@ -101,7 +146,21 @@ pub async fn run(
     let cancel = CancellationToken::new();
     let on_ctrl_c = cancel.clone();
     tokio::spawn(async move {
-        if sigint.recv().await.is_some() {
+        let hangup = async {
+            match sighup.as_mut() {
+                Some(hangup) => hangup.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let code = tokio::select! {
+            got = sigint.recv() => got.map(|()| 130),
+            got = sigterm.recv() => got.map(|()| 143),
+            got = hangup => got.map(|()| 129),
+        };
+        if let Some(code) = code {
+            if code != 130 {
+                signalled.store(code, std::sync::atomic::Ordering::SeqCst);
+            }
             on_ctrl_c.cancel();
         }
     });

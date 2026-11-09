@@ -108,6 +108,12 @@ impl Started {
         supervisor
     }
 
+    /// Children that run in Claude Code or Codex are not asked to confirm `full-access` (the
+    /// user did, for a headless run, with `--yes-full-access`).
+    pub fn confirm_children_full_access(&self) {
+        self.children.factory.confirm_full_access();
+    }
+
     /// The worktrees agents are isolated in, when the project is in a git repository.
     pub fn worktrees(&self) -> Option<Arc<harness_core::worktree::Worktrees>> {
         self.children.worktrees.clone()

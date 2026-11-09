@@ -165,6 +165,9 @@ pub async fn run(
     let (tx, rx) = mpsc::unbounded_channel();
     let rx = with_credential_warnings(rx, setup.credentials.clone());
     let (envelopes, rx) = wrap_main(rx);
+    if yes_full_access {
+        started.confirm_children_full_access();
+    }
     let supervisor = started.supervisor(envelopes.clone(), cancel.clone());
     let spawn = started.spawn_tool(&supervisor, true);
     let Started {

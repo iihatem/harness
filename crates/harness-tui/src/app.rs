@@ -1319,24 +1319,6 @@ impl App {
             );
             return None;
         }
-        // The agent runs in process on its definition's model, else on the session's own; a
-        // Claude Code or Codex model has no in-process provider, and running a subagent on one
-        // comes later. Nothing is substituted: the user picks the model.
-        let model = self
-            .agent_definitions
-            .as_ref()
-            .and_then(|definitions| definitions.get("general"))
-            .and_then(|def| def.model.clone())
-            .unwrap_or_else(|| self.model.clone());
-        if harness_core::agents::is_delegated_model(&model) {
-            self.transcript.push_error(
-                &format!(
-                    "a background agent runs in harness itself, and `{model}` is run by Claude Code or Codex, which a subagent cannot use yet: switch to another model with /model first"
-                ),
-                width,
-            );
-            return None;
-        }
         Some(Action::Background(task.to_string()))
     }
 

@@ -41,6 +41,9 @@ pub struct CliFactory {
     output_root: PathBuf,
     /// Stops a child's wait for a model's server.
     cancel: CancellationToken,
+    /// The user confirmed `full-access` for the program-run children of this run
+    /// (`ask --yes-full-access`): they are not asked again.
+    full_access: std::sync::atomic::AtomicBool,
 }
 
 impl CliFactory {
@@ -81,7 +84,15 @@ impl CliFactory {
             unsandboxed,
             output_root,
             cancel,
+            full_access: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Children that run in Claude Code or Codex in `full-access` mode are not asked to confirm
+    /// it: the user already did (a headless run started with `--yes-full-access`).
+    pub fn confirm_full_access(&self) {
+        self.full_access
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Where the parent agent publishes the model it is on, for it to be given
@@ -149,6 +160,19 @@ impl AgentFactory for CliFactory {
         }
     }
 
+    async fn usable(&self, model: &str) -> Result<(), String> {
+        if !harness_core::agents::is_delegated_model(model) {
+            return Ok(());
+        }
+        // The program is there and in its tested range; then the account (a Claude whose opt-in
+        // was declined and has no key says so). Not yet answered is usable: it asks at its start.
+        crate::delegate::ready(&self.setup, model).await?;
+        self.resolver
+            .resolve(model, self.cancel.clone())
+            .await
+            .map(|_| ())
+    }
+
     async fn build(&self, child: ChildSetup) -> Result<Agent, String> {
         let ChildSetup {
             tag,
@@ -178,6 +202,9 @@ impl AgentFactory for CliFactory {
         if let Some(steps) = spec.max_steps {
             config.max_steps = steps;
         }
+        // A model that runs in another program has no system prompt of harness's: what the
+        // definition says goes to it in front of the task.
+        config.brief = spec.instructions.clone();
         let (provider, mut tools) = match own_model(&spec, &parent) {
             Some(id) => {
                 let model = self.resolver.resolve(id, self.cancel.clone()).await?;
@@ -258,6 +285,9 @@ impl AgentFactory for CliFactory {
             .with_resolver(self.resolver.clone());
         if let Some(meter) = meter {
             agent = agent.with_meter(meter);
+        }
+        if self.full_access.load(std::sync::atomic::Ordering::SeqCst) {
+            agent.confirm_full_access();
         }
         Ok(agent)
     }
@@ -386,6 +416,78 @@ mod tests {
         assert_eq!((local.key.as_str(), local.local), ("mine", true));
         assert!(endpoint(Some("ollama/llama3")).local);
         assert!(!parents.delegated && !local.delegated);
+    }
+
+    /// A program that says its version and does nothing else.
+    fn fake_program(dir: &std::path::Path, name: &str, version: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn fixture_with_vars(
+        config: &str,
+        vars: &[(&str, &str)],
+    ) -> (tempfile::TempDir, Arc<CliFactory>) {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, workspace) = (dir.path().join("home"), dir.path().join("work"));
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(home.join("config/config.toml"), config).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let setup = setup_with(&home, &workspace, vars);
+        let factory = CliFactory::new(
+            setup.clone(),
+            crate::routes::CliResolver::new(setup.clone()),
+            MockProvider::new(vec![]),
+            AgentConfig::new("openai/gpt-5", "gpt-5", "p", dir.path().join("out")),
+            EditFormat::StrReplace,
+            Sandboxes::default(),
+            false,
+            Vec::new(),
+            None,
+            dir.path().join("out"),
+            CancellationToken::new(),
+        );
+        (dir, factory)
+    }
+
+    #[tokio::test]
+    async fn a_program_that_is_missing_or_untested_cannot_be_used_and_the_reason_is_given() {
+        let tools = tempfile::tempdir().unwrap();
+        let missing = tools.path().join("nope");
+        let (_d, f) = fixture_with_vars("", &[("HARNESS_CODEX_BIN", missing.to_str().unwrap())]);
+        let why = f.usable("codex/gpt-5").await.unwrap_err();
+        assert!(why.contains("codex"), "{why}");
+        let old = fake_program(tools.path(), "codex", "codex-cli 0.1.0");
+        let (_d, f) = fixture_with_vars("", &[("HARNESS_CODEX_BIN", old.to_str().unwrap())]);
+        let why = f.usable("codex/gpt-5").await.unwrap_err();
+        assert!(why.contains("tested range"), "{why}");
+        // A model of harness's own is always fine here.
+        assert!(f.usable("openai/gpt-5").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn claude_is_usable_with_the_opt_in_or_a_key_or_while_undecided_and_not_when_refused() {
+        let tools = tempfile::tempdir().unwrap();
+        let claude = fake_program(tools.path(), "claude", "2.1.312 (Claude Code)");
+        let bin = ("HARNESS_CLAUDE_BIN", claude.to_str().unwrap());
+        let (_d, f) = fixture_with_vars("[delegate.claude]\nuse_subscription = true\n", &[bin]);
+        assert!(f.usable("claude-code/sonnet").await.is_ok());
+        // Not answered yet: the child asks at its start.
+        let (_d, f) = fixture_with_vars("", &[bin]);
+        assert!(f.usable("claude-code/sonnet").await.is_ok());
+        // Declined, and no key: it says how to get one.
+        let (_d, f) = fixture_with_vars("[delegate.claude]\nuse_subscription = false\n", &[bin]);
+        let why = f.usable("claude-code/sonnet").await.unwrap_err();
+        assert!(why.contains("harness auth add anthropic"), "{why}");
+        let (_d, f) = fixture_with_vars(
+            "[delegate.claude]\nuse_subscription = false\n",
+            &[bin, ("ANTHROPIC_API_KEY", "sk-ant-api03-test")],
+        );
+        assert!(f.usable("claude-code/sonnet").await.is_ok());
     }
 
     #[test]

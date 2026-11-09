@@ -253,20 +253,23 @@ async fn bg_says_what_it_needs_instead_of_starting_wrongly() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn bg_is_refused_while_the_session_model_is_claude_code_or_codex() {
-    // The child would run in process on the parent's model, and a delegated model has no
-    // in-process provider: nothing starts and the message says why and what to do.
+async fn bg_starts_an_agent_while_the_session_model_is_claude_code_or_codex() {
+    // The agent runs on the session's model like any other (the program does the work, in its
+    // own worktree); nothing says it cannot.
     for model in ["claude-code/sonnet", "codex/gpt-5-codex"] {
         let mut r = rig_on(model, Mode::Auto, vec![writes("a.txt")], true);
         send(&mut r.ui, "/bg do things");
         assert!(
-            shows_wrapped(&r.ui, "Claude Code or Codex"),
+            shows_wrapped(&r.ui, "started a1"),
             "{model}: {:?}",
             everything(&r.ui)
         );
-        assert!(shows_wrapped(&r.ui, "/model"), "{:?}", everything(&r.ui));
-        assert!(r.sup.snapshot().is_empty(), "{model}");
-        assert!(r.wts.records().is_empty(), "{model}");
+        assert!(
+            !shows_wrapped(&r.ui, "cannot use yet"),
+            "{model}: {:?}",
+            everything(&r.ui)
+        );
+        assert_eq!(r.sup.snapshot().len(), 1, "{model}");
     }
 }
 

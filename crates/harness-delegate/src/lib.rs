@@ -8,6 +8,7 @@
 //! sign in on their own (`claude /login`, `codex login`).
 
 pub mod backend;
+pub mod detect;
 pub mod env;
 pub mod event;
 pub mod redact;

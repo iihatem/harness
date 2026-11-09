@@ -82,6 +82,9 @@ pub struct StartRequest {
     pub binary: Option<PathBuf>,
     /// The `PATH` to search, else the process's.
     pub path_var: Option<OsString>,
+    /// The environment the child starts from (before the credential scrub of [`crate::env`]);
+    /// else the process's.
+    pub parent_env: Option<Vec<(OsString, OsString)>>,
     /// Run a version outside the tested range.
     pub allow_untested: bool,
     /// How long an interrupt waits at each step before the next, harsher one.
@@ -104,6 +107,7 @@ impl StartRequest {
             redactor: Arc::new(Redactor::default()),
             binary: None,
             path_var: None,
+            parent_env: None,
             allow_untested: false,
             grace: Duration::from_secs(5),
             cost_baseline_usd: 0.0,

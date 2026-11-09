@@ -446,6 +446,9 @@ pub struct Agent {
     stats: Stats,
     /// The sandbox for each mode, when switching modes also switches the sandbox.
     sandboxes: Option<Sandboxes>,
+    /// The mode `ctx`'s sandbox and access are for: what the policy says changes under a child
+    /// whose parent switches mode, and the next command then gets the new mode's.
+    sandbox_mode: Option<Mode>,
     /// Input the user sends while a turn runs.
     steering: Option<Steering>,
     /// Told about every model request, for the usage ledger.
@@ -554,6 +557,7 @@ impl Agent {
             redactor: None,
             stats: Stats::default(),
             sandboxes: None,
+            sandbox_mode: None,
             steering: None,
             meter: None,
             turn_started: None,
@@ -1068,7 +1072,27 @@ impl Agent {
     /// started with.
     pub fn with_sandboxes(mut self, sandboxes: Sandboxes) -> Self {
         self.sandboxes = Some(sandboxes);
+        // What the context was made for is the mode the policy is in now.
+        self.sandbox_mode = self.policy.mode();
         self
+    }
+
+    /// A child's mode follows its parent's, narrower only: when the policy's mode is no longer
+    /// the one the sandbox and the access of commands were made for, they are taken for the
+    /// mode it is now, before the next call is checked. (The engine allows a command in plan or
+    /// read-only mode because the sandbox it runs in cannot write.)
+    fn follow_policy_mode(&mut self) {
+        let (Some(sandboxes), Some(mode)) = (&self.sandboxes, self.policy.mode()) else {
+            return;
+        };
+        if self.sandbox_mode == Some(mode) {
+            return;
+        }
+        self.sandbox_mode = Some(mode);
+        self.ctx.sandbox = sandboxes.for_mode(mode);
+        self.policy
+            .set_sandbox_available(self.ctx.sandbox.is_some());
+        self.ctx.access = mode.fs_access();
     }
 
     /// Gives the model what the user sends through `steering` while a turn runs, with the
@@ -1532,6 +1556,7 @@ impl Agent {
         }
         self.policy.set_mode(mode);
         self.ctx.access = mode.fs_access();
+        self.sandbox_mode = Some(mode);
         self.record(
             Message::User {
                 content: mode_note(mode, self.ctx.sandbox.is_some()),
@@ -3028,6 +3053,7 @@ impl Agent {
         call: &ToolCall,
         events: &UnboundedSender<AgentEvent>,
     ) -> ToolOutput {
+        self.follow_policy_mode();
         let Some(tool) = self.tools.get(&call.name) else {
             self.invalid_calls += 1;
             let names: Vec<String> = self.tools.specs().into_iter().map(|s| s.name).collect();

@@ -297,6 +297,9 @@ impl AgentFactory for CliFactory {
         let mut agent = Agent::new(provider, tools, policy, approver, config, ctx)
             .with_redactor(self.setup.redactor.clone())
             .with_session(session)
+            // Both sandboxes, as the parent has them: what its parent's mode does to the child
+            // while it runs also changes the sandbox its next command gets.
+            .with_sandboxes(self.sandboxes.clone())
             .with_checkpoints(checkpoints)
             .with_gates(self.setup.config.gates.clone())
             .with_roles(self.setup.config.roles.clone())

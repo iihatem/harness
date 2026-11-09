@@ -1,0 +1,318 @@
+//! Child agents in a session: the CLI's side of `harness_core::agents::AgentFactory`.
+//!
+//! A child shares its parent's provider, tools, sandbox, gates and settings unless its spec names
+//! another model, a narrower set of tools or a prompt of its own. Its permissions, approver,
+//! meter and session come from the supervisor.
+
+use std::{path::PathBuf, sync::Arc};
+
+use async_trait::async_trait;
+use harness_core::{
+    agent::{Agent, AgentConfig, Sandboxes},
+    agents::{AgentFactory, AgentSpec, ChildSetup, Endpoint},
+    edit_format::EditFormat,
+    provider::Provider,
+    role::ModelResolver,
+    tool::{Tool, ToolContext, ToolRegistry},
+};
+use tokio_util::sync::CancellationToken;
+
+use crate::{routes::CliResolver, setup::Setup};
+
+/// Makes child agents from the session's own pieces.
+pub struct CliFactory {
+    setup: Arc<Setup>,
+    resolver: Arc<CliResolver>,
+    /// The parent's provider and settings, which a child that names no model of its own uses.
+    provider: Arc<dyn Provider>,
+    template: AgentConfig,
+    edit_format: EditFormat,
+    /// The sandbox for each mode. A child that runs in a mode with none asks about every shell
+    /// command, as its parent would.
+    sandboxes: Sandboxes,
+    parent_local: bool,
+    /// Where each child's tool output goes: a directory of its own under this one.
+    output_root: PathBuf,
+    /// Stops a child's wait for a model's server.
+    cancel: CancellationToken,
+}
+
+impl CliFactory {
+    #[allow(clippy::too_many_arguments, reason = "what a session knows, passed on")]
+    pub fn new(
+        setup: Arc<Setup>,
+        resolver: Arc<CliResolver>,
+        provider: Arc<dyn Provider>,
+        template: AgentConfig,
+        edit_format: EditFormat,
+        sandboxes: Sandboxes,
+        parent_local: bool,
+        output_root: PathBuf,
+        cancel: CancellationToken,
+    ) -> Arc<CliFactory> {
+        Arc::new(CliFactory {
+            setup,
+            resolver,
+            provider,
+            template,
+            edit_format,
+            sandboxes,
+            parent_local,
+            output_root,
+            cancel,
+        })
+    }
+
+    /// The model a spec runs on when it names one other than its parent's.
+    fn own_model<'a>(&self, spec: &'a AgentSpec) -> Option<&'a str> {
+        spec.model
+            .as_deref()
+            .filter(|id| *id != self.template.model_id)
+    }
+}
+
+#[async_trait]
+impl AgentFactory for CliFactory {
+    fn endpoint(&self, spec: &AgentSpec) -> Endpoint {
+        let (id, local) = match self.own_model(spec) {
+            Some(id) => (
+                id,
+                self.resolver.runs_locally(id).unwrap_or(self.parent_local),
+            ),
+            None => (self.template.model_id.as_str(), self.parent_local),
+        };
+        Endpoint {
+            key: id.split('/').next().unwrap_or(id).to_string(),
+            local,
+        }
+    }
+
+    async fn build(&self, child: ChildSetup) -> Result<Agent, String> {
+        let ChildSetup {
+            tag,
+            spec,
+            policy,
+            mode,
+            approver,
+            meter,
+            session,
+        } = child;
+        let mut config = self.template.clone();
+        config.output_dir = self.output_root.join(tag.id.as_str());
+        if let Some(prompt) = &spec.system_prompt {
+            config.system_prompt = prompt.clone();
+        }
+        if let Some(steps) = spec.max_steps {
+            config.max_steps = steps;
+        }
+        let (provider, mut tools) = match self.own_model(&spec) {
+            Some(id) => {
+                let model = self.resolver.resolve(id, self.cancel.clone()).await?;
+                config.model_id = model.id.clone();
+                config.model_name = model.name.clone();
+                if let Some(window) = model.context_window {
+                    config.context_window = window;
+                }
+                if let Some(request) = model.request.clone() {
+                    config.request = request;
+                }
+                config.text_tool_calls = model.text_tool_calls;
+                config.edit_section = model.edit_section.clone();
+                let tools = model
+                    .tools
+                    .clone()
+                    .unwrap_or_else(|| harness_tools::builtin_for(self.edit_format));
+                (model.provider.clone(), tools)
+            }
+            None => (
+                self.provider.clone(),
+                harness_tools::builtin_for(self.edit_format),
+            ),
+        };
+        if let Some(names) = &spec.tools {
+            let allowed: Vec<Arc<dyn Tool>> = tools
+                .specs()
+                .into_iter()
+                .filter(|tool| names.contains(&tool.name))
+                .filter_map(|tool| tools.get(&tool.name))
+                .collect();
+            tools = ToolRegistry::new(allowed);
+        }
+        let workspace = spec
+            .workspace
+            .clone()
+            .unwrap_or_else(|| self.setup.workspace.clone());
+        let sandbox = self.sandboxes.for_mode(mode);
+        harness_core::permission::PermissionPolicy::set_sandbox_available(
+            &*policy,
+            sandbox.is_some(),
+        );
+        let ctx = ToolContext::new(&workspace).with_sandbox(sandbox, mode.fs_access());
+        let mut agent = Agent::new(provider, tools, policy, approver, config, ctx)
+            .with_redactor(self.setup.redactor.clone())
+            .with_session(session)
+            .with_gates(self.setup.config.gates.clone())
+            .with_roles(self.setup.config.roles.clone())
+            .with_resolver(self.resolver.clone());
+        if let Some(meter) = meter {
+            agent = agent.with_meter(meter);
+        }
+        Ok(agent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use harness_core::{
+        agent::{AgentConfig, Sandboxes},
+        agents::{AgentFactory, AgentSpec, AgentStatus, Limits, ParentContext, Supervisor},
+        edit_format::EditFormat,
+        engine::{EngineConfig, PermissionEngine, RuleSet},
+        permission::Mode,
+        testing::{MockProvider, Script},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    use super::CliFactory;
+    use crate::host::tests::setup_with;
+
+    const LOCAL: &str =
+        "[providers.mine]\nprotocol = \"openai-chat\"\nbase_url = \"http://127.0.0.1:9/v1\"\n";
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        factory: Arc<CliFactory>,
+        provider: Arc<MockProvider>,
+        workspace: std::path::PathBuf,
+        data: std::path::PathBuf,
+    }
+
+    fn fixture(config: &str, script: Vec<Script>) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, workspace) = (dir.path().join("home"), dir.path().join("work"));
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(home.join("config/config.toml"), config).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let setup = setup_with(&home, &workspace, &[("OPENAI_API_KEY", "sk-test")]);
+        let provider = MockProvider::new(script);
+        let template = AgentConfig::new(
+            "openai/gpt-5",
+            "gpt-5",
+            "the parent's prompt",
+            dir.path().join("out"),
+        );
+        let factory = CliFactory::new(
+            setup.clone(),
+            crate::routes::CliResolver::new(setup.clone()),
+            provider.clone(),
+            template,
+            EditFormat::StrReplace,
+            Sandboxes::default(),
+            false,
+            dir.path().join("out"),
+            CancellationToken::new(),
+        );
+        Fixture {
+            data: setup.paths.data_dir.clone(),
+            _dir: dir,
+            factory,
+            provider,
+            workspace,
+        }
+    }
+
+    fn parent(
+        f: &Fixture,
+        mode: Mode,
+    ) -> (
+        ParentContext,
+        tokio::sync::mpsc::UnboundedReceiver<harness_core::agents::AgentEnvelope>,
+        Arc<dyn harness_core::agent::Approver>,
+    ) {
+        let config = EngineConfig {
+            mode,
+            workspace: f.workspace.clone(),
+            read_dirs: vec![],
+            rules: RuleSet::default(),
+            sandbox_available: false,
+            writes_need_approval: false,
+        };
+        let approver: Arc<dyn harness_core::agent::Approver> =
+            Arc::new(harness_core::agent::NonInteractive);
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            ParentContext {
+                session: "parent-session".into(),
+                cancel: CancellationToken::new(),
+                policy: Arc::new(PermissionEngine::new(config.clone())),
+                engine: config,
+                approver: approver.clone(),
+                meter: None,
+                sessions_dir: Some(f.workspace.join("sessions")),
+                workspace: f.workspace.clone(),
+            },
+            rx,
+            approver,
+        )
+    }
+
+    #[test]
+    fn a_childs_endpoint_is_its_models_provider_and_side() {
+        let f = fixture(LOCAL, vec![]);
+        let endpoint = |model: Option<&str>| {
+            let mut spec = AgentSpec::new("x", "y");
+            spec.model = model.map(String::from);
+            f.factory.endpoint(&spec)
+        };
+        let parents = endpoint(None);
+        assert_eq!((parents.key.as_str(), parents.local), ("openai", false));
+        let local = endpoint(Some("mine/x"));
+        assert_eq!((local.key.as_str(), local.local), ("mine", true));
+        assert!(endpoint(Some("ollama/llama3")).local);
+    }
+
+    #[tokio::test]
+    async fn a_child_runs_through_the_cli_factory_with_the_parents_model_and_its_own_prompt() {
+        let f = fixture("", vec![Script::text("found it")]);
+        let (ctx, _rx, _a) = parent(&f, Mode::ReadOnly);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let sup = Supervisor::new(Limits::default(), f.factory.clone(), ctx, tx);
+        let mut spec = AgentSpec::new("explore", "where is main?");
+        spec.system_prompt = Some("you only look".into());
+        spec.tools = Some(vec!["read".into()]);
+        spec.mode = Some(Mode::Auto);
+        let report = sup.spawn(spec).wait().await;
+        assert_eq!(report.status, AgentStatus::Done, "{report:?}");
+        assert_eq!(report.summary, "found it");
+        let request = &f.provider.requests()[0];
+        assert_eq!(request.system, "you only look");
+        assert_eq!(request.model, "gpt-5");
+        // Only the tool it was given.
+        let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["read"]);
+        // Its transcript is a session of its own beside its parent's.
+        let sessions = f.workspace.join("sessions");
+        assert_eq!(
+            harness_core::session::children_of(&sessions, "parent-session").len(),
+            1
+        );
+        assert!(events.try_recv().is_ok());
+        let _ = &f.data;
+    }
+
+    #[tokio::test]
+    async fn a_model_that_cannot_be_used_fails_the_child_and_says_why() {
+        let f = fixture("", vec![]);
+        let (ctx, _rx, _a) = parent(&f, Mode::Auto);
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let sup = Supervisor::new(Limits::default(), f.factory.clone(), ctx, tx);
+        let mut spec = AgentSpec::new("x", "y");
+        spec.model = Some("nowhere/x".into());
+        let report = sup.spawn(spec).wait().await;
+        assert_eq!(report.status, AgentStatus::Failed);
+        assert!(report.error.unwrap().contains("nowhere"));
+    }
+}

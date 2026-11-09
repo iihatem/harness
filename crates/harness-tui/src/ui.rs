@@ -619,6 +619,10 @@ where
                 if let Some(cancel) = &self.cancel {
                     cancel.cancel();
                 }
+                // Stopping the turn stops the agents it started.
+                if let Some(watch) = &self.agents {
+                    watch.supervisor.cancel_all();
+                }
                 Flow::Continue
             }
             Action::Quit => Flow::Quit,
@@ -832,6 +836,10 @@ where
         let (points, can_undo) = update.rewind;
         self.app.set_rewind(points, can_undo);
         self.app.set_session_id(&update.session);
+        // Children spawned from now on belong to the session the agent is in.
+        if let Some(watch) = &self.agents {
+            watch.supervisor.set_parent_session(&update.session);
+        }
         if let Some(done) = update.done {
             self.app.on_done(done);
         }
@@ -1140,6 +1148,9 @@ where
     /// as if the user had left) fails it, saying so.
     pub async fn finish(&mut self) -> io::Result<()> {
         self.app.deny_waiting();
+        if let Some(watch) = &self.agents {
+            watch.supervisor.cancel_all();
+        }
         self.approvals.close();
         // Dropping a reply denies it.
         while self.approvals.try_recv().is_ok() {}

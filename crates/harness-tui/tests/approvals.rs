@@ -1505,5 +1505,18 @@ async fn the_session_follows_a_supervisor() {
     .unwrap();
     ui.draw().unwrap();
     assert!(!screen(&ui).iter().any(|r| r.contains("explore")));
+    // Leaving the session cancels the children still running.
+    let straggler = sup.spawn(AgentSpec::new("straggler", "look"));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        ui.until(|app| app.children().iter().any(|c| c.tag.label == "straggler")),
+    )
+    .await
+    .expect("the line appears")
+    .unwrap();
     ui.finish().await.unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(10), straggler.wait())
+        .await
+        .expect("leaving cancelled the child");
+    assert_eq!(report.status, harness_core::agents::AgentStatus::Cancelled);
 }

@@ -282,17 +282,7 @@ pub async fn run(
     }
     let (approver, approvals) = ChannelApprover::new();
     // Nothing cancels the start: Ctrl+C before the terminal UI ends the process.
-    let Some(Started {
-        agent,
-        sandbox_session,
-        policy,
-        window_note,
-        write_mode_warning,
-        writable,
-        meter,
-        diagnostics,
-        resolver,
-    }) = start::start(
+    let Some(started) = start::start(
         Request {
             setup: &setup,
             mode,
@@ -309,6 +299,23 @@ pub async fn run(
     else {
         return 130;
     };
+    // The session's child agents: nothing shows their events yet, only a line for each above
+    // the input and their approvals in the queue.
+    let (child_events, _) = tokio::sync::mpsc::unbounded_channel();
+    let supervisor = started.supervisor(child_events, CancellationToken::new());
+    let Started {
+        agent,
+        sandbox_session,
+        policy,
+        window_note,
+        write_mode_warning,
+        writable,
+        meter,
+        diagnostics,
+        resolver,
+        ..
+    } = started;
+    let agent = start::with_supervisor(agent, &supervisor);
     let unsaved_default = first_run.then(|| model.clone());
     let history = agent.rewind_points().into_iter().map(|p| p.text).collect();
     let options = Options {
@@ -352,6 +359,7 @@ pub async fn run(
         write_mode_warning,
         pick_session,
         first_run,
+        supervisor,
     )
     .await;
     // The language servers stop before the sandbox's session ends.
@@ -430,6 +438,7 @@ async fn terminal_session(
     write_mode_warning: Option<String>,
     pick_session: bool,
     first_run: bool,
+    supervisor: Arc<harness_core::agents::Supervisor>,
 ) -> std::io::Result<Ending> {
     // From here on, a hangup or SIGTERM ends the session rather than harness.
     let shutdown = shutdown_signals()?;
@@ -478,6 +487,7 @@ async fn terminal_session(
     let mut ui = Ui::start(agent, host, term, options, approvals)
         .with_redactor(redactor)
         .with_cursor_query(input.cursor_query());
+    ui.watch_agents(supervisor);
     ui.app_mut().set_write_mode_warning(write_mode_warning);
     if first_run {
         ui.app_mut().set_first_run_model();

@@ -57,6 +57,53 @@ pub struct Started {
     pub diagnostics: Arc<harness_lsp::LspDiagnostics>,
     /// Makes the models of roles ready: the agent's, and the host's for `/model --role`.
     pub resolver: Arc<crate::routes::CliResolver>,
+    /// What child agents are made from, and what they inherit; see [`Started::supervisor`].
+    children: ChildKit,
+}
+
+/// What a session keeps for the child agents it may run.
+pub struct ChildKit {
+    factory: Arc<crate::children::CliFactory>,
+    engine: EngineConfig,
+    approver: Arc<dyn Approver>,
+    sessions_dir: Option<std::path::PathBuf>,
+    session_id: String,
+    workspace: std::path::PathBuf,
+    limits: harness_core::agents::Limits,
+}
+
+impl Started {
+    /// The supervisor of the session's child agents. Their events go to `sink`; cancelling
+    /// `cancel` cancels the children spawned without a token of their own. The agent keeps the
+    /// supervisor's records of them in its session when given its
+    /// [`records`](harness_core::agents::Supervisor::records), as [`with_supervisor`] does.
+    pub fn supervisor(
+        &self,
+        sink: tokio::sync::mpsc::UnboundedSender<harness_core::agents::AgentEnvelope>,
+        cancel: CancellationToken,
+    ) -> Arc<harness_core::agents::Supervisor> {
+        let kit = &self.children;
+        harness_core::agents::Supervisor::new(
+            kit.limits,
+            kit.factory.clone(),
+            harness_core::agents::ParentContext {
+                session: kit.session_id.clone(),
+                cancel,
+                policy: self.policy.clone(),
+                engine: kit.engine.clone(),
+                approver: kit.approver.clone(),
+                meter: Some(self.meter.clone()),
+                sessions_dir: kit.sessions_dir.clone(),
+                workspace: kit.workspace.clone(),
+            },
+            sink,
+        )
+    }
+}
+
+/// `agent` keeping the records `supervisor` makes of its children in its session.
+pub fn with_supervisor(agent: Agent, supervisor: &harness_core::agents::Supervisor) -> Agent {
+    agent.with_child_records(supervisor.records())
 }
 
 /// The model a session starts on when it is not chosen another way: the `--model` flag, then
@@ -94,7 +141,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     if mode == Mode::FullAccess {
         notices.warn("full-access mode: commands run without approval or sandbox");
     }
-    let output_dir = setup.paths.state_dir.join("tool-output").join(run_id);
+    let output_dir = setup.paths.state_dir.join("tool-output").join(&run_id);
     let env_says_none = std::env::var("HARNESS_SANDBOX").as_deref() == Ok("none");
     let sandbox_disabled_by_env = env_says_none && mode != Mode::FullAccess;
     // Write access to `/`, `$HOME` or an ancestor of it would cover the user's dotfiles. Plan and
@@ -167,7 +214,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         .filter(|warning| interactive && said.as_ref() != Some(warning));
     let mut read_dirs = setup.config.read_dirs.clone();
     read_dirs.push(output_dir.clone());
-    let mut policy = PermissionEngine::new(EngineConfig {
+    let engine_config = EngineConfig {
         mode,
         workspace: setup.workspace.clone(),
         read_dirs,
@@ -178,7 +225,8 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         },
         sandbox_available: sandboxed,
         writes_need_approval: workspace_too_broad,
-    });
+    };
+    let mut policy = PermissionEngine::new(engine_config.clone());
     if let Some(why) = lack.unsandboxed {
         policy = policy.with_unsandboxed_reason(why);
     }
@@ -248,6 +296,35 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
     );
     let diagnostics = crate::lsp::diagnostics(setup, interactive.then(|| approver.clone()));
     let resolver = crate::routes::CliResolver::new(setup.clone());
+    let children = ChildKit {
+        factory: crate::children::CliFactory::new(
+            setup.clone(),
+            resolver.clone(),
+            resolved.provider.clone(),
+            config.clone(),
+            model.edit_format,
+            sandboxes.clone(),
+            config.request.local,
+            setup.paths.state_dir.join("tool-output").join(&run_id),
+            cancel.clone(),
+        ),
+        engine: engine_config,
+        approver: approver.clone(),
+        sessions_dir: session
+            .path()
+            .and_then(|path| path.parent())
+            .map(std::path::Path::to_path_buf),
+        session_id: session.id().to_string(),
+        workspace: setup.workspace.clone(),
+        limits: {
+            let a = setup.config.agents;
+            harness_core::agents::Limits {
+                per_local: a.per_local as usize,
+                per_hosted: a.per_hosted as usize,
+                total: a.max_total as usize,
+            }
+        },
+    };
     let mut agent = Agent::new(
         resolved.provider,
         harness_tools::builtin_for(model.edit_format),
@@ -278,6 +355,7 @@ pub async fn start(request: Request<'_>, notices: &mut Notices) -> Option<Starte
         meter,
         diagnostics,
         resolver,
+        children,
     })
 }
 

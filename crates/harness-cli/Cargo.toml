@@ -16,6 +16,7 @@ default = ["chatgpt-login"]
 chatgpt-login = ["harness-providers/chatgpt-login"]
 
 [dependencies]
+async-trait.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 futures.workspace = true

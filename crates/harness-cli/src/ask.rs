@@ -131,12 +131,7 @@ pub async fn run(
     } else {
         None
     };
-    let Some(Started {
-        mut agent,
-        sandbox_session,
-        policy,
-        ..
-    }) = start::start(
+    let Some(started) = start::start(
         Request {
             setup: &setup,
             mode,
@@ -153,6 +148,19 @@ pub async fn run(
     else {
         return exit_code(TurnEndReason::Interrupted, false);
     };
+    // The main agent's events, and those of any child a supervisor runs, reach the renderer in
+    // one stream of envelopes.
+    let (tx, rx) = mpsc::unbounded_channel();
+    let rx = with_credential_warnings(rx, setup.credentials.clone());
+    let (envelopes, rx) = wrap_main(rx);
+    let supervisor = started.supervisor(envelopes.clone(), cancel.clone());
+    let Started {
+        agent,
+        sandbox_session,
+        policy,
+        ..
+    } = started;
+    let mut agent = start::with_supervisor(agent, &supervisor);
     // `with_piped_stdin` returns the prompt with any piped text appended.
     let turn = crate::slash::turn_input(
         &typed,
@@ -164,11 +172,6 @@ pub async fn run(
     crate::slash::print_messages(&turn.messages, &mut notices);
     let turn = turn.input;
 
-    let (tx, rx) = mpsc::unbounded_channel();
-    let rx = with_credential_warnings(rx, setup.credentials.clone());
-    // The main agent's events, and those of any child a supervisor runs, reach the renderer in
-    // one stream of envelopes.
-    let (envelopes, rx) = wrap_main(rx);
     let renderer = tokio::spawn(render(
         rx,
         json,
@@ -179,6 +182,9 @@ pub async fn run(
     ));
     let reason = agent.run_turn(turn, &tx, cancel).await;
     drop(tx);
+    // Children still running end with the run, and the renderer ends once they have.
+    supervisor.cancel_all();
+    drop(supervisor);
     drop(envelopes);
     let (final_text, blocked) = renderer.await.unwrap_or_default();
     if !json && !final_text.is_empty() {

@@ -268,6 +268,11 @@ pub async fn run(
             return 2;
         }
     };
+    // A delegated model's program is looked for now, not at the first turn.
+    if let Err(why) = crate::delegate::ready(&setup, &resolved.id).await {
+        eprintln!("error: {}", terminal_safe(&why));
+        return 2;
+    }
     let model = resolved.id.clone();
     let mode = mode_flag
         .or(setup.config.mode)

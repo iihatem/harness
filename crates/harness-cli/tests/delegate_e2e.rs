@@ -78,16 +78,22 @@ impl Env {
                 "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '{version}'; exit 0; fi\n\
                  if [ \"$1\" = \"--help\" ]; then cat '{}'; exit 0; fi\n\
                  if [ \"$1\" = \"mcp\" ]; then echo '[]'; exit 0; fi\n\
-                 FAKE_CHILD_SCRIPT='{}' FAKE_CHILD_LOG='{}' exec '{}' \"$@\"\n",
+                 FAKE_CHILD_SCRIPT='{}' FAKE_CHILD_LOG='{}' FAKE_CHILD_ENVDUMP='{}' exec '{}' \"$@\"\n",
                 help_path.display(),
                 script_path.display(),
                 log.display(),
+                self.tools.path().join(format!("{name}.env")).display(),
                 fake_child().display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         binary
+    }
+
+    /// The environment the program was started with (`<tools>/<name>.env`).
+    fn env_of(&self, name: &str) -> String {
+        std::fs::read_to_string(self.tools.path().join(format!("{name}.env"))).unwrap_or_default()
     }
 
     fn log(&self, name: &str) -> String {
@@ -430,6 +436,10 @@ fn with_the_opt_in_the_subscription_is_used_and_a_second_run_resumes_the_session
     assert!(!argvs[0].contains("--resume"), "{}", argvs[0]);
     assert!(argvs[1].contains("--resume\u{1f}sess-9"), "{}", argvs[1]);
     // Subscription mode: the key in the environment never reached the child.
+    let seen = env.env_of("claude");
+    assert!(!seen.is_empty(), "the child's environment was recorded");
+    assert!(!seen.contains("ANTHROPIC_API_KEY"), "{seen}");
+    assert!(!seen.contains("sk-ant-api03-test"), "{seen}");
 }
 
 #[test]
@@ -504,6 +514,84 @@ fn models_lists_what_can_be_used_and_says_why_the_rest_cannot() {
     assert!(!stdout.contains("codex/"), "{stdout}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("codex: not listed"), "{stderr}");
+}
+
+#[test]
+fn models_says_nothing_about_a_program_that_is_not_installed() {
+    let env = Env::new("");
+    let out = env
+        .cmd()
+        .env("PATH", "/nonexistent")
+        .env_remove("HARNESS_CLAUDE_BIN")
+        .env_remove("HARNESS_CODEX_BIN")
+        .arg("models")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("not listed"), "{stderr}");
+}
+
+#[test]
+fn the_flag_that_confirms_full_access_is_refused_where_only_ask_can_use_it() {
+    let env = Env::new("");
+    let out = env
+        .cmd()
+        .args(["--yes-full-access", "models"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only works with `harness ask`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn an_untested_version_is_run_when_allow_untested_is_set() {
+    let env = Env::new("[delegate]\nallow_untested = true\n");
+    let codex = env.fake(
+        "codex",
+        "codex-cli 0.200.0",
+        "",
+        &codex_script(env.ws.path()),
+    );
+    env.cmd()
+        .env("HARNESS_CODEX_BIN", &codex)
+        .args([
+            "--model",
+            "codex/gpt-5.6-luna",
+            "--mode",
+            "full-access",
+            "--yes-full-access",
+            "ask",
+            "go",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn models_lists_what_codex_answers_to_model_list() {
+    let env = Env::new("");
+    let script = "expect \"method\":\"initialize\"\n\
+        emit {\"id\":1,\"result\":{\"userAgent\":\"codex/0.154.0\"}}\n\
+        expect \"method\":\"initialized\"\n\
+        expect \"method\":\"model/list\"\n\
+        emit {\"id\":2,\"result\":{\"data\":[{\"id\":\"a\",\"model\":\"gpt-5-codex\"},{\"id\":\"b\",\"model\":\"gpt-5.1\",\"hidden\":true}],\"nextCursor\":null}}\n\
+        until-eof\n";
+    let codex = env.fake("codex", CODEX_VERSION, "", script);
+    let out = env
+        .cmd()
+        .env("HARNESS_CODEX_BIN", &codex)
+        .env("HARNESS_CLAUDE_BIN", "/nonexistent/claude")
+        .arg("models")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("codex/gpt-5-codex"), "{stdout}");
+    assert!(!stdout.contains("gpt-5.1"), "a hidden model: {stdout}");
 }
 
 #[test]

@@ -72,6 +72,8 @@ pub async fn listing(setup: &Setup) -> (Vec<String>, Vec<(&'static str, String)>
         // The test hooks of a debug build, so a fake program can stand in.
         binary: None,
         allow_untested: setup.config.delegate.allow_untested,
+        // The picker waits for this: a program that does not answer soon is not offered.
+        timeout: std::time::Duration::from_secs(8),
         ..ListOptions::default()
     };
     let hook = |var: &str| {
@@ -100,6 +102,9 @@ pub async fn listing(setup: &Setup) -> (Vec<String>, Vec<(&'static str, String)>
                 missing.push((provider, format!("{} listed no models", kind.binary())))
             }
             Ok(list) => ids.extend(list.into_iter().map(|m| format!("{provider}/{m}"))),
+            // A program that is not installed is nothing to report to everyone who never
+            // installed it: only one that is there and cannot be used is said.
+            Err(harness_delegate::DelegateError::NotFound(_)) => {}
             Err(e) => missing.push((provider, e.to_string())),
         }
     }

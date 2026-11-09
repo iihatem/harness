@@ -93,12 +93,8 @@ pub async fn run(
         }
     };
 
-    if let Err(why) = crate::delegate::ready(&setup, &resolved.id).await {
-        eprintln!("error: {}", terminal_safe(&why));
-        return 2;
-    }
-
-    // Ctrl+C must be honoured from here on: the piped-stdin wait below can block for seconds (the
+    // Ctrl+C must be honoured from here on (also while the program of a delegated model is
+    // looked for, which can take seconds): the piped-stdin wait below can block for seconds (the
     // first-data timeout) or indefinitely (the unbounded read-to-EOF phase once data has started
     // arriving but the pipe never closes, e.g. `tail -f | harness ask ...`). So the cancellation
     // token and its SIGINT listener are wired up before that wait, not after it.
@@ -109,6 +105,16 @@ pub async fn run(
             on_ctrl_c.cancel();
         }
     });
+
+    let found = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return exit_code(TurnEndReason::Interrupted, false),
+        found = crate::delegate::ready(&setup, &resolved.id) => found,
+    };
+    if let Err(why) = found {
+        eprintln!("error: {}", terminal_safe(&why));
+        return 2;
+    }
 
     // Only read (and potentially block on) stdin once we know we're actually going to run: a
     // missing model must exit 2 promptly even if a pipe into stdin is still open.

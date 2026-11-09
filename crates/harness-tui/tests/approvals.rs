@@ -1355,6 +1355,8 @@ fn info(
         summary: None,
         error: None,
         started: None,
+        background: false,
+        worktree: None,
     }
 }
 

@@ -166,6 +166,7 @@ fn settings(max: u32) -> SpawnSettings {
         background_model: None,
         parent: ParentModel::default(),
         also_in_play: vec!["openai/gpt-5".into(), "mock/other".into()],
+        wait_for_background: false,
     }
 }
 
@@ -704,6 +705,7 @@ fn in_play_settings(cell: &ParentModel, also: &[&str]) -> SpawnSettings {
         background_model: None,
         parent: cell.clone(),
         also_in_play: also.iter().map(|m| m.to_string()).collect(),
+        wait_for_background: false,
     }
 }
 

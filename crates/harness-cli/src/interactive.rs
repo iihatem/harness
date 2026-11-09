@@ -304,11 +304,57 @@ pub async fn run(
     else {
         return 130;
     };
+    // Agents an earlier harness left running when it died are failed, their edits committed so
+    // they can be reviewed, and their stale locks released.
+    if let Some(worktrees) = started.worktrees() {
+        let listing = worktrees.clone();
+        let ended = tokio::task::spawn_blocking(move || {
+            let ended = worktrees.reconcile();
+            // Those that changed nothing were removed; those with a result are reviewed with
+            // /results and /agents; the rest (its changes could not be committed) are left as
+            // they were, and `harness worktrees` lists them.
+            let records = listing.records();
+            let mut ready = 0;
+            let mut left = 0;
+            for name in &ended {
+                match records.iter().find(|r| &r.name == name) {
+                    Some(r) if r.outcome.is_some() => ready += 1,
+                    Some(_) => left += 1,
+                    None => {}
+                }
+            }
+            (ended.len(), ready, left)
+        })
+        .await
+        .unwrap_or_default();
+        let (ended, ready, left) = ended;
+        if ready + left > 0 {
+            let plural = |n: usize| if n == 1 { "" } else { "s" };
+            let mut text = format!(
+                "{ended} agent{} of an earlier session ended while it ran",
+                plural(ended)
+            );
+            if ready > 0 {
+                text.push_str(&format!(
+                    ": /agents lists {ready} with changes, and /results shows what {} changed",
+                    if ready == 1 { "it" } else { "they" }
+                ));
+            }
+            if left > 0 {
+                text.push_str(&format!(
+                    "; {left} could not have {} changes saved: `harness worktrees` lists {}",
+                    if left == 1 { "its" } else { "their" },
+                    if left == 1 { "it" } else { "them" }
+                ));
+            }
+            notices.note(&text);
+        }
+    }
     // The session's child agents: nothing shows their events yet, only a line for each above
     // the input and their approvals in the queue.
     let (child_events, _) = tokio::sync::mpsc::unbounded_channel();
     let supervisor = started.supervisor(child_events, CancellationToken::new());
-    let spawn = started.spawn_tool(&supervisor);
+    let spawn = started.spawn_tool(&supervisor, false);
     let definitions = started.agent_definitions();
     let Started {
         agent,

@@ -40,6 +40,7 @@ use crate::{
     notify::{self, Notify},
     picker::{Item, Picked, Picker, model_item},
     plan::{Choice, PlanChoice, TextEditor},
+    review::{self, Review, Reviewed, Shown},
     status::{self, Costs, Totals},
     style::Theme,
     text::{sanitize, wrap},
@@ -108,6 +109,14 @@ enum Pick {
     Model(Vec<String>),
     /// What to restore to before this message.
     RewindScope(RewindPoint),
+    /// The result to review, one name per item.
+    ReviewWhich(Vec<String>),
+    /// What to do with the result of this name.
+    Review(String),
+    /// Whether to discard the result of this name.
+    ConfirmDiscard(String),
+    /// What to do with the agents still running in the background when leaving.
+    QuitWithAgents,
 }
 
 /// How many times the countdown to an automatic resume is armed again when the window still shows
@@ -394,6 +403,10 @@ pub enum Action {
     SetRole { role: Role, id: String },
     /// Sign in to a provider, with a device code when `device` is set.
     Login { provider: String, device: bool },
+    /// Do something with the result an agent left in its worktree.
+    Review(Review),
+    /// Start a background agent on this task, in a worktree of its own.
+    Background(String),
     /// Stop the running turn.
     Interrupt,
     /// Leave harness.
@@ -435,6 +448,17 @@ pub struct App {
     announced: std::collections::HashSet<String>,
     /// The agents the model can start, for `/agents`.
     agent_definitions: Option<harness_core::agents::Definitions>,
+    /// The worktrees agents left, as the records say: what is ready for review, and what
+    /// earlier sessions left.
+    results: Vec<harness_core::worktree::Record>,
+    /// A review action (apply, keep, discard, or fetching a diff) is running.
+    reviewing: bool,
+    /// How each background agent was when the supervisor last said, to notice when one ends.
+    last_status: std::collections::HashMap<String, harness_core::agents::AgentStatus>,
+    /// The failed agents the user has seen listed.
+    seen_failed: std::collections::HashSet<String>,
+    /// The user chose to wait for the background agents: harness leaves when none runs.
+    quit_when_idle: bool,
     /// When the approval or the plan choice shown starts to take keys.
     arming: Arming,
     /// Whether `arming` is the offer to resume automatically's: it starts afresh when the offer
@@ -537,6 +561,11 @@ impl App {
             children: Vec::new(),
             announced: std::collections::HashSet::new(),
             agent_definitions: None,
+            results: Vec::new(),
+            reviewing: false,
+            last_status: std::collections::HashMap::new(),
+            seen_failed: std::collections::HashSet::new(),
+            quit_when_idle: false,
             arming: Arming::default(),
             offer_owns_arming: false,
             pending_mode: None,
@@ -1155,12 +1184,61 @@ impl App {
         }
     }
 
+    /// Whether the approval of `prompt` is a background agent's: one that waits as "needs
+    /// input" and survives an interrupt of the turn.
+    fn is_background_prompt(&self, prompt: &Prompt) -> bool {
+        prompt.request().agent.as_ref().is_some_and(|tag| {
+            self.children
+                .iter()
+                .any(|child| child.tag.id == tag.id && child.background)
+        })
+    }
+
+    /// Denies the approvals of the turn that is stopped: its own, and those of the agents it
+    /// waits for. A background agent's stays queued, still needing input. Whether any was denied.
+    pub fn deny_foreground(&mut self) -> bool {
+        let mut denied = false;
+        let mut at = 0;
+        while at < self.prompts.len() {
+            if self.is_background_prompt(&self.prompts[at]) {
+                at += 1;
+            } else {
+                self.answer_at(at, Answered::Interrupt);
+                denied = true;
+            }
+        }
+        denied
+    }
+
     /// What the supervisor says its child agents are doing now.
     pub fn set_children(&mut self, children: Vec<harness_core::agents::AgentInfo>) {
         // A child that has ended leaves one line, once.
         for child in children.iter().filter(|child| child.status.is_final()) {
             if self.announced.insert(child.tag.id.to_string()) {
                 self.push_note(&crate::agents::result_line(child));
+            }
+        }
+        // A background agent that ended is told to the user, who may be looking elsewhere.
+        for child in children.iter().filter(|child| child.background) {
+            let before = self
+                .last_status
+                .insert(child.tag.id.to_string(), child.status);
+            if child.status.is_final() && !before.is_some_and(|status| status.is_final()) {
+                let what = match child.status {
+                    harness_core::agents::AgentStatus::Done
+                        if child.worktree.as_ref().is_some_and(|w| w.outcome.is_some()) =>
+                    {
+                        "finished: its changes are ready for review (/results)"
+                    }
+                    harness_core::agents::AgentStatus::Done => "finished",
+                    harness_core::agents::AgentStatus::Failed => "failed",
+                    _ => "was stopped",
+                };
+                self.notifications.push(format!(
+                    "{} ({}) {what}",
+                    child.tag.id,
+                    short(&child.tag.label, 40)
+                ));
             }
         }
         self.children = children;
@@ -1175,6 +1253,183 @@ impl App {
 
     pub fn children(&self) -> &[harness_core::agents::AgentInfo] {
         &self.children
+    }
+
+    /// What the records of worktrees say now.
+    pub fn set_results(&mut self, results: Vec<harness_core::worktree::Record>) {
+        self.results = results;
+    }
+
+    /// The results waiting for review, and the others the records hold.
+    pub fn results(&self) -> &[harness_core::worktree::Record] {
+        &self.results
+    }
+
+    /// A review action is running.
+    pub fn reviewing(&self) -> bool {
+        self.reviewing
+    }
+
+    /// How many background agents have not ended.
+    pub fn live_background(&self) -> usize {
+        self.children
+            .iter()
+            .filter(|child| child.background && !child.status.is_final())
+            .count()
+    }
+
+    /// The user chose to wait for the background agents, and none runs now: harness leaves.
+    pub fn quit_ready(&self) -> bool {
+        self.quit_when_idle && self.live_background() == 0
+    }
+
+    /// The agents the model can start (and `/bg` runs one of).
+    pub fn agent_definitions(&self) -> Option<&harness_core::agents::Definitions> {
+        self.agent_definitions.as_ref()
+    }
+
+    /// Shows `text`, something that did not work, as an error.
+    pub fn push_error(&mut self, text: &str) {
+        let text = self.redacted(text);
+        self.transcript.push_error(&text, self.width);
+    }
+
+    /// `/bg <task>`.
+    fn bg_command(&mut self, args: &str) -> Option<Action> {
+        let width = self.width;
+        let task = args.trim();
+        if task.is_empty() {
+            self.transcript.push_error(
+                "/bg takes the task for the agent, such as /bg fix the failing parser test",
+                width,
+            );
+            return None;
+        }
+        if self.agent_definitions.is_none() {
+            self.transcript.push_error(
+                "this session cannot start agents: [agents] spawn is off in the configuration",
+                width,
+            );
+            return None;
+        }
+        if matches!(self.mode, Mode::Plan | Mode::ReadOnly) {
+            self.transcript.push_error(
+                "a background agent edits files, and the session is in plan or read-only mode: switch to ask or auto first",
+                width,
+            );
+            return None;
+        }
+        // The agent runs in process on its definition's model, else on the session's own; a
+        // Claude Code or Codex model has no in-process provider, and running a subagent on one
+        // comes later. Nothing is substituted: the user picks the model.
+        let model = self
+            .agent_definitions
+            .as_ref()
+            .and_then(|definitions| definitions.get("general"))
+            .and_then(|def| def.model.clone())
+            .unwrap_or_else(|| self.model.clone());
+        if harness_core::agents::is_delegated_model(&model) {
+            self.transcript.push_error(
+                &format!(
+                    "a background agent runs in harness itself, and `{model}` is run by Claude Code or Codex, which a subagent cannot use yet: switch to another model with /model first"
+                ),
+                width,
+            );
+            return None;
+        }
+        Some(Action::Background(task.to_string()))
+    }
+
+    /// `/results [target]`: with a target, that result; alone, the only one waiting, or a choice
+    /// among them.
+    fn review_command(&mut self, args: &str) -> Option<Action> {
+        let width = self.width;
+        let ready: Vec<&harness_core::worktree::Record> = self
+            .results
+            .iter()
+            .filter(|r| review::is_ready(r))
+            .collect();
+        let args = args.trim();
+        if !args.is_empty() {
+            return match review::find(&self.results, args) {
+                Some(record) => self.start_review(&record.name.clone()),
+                None => {
+                    let known: Vec<String> = ready.iter().map(|r| r.branch.clone()).collect();
+                    let message = if known.is_empty() {
+                        format!(
+                            "no result named {}: nothing is waiting for review",
+                            sanitize(args)
+                        )
+                    } else {
+                        format!(
+                            "no result named {}; waiting for review: {}",
+                            sanitize(args),
+                            known.join(", ")
+                        )
+                    };
+                    self.transcript.push_error(&message, width);
+                    None
+                }
+            };
+        }
+        match ready.len() {
+            0 => {
+                self.transcript.push_note(
+                    "nothing to review: no agent has left changes in a worktree",
+                    width,
+                );
+                None
+            }
+            1 => {
+                let name = ready[0].name.clone();
+                self.start_review(&name)
+            }
+            _ => {
+                let names: Vec<String> = ready.iter().map(|r| r.name.clone()).collect();
+                let picker = Picker::new("Review which result?", review::which_items(&ready));
+                self.open_picker(Pick::ReviewWhich(names), picker);
+                None
+            }
+        }
+    }
+
+    /// Asks for the diff of the result `name`.
+    fn start_review(&mut self, name: &str) -> Option<Action> {
+        self.reviewing = true;
+        Some(Action::Review(Review::Show(name.to_string())))
+    }
+
+    /// What a review action came to.
+    pub fn review_done(&mut self, done: Reviewed) {
+        let width = self.width;
+        self.reviewing = false;
+        match done {
+            Reviewed::Shown(shown) => self.show_review(*shown),
+            Reviewed::Applied(text) | Reviewed::Kept(text) | Reviewed::Discarded(text) => {
+                let text = self.redacted(&text);
+                self.transcript.push_note(&text, width);
+            }
+            Reviewed::Failed(why) => {
+                let why = self.redacted(&why);
+                self.transcript.push_error(&why, width);
+            }
+        }
+    }
+
+    /// The diff of a result, and the question of what to do with it, in a full-screen view.
+    fn show_review(&mut self, shown: Shown) {
+        let theme = self.theme();
+        let mut preview = review::lines(&shown, &theme);
+        preview.extend(review::overlap_lines(&shown, &theme));
+        let mut picker = Picker::new(
+            &format!("What to do with {}?", shown.record.branch),
+            review::choices(),
+        )
+        .with_footer(review::footer(&shown))
+        .with_preview(preview);
+        // Enter without a choice does nothing: the safe answer is the one it lands on.
+        picker.select(3);
+        self.open_picker(Pick::Review(shown.record.name), picker);
     }
 
     /// One line for each child that has not ended: label, status, model, and the tool it called
@@ -1193,14 +1448,8 @@ impl App {
             AgentStatus::Working => 1,
             _ => 2,
         });
-        let (shown, hidden) = if running.len() > MAX_CHILD_LINES {
-            (MAX_CHILD_LINES - 1, running.len() - (MAX_CHILD_LINES - 1))
-        } else {
-            (running.len(), 0)
-        };
         let mut lines: Vec<Line<'static>> = running
             .into_iter()
-            .take(shown)
             .map(|child| {
                 let status_style = if child.status == AgentStatus::NeedsInput {
                     theme.warning()
@@ -1215,6 +1464,9 @@ impl App {
                     ),
                     Span::styled(format!(" · {}", child.status.as_str()), status_style),
                 ];
+                if child.background {
+                    spans.push(Span::styled(" · background", theme.dim()));
+                }
                 if let Some(model) = &child.model {
                     spans.push(Span::styled(
                         format!(" · {}", short(model, 40)),
@@ -1227,7 +1479,68 @@ impl App {
                 Line::from(spans)
             })
             .collect();
-        if hidden > 0 {
+        // What agents left in their worktrees, from this session and earlier ones, waits below
+        // those that run.
+        let ready = self.results.iter().filter(|r| review::is_ready(r));
+        for (n, record) in ready.enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled("◦ ", theme.accent()),
+                Span::styled(
+                    format!("{} {}", short(&record.agent, 12), short(&record.label, 40)),
+                    theme.bold(),
+                ),
+                Span::styled(
+                    format!(
+                        " · {}{}",
+                        review::state(record),
+                        if n == 0 { " (/results)" } else { "" }
+                    ),
+                    if record.status == AgentStatus::Done {
+                        theme.accent()
+                    } else {
+                        theme.warning()
+                    },
+                ),
+                Span::styled(
+                    format!(
+                        " · {} · {}",
+                        short(&record.branch, 50),
+                        review::counts(record)
+                    ),
+                    theme.dim(),
+                ),
+            ]));
+        }
+        // A background agent that failed stays until the user has looked (/agents).
+        for child in self.children.iter().filter(|child| {
+            child.background
+                && child.status == AgentStatus::Failed
+                && !self.seen_failed.contains(child.tag.id.as_str())
+                && !self.results.iter().any(|r| {
+                    review::is_ready(r)
+                        && r.agent == child.tag.id.as_str()
+                        && r.label == child.tag.label
+                })
+        }) {
+            let mut spans = vec![
+                Span::styled("◦ ", theme.accent()),
+                Span::styled(
+                    format!("{} {}", child.tag.id, short(&child.tag.label, 40)),
+                    theme.bold(),
+                ),
+                Span::styled(" · failed", theme.warning()),
+            ];
+            if let Some(error) = &child.error {
+                spans.push(Span::styled(
+                    format!(" · {}", short(error, 60)),
+                    theme.dim(),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+        if lines.len() > MAX_CHILD_LINES {
+            let hidden = lines.len() - (MAX_CHILD_LINES - 1);
+            lines.truncate(MAX_CHILD_LINES - 1);
             lines.push(Line::from(Span::styled(
                 format!("◦ and {hidden} more agents"),
                 theme.dim(),
@@ -1252,6 +1565,23 @@ impl App {
 
     /// Leaves harness: nothing waits for an answer after.
     fn quit(&mut self) -> Option<Action> {
+        let live = self.live_background();
+        if live > 0 {
+            let plural = if live == 1 { "" } else { "s" };
+            let mut picker = Picker::new(
+                &format!("{live} agent{plural} still running in the background"),
+                vec![
+                    Item::new("Stop them and quit", "what they changed is kept for review"),
+                    Item::new("Wait for them to finish, then quit", ""),
+                    Item::new("Keep working", "do not quit"),
+                ],
+            );
+            picker.select(2);
+            // Asking again takes back an earlier "wait": only a new answer quits.
+            self.quit_when_idle = false;
+            self.open_picker(Pick::QuitWithAgents, picker);
+            return None;
+        }
         self.deny_waiting();
         Some(Action::Quit)
     }
@@ -1263,12 +1593,19 @@ impl App {
 
     /// Answers the waiting approval, and notes the answer in the transcript.
     fn answer(&mut self, answered: Answered) {
-        let Some(mut prompt) = self.prompts.pop_front() else {
+        self.answer_at(0, answered);
+    }
+
+    /// Answers the `at`th approval in the queue.
+    fn answer_at(&mut self, at: usize, answered: Answered) {
+        let Some(mut prompt) = self.prompts.remove(at) else {
             return;
         };
         // The next one is shown, and takes keys only once the user has paused again: a key typed
         // for the answer just given is not an answer to it.
-        self.arming = Arming::default();
+        if at == 0 {
+            self.arming = Arming::default();
+        }
         let line = prompt.outcome(&answered, &self.theme());
         let decision = match answered {
             Answered::Decided(decision) => decision,
@@ -1706,8 +2043,10 @@ impl App {
             }
             // Esc stops the turn, as it does without the prompt: the approval is denied.
             if key.code == KeyCode::Esc && !self.prompts.is_empty() {
-                self.deny_waiting();
-                return Some(Action::Interrupt);
+                // Only the turn's own approvals (and those of agents it waits for): a background
+                // agent's stays queued.
+                let denied = self.deny_foreground();
+                return (denied || self.busy()).then_some(Action::Interrupt);
             }
             // Until the prompt or the picker takes keys, they were typed for the input, and it
             // waits for the user to pause.
@@ -1769,8 +2108,9 @@ impl App {
             let interrupt = answered == Answered::Interrupt;
             self.answer(answered);
             if interrupt {
-                // Stopping the turn stops the agents it started: nothing else asks after.
-                self.deny_waiting();
+                // Stopping the turn stops the agents it started: nothing else of theirs asks
+                // after (a background agent's approval stays queued).
+                self.deny_foreground();
             }
             return interrupt.then_some(Action::Interrupt);
         }
@@ -1841,7 +2181,7 @@ impl App {
         if self.picker.take().is_some() {
             return None;
         }
-        self.deny_waiting();
+        self.deny_foreground();
         if self.busy() {
             return Some(Action::Interrupt);
         }
@@ -2090,13 +2430,27 @@ impl App {
                 );
                 self.transcript.push_lines(lines, width);
             }
+            "bg" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return self.bg_command(args);
+            }
+            "results" => {
+                self.editor.submit();
+                self.transcript.push_user(full, width);
+                return self.review_command(args);
+            }
             "agents" => {
                 self.editor.submit();
                 self.transcript.push_user(full, width);
                 let theme = self.theme();
+                for child in &self.children {
+                    self.seen_failed.insert(child.tag.id.to_string());
+                }
                 let lines = crate::agents::report(
                     self.agent_definitions.as_ref(),
                     &self.children,
+                    &self.results,
                     &theme,
                     &|text| self.redacted(text),
                 );
@@ -2207,6 +2561,71 @@ impl App {
                 let id = ids.into_iter().nth(index)?;
                 self.work("loading the session", true);
                 Some(Action::OpenSession(Some(id)))
+            }
+            Pick::ReviewWhich(names) => {
+                let name = names.into_iter().nth(index)?;
+                self.start_review(&name)
+            }
+            Pick::Review(name) => match index {
+                0 => {
+                    if self.busy() {
+                        self.hint = Some(
+                            "apply works between turns: the turn that runs changes the files it would change"
+                                .into(),
+                        );
+                        return None;
+                    }
+                    self.reviewing = true;
+                    Some(Action::Review(Review::Apply(name)))
+                }
+                1 => {
+                    self.reviewing = true;
+                    Some(Action::Review(Review::Keep(name)))
+                }
+                2 => {
+                    let picker = Picker::new(
+                        "Discard this result?",
+                        vec![Item::new("No", "keep it"), Item::new("Yes, discard it", "")],
+                    )
+                    .with_footer(vec![
+                        "The worktree and the branch are deleted: this cannot be undone.".into(),
+                    ]);
+                    self.open_picker(Pick::ConfirmDiscard(name), picker);
+                    None
+                }
+                _ => None,
+            },
+            Pick::QuitWithAgents => match index {
+                0 => {
+                    self.deny_waiting();
+                    Some(Action::Quit)
+                }
+                1 => {
+                    let live = self.live_background();
+                    // The last one has ended since the question was asked: nothing to wait for.
+                    if live == 0 {
+                        return Some(Action::Quit);
+                    }
+                    self.quit_when_idle = true;
+                    self.transcript.push_note(
+                        &format!(
+                            "waiting for {live} agent{} to finish: harness leaves when {} has (Ctrl+D asks again)",
+                            if live == 1 { "" } else { "s" },
+                            if live == 1 { "it" } else { "they" },
+                        ),
+                        self.width,
+                    );
+                    None
+                }
+                _ => None,
+            },
+            Pick::ConfirmDiscard(name) => {
+                if index == 1 {
+                    self.reviewing = true;
+                    Some(Action::Review(Review::Discard(name)))
+                } else {
+                    None
+                }
             }
             Pick::RewindScope(point) => {
                 let scope = SCOPES.get(index)?.0;

@@ -11,6 +11,7 @@ async-trait.workspace = true
 futures.workspace = true
 harness-shell.workspace = true
 hex.workspace = true
+ignore.workspace = true
 jsonschema.workspace = true
 libc.workspace = true
 nix.workspace = true

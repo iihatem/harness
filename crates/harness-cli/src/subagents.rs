@@ -44,6 +44,8 @@ pub fn load(setup: &Setup, notices: &mut Notices) -> Subagents {
             // other model an entry may name.
             parent: harness_core::agents::ParentModel::default(),
             also_in_play: setup.config.roles.main.iter().cloned().collect(),
+            // `harness ask` sets this; a session that stays open leaves them running.
+            wait_for_background: false,
         },
         spawn: limits.spawn,
     }

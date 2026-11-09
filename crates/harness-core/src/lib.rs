@@ -26,3 +26,4 @@ pub mod time;
 pub mod tokens;
 pub mod tool;
 pub mod turn;
+pub mod worktree;

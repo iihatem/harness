@@ -189,11 +189,20 @@ mod tests {
         let finished = AgentEvent::AgentFinished {
             status: AgentStatus::Done,
             summary: "ok".into(),
+            branch: None,
         };
         let s = serde_json::to_value(AgentEnvelope::child(&id, started)).unwrap();
         let f = serde_json::to_value(AgentEnvelope::child(&id, finished)).unwrap();
         assert_eq!(s["type"], json!("agent_started"));
         assert_eq!(f["status"], json!("done"));
         assert_eq!(f["agent"], json!("a1"));
+        assert!(f.get("branch").is_none(), "left out when there is none");
+        let with_branch = AgentEvent::AgentFinished {
+            status: AgentStatus::Done,
+            summary: "ok".into(),
+            branch: Some("harness/x".into()),
+        };
+        let w = serde_json::to_value(AgentEnvelope::child(&id, with_branch)).unwrap();
+        assert_eq!(w["branch"], json!("harness/x"));
     }
 }

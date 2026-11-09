@@ -112,6 +112,9 @@ pub struct ToolContext {
     /// Which of its user turns the agent is in: the same for every call of a turn, different
     /// for each turn (a tool that limits what one turn may do counts by it). 0 outside a turn.
     pub turn: u64,
+    /// Variables every shell command of this agent gets besides harness's own environment: in a
+    /// worktree, who the agent is and its port offset.
+    pub env: Vec<(String, String)>,
 }
 
 impl ToolContext {
@@ -126,7 +129,14 @@ impl ToolContext {
             access: FsAccess::WorkspaceWrite,
             unsandboxed: false,
             turn: 0,
+            env: Vec::new(),
         }
+    }
+
+    /// `self` whose shell commands also get `env`.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
+        self
     }
 
     /// Resolves a path argument against the workspace, following symlinks.

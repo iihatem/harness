@@ -23,6 +23,7 @@ mod subagents;
 mod term;
 mod trust;
 mod usage;
+mod worktrees;
 
 use std::{io::IsTerminal, process::ExitCode};
 
@@ -64,6 +65,27 @@ struct Cli {
     resume: Option<Option<String>>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum WorktreesCommand {
+    /// Remove the worktrees and branches harness made that have nothing left to review: finished
+    /// agents that changed nothing, and those of a harness that died. Results not applied stay;
+    /// a running agent's, anything harness did not make, and any worktree that holds changes or
+    /// commits saved nowhere else are never touched (they are listed)
+    Clean {
+        /// Also remove results that were not applied or kept, once their commits are on another
+        /// branch (combine with --discard-unsaved to remove those that are not)
+        #[arg(long)]
+        all: bool,
+        /// With --all: also remove worktrees and branches whose changes or commits exist nowhere
+        /// else, losing them. Lists them and asks first
+        #[arg(long, requires = "all")]
+        discard_unsaved: bool,
+        /// Do not ask: needed for --discard-unsaved without a terminal
+        #[arg(long, requires = "discard_unsaved")]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -116,6 +138,12 @@ enum Command {
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommand,
+    },
+    /// List the git worktrees harness made for agents, with their state; `worktrees clean`
+    /// removes the ones that are finished and have nothing to review
+    Worktrees {
+        #[command(subcommand)]
+        command: Option<WorktreesCommand>,
     },
     /// Update the price table the cost figures use (the only time harness connects to models.dev)
     Pricing {
@@ -245,6 +273,7 @@ fn command_line(command: &Command) -> &'static str {
         Command::Sandbox { .. } => "harness sandbox doctor",
         Command::Usage { .. } => "harness usage",
         Command::Pricing { .. } => "harness pricing update",
+        Command::Worktrees { .. } => "harness worktrees",
     }
 }
 
@@ -379,6 +408,15 @@ fn main() -> ExitCode {
                 command: Some(UsageCommand::Forget { before, all }),
                 ..
             }) => usage::forget(before.as_deref(), all),
+            Some(Command::Worktrees { command: None }) => worktrees::list(),
+            Some(Command::Worktrees {
+                command:
+                    Some(WorktreesCommand::Clean {
+                        all,
+                        discard_unsaved,
+                        yes,
+                    }),
+            }) => worktrees::clean(all, discard_unsaved, yes),
             Some(Command::Pricing {
                 command: PricingCommand::Update,
             }) => pricing::update().await,

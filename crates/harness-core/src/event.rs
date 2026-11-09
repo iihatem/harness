@@ -249,5 +249,9 @@ pub enum AgentEvent {
     AgentFinished {
         status: crate::agents::AgentStatus,
         summary: String,
+        /// The branch its changes were committed on, when it worked in a worktree and changed
+        /// something (headless runs report it; they never apply it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
     },
 }

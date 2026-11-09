@@ -166,7 +166,7 @@ pub async fn run(
     let rx = with_credential_warnings(rx, setup.credentials.clone());
     let (envelopes, rx) = wrap_main(rx);
     let supervisor = started.supervisor(envelopes.clone(), cancel.clone());
-    let spawn = started.spawn_tool(&supervisor);
+    let spawn = started.spawn_tool(&supervisor, true);
     let Started {
         agent,
         sandbox_session,
@@ -199,7 +199,7 @@ pub async fn run(
     let reason = agent.run_turn(turn, &tx, cancel).await;
     drop(tx);
     // Children still running end with the run, and the renderer ends once they have.
-    supervisor.cancel_all();
+    supervisor.stop_all();
     drop(supervisor);
     drop(envelopes);
     let (final_text, blocked) = renderer.await.unwrap_or_default();
@@ -516,8 +516,14 @@ impl Shown {
                         terminal_safe(label),
                         terminal_safe(model)
                     ),
-                    AgentEvent::AgentFinished { status, .. } => {
-                        eprintln!("agent {agent} {}", status.as_str())
+                    AgentEvent::AgentFinished { status, branch, .. } => {
+                        eprintln!("agent {agent} {}", status.as_str());
+                        if let Some(branch) = branch {
+                            eprintln!(
+                                "agent {agent} left its changes on the branch {} (not applied: review it with git, or in an interactive session)",
+                                terminal_safe(branch)
+                            );
+                        }
                     }
                     _ => {}
                 }

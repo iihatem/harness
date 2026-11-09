@@ -59,6 +59,7 @@ pub fn result_line(child: &AgentInfo) -> String {
 pub fn report(
     definitions: Option<&Definitions>,
     children: &[AgentInfo],
+    results: &[harness_core::worktree::Record],
     theme: &Theme,
     redact: &dyn Fn(&str) -> String,
 ) -> Vec<Line<'static>> {
@@ -136,6 +137,9 @@ pub fn report(
         if let Some(model) = &child.model {
             text.push_str(&format!(" · {}", sanitize(&cut(model, 40))));
         }
+        if child.background {
+            text.push_str(" · background");
+        }
         text.push_str(&format!(" · {}", calls(child.tool_calls, child.status)));
         if child.status == AgentStatus::Failed
             && let Some(error) = &child.error
@@ -143,6 +147,23 @@ pub fn report(
             text.push_str(&format!(" — {}", sanitize(&cut(error, SUMMARY_SHOWN))));
         }
         lines.push(Line::from(text));
+    }
+    // What the worktrees hold: results waiting for review, from this session and earlier ones.
+    let ready: Vec<&harness_core::worktree::Record> = results
+        .iter()
+        .filter(|r| crate::review::is_ready(r))
+        .collect();
+    if !ready.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Results waiting for review (/results)",
+            theme.bold(),
+        )));
+        for record in ready {
+            lines.push(Line::from(format!(
+                "  {}",
+                sanitize(&redact(&crate::review::describe(record)))
+            )));
+        }
     }
     lines
 }

@@ -43,15 +43,17 @@ fn shadow_repository(setup: &Setup) -> PathBuf {
 /// The checkpoints of a child agent's session `session_id`, in the same repository: what the
 /// child changed is told by comparing the workspace with its snapshot. `None` when they cannot
 /// work; the child's report then holds only what its tools say they changed. Nothing is pruned
-/// here: the session that spawned it did.
+/// here: the session that spawned it did. `root` is where the child works: the session's
+/// workspace, or the worktree made for it (whose changes are told from its own snapshot).
 pub fn child_checkpoints(
     setup: &Setup,
     session_id: &str,
     writable: &[PathBuf],
+    root: &std::path::Path,
 ) -> Option<Arc<Checkpoints>> {
     let gitdir = shadow_repository(setup);
-    checkpoint::check_location(&gitdir, &setup.workspace, writable)
-        .and_then(|()| Checkpoints::open(&gitdir, &setup.workspace, session_id))
+    checkpoint::check_location(&gitdir, root, writable)
+        .and_then(|()| Checkpoints::open(&gitdir, root, session_id))
         .ok()
         .map(Arc::new)
 }

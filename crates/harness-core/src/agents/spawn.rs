@@ -554,6 +554,12 @@ impl Tool for SpawnAgentsTool {
                     def.name
                 ));
             }
+            if def.background_ignored {
+                notes.push(format!(
+                    "note: the project's agent `{}` asks to run in the background, which was not used because this workspace is not trusted (`harness trust` trusts it); the call waited for it.",
+                    def.name
+                ));
+            }
             if plan.read_only_asked {
                 notes.push(format!(
                     "note: `{}` is read-only, so it works in the checkout and has no worktree.",

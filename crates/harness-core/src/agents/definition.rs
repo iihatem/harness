@@ -52,15 +52,18 @@ pub struct AgentDefinition {
     /// Its mode. Never wider than its parent's: a child's permissions are narrowed from them.
     pub mode: Option<Mode>,
     pub max_steps: Option<u32>,
-    /// Kept for worktree isolation (`worktree`); no effect yet.
+    /// `worktree`: the agent always works in a git worktree of its own.
     pub isolation: Option<String>,
-    /// Kept for background agents; no effect yet.
+    /// `true`: the agent is started in the background, and keeps running when the turn ends.
     pub background: Option<bool>,
     /// Its instructions: what the file says after its frontmatter.
     pub body: String,
     pub source: DefinitionSource,
     /// The model a project file names that is not used because the workspace is not trusted.
     pub model_ignored: Option<String>,
+    /// A project file says `background: true` and it is not used because the workspace is not
+    /// trusted: a cloned repository must not make the model's helper outlive the turn.
+    pub background_ignored: bool,
 }
 
 impl AgentDefinition {
@@ -79,6 +82,7 @@ impl AgentDefinition {
             body: body.into(),
             source: DefinitionSource::Builtin,
             model_ignored: None,
+            background_ignored: false,
         }
     }
 
@@ -193,15 +197,21 @@ impl Definitions {
         Definitions { list }
     }
 
-    /// With a project definition's `model` kept only when `trusted`; otherwise it is set aside in
-    /// `model_ignored`, to be said where the definition is shown or used.
+    /// With a project definition's `model` and `background: true` kept only when `trusted`;
+    /// otherwise they are set aside in `model_ignored` and `background_ignored`, to be said where
+    /// the definition is shown or used.
     pub fn with_trust(mut self, trusted: bool) -> Self {
         if !trusted {
             for def in &mut self.list {
-                if matches!(def.source, DefinitionSource::Project(_))
-                    && let Some(model) = def.model.take()
-                {
+                if !matches!(def.source, DefinitionSource::Project(_)) {
+                    continue;
+                }
+                if let Some(model) = def.model.take() {
                     def.model_ignored = Some(model);
+                }
+                if def.background == Some(true) {
+                    def.background = None;
+                    def.background_ignored = true;
                 }
             }
         }
@@ -360,5 +370,34 @@ mod tests {
             Some("openai/gpt-5")
         );
         assert_eq!(trusted.get("p").unwrap().model_ignored, None);
+    }
+
+    #[test]
+    fn a_project_files_background_is_kept_only_when_the_workspace_is_trusted() {
+        let project = |background| AgentDefinition {
+            background,
+            ..file(
+                "helper",
+                DefinitionSource::Project(PathBuf::from("/repo/.harness/agents/helper.md")),
+            )
+        };
+        let user = AgentDefinition {
+            background: Some(true),
+            ..file(
+                "mine",
+                DefinitionSource::User(PathBuf::from("/home/me/mine.md")),
+            )
+        };
+        let untrusted = Definitions::new(vec![project(Some(true)), user.clone()]).with_trust(false);
+        let helper = untrusted.get("helper").unwrap();
+        assert_eq!(helper.background, None);
+        assert!(helper.background_ignored);
+        // The user's own definition and a project file that did not ask are as they were.
+        assert_eq!(untrusted.get("mine").unwrap().background, Some(true));
+        let quiet = Definitions::new(vec![project(Some(false))]).with_trust(false);
+        assert_eq!(quiet.get("helper").unwrap().background, Some(false));
+        assert!(!quiet.get("helper").unwrap().background_ignored);
+        let trusted = Definitions::new(vec![project(Some(true))]).with_trust(true);
+        assert_eq!(trusted.get("helper").unwrap().background, Some(true));
     }
 }

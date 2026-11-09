@@ -283,6 +283,7 @@ fn definition(
         body: body.to_string(),
         source,
         model_ignored: None,
+        background_ignored: false,
     })
 }
 

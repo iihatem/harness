@@ -1175,7 +1175,6 @@ pub fn project_widening(global_file: &Path, workspace: &Path) -> Result<Widening
         .or_else(|| project.roles.problem())
         .or_else(|| fallback_problem(&project.fallback))
         .or_else(|| project.escalation.problem())
-        .or_else(|| project.agents.problem())
     {
         return Err(ConfigError::Parse { path, message });
     }
@@ -1246,6 +1245,13 @@ pub fn load(
         cfg.fallback = global.fallback;
         cfg.escalation_to = global.escalation.to;
         cfg.agents = Agents::from(&global.agents);
+        if cfg.agents.max_depth > 1 {
+            cfg.warnings.push(format!(
+                "{}: agents.max_depth = {} has no effect: a subagent never starts subagents, so nesting is one level deep",
+                global_file.display(),
+                cfg.agents.max_depth
+            ));
+        }
         cfg.delegate = Delegate::from(&global.delegate);
         cfg.lsp.overlaid(&global.lsp, true);
     }

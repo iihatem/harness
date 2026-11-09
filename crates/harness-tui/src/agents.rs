@@ -105,6 +105,12 @@ pub fn report(
                         theme.dim(),
                     )));
                 }
+                if def.background_ignored {
+                    lines.push(Line::from(Span::styled(
+                        "    background ignored: workspace not trusted",
+                        theme.warning(),
+                    )));
+                }
                 if let Some(model) = &def.model_ignored {
                     lines.push(Line::from(Span::styled(
                         format!(

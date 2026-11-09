@@ -100,3 +100,37 @@ fn a_project_can_turn_spawn_off_but_never_on() {
         still_off.warnings
     );
 }
+
+#[test]
+fn a_depth_above_one_is_said_to_have_no_effect() {
+    let cfg = load("[agents]\nmax_depth = 3\n", "").unwrap();
+    assert!(
+        cfg.warnings
+            .iter()
+            .any(|w| w.contains("max_depth") && w.contains("no effect")),
+        "{:?}",
+        cfg.warnings
+    );
+    let one = load("[agents]\nmax_depth = 1\n", "").unwrap();
+    assert!(one.warnings.iter().all(|w| !w.contains("max_depth")));
+}
+
+#[test]
+fn a_zero_in_a_projects_agents_is_ignored_with_a_warning_and_does_not_stop_trust() {
+    let dir = tempfile::tempdir().unwrap();
+    let global_file = dir.path().join("config.toml");
+    std::fs::write(&global_file, "").unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(workspace.join(".harness")).unwrap();
+    std::fs::write(
+        workspace.join(".harness/config.toml"),
+        "[agents]\nmax_total = 0\n",
+    )
+    .unwrap();
+    let trust = TrustStore::load(&dir.path().join("data")).unwrap();
+    // The session reads it, ignoring [agents] with a warning ...
+    let cfg = config::load(&global_file, &workspace, &trust).unwrap();
+    assert_eq!(cfg.agents.max_total, 4);
+    // ... so `harness trust` must not fail on it either.
+    assert!(config::project_widening(&global_file, &workspace).is_ok());
+}

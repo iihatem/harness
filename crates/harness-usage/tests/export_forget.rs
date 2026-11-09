@@ -115,6 +115,30 @@ fn jsonl_is_the_default_and_every_line_is_a_record() {
 }
 
 #[test]
+fn csv_says_which_agent_made_a_request_and_which_session_paid() {
+    let data = tempfile::tempdir().unwrap();
+    let dirs = Dirs::under(data.path());
+    let mut r = record(SEPT_30, "a/b");
+    r.agent = Some("a2".into());
+    r.parent = Some("parent-session".into());
+    r.label = Some("general".into());
+    Ledger::new(&dirs.usage).append(&r).unwrap();
+    let lines = lines(Format::Csv, None, data.path());
+    // The columns of before keep their places; the new ones come last.
+    assert!(
+        lines[0].ends_with(",window,agent,parent,label"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].ends_with(",a2,parent-session,general"),
+        "{}",
+        lines[1]
+    );
+    assert_eq!(lines[1].split(',').count(), lines[0].split(',').count());
+}
+
+#[test]
 fn csv_quotes_what_needs_it() {
     let data = tempfile::tempdir().unwrap();
     let dirs = Dirs::under(data.path());

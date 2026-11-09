@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 /// The workspace of a child. Made by [`ChildWorkspace::parent`] (its parent's own), by
 /// [`ChildWorkspace::from_path`] (a path someone named, accepted only when it is the parent's), or
-/// by harness code that created a workspace for the child itself (`created`, crate-internal until
-/// the code that creates worktrees lands).
+/// by harness code that created a workspace for the child itself ([`ChildWorkspace::worktree`],
+/// the only door: a worktree harness made).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChildWorkspace(Choice);
 

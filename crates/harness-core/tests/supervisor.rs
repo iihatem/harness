@@ -1210,6 +1210,99 @@ async fn a_child_that_edited_through_a_command_runs_the_gates() {
     assert_eq!(report.files_changed, vec!["made.txt"]);
 }
 
+/// Writes `sibling.txt` and says no file changed: what another agent in the same checkout does
+/// while this one works.
+struct Sibling;
+
+#[async_trait]
+impl harness_core::tool::Tool for Sibling {
+    fn spec(&self) -> harness_core::message::ToolSpec {
+        harness_core::message::ToolSpec {
+            name: "sibling".into(),
+            description: "another agent's edit".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    fn action(
+        &self,
+        _args: &serde_json::Value,
+        ctx: &ToolContext,
+    ) -> harness_core::permission::Action {
+        harness_core::permission::Action::Read(ctx.workspace.clone())
+    }
+    async fn run(
+        &self,
+        _args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> harness_core::tool::ToolOutput {
+        std::fs::write(ctx.workspace.join("sibling.txt"), "x").unwrap();
+        harness_core::tool::ToolOutput::ok("done")
+    }
+}
+
+#[tokio::test]
+async fn a_child_in_a_shared_checkout_that_ran_no_command_lists_only_its_own_edits() {
+    let (dir, work) = bash_workspace();
+    let base = dir.path().canonicalize().unwrap();
+    let provider = MockProvider::new(vec![
+        Script::tool_call("c1", "edit", json!({"path": "mine.txt", "content": "m"})),
+        Script::tool_call("c2", "sibling", json!({})),
+        Script::text("done"),
+    ]);
+    let factory = factory(move |setup| {
+        let mode = setup.mode;
+        let checkpoints = harness_core::checkpoint::Checkpoints::open(
+            &base.join("data/checkpoints/project.git"),
+            &base.join("work"),
+            setup.session.id(),
+        )
+        .unwrap();
+        Ok(Agent::new(
+            provider.clone(),
+            ToolRegistry::new(vec![Arc::new(common::gates::Edit), Arc::new(Sibling)]),
+            setup.policy,
+            setup.approver,
+            AgentConfig::new("mock/m1", "m1", "p", base.join(".spill")),
+            ToolContext::new(&base.join("work")).with_sandbox(None, mode.fs_access()),
+        )
+        .with_session(setup.session)
+        .with_checkpoints(Some(Arc::new(checkpoints))))
+    });
+    let p = parent(&work, Mode::Auto, Arc::new(NonInteractive));
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    let report = wait(sup.spawn(spec("editor"))).await;
+    assert_eq!(report.status, AgentStatus::Done, "{report:?}");
+    assert_eq!(report.files_changed, vec!["mine.txt"], "{report:?}");
+}
+
+#[tokio::test]
+async fn a_child_started_while_the_parent_was_in_plan_stays_there_when_the_parent_widens() {
+    use harness_core::permission::PermissionPolicy;
+    let dir = tempfile::tempdir().unwrap();
+    let policies: Arc<Mutex<Vec<Arc<dyn PermissionPolicy>>>> = Arc::default();
+    let seen = policies.clone();
+    let work = dir.path().to_path_buf();
+    let factory = factory(move |setup| {
+        seen.lock().unwrap().push(setup.policy.clone());
+        Ok(child_agent(
+            setup,
+            MockProvider::new(vec![Script::text("ok")]),
+            &work,
+        ))
+    });
+    let p = parent(dir.path(), Mode::Auto, Arc::new(NonInteractive));
+    PermissionPolicy::set_mode(&*p.engine, Mode::Plan);
+    let (sup, _rx) = supervisor(factory, p.ctx);
+    wait(sup.spawn(spec("x"))).await;
+    PermissionPolicy::set_mode(&*p.engine, Mode::Auto);
+    let child = policies.lock().unwrap()[0].clone();
+    assert_eq!(
+        child.mode(),
+        Some(Mode::Plan),
+        "it never widens beyond its start"
+    );
+}
+
 // ---- records reach the session they belong to -----------------------------------------------
 
 fn record_lines(path: &Path) -> Vec<String> {

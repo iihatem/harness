@@ -837,7 +837,9 @@ async fn run_child(
     let policy: Arc<dyn PermissionPolicy> = Arc::new(perm::ChildPolicy::new(
         PermissionEngine::new(config),
         parent.policy.clone(),
-        spec.mode,
+        // The mode it starts in, never wider than that later: a child that began while its
+        // parent was in plan mode does not follow the parent back up.
+        Some(mode),
     ));
     let failure = Arc::new(Mutex::new(None));
     let approver = Arc::new(ChildApprover {
@@ -963,7 +965,9 @@ async fn run_child(
     };
     let input = TurnInput {
         parts: vec![InputPart::Text(spec.task.clone())],
-        role: spec.role,
+        // The child's own model is the one it runs on, whatever mode its parent is in: a turn
+        // that names no role would take the plan role's model while the policy is in plan mode.
+        role: spec.role.or(Some(Role::Main)),
         ..TurnInput::default()
     };
     let reason = agent.run_turn(input, &events, cancel.clone()).await;
@@ -971,8 +975,12 @@ async fn run_child(
     let seen = forward.await.unwrap_or_default();
     let mut log = agent.take_tool_log();
     // What changed in the workspace since the child's checkpoint counts too, so a file `bash`
-    // edited is listed (the tools' own list comes first). Not waited for after a cancel.
+    // edited is listed (the tools' own list comes first). In a checkout shared with siblings
+    // that comparison also holds their edits, so there it counts only for a child that ran a
+    // shell command itself (and in a worktree of its own it always does). Not waited for after
+    // a cancel.
     if !cancel.is_cancelled()
+        && (worktree.is_some() || !log.commands.is_empty())
         && let Some(files) = agent.files_changed_in_workspace().await
     {
         for file in files {

@@ -228,3 +228,25 @@ fn the_readme_reads_top_to_bottom() {
         assert!(line.len() < 1300, "too long for the list: {}", &line[..60]);
     }
 }
+
+#[test]
+fn the_readme_names_the_csv_columns_that_say_which_agent_made_a_request() {
+    // The last columns of `usage export --format csv`, as the code writes them.
+    let source = include_str!("../../harness-usage/src/export.rs");
+    let header = source
+        .lines()
+        .find_map(|l| l.strip_prefix("const CSV_HEADER: &str = \""))
+        .and_then(|l| l.strip_suffix("\";"))
+        .expect("the CSV header is in export.rs");
+    let columns: Vec<&str> = header.split(',').collect();
+    let last = columns[columns.len() - 3..].join(",");
+    assert!(
+        readme().contains(&last),
+        "the README does not name the columns {last}"
+    );
+    // And what the delegation section says about limits that the code does not have.
+    let text = readme();
+    for word in ["ignores `max_steps`", "`143` or `129`", "Git 2.31 or newer"] {
+        assert!(text.contains(word), "the README does not mention {word}");
+    }
+}
